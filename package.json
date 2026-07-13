@@ -24,7 +24,9 @@
   },
   "files": [
     "README.md",
+    "DEVELOPMENT.md",
     "LICENSE",
+    "docs/**/*.md",
     "src/*.ts",
     "skills/**/*.md"
   ],
