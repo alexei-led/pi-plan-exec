@@ -6,40 +6,36 @@
 [![CI](https://img.shields.io/github/actions/workflow/status/alexei-led/pi-plan-exec/ci.yml?branch=main&style=flat-square&label=ci)](https://github.com/alexei-led/pi-plan-exec/actions/workflows/ci.yml?query=branch%3Amain)
 [![Release](https://img.shields.io/github/actions/workflow/status/alexei-led/pi-plan-exec/release.yml?style=flat-square&label=release)](https://github.com/alexei-led/pi-plan-exec/actions/workflows/release.yml)
 [![node](https://img.shields.io/badge/node-%3E%3D22.19.0-5fa04e?style=flat-square&logo=node.js&logoColor=white)](https://nodejs.org/)
-[![license](https://img.shields.io/github/license/alexei-led/pi-plan-exec?style=flat-square)](LICENSE)
+[![license: MIT](https://img.shields.io/badge/license-MIT-2ea44f?style=flat-square)](https://github.com/alexei-led/pi-plan-exec/blob/main/LICENSE)
 
-**Give Pi a plan. Get an isolated branch, sequential implementation, adversarial reviews, and a resumable run record.**
+**Turn a Markdown execution plan into an isolated, resumable Pi run.**
 
-`pi-plan-exec` turns a checkbox plan into a controlled execution pipeline. It
-runs one fresh worker at a time, checks the plan instead of trusting “done,”
-reviews the result through Pi subagents and Fusion, and survives session restarts
-without intentionally starting a second writer.
+`pi-plan-exec` solves the control problem of long-running AI implementation.
+A capable agent can lose context, repeat work, skip verification, or start a
+second writer after a restart. This extension moves task order, retry limits,
+worktree checks, and recovery out of prompt prose into durable controller state.
 
-Built for long-running AI coding work where a prompt alone is not a reliable
-orchestrator.
+It executes one checked-list task at a time in a Git checkout you choose, then
+runs review and fix stages with fresh Pi subagents and Fusion. A worker saying
+“done” is not enough: the plan’s checked items are the implementation record.
 
-> Experimental. Start in disposable repositories or reviewable worktrees until
-> the package has seen more production plan runs.
+> Experimental. Start with disposable repositories or reviewable worktrees.
 
-## Why
+## What it does
 
-A capable coding agent can still lose the thread across a long implementation:
-repeat a task, skip a review, exceed a retry cap, write in the wrong checkout, or
-forget what was running after the session restarts.
+- **Keeps one writer in one checkout.** `/exec` always asks whether to use an
+  isolated Git worktree or work in place.
+- **Executes plans deterministically.** It selects the first incomplete task,
+  starts a fresh worker, and verifies completion from the plan checkboxes.
+- **Recovers deliberately.** Run records, operation IDs, leases, and adoption
+  prevent an interrupted session from intentionally starting another writer.
+- **Reviews before it finishes.** It runs comprehensive, smells, Fusion, and
+  critical review/fix phases. Unresolved findings remain visible in the final
+  `completed_with_findings` state.
 
-`pi-plan-exec` moves that control flow out of prompt prose and into a durable
-state machine:
+## Install and run
 
-- **one writer** in one selected Git worktree;
-- **fresh context** for every worker, reviewer, fixer, and stats pass;
-- **checkbox truth** — implementation completes only when the plan says it does;
-- **bounded review loops** with honest `completed_with_findings` outcomes;
-- **crash-safe operation IDs**, leases, and cross-session adoption;
-- **visible progress** through a pi-tasks projection and global run record.
-
-## Quick start
-
-Install the Pi packages:
+Install the runtime extensions:
 
 ```bash
 pi install npm:pi-subagents
@@ -49,39 +45,19 @@ pi install npm:@alexeiled/pi-fusion
 pi install npm:@alexeiled/pi-plan-exec
 ```
 
-Reload Pi, then run a plan from inside a Git repository:
+Reload Pi. From an interactive session in a Git repository, run an executable
+plan:
 
 ```text
 /reload
 /exec docs/plans/20260713-add-greeting.md
 ```
 
-A minimal plan:
+The **[Guide](docs/guide.md#executable-plan-format)** defines the accepted plan
+format, including the exact heading and checkbox rules. Omit the path to select
+an eligible Markdown plan below `docs/plans/`.
 
-```markdown
-# Add greeting
-
-### Task 1: Add the greeting
-
-- [ ] Create `greeting.txt` containing `hello`.
-- [ ] Verify the file contents.
-```
-
-`/exec` asks whether to run in place or in an isolated worktree. Prefer the
-worktree. Omit the path to choose a plan interactively from `docs/plans/`.
-
-## What you get
-
-- **Sequential implementation** — the first incomplete task runs; later tasks wait.
-- **Strict plan validation** — ordered task/iteration headings and checkbox items.
-- **Git isolation** — worktrees live outside the source repository under `~/.pi/plan-exec/worktrees/`.
-- **Ralphex-style review pipeline** — comprehensive, smells, Fusion, and critical review/fix stages.
-- **Durable recovery** — run records under `~/.pi/plan-exec/runs/` survive Pi sessions.
-- **Safe adoption** — a stale run can be claimed without replacing an active foreign-session child.
-- **pi-tasks visibility** — each session gets a task projection; it is not a second executor.
-- **No cc-thingz dependency** — uses pi-subagents' built-in `worker` and `reviewer` agents.
-
-## How it works
+## Runtime model
 
 ```mermaid
 flowchart LR
@@ -96,29 +72,18 @@ flowchart LR
     controller --> result["completed or completed_with_findings"]
 ```
 
-The controller owns stage order, retry limits, leases, and recovery. Existing Pi
-extensions keep ownership of model execution, task UI, and panel review. See the
-[architecture](docs/architecture.md) for the contracts and state model.
-
-## Commands
-
-```text
-/exec <plan>            Start a run
-/exec                   Select and start a plan
-/exec runs              List recent runs
-/exec status <run-id>   Show stage, branch, and worktree
-/exec pause <run-id>    Finish the active child, then pause
-/exec resume <run-id>   Continue a paused run
-/exec adopt <run-id>    Claim a stale cross-session run
-/exec cancel <run-id>   Stop when safe and keep the worktree
-```
+`pi-plan-exec` owns plan-specific control flow. Existing Pi packages retain
+ownership of subagent execution, task UI, and multi-model review.
 
 ## Read next
 
-- **[Guide](docs/guide.md)** — installation, plan format, commands, recovery, and safety.
-- **[Architecture](docs/architecture.md)** — ownership, data flow, state, stages, and trust boundaries.
-- [Development](DEVELOPMENT.md) — local checks and trusted-publishing releases.
-- [Original design record](docs/plans/2026-07-12-pi-plan-exec-design.md) — detailed design discussion.
+- **[Guide](docs/guide.md)** — requirements, executable-plan format, commands,
+  lifecycle, recovery, and safety limits.
+- **[Architecture](docs/architecture.md)** — component ownership, state, RPC
+  contracts, stages, and trust boundaries.
+- [Development](DEVELOPMENT.md) — local verification and release process.
+- [Original design record](docs/plans/2026-07-12-pi-plan-exec-design.md) —
+  design decisions and intended behavior.
 
 ## License
 

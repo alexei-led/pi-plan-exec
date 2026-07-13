@@ -2,12 +2,26 @@
 
 <!-- markdownlint-disable MD013 -->
 
-This guide covers installation, plan format, commands, run behavior, recovery,
-and local development. See [Architecture](architecture.md) for internal design.
+Use this guide to install `pi-plan-exec`, write an executable plan, run it, and
+recover a run safely. See [Architecture](architecture.md) for implementation
+contracts and component ownership.
+
+## Requirements
+
+- Pi in an **interactive** session. `/exec` asks whether to use a worktree.
+- A Git repository with a non-detached `HEAD`.
+- A plan file inside that repository.
+- These installed Pi packages:
+  - `pi-subagents` `0.34.0` or later;
+  - `@tintinweb/pi-tasks` `0.7.1` or later;
+  - `@alexeiled/pi-subagents-bridge` `0.1.6` or later;
+  - `@alexeiled/pi-fusion` `0.5.1` or later;
+  - `@alexeiled/pi-plan-exec`.
+
+`pi-plan-exec` uses pi-subagents’ built-in `worker` and `reviewer` agents. It
+does not require cc-thingz agents.
 
 ## Install
-
-Install Pi and the runtime extensions:
 
 ```bash
 pi install npm:pi-subagents
@@ -17,81 +31,113 @@ pi install npm:@alexeiled/pi-fusion
 pi install npm:@alexeiled/pi-plan-exec
 ```
 
-Reload Pi after installation:
+Reload Pi after installing:
 
 ```text
 /reload
 ```
 
-Compatible minimum versions:
+## Executable plan format
 
-- `pi-subagents` `0.34.0`
-- `@tintinweb/pi-tasks` `0.7.1`
-- `@alexeiled/pi-subagents-bridge` `0.1.6`
-- `@alexeiled/pi-fusion` `0.5.1`
-
-`pi-plan-exec` uses the built-in `worker` and `reviewer` agents. It does not
-require cc-thingz agents.
-
-## Write a plan
-
-Plans are Markdown files with ordered task or iteration headings and checkbox
-items:
+An executable plan is a Markdown file with a sequence of numbered task or
+iteration sections. Each section contains one or more checkbox items.
 
 ```markdown
 # Add greeting
 
+Optional context is allowed before, between, and inside task sections.
+
 ### Task 1: Add the greeting
 
-- [ ] Create `greeting.txt` containing `hello`.
-- [ ] Verify the file contents.
+- [ ] Create `greeting.txt` containing exactly `hello`.
+- [ ] Verify it with `test "$(cat greeting.txt)" = "hello"`.
 
 ### Task 2: Document the behavior
 
 - [ ] Add the user-facing documentation.
-- [ ] Run the documentation checks.
+- [ ] Run the relevant documentation checks.
 ```
 
-Accepted headings:
+The parser accepts these heading forms:
 
 ```text
-### Task 1: Title
-### Iteration 1: Title
+### Task 1: Short task title
+### Iteration 1: Short task title
 ```
 
-Requirements:
+The plan contract is strict:
 
-- numbering starts at 1 and is consecutive;
-- every section has at least one checkbox;
-- task structure stays stable while a run is active;
-- workers mark completed items with `[x]`;
-- the plan lives inside the Git repository.
+| Rule          | Required behavior                                                                                        |
+| ------------- | -------------------------------------------------------------------------------------------------------- |
+| Heading level | Use exactly `###`.                                                                                       |
+| Heading kind  | Use `Task` or `Iteration`, followed by a positive integer and `:`.                                       |
+| Numbering     | Start at `1`; use each number exactly once; do not skip numbers.                                         |
+| Title         | Put non-empty text after `:`.                                                                            |
+| Checkbox      | Each task needs at least one `- [ ] item` or `- [x] item`. `[X]` also means checked.                     |
+| Location      | Keep the plan inside the Git repository.                                                                 |
+| Active run    | Do not change task numbers, titles, checkbox text, or add/remove task items. Only change checkbox state. |
 
-By default, `/exec` can select Markdown plans under `docs/plans/`, excluding
-`completed/`.
+Text that is not a matching checkbox is context only. It does not create work or
+complete a task. All matching checkboxes between one task heading and the next
+belong to that task.
+
+### Completion semantics
+
+A task is incomplete while it has any unchecked item. The controller starts the
+first incomplete task, then re-reads the plan after the worker finishes:
+
+- `[ ]` means pending work.
+- `[x]` or `[X]` means completed work.
+- A worker’s chat summary does **not** complete a task.
+- Checking every item in a task advances to the next numbered task.
+- Changing task structure during a run fails the run; restore the original
+  structure, then inspect the run before resuming it.
+
+Write concrete, verifiable items. Each item should name an outcome and, where
+possible, its verification. Avoid broad items such as “finish feature” that
+combine unrelated behavior and checks.
+
+### Invalid examples
+
+These plans are rejected before the controller starts work:
+
+```markdown
+## Task 1: Wrong heading level
+
+- [ ] This is ignored because the heading is not `###`.
+
+### Task 2: Wrong first task number
+
+- [ ] Numbering must start at 1.
+
+### Task 1: Missing checkboxes
+
+Write the feature.
+```
 
 ## Start a run
 
-From an interactive Pi session in a Git repository:
+From an interactive Pi session at the repository root:
 
 ```text
 /exec docs/plans/20260713-add-greeting.md
 ```
 
-When the path is omitted, choose a plan from the interactive list:
+To choose a Markdown plan beneath `docs/plans/`, excluding directories named
+`completed`:
 
 ```text
 /exec
 ```
 
-The extension always asks whether to execute in place or in an isolated Git
-worktree. Prefer the isolated worktree. Execution worktrees live under:
+The extension always asks whether to use the current checkout or an isolated
+Git worktree. Prefer the worktree. Worktrees live outside the source repository:
 
 ```text
 ~/.pi/plan-exec/worktrees/
 ```
 
-No stage pushes or merges the branch.
+No stage pushes or merges a branch.
 
 ## Commands
 
@@ -106,22 +152,25 @@ No stage pushes or merges the branch.
 /exec cancel <run-id>   Stop when safe and preserve the worktree
 ```
 
-## What a run does
+## Run lifecycle
 
-1. Validate the Git repository and plan structure.
-2. Ask for worktree isolation.
-3. Create a durable global run record and pi-tasks projection.
-4. Run implementation tasks sequentially with fresh `worker` subagents.
-5. Re-read plan checkboxes after every worker; worker prose does not complete a task.
-6. Run comprehensive, smells, Fusion, and critical review/fix stages.
-7. Finalize, collect statistics, and archive the completed plan best effort.
+A run:
 
-Only one writer is active in the execution worktree. Review and fix operations
-also use fresh subagent contexts.
+1. Validates the Git repository and executable-plan contract.
+2. Asks for in-place execution or worktree isolation.
+3. Creates a durable global run record and a pi-tasks projection.
+4. Runs implementation tasks in order with fresh `worker` subagents.
+5. Re-reads plan checkboxes after every worker; worker prose is not completion
+   evidence.
+6. Runs comprehensive, smells, Fusion, and critical review/fix stages.
+7. Finalizes, collects statistics, and archives the completed plan best effort.
 
-## Review output
+Only one writer is active in the execution worktree. Every implementation,
+review, and fix operation has fresh subagent context.
 
-Review stages must return either:
+## Review results
+
+Review stages return either:
 
 ```text
 NO_FINDINGS
@@ -136,60 +185,37 @@ Fix: Reject empty input at the boundary.
 ```
 
 Supported severities are `CRITICAL`, `MAJOR`, and `MINOR`. If known findings
-remain after configured review caps, the run finishes as
-`completed_with_findings` rather than claiming that reviews passed.
+survive configured review caps, the result is `completed_with_findings`. The
+controller does not claim that reviews passed.
 
-## State and recovery
+## Recovery and safety
 
-The authoritative run records live under:
+Authoritative records live at:
 
 ```text
 ~/.pi/plan-exec/runs/<run-id>/run.json
 ```
 
-The record stores the current stage, attempts, active child/Fusion operation,
-worktree, branch, findings, and lease. Durable operation IDs let the controller
-replay a start request after a crash without intentionally launching a second
-writer.
+They store stage, attempts, active Bridge/Fusion operation, worktree, branch,
+findings, and lease. Durable operation IDs let the controller replay a start
+after a crash without intentionally launching a second writer.
 
-Pi-tasks rows are a session-scoped UI projection. On adoption, the extension
-rebuilds that projection from the global run record and plan.
+Pi-tasks is a session-scoped UI projection. On adoption, the projection is
+rebuilt from the global record and plan.
 
 Pause, cancellation, failure, and completion preserve the worktree for review.
 Use `/exec status <run-id>` before manually changing it.
 
-## Safety limits
+Safety limits:
 
-- Git only; Mercurial is rejected.
-- Detached HEAD is rejected.
+- Git only; Mercurial and detached `HEAD` are rejected.
 - Dirty state is not silently copied into a worktree.
 - The execution directory and branch are checked before writer stages.
-- Task structure changes outside checkbox completion fail the run.
 - Implementation tasks never run in parallel.
-- Finalization, statistics, and archival are best effort.
+- Finalization, statistics, and plan archival are best effort.
 
-The package is experimental. Start with disposable repositories or reviewable
+The package is experimental. Use disposable repositories or reviewable
 worktrees until it has seen more production plan runs.
 
-## Local source setup
-
-Load all source extensions together:
-
-```bash
-pi --no-extensions --no-skills --no-prompt-templates --no-context-files \
-  -e /path/to/pi-subagents/src/extension/index.ts \
-  -e /path/to/pi-tasks/src/index.ts \
-  -e /path/to/pi-subagents-bridge/src/index.ts \
-  -e /path/to/pi-fusion/src/index.ts \
-  -e /path/to/pi-plan-exec/src/index.ts
-```
-
-Project validation:
-
-```bash
-npm run test:all
-npm run publish:dry
-```
-
-See [DEVELOPMENT.md](../DEVELOPMENT.md) for release and trusted-publishing
-instructions.
+For local setup, validation, and tag-driven releases, see
+[DEVELOPMENT.md](../DEVELOPMENT.md).

@@ -42,7 +42,8 @@
     ],
     "skills": [
       "./skills"
-    ]
+    ],
+    "image": "https://raw.githubusercontent.com/alexei-led/pi-plan-exec/main/assets/plan-exec-card.png"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
