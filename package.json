@@ -1,0 +1,64 @@
+{
+  "name": "@alexeiled/pi-plan-exec",
+  "version": "0.1.0",
+  "description": "Reliable, resumable ralphex-style plan execution for Pi",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "plan-execution",
+    "ralphex"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/alexei-led/pi-plan-exec.git"
+  },
+  "homepage": "https://github.com/alexei-led/pi-plan-exec#readme",
+  "bugs": {
+    "url": "https://github.com/alexei-led/pi-plan-exec/issues"
+  },
+  "type": "module",
+  "main": "./src/index.ts",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "files": [
+    "README.md",
+    "LICENSE",
+    "src/*.ts",
+    "skills/**/*.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "node --import jiti/register --test test/*.test.ts",
+    "lint": "eslint . --cache --cache-strategy content",
+    "pack:dry": "npm pack --dry-run",
+    "publish:dry": "npm publish --dry-run",
+    "test:all": "npm run lint && npm run check && npm test && npm run pack:dry"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "@tintinweb/pi-tasks": "^0.7.1",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.6.0",
+    "globals": "^17.7.0",
+    "jiti": "^2.7.0",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.62.1"
+  }
+}

@@ -1,0 +1,188 @@
+import { randomUUID } from "node:crypto";
+import type { EventBus } from "./bridge.js";
+
+export const FUSION_REQUEST_EVENT = "fusion:rpc:v1:request";
+const FUSION_REPLY_PREFIX = "fusion:rpc:v1:reply:";
+
+export type FusionPhase =
+  "chain" | "panel" | "judge" | "done" | "failed" | "cancelled";
+
+export interface FusionRunState {
+  runId: string;
+  operationId?: string;
+  phase: FusionPhase;
+  terminal: boolean;
+  report?: string;
+  error?: string;
+}
+
+export type FusionResult =
+  | { success: true; data: Record<string, unknown> }
+  | { success: false; error: { code?: string; message: string } };
+
+export class FusionClient {
+  constructor(
+    private readonly events: EventBus,
+    private readonly timeoutMs = 30_000,
+  ) {}
+
+  ping(): Promise<FusionResult> {
+    return this.request("ping", {});
+  }
+
+  start(
+    operationId: string,
+    prompt: string,
+    profile?: string,
+  ): Promise<FusionResult> {
+    return this.request("start", {
+      params: { operationId, prompt, ...(profile ? { profile } : {}) },
+    });
+  }
+
+  status(runId?: string, operationId?: string): Promise<FusionResult> {
+    return this.select("status", runId, operationId);
+  }
+
+  result(runId?: string, operationId?: string): Promise<FusionResult> {
+    return this.select("result", runId, operationId);
+  }
+
+  adopt(runId: string): Promise<FusionResult> {
+    return this.request("adopt", { params: { runId } });
+  }
+
+  cancel(runId?: string, operationId?: string): Promise<FusionResult> {
+    return this.select("cancel", runId, operationId);
+  }
+
+  private select(
+    method: "status" | "result" | "cancel",
+    runId?: string,
+    operationId?: string,
+  ): Promise<FusionResult> {
+    if (runId && operationId) {
+      return Promise.resolve({
+        success: false,
+        error: {
+          code: "invalid_request",
+          message: "Specify runId or operationId, not both.",
+        },
+      });
+    }
+    return this.request(method, {
+      params: {
+        ...(runId ? { runId } : {}),
+        ...(operationId ? { operationId } : {}),
+      },
+    });
+  }
+
+  private request(
+    method: string,
+    body: Record<string, unknown>,
+  ): Promise<FusionResult> {
+    const requestId = randomUUID();
+    return new Promise((resolve) => {
+      const state: { timeout?: ReturnType<typeof setTimeout> } = {};
+      const registered = this.events.on(
+        `${FUSION_REPLY_PREFIX}${requestId}`,
+        (payload: unknown) => {
+          if (state.timeout) clearTimeout(state.timeout);
+          unsubscribe();
+          resolve(parseReply(payload));
+        },
+      );
+      const unsubscribe =
+        typeof registered === "function" ? registered : () => undefined;
+      state.timeout = setTimeout(() => {
+        unsubscribe();
+        resolve({
+          success: false,
+          error: {
+            code: "timeout",
+            message: `Fusion ${method} timed out after ${this.timeoutMs}ms.`,
+          },
+        });
+      }, this.timeoutMs);
+      this.events.emit(FUSION_REQUEST_EVENT, {
+        version: 1,
+        requestId,
+        method,
+        ...body,
+      });
+    });
+  }
+}
+
+export function fusionState(value: unknown): FusionRunState | undefined {
+  if (!isRecord(value)) return undefined;
+  const run = isRecord(value.run) ? value.run : value;
+  const runId = text(run.runId);
+  const phase = text(run.phase);
+  const operationId = text(run.operationId);
+  const report = text(run.report);
+  const error = text(run.error);
+  if (
+    !runId ||
+    !phase ||
+    !isFusionPhase(phase) ||
+    typeof run.terminal !== "boolean"
+  ) {
+    return undefined;
+  }
+  return {
+    runId,
+    phase,
+    terminal: run.terminal,
+    ...(operationId ? { operationId } : {}),
+    ...(report ? { report } : {}),
+    ...(error ? { error } : {}),
+  };
+}
+
+function parseReply(value: unknown): FusionResult {
+  if (!isRecord(value) || typeof value.success !== "boolean") {
+    return {
+      success: false,
+      error: {
+        code: "malformed",
+        message: "Fusion returned a malformed reply.",
+      },
+    };
+  }
+  if (value.success) {
+    return isRecord(value.data)
+      ? { success: true, data: value.data }
+      : {
+          success: false,
+          error: {
+            code: "malformed",
+            message: "Fusion returned non-object data.",
+          },
+        };
+  }
+  const error = isRecord(value.error) ? value.error : {};
+  const code = text(error.code);
+  return {
+    success: false,
+    error: {
+      ...(code ? { code } : {}),
+      message: text(error.message) ?? "Fusion request failed.",
+    },
+  };
+}
+
+function isFusionPhase(value: string): value is FusionPhase {
+  return ["chain", "panel", "judge", "done", "failed", "cancelled"].includes(
+    value,
+  );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function text(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}

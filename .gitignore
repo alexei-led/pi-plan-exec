@@ -1,0 +1,14 @@
+node_modules/
+.eslintcache
+*.tgz
+
+# Pi runtime/session state
+.pi/
+.pi-subagents/
+.ralphex/
+
+# Local environment
+.env
+.env.*
+!.env.example
+.DS_Store
