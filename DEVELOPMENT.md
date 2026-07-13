@@ -21,10 +21,11 @@ npm run lint
 npm run check
 npm test
 npm run pack:dry
-npm run publish:dry
 ```
 
 `npm run test:all` is the local gate used by CI and the release workflow.
+`npm run pack:dry` checks the final npm tarball against a runtime-only allowlist;
+the release workflow checks npm before it performs an actual publish.
 
 ## Release
 
