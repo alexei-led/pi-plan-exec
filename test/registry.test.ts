@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -56,6 +56,241 @@ test("registry persists runs, protects path traversal, and reclaims stale leases
   };
   const adopted = await registry.claim(stale, "session-2");
   assert.equal(adopted.lease?.sessionId, "session-2");
+});
+
+test("concurrent claims allow only one session to acquire the lease", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-plan-exec-registry-"));
+  const registry = new RunRegistry(directory);
+  const run = await registry.create({
+    schemaVersion: 1,
+    repositoryRoot: "/repo",
+    planPath: "/repo/plan.md",
+    planHash: "hash",
+    worktreeCwd: "/repo",
+    branch: "feature",
+    defaultBranch: "main",
+    status: "running",
+    stage: "resolve",
+    taskAttempts: {},
+    stageAttempts: {},
+    reviewFindings: [],
+    unresolvedFindings: [],
+    config,
+  });
+
+  const claims = await Promise.allSettled([
+    registry.claim(run, "session-1"),
+    registry.claim(run, "session-2"),
+  ]);
+
+  assert.equal(
+    claims.filter((claim) => claim.status === "fulfilled").length,
+    1,
+  );
+  assert.equal(claims.filter((claim) => claim.status === "rejected").length, 1);
+  const stored = await registry.get(run.id);
+  assert.equal(
+    stored?.lease?.sessionId,
+    claims.find((claim) => claim.status === "fulfilled")?.value.lease
+      ?.sessionId,
+  );
+});
+
+test("claiming from a stale snapshot preserves newer run state", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-plan-exec-registry-"));
+  const registry = new RunRegistry(directory);
+  const run = await registry.create({
+    schemaVersion: 1,
+    repositoryRoot: "/repo",
+    planPath: "/repo/plan.md",
+    planHash: "hash",
+    worktreeCwd: "/repo",
+    branch: "feature",
+    defaultBranch: "main",
+    status: "running",
+    stage: "implementation",
+    taskAttempts: {},
+    stageAttempts: {},
+    reviewFindings: [],
+    unresolvedFindings: [],
+    config,
+  });
+  await registry.update({
+    ...run,
+    activeOperation: {
+      operationId: "operation-1",
+      service: "bridge",
+      kind: "implementation",
+      taskId: 1,
+    },
+  });
+
+  const claimed = await registry.claim(run, "session-1");
+
+  assert.equal(claimed.activeOperation?.operationId, "operation-1");
+});
+
+test("ordinary stale updates cannot erase a newer active operation", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-plan-exec-registry-"));
+  const registry = new RunRegistry(directory);
+  const run = await registry.create({
+    schemaVersion: 1,
+    repositoryRoot: "/repo",
+    planPath: "/repo/plan.md",
+    planHash: "hash",
+    worktreeCwd: "/repo",
+    branch: "feature",
+    defaultBranch: "main",
+    status: "running",
+    stage: "implementation",
+    taskAttempts: {},
+    stageAttempts: {},
+    reviewFindings: [],
+    unresolvedFindings: [],
+    config,
+  });
+  const launching = await registry.update({
+    ...run,
+    activeOperation: {
+      operationId: "operation-1",
+      service: "bridge",
+      kind: "implementation",
+      taskId: 1,
+    },
+  });
+
+  const preserved = await registry.update({ ...run, status: "paused" });
+
+  assert.equal(preserved.updatedAt, launching.updatedAt);
+  assert.equal(preserved.status, "running");
+  assert.equal(preserved.activeOperation?.operationId, "operation-1");
+});
+
+test("stale heartbeat preserves a newer cancellation request", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-plan-exec-registry-"));
+  const registry = new RunRegistry(directory);
+  const run = await registry.create({
+    schemaVersion: 1,
+    repositoryRoot: "/repo",
+    planPath: "/repo/plan.md",
+    planHash: "hash",
+    worktreeCwd: "/repo",
+    branch: "feature",
+    defaultBranch: "main",
+    status: "running",
+    stage: "implementation",
+    taskAttempts: {},
+    stageAttempts: {},
+    reviewFindings: [],
+    unresolvedFindings: [],
+    config,
+    lease: { sessionId: "session-1", pid: 123, heartbeatAt: 1 },
+  });
+  const cancelling = await registry.update({
+    ...run,
+    status: "cancel_pending",
+  });
+
+  const observed = await registry.heartbeat(run);
+
+  assert.equal(observed.status, "cancel_pending");
+  assert.equal(observed.updatedAt, cancelling.updatedAt);
+});
+
+test("controller lock recovers an orphan from the same live Pi process", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-plan-exec-registry-"));
+  const registry = new RunRegistry(directory);
+  const run = await registry.create({
+    schemaVersion: 1,
+    repositoryRoot: "/repo",
+    planPath: "/repo/plan.md",
+    planHash: "hash",
+    worktreeCwd: "/repo",
+    branch: "feature",
+    defaultBranch: "main",
+    status: "running",
+    stage: "implementation",
+    taskAttempts: {},
+    stageAttempts: {},
+    reviewFindings: [],
+    unresolvedFindings: [],
+    config,
+  });
+  const lockPath = join(directory, run.id, "run.json.controller.lock");
+  await writeFile(
+    lockPath,
+    `${JSON.stringify({
+      pid: process.pid,
+      createdAt: Date.now() - 180_000,
+      token: "orphaned-extension",
+    })}\n`,
+  );
+
+  const result = await registry.withControllerLock(run.id, async () => "ok");
+
+  assert.equal(result, "ok");
+  await assert.rejects(readFile(lockPath), /ENOENT/);
+});
+
+test("controller lock does not steal a fresh live provider request", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-plan-exec-registry-"));
+  const registry = new RunRegistry(directory);
+  const run = await registry.create({
+    schemaVersion: 1,
+    repositoryRoot: "/repo",
+    planPath: "/repo/plan.md",
+    planHash: "hash",
+    worktreeCwd: "/repo",
+    branch: "feature",
+    defaultBranch: "main",
+    status: "running",
+    stage: "implementation",
+    taskAttempts: {},
+    stageAttempts: {},
+    reviewFindings: [],
+    unresolvedFindings: [],
+    config,
+  });
+  const lockPath = join(directory, run.id, "run.json.controller.lock");
+  await writeFile(
+    lockPath,
+    `${JSON.stringify({
+      pid: process.pid,
+      createdAt: Date.now() - 60_000,
+      token: "live-provider-request",
+    })}\n`,
+  );
+
+  const result = await registry.withControllerLock(run.id, async () => "ok");
+
+  assert.equal(result, undefined);
+  assert.match(await readFile(lockPath, "utf8"), /live-provider-request/);
+  await rm(lockPath);
+});
+
+test("registry update timestamps are monotonic for compare-and-set safety", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-plan-exec-registry-"));
+  const registry = new RunRegistry(directory);
+  const run = await registry.create({
+    schemaVersion: 1,
+    repositoryRoot: "/repo",
+    planPath: "/repo/plan.md",
+    planHash: "hash",
+    worktreeCwd: "/repo",
+    branch: "feature",
+    defaultBranch: "main",
+    status: "running",
+    stage: "resolve",
+    taskAttempts: {},
+    stageAttempts: {},
+    reviewFindings: [],
+    unresolvedFindings: [],
+    config,
+  });
+
+  const updated = await registry.update({ ...run, status: "paused" });
+
+  assert.ok(updated.updatedAt > run.updatedAt);
 });
 
 test("registry rejects stale compare-and-set updates", async () => {

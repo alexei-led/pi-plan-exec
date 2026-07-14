@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import {
   execHelp,
@@ -6,7 +9,11 @@ import {
   formatRunList,
   formatRunStatus,
   getExecArgumentCompletions,
+  isRecoverableFailure,
   missingRuntimeTools,
+  needsPlanStructureReview,
+  prioritizeRunCandidates,
+  reviewedPlanHashForResume,
 } from "../src/index.js";
 import type { PlanExecRun } from "../src/types.js";
 
@@ -61,11 +68,11 @@ test("exec command completions explain the command family", () => {
     ["start", "status"],
   );
   assert.match(items?.[0]?.description ?? "", /Start a plan/);
+  const allItems = getExecArgumentCompletions("") ?? [];
+  assert.match(allItems.map((item) => item.value).join(" "), /setup/);
   assert.match(
-    getExecArgumentCompletions("")
-      ?.map((item) => item.value)
-      .join(" ") ?? "",
-    /setup/,
+    allItems.find((item) => item.value === "resume")?.description ?? "",
+    /plan-structure recovery/,
   );
 });
 
@@ -76,9 +83,35 @@ test("runtime prerequisite check identifies missing provider extensions", () => 
 
 test("help and setup explain the installed command surface", () => {
   assert.match(execHelp(), /\/exec status \[run-id\]/);
+  assert.match(execHelp(), /plan-structure recovery/);
   assert.match(execHelp(), /\/skill:exec-plan/);
   assert.match(execSetup(), /pi install npm:@alexeiled\/pi-fusion/);
   assert.match(execSetup(), /pi install npm:@alexeiled\/pi-plan-exec/);
+});
+
+test("only plan-structure failures are eligible for legacy resume recovery", () => {
+  assert.equal(
+    isRecoverableFailure(
+      run({
+        status: "failed",
+        error: "Plan task structure changed outside checkbox completion.",
+      }),
+    ),
+    true,
+  );
+  assert.equal(
+    needsPlanStructureReview(
+      run({
+        status: "paused",
+        error: "Plan task structure changed outside checkbox completion.",
+      }),
+    ),
+    true,
+  );
+  assert.equal(
+    isRecoverableFailure(run({ status: "failed", error: "worker crashed" })),
+    false,
+  );
 });
 
 test("run status includes live operation, progress, and recovery hints", () => {
@@ -90,6 +123,23 @@ test("run status includes live operation, progress, and recovery hints", () => {
   assert.match(status, /progress: \/repo\/\.ralphex\/progress\.txt/);
   assert.match(status, /error: Plan structure changed/);
   assert.match(status, /worktree preserved/);
+
+  const recoverable = formatRunStatus(
+    run({
+      status: "failed",
+      error: "Plan task structure changed outside checkbox completion.",
+    }),
+  );
+  assert.match(recoverable, /interactive \/exec resume/);
+
+  const paused = formatRunStatus(
+    run({
+      status: "paused",
+      error: "Plan task structure changed outside checkbox completion.",
+    }),
+  );
+  assert.match(paused, /interactive \/exec resume/);
+  assert.doesNotMatch(paused, /next: \/exec status/);
 });
 
 test("run status distinguishes unavailable observation from normal polling", () => {
@@ -107,6 +157,85 @@ test("run status distinguishes unavailable observation from normal polling", () 
   );
   assert.match(status, /observation: unavailable \(2\/3\)/);
   assert.match(status, /bridge unavailable/);
+});
+
+test("status prefers a live isolated run over a failed current-checkout run", () => {
+  const failedInPlace = run({
+    id: "11111111-1111-4111-8111-111111111111",
+    status: "failed",
+    worktreeCwd: "/repo",
+  });
+  const activeIsolated = run({
+    id: "22222222-2222-4222-8222-222222222222",
+    worktreeCwd: "/tmp/execution-worktree",
+  });
+
+  assert.deepEqual(
+    prioritizeRunCandidates([failedInPlace, activeIsolated], "/repo", true).map(
+      (candidate) => candidate.id,
+    ),
+    [activeIsolated.id],
+  );
+});
+
+test("resume keeps exact-worktree priority over a live isolated run", () => {
+  const recoverableInPlace = run({
+    id: "11111111-1111-4111-8111-111111111111",
+    status: "failed",
+    error: "Plan task structure changed outside checkbox completion.",
+    worktreeCwd: "/repo",
+  });
+  const pausedIsolated = run({
+    id: "22222222-2222-4222-8222-222222222222",
+    status: "paused",
+    worktreeCwd: "/tmp/execution-worktree",
+  });
+
+  assert.deepEqual(
+    prioritizeRunCandidates([recoverableInPlace, pausedIsolated], "/repo").map(
+      (candidate) => candidate.id,
+    ),
+    [recoverableInPlace.id],
+  );
+});
+
+test("plan-structure recovery requires interactive adoption", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-index-"));
+  const planPath = join(root, "plan.md");
+  await writeFile(planPath, "### Task 1: Changed\n- [ ] New text\n");
+  const recoverable = run({
+    planPath,
+    status: "failed",
+    error: "Plan task structure changed outside checkbox completion.",
+  });
+
+  await assert.rejects(
+    reviewedPlanHashForResume(recoverable, {
+      hasUI: false,
+      ui: { confirm: async () => false },
+    }),
+    /interactive Pi/,
+  );
+
+  let confirmed = false;
+  const adoptedHash = await reviewedPlanHashForResume(recoverable, {
+    hasUI: true,
+    ui: {
+      confirm: async () => {
+        confirmed = true;
+        return true;
+      },
+    },
+  });
+  assert.equal(confirmed, true);
+  assert.notEqual(adoptedHash, recoverable.planHash);
+  assert.equal(
+    await reviewedPlanHashForResume(run({ status: "failed" }), {
+      hasUI: false,
+      ui: { confirm: async () => false },
+    }),
+    undefined,
+  );
 });
 
 test("run list tells users how to inspect an unambiguous run", () => {

@@ -79,7 +79,10 @@ Run records live at:
 ~/.pi/plan-exec/runs/<run-id>/run.json
 ```
 
-Writes use a lock file and temporary-file rename. Each record includes:
+Writes use compare-and-set updates under tokenized lock files plus temporary-file
+rename. Controller transitions use a per-run lock; stale reload instances cannot
+blindly overwrite newer pause, cancellation, or operation state. Each record
+includes:
 
 - repository, worktree, branch, and plan structure hash;
 - status and current stage;
@@ -90,8 +93,9 @@ Writes use a lock file and temporary-file rename. Each record includes:
 - session lease and heartbeat.
 
 A session may claim a run when no lease exists, the lease belongs to that
-session, or the prior lease is stale. This prevents two controllers from
-advancing one run concurrently.
+session, or the prior lease is stale. The lease controls cross-session ownership;
+compare-and-set updates and the per-run controller lock serialize same-session
+reload instances.
 
 ## Crash safety
 
@@ -102,9 +106,10 @@ External starts follow this order:
 3. Call Bridge or Fusion with that operation ID.
 4. Persist the returned external run ID.
 
-If Pi stops between steps 2 and 4, recovery repeats the same operation ID.
-Bridge and Fusion return the existing run instead of starting another. Active
-foreign-session runs are observed rather than replaced.
+If Pi stops between steps 2 and 4, or a start reply times out or is malformed,
+recovery repeats the same operation ID. Bridge and Fusion return the existing run
+instead of starting another. Active foreign-session runs are observed rather
+than replaced.
 
 ## Stage pipeline
 
@@ -137,7 +142,8 @@ findings that survive caps are retained and produce `completed_with_findings`.
 - `pause` allows the active external operation to finish, then removes it without
   advancing the stage.
 - `cancel` requests Bridge/Fusion stop when possible, keeps polling through
-  `cancel_pending`, and ends at `cancelled` only after the operation is terminal.
+  `cancel_pending`, retries provider errors without discarding operation state,
+  and ends at `cancelled` only after the operation is terminal.
 - Both preserve the execution worktree.
 
 The background loop serializes ticks per run. It temporarily hides active tools

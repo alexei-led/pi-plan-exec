@@ -73,6 +73,7 @@ export interface ActiveOperation {
   kind: "implementation" | "review" | "fix" | "fusion" | "finalize" | "stats";
   externalRunId?: string;
   asyncDir?: string;
+  launchStartedAt?: number;
   params?: Record<string, unknown>;
   taskId?: number;
   reviewIteration?: number;

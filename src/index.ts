@@ -6,9 +6,13 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { BridgeClient } from "./bridge.js";
-import { PlanExecController } from "./controller.js";
+import {
+  PLAN_STRUCTURE_CHANGED_ERROR,
+  PlanExecController,
+} from "./controller.js";
 import { FusionClient } from "./fusion.js";
 import { RunRegistry } from "./registry.js";
+import { readPlan } from "./plan.js";
 import { TaskProjector } from "./task-projection.js";
 import type { PlanExecRun } from "./types.js";
 
@@ -56,7 +60,11 @@ const EXEC_COMMANDS: AutocompleteItem[] = [
     label: "pause",
     description: "Pause advancing after the active child",
   },
-  { value: "resume", label: "resume", description: "Resume a paused run" },
+  {
+    value: "resume",
+    label: "resume",
+    description: "Resume a paused run or review plan-structure recovery",
+  },
   {
     value: "adopt",
     label: "adopt",
@@ -349,7 +357,11 @@ export function formatRunStatus(run: PlanExecRun): string {
     );
   }
   if (run.error) lines.push(`error: ${run.error}`);
-  if (isTerminal(run.status)) {
+  if (needsPlanStructureReview(run)) {
+    lines.push(
+      "next: use interactive /exec resume to restore or explicitly adopt the reviewed plan structure.",
+    );
+  } else if (isTerminal(run.status)) {
     lines.push(
       run.status === "failed"
         ? "next: worktree preserved; inspect the error, then use /exec runs."
@@ -396,8 +408,17 @@ async function handleCommand(
     const run = await resolveRunForAction(action, rest[0], ctx);
     if (action === "status") return formatRunStatus(run);
     if (action === "resume" || action === "adopt") {
+      const reviewedPlanHash =
+        action === "resume"
+          ? await reviewedPlanHashForResume(run, ctx)
+          : undefined;
       const resumed = await syncProjection(
-        await controller.resume(run.id, ctx.sessionManager.getSessionId()),
+        await controller.resume(
+          run.id,
+          ctx.sessionManager.getSessionId(),
+          true,
+          reviewedPlanHash,
+        ),
         { cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId() },
       );
       startBackgroundController(
@@ -412,13 +433,13 @@ async function handleCommand(
     const claimed = await registry.claim(run, sessionId);
     if (action === "pause") {
       const paused = await syncProjection(
-        await registry.update({ ...claimed, status: "paused" }),
+        await requestStatus(claimed, "pause", sessionId),
         { cwd: ctx.cwd, sessionId },
       );
       return `Run ${shortRunId(paused.id)} paused after its active operation. Use /exec resume to continue.`;
     }
     const cancelled = await syncProjection(
-      await registry.update({ ...claimed, status: "cancel_pending" }),
+      await requestStatus(claimed, "cancel", sessionId),
       { cwd: ctx.cwd, sessionId },
     );
     startBackgroundController(cancelled, sessionId, ctx.cwd, ctx);
@@ -467,17 +488,21 @@ async function resolveRunForAction(
       matchesContext(run, ctx.cwd) && isActionAllowed(action, run, sessionId),
   );
   if (candidates.length === 0) {
-    const verb = action === "status" ? "matching" : `${action}able`;
+    const verb =
+      action === "status"
+        ? "matching"
+        : action === "resume"
+          ? "resumable"
+          : `${action}able`;
     throw new Error(
       `No ${verb} plan execution run found here. Use /exec runs or /exec <plan> to start one.`,
     );
   }
-  const exactWorktree = candidates.filter(
-    (run) => resolve(run.worktreeCwd) === resolve(ctx.cwd),
+  const preferred = prioritizeRunCandidates(
+    candidates,
+    ctx.cwd,
+    action === "status",
   );
-  const pool = exactWorktree.length > 0 ? exactWorktree : candidates;
-  const live = pool.filter((run) => !isTerminal(run.status));
-  const preferred = live.length > 0 ? live : pool;
   if (preferred.length === 1) return preferred[0]!;
   if (!ctx.hasUI) {
     throw new Error(
@@ -493,6 +518,21 @@ async function resolveRunForAction(
   const selected = preferred[index];
   if (!selected) throw new Error("Run selection returned an unknown run.");
   return selected;
+}
+
+export function prioritizeRunCandidates(
+  candidates: PlanExecRun[],
+  cwd: string,
+  preferLive = false,
+): PlanExecRun[] {
+  const live = preferLive
+    ? candidates.filter((run) => !isTerminal(run.status))
+    : [];
+  const pool = live.length > 0 ? live : candidates;
+  const exactWorktree = pool.filter(
+    (run) => resolve(run.worktreeCwd) === resolve(cwd),
+  );
+  return exactWorktree.length > 0 ? exactWorktree : pool;
 }
 
 function matchesContext(run: PlanExecRun, cwd: string): boolean {
@@ -511,11 +551,72 @@ function isActionAllowed(
   if (action === "status") return true;
   if (action === "pause")
     return run.status === "starting" || run.status === "running";
-  if (action === "resume") return run.status === "paused";
+  if (action === "resume")
+    return run.status === "paused" || isRecoverableFailure(run);
   if (action === "adopt") {
     return !isTerminal(run.status) && run.lease?.sessionId !== sessionId;
   }
   return !isTerminal(run.status) && run.status !== "cancel_pending";
+}
+
+export function isRecoverableFailure(run: PlanExecRun): boolean {
+  return run.status === "failed" && needsPlanStructureReview(run);
+}
+
+export function needsPlanStructureReview(run: PlanExecRun): boolean {
+  return (
+    (run.status === "paused" || run.status === "failed") &&
+    run.error === PLAN_STRUCTURE_CHANGED_ERROR
+  );
+}
+
+export async function reviewedPlanHashForResume(
+  run: PlanExecRun,
+  ctx: {
+    hasUI: boolean;
+    ui: {
+      confirm(title: string, message: string): Promise<boolean>;
+    };
+  },
+): Promise<string | undefined> {
+  if (!needsPlanStructureReview(run)) return undefined;
+  const current = await readPlan(run.planPath);
+  if (current.hash !== run.planHash) {
+    if (!ctx.hasUI) {
+      throw new Error(
+        `Run ${shortRunId(run.id)} changed the plan structure. Review ${run.planPath}, then resume from interactive Pi to confirm adopting the current structure.`,
+      );
+    }
+    const accepted = await ctx.ui.confirm(
+      "Adopt changed plan structure?",
+      `The saved run expects a different task structure. Adopt the current structure at ${run.planPath} and continue?`,
+    );
+    if (!accepted) throw new Error("Plan structure adoption cancelled.");
+  }
+  return current.hash;
+}
+
+async function requestStatus(
+  run: PlanExecRun,
+  action: "pause" | "cancel",
+  sessionId: string,
+): Promise<PlanExecRun> {
+  let current = run;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    assertActionAllowed(action, current, sessionId);
+    const requested = await registry.updateIfCurrent(
+      {
+        ...current,
+        status: action === "pause" ? "paused" : "cancel_pending",
+      },
+      current.updatedAt,
+    );
+    if (requested.applied) return requested.run;
+    current = requested.run;
+  }
+  throw new Error(
+    `Run ${shortRunId(run.id)} changed repeatedly while requesting ${action}.`,
+  );
 }
 
 function assertActionAllowed(
@@ -618,7 +719,7 @@ export function execHelp(): string {
     "/exec status [run-id]   Show progress; run-id is optional when unambiguous.",
     "/exec runs              List runs and their full IDs.",
     "/exec pause [run-id]    Pause after the active child finishes.",
-    "/exec resume [run-id]   Resume a paused run.",
+    "/exec resume [run-id]   Resume a paused run or review plan-structure recovery.",
     "/exec adopt [run-id]    Adopt a stale run from another session.",
     "/exec cancel [run-id]   Cancel safely and preserve the worktree.",
     "",

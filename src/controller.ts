@@ -31,6 +31,10 @@ import type {
 } from "./types.js";
 
 const MAX_STATUS_FAILURES = 3;
+const OPERATION_RECOVERY_DELAY_MS = 35_000;
+const SPAWN_CONTENTION_RETRY_MS = 5_000;
+export const PLAN_STRUCTURE_CHANGED_ERROR =
+  "Plan task structure changed outside checkbox completion.";
 
 const INITIAL_CONFIG: FrozenRunConfig = {
   taskRetries: 1,
@@ -48,7 +52,7 @@ const INITIAL_CONFIG: FrozenRunConfig = {
 
 type ServiceReply =
   | { success: true; data: Record<string, unknown> }
-  | { success: false; error: { message: string } };
+  | { success: false; error: { code?: string; message: string } };
 
 interface BridgeLike {
   spawn(
@@ -150,18 +154,55 @@ export class PlanExecController {
     runId: string,
     sessionId: string,
     explicit = true,
+    reviewedPlanHash?: string,
+  ): Promise<PlanExecRun> {
+    const coordinated = await this.registry.withControllerLock(runId, () =>
+      this.resumeLocked(runId, sessionId, explicit, reviewedPlanHash),
+    );
+    if (coordinated) return coordinated;
+    const current = await this.registry.get(runId);
+    if (!current) throw new Error(`Plan execution run not found: ${runId}`);
+    return current;
+  }
+
+  private async resumeLocked(
+    runId: string,
+    sessionId: string,
+    explicit: boolean,
+    reviewedPlanHash?: string,
   ): Promise<PlanExecRun> {
     const existing = await this.registry.get(runId);
     if (!existing) throw new Error(`Plan execution run not found: ${runId}`);
     const claimed = await this.registry.claim(existing, sessionId);
-    const resumed =
-      explicit && claimed.status === "paused"
-        ? await this.registry.update({ ...claimed, status: "running" })
-        : claimed;
-    return this.advance(await this.adoptActiveOperation(resumed));
+    let prepared = claimed;
+    if (reviewedPlanHash !== undefined) {
+      const adopted = await this.registry.updateIfCurrent(
+        { ...claimed, planHash: reviewedPlanHash, status: "paused" },
+        claimed.updatedAt,
+      );
+      if (!adopted.applied) return adopted.run;
+      prepared = adopted.run;
+    }
+    if (explicit && prepared.status === "paused") {
+      const resumed = await this.registry.updateIfCurrent(
+        clearError({ ...prepared, status: "running" }),
+        prepared.updatedAt,
+      );
+      if (!resumed.applied) return resumed.run;
+      prepared = resumed.run;
+    }
+    return this.advanceUnlocked(await this.adoptActiveOperation(prepared));
   }
 
   async advance(run: PlanExecRun): Promise<PlanExecRun> {
+    const coordinated = await this.registry.withControllerLock(run.id, () =>
+      this.advanceUnlocked(run),
+    );
+    if (coordinated) return coordinated;
+    return (await this.registry.get(run.id)) ?? run;
+  }
+
+  private async advanceUnlocked(run: PlanExecRun): Promise<PlanExecRun> {
     if (isTerminal(run.status)) return run;
     if (run.status === "cancel_pending") return this.cancel(run);
     if (run.status === "paused") {
@@ -226,10 +267,7 @@ export class PlanExecController {
   private async advanceImplementation(run: PlanExecRun): Promise<PlanExecRun> {
     const plan = await readPlan(run.planPath);
     if (plan.hash !== run.planHash) {
-      return this.fail(
-        run,
-        "Plan task structure changed outside checkbox completion.",
-      );
+      return this.pauseForReview(run, PLAN_STRUCTURE_CHANGED_ERROR);
     }
     const task = plan.tasks.find((candidate) => candidate.unchecked.length > 0);
     if (!task)
@@ -265,15 +303,15 @@ export class PlanExecController {
     const limit =
       run.stage === "comprehensive_review" ? run.config.reviewIterations : 1;
     if (iteration > limit) {
-      return this.advance(
+      return this.advanceUnlocked(
         await this.recordUnresolvedAndAdvance(run, run.reviewFindings),
       );
     }
-    const updated = await this.registry.update({
+    const updated = {
       ...run,
       stageAttempts: { ...run.stageAttempts, [run.stage]: iteration },
       reviewFindings: [],
-    });
+    };
     return this.launchBridge(updated, {
       kind: "review",
       reviewIteration: iteration,
@@ -286,43 +324,43 @@ export class PlanExecController {
   private async launchFusion(run: PlanExecRun): Promise<PlanExecRun> {
     const iteration = (run.stageAttempts.fusion_review ?? 0) + 1;
     if (iteration > run.config.fusionIterations) {
-      return this.advance(
+      return this.advanceUnlocked(
         await this.recordUnresolvedAndAdvance(run, run.reviewFindings),
       );
     }
     const operationId = randomUUID();
-    const intended = await this.registry.update({
-      ...run,
-      stageAttempts: { ...run.stageAttempts, fusion_review: iteration },
-      reviewFindings: [],
-      activeOperation: {
-        operationId,
-        service: "fusion",
-        kind: "fusion",
-        reviewIteration: iteration,
+    const launchStartedAt = Date.now();
+    const persisted = await this.registry.updateIfCurrent(
+      {
+        ...run,
+        stageAttempts: { ...run.stageAttempts, fusion_review: iteration },
+        reviewFindings: [],
+        activeOperation: {
+          operationId,
+          service: "fusion",
+          kind: "fusion",
+          reviewIteration: iteration,
+          launchStartedAt,
+        },
       },
-    });
+      run.updatedAt,
+    );
+    if (!persisted.applied) return persisted.run;
+    const intended = persisted.run;
     const reply = await this.fusion.start(
       operationId,
       fusionPrompt(intended),
       intended.config.fusionProfile,
     );
-    if (!reply.success) return this.fail(intended, reply.error.message);
+    if (!reply.success) {
+      return isAmbiguousLaunchFailure(reply.error)
+        ? this.deferActiveOperationRetry(intended, operationId)
+        : this.fail(intended, reply.error.message);
+    }
     const state = fusionState(reply.data);
-    if (!state)
-      return this.fail(
-        intended,
-        "Fusion start returned no structured run state.",
-      );
-    return this.registry.update({
-      ...intended,
-      activeOperation: {
-        operationId,
-        service: "fusion",
-        kind: "fusion",
-        externalRunId: state.runId,
-        reviewIteration: iteration,
-      },
+    if (!state) return this.deferActiveOperationRetry(intended, operationId);
+    return this.updateActiveOperation(intended, operationId, {
+      externalRunId: state.runId,
     });
   }
 
@@ -358,6 +396,7 @@ export class PlanExecController {
     },
   ): Promise<PlanExecRun> {
     const operationId = randomUUID();
+    const launchStartedAt = Date.now();
     const params = {
       agent: input.agent,
       task: input.task,
@@ -366,40 +405,43 @@ export class PlanExecController {
       turnBudget: { maxTurns: input.maxTurns },
       acceptance: false,
     };
-    const intended = await this.registry.update({
-      ...run,
-      status: "running",
-      activeOperation: {
-        operationId,
-        service: "bridge",
-        kind: input.kind,
-        params,
-        ...(input.taskId ? { taskId: input.taskId } : {}),
-        ...(input.reviewIteration
-          ? { reviewIteration: input.reviewIteration }
-          : {}),
+    const persisted = await this.registry.updateIfCurrent(
+      {
+        ...run,
+        status: "running",
+        activeOperation: {
+          operationId,
+          service: "bridge",
+          kind: input.kind,
+          params,
+          launchStartedAt,
+          ...(input.taskId ? { taskId: input.taskId } : {}),
+          ...(input.reviewIteration
+            ? { reviewIteration: input.reviewIteration }
+            : {}),
+        },
       },
-    });
+      run.updatedAt,
+    );
+    if (!persisted.applied) return persisted.run;
+    const intended = persisted.run;
     const reply = await this.bridge.spawn(operationId, params);
-    if (!reply.success) return this.fail(intended, reply.error.message);
+    if (!reply.success) {
+      if (
+        isSpawnContention(reply.error.message) ||
+        isAmbiguousLaunchFailure(reply.error)
+      ) {
+        return this.deferActiveOperationRetry(intended, operationId);
+      }
+      return this.fail(intended, reply.error.message);
+    }
     const externalRunId = text(reply.data.runId);
     if (!externalRunId)
-      return this.fail(intended, "Bridge spawn returned no runId.");
+      return this.deferActiveOperationRetry(intended, operationId);
     const asyncDir = text(reply.data.asyncDir);
-    return this.registry.update({
-      ...intended,
-      activeOperation: {
-        operationId,
-        service: "bridge",
-        kind: input.kind,
-        params,
-        externalRunId,
-        ...(asyncDir ? { asyncDir } : {}),
-        ...(input.taskId ? { taskId: input.taskId } : {}),
-        ...(input.reviewIteration
-          ? { reviewIteration: input.reviewIteration }
-          : {}),
-      },
+    return this.updateActiveOperation(intended, operationId, {
+      externalRunId,
+      ...(asyncDir ? { asyncDir } : {}),
     });
   }
 
@@ -407,24 +449,34 @@ export class PlanExecController {
     run: PlanExecRun,
     operation: ActiveOperation,
   ): Promise<PlanExecRun> {
+    if (
+      operation.launchStartedAt !== undefined &&
+      Date.now() - operation.launchStartedAt < OPERATION_RECOVERY_DELAY_MS
+    ) {
+      return run;
+    }
     if (operation.service === "bridge") {
       const params =
         operation.params ??
         (await this.reconstructBridgeParams(run, operation));
       const reply = await this.bridge.spawn(operation.operationId, params);
-      if (!reply.success) return this.fail(run, reply.error.message);
+      if (!reply.success) {
+        if (
+          isSpawnContention(reply.error.message) ||
+          isAmbiguousLaunchFailure(reply.error)
+        ) {
+          return this.deferActiveOperationRetry(run, operation.operationId);
+        }
+        return this.fail(run, reply.error.message);
+      }
       const externalRunId = text(reply.data.runId);
       if (!externalRunId)
-        return this.fail(run, "Bridge recovery returned no runId.");
+        return this.deferActiveOperationRetry(run, operation.operationId);
       const asyncDir = text(reply.data.asyncDir);
-      return this.registry.update({
-        ...run,
-        activeOperation: {
-          ...operation,
-          params,
-          externalRunId,
-          ...(asyncDir ? { asyncDir } : {}),
-        },
+      return this.updateActiveOperation(run, operation.operationId, {
+        params,
+        externalRunId,
+        ...(asyncDir ? { asyncDir } : {}),
       });
     }
 
@@ -433,17 +485,48 @@ export class PlanExecController {
       fusionPrompt(run),
       run.config.fusionProfile,
     );
-    if (!reply.success) return this.fail(run, reply.error.message);
+    if (!reply.success) {
+      return isAmbiguousLaunchFailure(reply.error)
+        ? this.deferActiveOperationRetry(run, operation.operationId)
+        : this.fail(run, reply.error.message);
+    }
     const state = fusionState(reply.data);
     if (!state)
-      return this.fail(
-        run,
-        "Fusion recovery returned no structured run state.",
-      );
-    return this.registry.update({
-      ...run,
-      activeOperation: { ...operation, externalRunId: state.runId },
+      return this.deferActiveOperationRetry(run, operation.operationId);
+    return this.updateActiveOperation(run, operation.operationId, {
+      externalRunId: state.runId,
     });
+  }
+
+  private deferActiveOperationRetry(
+    run: PlanExecRun,
+    operationId: string,
+  ): Promise<PlanExecRun> {
+    return this.updateActiveOperation(run, operationId, {
+      launchStartedAt:
+        Date.now() - (OPERATION_RECOVERY_DELAY_MS - SPAWN_CONTENTION_RETRY_MS),
+    });
+  }
+
+  private async updateActiveOperation(
+    run: PlanExecRun,
+    operationId: string,
+    patch: Partial<ActiveOperation>,
+  ): Promise<PlanExecRun> {
+    let current = (await this.registry.get(run.id)) ?? run;
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      if (current.activeOperation?.operationId !== operationId) return current;
+      const updated = await this.registry.updateIfCurrent(
+        {
+          ...current,
+          activeOperation: { ...current.activeOperation, ...patch },
+        },
+        current.updatedAt,
+      );
+      if (updated.applied) return updated.run;
+      current = updated.run;
+    }
+    return current;
   }
 
   private async reconstructBridgeParams(
@@ -514,6 +597,7 @@ export class PlanExecController {
         status.error.message,
       );
     const observed = await this.recordObservation(run, operation);
+    if (!sameOperationState(run, observed, operation)) return observed;
     const state =
       operation.service === "bridge"
         ? text(status.data.state)
@@ -560,18 +644,27 @@ export class PlanExecController {
         status.error.message,
       );
     const observed = await this.recordObservation(run, operation);
+    if (!sameOperationState(run, observed, operation)) return observed;
     const state = text(status.data.state);
     if (!state || state === "running" || state === "stopping") return observed;
 
     if (operation.kind === "implementation")
       return this.finishImplementation(observed, operation, state);
-    if (operation.kind === "review")
-      return this.finishReview(
-        observed,
-        operation,
-        state,
-        await this.bridgeOutput(operation),
-      );
+    if (operation.kind === "review") {
+      let output: string;
+      try {
+        output = await this.bridgeOutput(operation);
+      } catch (error: unknown) {
+        return this.retryReviewOutput(
+          observed,
+          operation,
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+      const current = (await this.registry.get(run.id)) ?? observed;
+      if (!sameOperationState(observed, current, operation)) return current;
+      return this.finishReview(current, operation, state, output);
+    }
     if (operation.kind === "fix")
       return this.finishFix(observed, operation, state);
     if (operation.kind === "finalize")
@@ -596,17 +689,20 @@ export class PlanExecController {
         status.error.message,
       );
     const observed = await this.recordObservation(run, operation);
+    if (!sameOperationState(run, observed, operation)) return observed;
     const state = fusionState(status.data);
     if (!state || !state.terminal) return observed;
     const result = await this.fusion.result(state.runId);
     if (!result.success) return this.fail(run, result.error.message);
+    const current = (await this.registry.get(run.id)) ?? observed;
+    if (!sameOperationState(observed, current, operation)) return current;
     const final = fusionState(result.data);
     if (!final?.report)
       return this.fail(
-        run,
+        current,
         "Fusion completed without a machine-readable report.",
       );
-    return this.finishReview(observed, operation, final.phase, final.report);
+    return this.finishReview(current, operation, final.phase, final.report);
   }
 
   private async recordObservation(
@@ -640,6 +736,42 @@ export class PlanExecController {
     });
   }
 
+  private recordCancellationFailure(
+    run: PlanExecRun,
+    operation: ActiveOperation,
+    error: string,
+  ): Promise<PlanExecRun> {
+    const failures = Math.min(
+      (operation.statusFailures ?? 0) + 1,
+      MAX_STATUS_FAILURES,
+    );
+    return this.registry.heartbeat({
+      ...run,
+      activeOperation: {
+        ...operation,
+        statusFailures: failures,
+        lastStatusError: error,
+      },
+    });
+  }
+
+  private async pauseForReview(
+    run: PlanExecRun,
+    error: string,
+  ): Promise<PlanExecRun> {
+    const paused = await this.registry.updateIfCurrent(
+      withoutOperation({ ...run, status: "paused", error }),
+      run.updatedAt,
+    );
+    if (!paused.applied) return paused.run;
+    try {
+      await appendProgress(paused.run, `Run paused for review: ${error}`);
+    } catch {
+      // The registry is authoritative if the optional progress file is unavailable.
+    }
+    return paused.run;
+  }
+
   private async finishImplementation(
     run: PlanExecRun,
     operation: ActiveOperation,
@@ -650,10 +782,7 @@ export class PlanExecController {
       return this.fail(run, "Implementation operation has no task ID.");
     const plan = await readPlan(run.planPath);
     if (plan.hash !== run.planHash)
-      return this.fail(
-        run,
-        "Plan task structure changed outside checkbox completion.",
-      );
+      return this.pauseForReview(run, PLAN_STRUCTURE_CHANGED_ERROR);
     const task = plan.tasks.find((candidate) => candidate.id === taskId);
     if (!task)
       return this.fail(run, `Task ${taskId} disappeared from the plan.`);
@@ -667,7 +796,7 @@ export class PlanExecController {
         cleared,
         `Task ${taskId} completed after ${attempts} attempt(s).`,
       );
-      return this.advance(await this.registry.update(cleared));
+      return this.advanceUnlocked(await this.registry.update(cleared));
     }
     if (attempts > run.config.taskRetries) {
       return this.fail(
@@ -675,7 +804,36 @@ export class PlanExecController {
         `Worker ${operation.externalRunId} ended as ${state} and left task ${taskId} checkboxes unchecked.`,
       );
     }
-    return this.advance(await this.registry.update(cleared));
+    return this.advanceUnlocked(await this.registry.update(cleared));
+  }
+
+  private async retryReviewOutput(
+    run: PlanExecRun,
+    operation: ActiveOperation,
+    error: string,
+  ): Promise<PlanExecRun> {
+    const cleared = withoutOperation(run);
+    const iteration = operation.reviewIteration ?? 1;
+    const limit =
+      run.stage === "comprehensive_review" ? run.config.reviewIterations : 1;
+    if (iteration >= limit) {
+      return this.fail(
+        cleared,
+        `Review result output was unavailable after ${iteration} attempt(s): ${error}`,
+      );
+    }
+    await appendProgress(
+      cleared,
+      `Review attempt ${iteration} produced no usable output; retrying: ${error}`,
+    );
+    const ready = await this.registry.update(cleared);
+    if (
+      ready.status !== cleared.status ||
+      ready.activeOperation !== undefined
+    ) {
+      return ready;
+    }
+    return this.launchReview(ready);
   }
 
   private async finishReview(
@@ -698,7 +856,7 @@ export class PlanExecController {
     const cleared = withoutOperation({ ...run, reviewFindings: findings });
     if (findings.length === 0) {
       await appendProgress(cleared, `${run.stage} found no issues.`);
-      return this.advance(
+      return this.advanceUnlocked(
         await this.transition(
           cleared,
           nextStage(run.stage),
@@ -718,7 +876,7 @@ export class PlanExecController {
     const minorOnlyFusion =
       run.stage === "fusion_review" && !hasBlockingFindings(findings);
     if (!singlePass && !minorOnlyFusion && iteration >= limit) {
-      return this.advance(
+      return this.advanceUnlocked(
         await this.recordUnresolvedAndAdvance(cleared, findings),
       );
     }
@@ -744,7 +902,7 @@ export class PlanExecController {
       `Applied fixes for ${run.stage} iteration ${operation.reviewIteration ?? 1}.`,
     );
     if (run.stage === "smells_review" || run.stage === "critical_review") {
-      return this.advance(
+      return this.advanceUnlocked(
         await this.transition(
           cleared,
           nextStage(run.stage),
@@ -756,7 +914,7 @@ export class PlanExecController {
       run.stage === "fusion_review" &&
       !hasBlockingFindings(run.reviewFindings)
     ) {
-      return this.advance(
+      return this.advanceUnlocked(
         await this.transition(
           cleared,
           nextStage(run.stage),
@@ -764,7 +922,7 @@ export class PlanExecController {
         ),
       );
     }
-    return this.advance(await this.registry.update(cleared));
+    return this.advanceUnlocked(await this.registry.update(cleared));
   }
 
   private async finishBestEffort(
@@ -778,7 +936,7 @@ export class PlanExecController {
       cleared,
       `${operation.kind} finished as ${state}; continuing best-effort.`,
     );
-    return this.advance(
+    return this.advanceUnlocked(
       await this.transition(cleared, next, `${operation.kind} stage complete.`),
     );
   }
@@ -852,14 +1010,27 @@ export class PlanExecController {
 
   private async cancel(run: PlanExecRun): Promise<PlanExecRun> {
     const operation = run.activeOperation;
-    if (!operation?.externalRunId)
+    if (!operation)
       return this.registry.release(
         await this.registry.update({ ...run, status: "cancelled" }),
       );
+    if (!operation.externalRunId) {
+      const recovered = await this.recoverActiveOperation(run, operation);
+      return recovered.activeOperation?.externalRunId
+        ? this.cancel(recovered)
+        : recovered;
+    }
     if (!operation.stopRequested) {
-      if (operation.service === "bridge")
-        await this.bridge.stop(operation.externalRunId, operation.asyncDir);
-      else await this.fusion.cancel(operation.externalRunId);
+      const stopped =
+        operation.service === "bridge"
+          ? await this.bridge.stop(operation.externalRunId, operation.asyncDir)
+          : await this.fusion.cancel(operation.externalRunId);
+      if (!stopped.success)
+        return this.recordCancellationFailure(
+          run,
+          operation,
+          stopped.error.message,
+        );
       return this.registry.update({
         ...run,
         activeOperation: { ...operation, stopRequested: true },
@@ -870,7 +1041,7 @@ export class PlanExecController {
         ? await this.bridge.status(operation.externalRunId, operation.asyncDir)
         : await this.fusion.status(operation.externalRunId);
     if (!terminal.success)
-      return this.recordObservationFailure(
+      return this.recordCancellationFailure(
         run,
         operation,
         terminal.error.message,
@@ -1084,6 +1255,40 @@ function withoutOperation(run: PlanExecRun): PlanExecRun {
   const next = { ...run };
   delete next.activeOperation;
   return next;
+}
+
+function clearError(run: PlanExecRun): PlanExecRun {
+  const next = { ...run };
+  delete next.error;
+  return next;
+}
+
+function sameOperationState(
+  before: PlanExecRun,
+  after: PlanExecRun,
+  operation: ActiveOperation,
+): boolean {
+  return (
+    after.status === before.status &&
+    after.activeOperation?.operationId === operation.operationId
+  );
+}
+
+function isAmbiguousLaunchFailure(error: {
+  code?: string;
+  message: string;
+}): boolean {
+  return (
+    error.code === "timeout" ||
+    error.code === "malformed" ||
+    /timed out|malformed reply/i.test(error.message)
+  );
+}
+
+function isSpawnContention(message: string): boolean {
+  return /subagent call is already in progress|exactly ONE subagent call per turn/i.test(
+    message,
+  );
 }
 
 function isTerminal(status: PlanExecRun["status"]): boolean {

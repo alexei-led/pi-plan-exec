@@ -27,8 +27,9 @@ runs review and fix stages with fresh Pi subagents and Fusion. A worker saying
   isolated Git worktree or work in place.
 - **Executes plans deterministically.** It selects the first incomplete task,
   starts a fresh worker, and verifies completion from the plan checkboxes.
-- **Recovers deliberately.** Run records, operation IDs, leases, and adoption
-  prevent an interrupted session from intentionally starting another writer.
+- **Recovers deliberately.** Compare-and-set run records, operation IDs,
+  controller locks, leases, and adoption prevent reloads and ambiguous provider
+  replies from intentionally starting another writer or losing cancellation.
 - **Reviews before it finishes.** It runs comprehensive, smells, Fusion, and
   critical review/fix phases. Unresolved findings remain visible in the final
   `completed_with_findings` state.

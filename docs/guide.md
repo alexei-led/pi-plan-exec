@@ -90,8 +90,9 @@ first incomplete task, then re-reads the plan after the worker finishes:
 - `[x]` or `[X]` means completed work.
 - A worker’s chat summary does **not** complete a task.
 - Checking every item in a task advances to the next numbered task.
-- Changing task structure during a run fails the run; restore the original
-  structure, then inspect the run before resuming it.
+- Changing task structure during a run pauses the run for review. Restore the
+  original structure, or use interactive `/exec resume` to explicitly adopt the
+  current structure before continuing.
 
 Write concrete, verifiable items. Each item should name an outcome and, where
 possible, its verification. Avoid broad items such as “finish feature” that
@@ -155,7 +156,7 @@ runs match, Pi opens a picker; headless mode asks for the full ID shown by
 /exec runs              List recent runs and full IDs
 /exec status [run-id]   Show status, active worker, progress path, and error
 /exec pause [run-id]    Let the active child finish, then stop advancing
-/exec resume [run-id]   Continue a paused run
+/exec resume [run-id]   Continue a paused run or recover a reviewed plan-structure failure
 /exec adopt [run-id]    Claim a stale or released cross-session run
 /exec cancel [run-id]   Stop when safe and preserve the worktree
 ```
@@ -165,7 +166,9 @@ Stage transitions, observation degradation, and terminal states generate
 notifications. `/exec status` shows the last successful observation and retry
 count; three failed observations stop the run plainly instead of implying it is
 still progressing. A failed run preserves its worktree and remains visible in
-`/exec status` and the projected task description.
+`/exec status` and the projected task description. Legacy runs stopped by a plan
+structure mismatch can be resumed interactively after confirming the current
+structure; other failures require fixing the cause before starting or retrying.
 
 ## Run lifecycle
 
@@ -212,14 +215,17 @@ Authoritative records live at:
 ```
 
 They store stage, attempts, active Bridge/Fusion operation, worktree, branch,
-findings, and lease. Durable operation IDs let the controller replay a start
-after a crash without intentionally launching a second writer.
+findings, and lease. Durable operation IDs let the controller replay an
+ambiguous or interrupted start without intentionally launching a second writer.
+Registry compare-and-set updates and controller locks keep stale reload instances
+from overwriting cancellation, pause, or operation state.
 
 Pi-tasks is a session-scoped UI projection. On adoption, the projection is
 rebuilt from the global record and plan.
 
 Pause, cancellation, failure, and completion preserve the worktree for review.
-Use `/exec status <run-id>` before manually changing it.
+Cancellation retries transient provider failures without dropping the active
+operation record. Use `/exec status <run-id>` before manually changing it.
 
 Safety limits:
 

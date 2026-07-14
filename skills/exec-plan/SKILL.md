@@ -33,7 +33,7 @@ shows full IDs for explicit selection and headless recovery.
 /exec status                      Show live stage, worker, error, and worktree
 /exec runs                        List recent runs and full IDs
 /exec pause                       Pause after the active child finishes
-/exec resume                      Continue a paused run
+/exec resume                      Continue a paused run or review plan-structure recovery
 /exec adopt                       Claim a stale cross-session run
 /exec cancel                      Stop safely and preserve the worktree
 ```
@@ -51,8 +51,11 @@ transitions, failures, cancellation, and completion are notified in Pi.
 - Do not manually launch implementation/review subagents for an active run.
 - A worker report does not complete a task. The controller re-reads the plan and
   advances only when all task checkboxes are checked.
+- Plan structure changes pause the run for review. Do not silently accept them in
+  headless mode; interactive `/exec resume` asks for explicit confirmation.
 - Failed or cancelled runs preserve their worktrees. Inspect with `/exec status`
-  before changing anything manually.
+  before changing anything manually. A legacy run failed by a plan-structure
+  mismatch can be resumed interactively after confirming the current structure.
 
 ## Completion truth
 
