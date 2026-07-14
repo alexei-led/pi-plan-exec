@@ -99,12 +99,11 @@ export class PlanExecController {
     const baseBranch = await defaultBranch(this.runCommand, repositoryRoot);
     const current = await currentBranch(this.runCommand, options.cwd);
     const planBranch = branchNameFromPlan(plan.path);
-    const branch =
-      options.useWorktree && current !== baseBranch
-        ? `${current}-${planBranch}`
-        : current === baseBranch
-          ? planBranch
-          : current;
+    const branch = options.useWorktree
+      ? current === baseBranch
+        ? planBranch
+        : `${current}-${planBranch}`
+      : current;
     const worktreeCwd = options.useWorktree
       ? await this.createExecutionWorktree(repositoryRoot, plan.path, branch)
       : options.cwd;

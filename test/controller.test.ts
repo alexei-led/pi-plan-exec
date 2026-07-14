@@ -12,6 +12,29 @@ const success = (data: Record<string, unknown>) => ({
   data,
 });
 
+test("in-place execution on the default branch keeps that branch", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
+  const planPath = join(root, "plan.md");
+  await writeFile(planPath, "### Task 1: Implement\n- [ ] Do the work\n");
+  const controller = new PlanExecController(
+    new RunRegistry(join(root, "runs")),
+    new FakeBridge(join(root, "none.json")),
+    new FakeFusion(),
+    fakeGit(root, "main"),
+  );
+
+  const run = await controller.start({
+    cwd: root,
+    planPath,
+    useWorktree: false,
+    sessionId: "session-1",
+  });
+
+  assert.equal(run.branch, "main");
+  assert.equal(run.worktreeCwd, root);
+  assert.equal(run.stage, "project_tasks");
+});
+
 test("controller advances checkbox-complete implementation into review stages", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
   const planPath = join(root, "plan.md");
@@ -268,12 +291,12 @@ class FakeFusion {
   }
 }
 
-function fakeGit(root: string) {
+function fakeGit(root: string, branch = "feature") {
   return async (_command: string, args: string[]) => {
     if (args[0] === "symbolic-ref")
       return { stdout: "origin/main\n", stderr: "", code: 0 };
     if (args[0] === "branch")
-      return { stdout: "feature\n", stderr: "", code: 0 };
+      return { stdout: `${branch}\n`, stderr: "", code: 0 };
     if (args.includes("--git-common-dir"))
       return { stdout: `${root}/.git\n`, stderr: "", code: 0 };
     return { stdout: `${root}\n`, stderr: "", code: 0 };
