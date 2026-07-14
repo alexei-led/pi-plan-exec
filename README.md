@@ -35,7 +35,7 @@ runs review and fix stages with fresh Pi subagents and Fusion. A worker saying
 
 ## Install and run
 
-Install the runtime extensions:
+Install the prerequisites, then plan-exec:
 
 ```bash
 pi install npm:pi-subagents
@@ -45,13 +45,23 @@ pi install npm:@alexeiled/pi-fusion
 pi install npm:@alexeiled/pi-plan-exec
 ```
 
+The providers remain independent Pi packages. `pi-plan-exec` probes the bridge
+and Fusion capabilities before it creates a run and tells you how to recover if
+they are unavailable.
+
 Reload Pi. From an interactive session in a Git repository, run an executable
 plan:
 
 ```text
 /reload
+/exec help
 /exec docs/plans/20260713-add-greeting.md
 ```
+
+While it runs, the footer shows the current stage and worker. Use
+`/exec status` without a run ID for the current repository; use `/exec runs`
+only when several runs need disambiguation. The installed `exec-plan` skill is
+also available as `/skill:exec-plan` for the plan format and recovery rules.
 
 The **[Guide](docs/guide.md#executable-plan-format)** defines the accepted plan
 format, including the exact heading and checkbox rules. Omit the path to select

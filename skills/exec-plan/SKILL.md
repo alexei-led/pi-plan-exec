@@ -1,26 +1,77 @@
 ---
 name: exec-plan
-description: Run or control a ralphex-style implementation plan through the pi-plan-exec extension. Use when the user says exec, execute plan, run plan, resume plan execution, or asks for an execution-run status.
+description: Execute and recover a checked Markdown implementation plan through pi-plan-exec. Use when the user asks to run or resume a plan, inspect execution progress, or control a plan-exec run; use /exec help for the interactive command list.
 ---
 
 <!-- markdownlint-disable MD013 -->
 
 # Plan Execution
 
-Use `/exec <plan>` to start a run. The extension owns stage order, retries,
-worktrees, checkpoints, background child observation, and final status.
+Use the installed `/exec` command. Do not manually launch implementation or
+review subagents for an active plan-exec run.
+
+## Start
+
+```text
+/exec help                         Show commands and recovery hints
+/exec                              Pick a plan under docs/plans/
+/exec path/to/plan.md              Start a named plan
+/exec start path/to/plan.md        Explicit start form
+/exec setup                         Show provider install commands
+```
+
+The command asks whether to use an isolated worktree. Prefer `Worktree
+(isolated)` unless the user explicitly requests in-place execution.
+
+## Inspect and control
+
+Run IDs are optional when one run matches the current repository or worktree.
+If multiple runs match, Pi opens a picker in interactive mode. `/exec runs`
+shows full IDs for explicit selection and headless recovery.
+
+```text
+/exec status                      Show live stage, worker, error, and worktree
+/exec runs                        List recent runs and full IDs
+/exec pause                       Pause after the active child finishes
+/exec resume                      Continue a paused run
+/exec adopt                       Claim a stale cross-session run
+/exec cancel                      Stop safely and preserve the worktree
+```
+
+The footer shows the current stage and active worker while polling. Stage
+transitions, failures, cancellation, and completion are notified in Pi.
 
 ## Rules
 
-- Do not manually launch implementation/review subagents for an active plan-exec run.
-- Do not edit the execution plan while a run is active except to complete checkbox items through the assigned worker.
-- Use `/exec status <run-id>` or `/exec runs` for status.
-- Use `/exec pause`, `/exec resume`, `/exec adopt`, and `/exec cancel` rather than changing run registry files.
-- A `completed_with_findings` run completed its workflow with known findings left after review caps. State that plainly.
-- A failed or cancelled run preserves its worktree. Do not remove it without explicit user approval.
+- Do not edit an active execution plan except to change completed checkbox
+  markers from `[ ]` to `[x]` (or `[X]`). Keep headings, task numbers, checkbox
+  text, and item count unchanged.
+- Do not write verification results into checkbox item text. Report them in the
+  worker response and progress artifacts.
+- Do not manually launch implementation/review subagents for an active run.
+- A worker report does not complete a task. The controller re-reads the plan and
+  advances only when all task checkboxes are checked.
+- Failed or cancelled runs preserve their worktrees. Inspect with `/exec status`
+  before changing anything manually.
 
-## Completion Truth
+## Completion truth
 
-The plan's checkbox state is the implementation truth. A worker report alone does
-not complete a task. Review stages use either `NO_FINDINGS` or structured
-`FINDING: CRITICAL|MAJOR|MINOR | ...` records.
+The plan checkbox state is the implementation truth. Review stages use either
+`NO_FINDINGS` or structured `FINDING: CRITICAL|MAJOR|MINOR | ...` records. A
+`completed_with_findings` run completed its workflow with known findings left
+after review caps; state that plainly.
+
+## Prerequisites
+
+`pi-plan-exec` integrates with independently installed Pi packages at compatible
+versions:
+
+- `pi-subagents`
+- `@tintinweb/pi-tasks`
+- `@alexeiled/pi-subagents-bridge`
+- `@alexeiled/pi-fusion`
+
+Use `/exec setup` for install commands, then run `/reload`. `/exec` probes the
+bridge and Fusion capabilities before creating a run and fails clearly if they
+are unavailable. The `pi-plan-exec` package installs only its own `exec-plan`
+skill and `/exec` command.

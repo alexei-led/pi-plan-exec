@@ -67,6 +67,36 @@ export class RunRegistry {
     return updated;
   }
 
+  async updateIfCurrent(
+    run: PlanExecRun,
+    expectedUpdatedAt: number,
+  ): Promise<{ run: PlanExecRun; applied: boolean }> {
+    assertRun(run);
+    const path = this.pathFor(run.id);
+    const lockPath = `${path}.lock`;
+    const lock = await acquireLock(lockPath);
+    try {
+      let current: PlanExecRun;
+      try {
+        current = parseRun(await readFile(path, "utf8"), run.id);
+      } catch (error: unknown) {
+        if (isNodeError(error, "ENOENT"))
+          throw new Error(`Plan execution run not found: ${run.id}`, {
+            cause: error,
+          });
+        throw error;
+      }
+      if (current.updatedAt !== expectedUpdatedAt)
+        return { run: current, applied: false };
+      const updated: PlanExecRun = { ...run, updatedAt: Date.now() };
+      await writeLocked(path, updated);
+      return { run: updated, applied: true };
+    } finally {
+      await lock.close();
+      await rm(lockPath, { force: true });
+    }
+  }
+
   async claim(run: PlanExecRun, sessionId: string): Promise<PlanExecRun> {
     if (!sessionId.trim())
       throw new Error("A Pi session ID is required to claim a run.");
@@ -112,14 +142,19 @@ export class RunRegistry {
     const lockPath = `${path}.lock`;
     const lock = await acquireLock(lockPath);
     try {
-      const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
-      await writeFile(temporary, `${JSON.stringify(run, null, 2)}\n`, "utf8");
-      await rename(temporary, path);
+      await writeLocked(path, run);
     } finally {
       await lock.close();
       await rm(lockPath, { force: true });
     }
   }
+}
+
+async function writeLocked(path: string, run: PlanExecRun): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  await writeFile(temporary, `${JSON.stringify(run, null, 2)}\n`, "utf8");
+  await rename(temporary, path);
 }
 
 async function acquireLock(path: string) {

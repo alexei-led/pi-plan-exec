@@ -30,6 +30,8 @@ import type {
   RunStage,
 } from "./types.js";
 
+const MAX_STATUS_FAILURES = 3;
+
 const INITIAL_CONFIG: FrozenRunConfig = {
   taskRetries: 1,
   maxTaskIterations: 50,
@@ -132,10 +134,13 @@ export class PlanExecController {
     return this.advance(await this.registry.claim(run, options.sessionId));
   }
 
-  async markFailed(runId: string, error: unknown): Promise<void> {
+  async markFailed(
+    runId: string,
+    error: unknown,
+  ): Promise<PlanExecRun | undefined> {
     const run = await this.registry.get(runId);
-    if (!run || isTerminal(run.status)) return;
-    await this.fail(
+    if (!run || isTerminal(run.status)) return run;
+    return this.fail(
       run,
       error instanceof Error ? error.message : String(error),
     );
@@ -502,7 +507,13 @@ export class PlanExecController {
       operation.service === "bridge"
         ? await this.bridge.status(operation.externalRunId, operation.asyncDir)
         : await this.fusion.status(operation.externalRunId);
-    if (!status.success) return this.registry.heartbeat(run);
+    if (!status.success)
+      return this.recordObservationFailure(
+        run,
+        operation,
+        status.error.message,
+      );
+    const observed = await this.recordObservation(run, operation);
     const state =
       operation.service === "bridge"
         ? text(status.data.state)
@@ -515,13 +526,13 @@ export class PlanExecController {
       state === "panel" ||
       state === "judge"
     ) {
-      return this.registry.heartbeat(run);
+      return observed;
     }
     await appendProgress(
-      run,
+      observed,
       `Paused after active ${operation.kind} operation reached ${state}.`,
     );
-    return this.registry.update(withoutOperation(run));
+    return this.registry.update(withoutOperation(observed));
   }
 
   private async observeActiveOperation(run: PlanExecRun): Promise<PlanExecRun> {
@@ -542,25 +553,31 @@ export class PlanExecController {
       operation.externalRunId!,
       operation.asyncDir,
     );
-    if (!status.success) return this.registry.heartbeat(run);
+    if (!status.success)
+      return this.recordObservationFailure(
+        run,
+        operation,
+        status.error.message,
+      );
+    const observed = await this.recordObservation(run, operation);
     const state = text(status.data.state);
-    if (!state || state === "running" || state === "stopping")
-      return this.registry.heartbeat(run);
+    if (!state || state === "running" || state === "stopping") return observed;
 
     if (operation.kind === "implementation")
-      return this.finishImplementation(run, operation, state);
+      return this.finishImplementation(observed, operation, state);
     if (operation.kind === "review")
       return this.finishReview(
-        run,
+        observed,
         operation,
         state,
         await this.bridgeOutput(operation),
       );
-    if (operation.kind === "fix") return this.finishFix(run, operation, state);
+    if (operation.kind === "fix")
+      return this.finishFix(observed, operation, state);
     if (operation.kind === "finalize")
-      return this.finishBestEffort(run, operation, state, "stats");
+      return this.finishBestEffort(observed, operation, state, "stats");
     if (operation.kind === "stats")
-      return this.finishBestEffort(run, operation, state, "archive");
+      return this.finishBestEffort(observed, operation, state, "archive");
     return this.fail(
       run,
       `Unexpected bridge operation kind: ${operation.kind}.`,
@@ -572,9 +589,15 @@ export class PlanExecController {
     operation: ActiveOperation,
   ): Promise<PlanExecRun> {
     const status = await this.fusion.status(operation.externalRunId);
-    if (!status.success) return this.registry.heartbeat(run);
+    if (!status.success)
+      return this.recordObservationFailure(
+        run,
+        operation,
+        status.error.message,
+      );
+    const observed = await this.recordObservation(run, operation);
     const state = fusionState(status.data);
-    if (!state || !state.terminal) return this.registry.heartbeat(run);
+    if (!state || !state.terminal) return observed;
     const result = await this.fusion.result(state.runId);
     if (!result.success) return this.fail(run, result.error.message);
     const final = fusionState(result.data);
@@ -583,7 +606,38 @@ export class PlanExecController {
         run,
         "Fusion completed without a machine-readable report.",
       );
-    return this.finishReview(run, operation, final.phase, final.report);
+    return this.finishReview(observed, operation, final.phase, final.report);
+  }
+
+  private async recordObservation(
+    run: PlanExecRun,
+    operation: ActiveOperation,
+  ): Promise<PlanExecRun> {
+    const observedOperation = { ...operation, lastObservedAt: Date.now() };
+    delete observedOperation.statusFailures;
+    delete observedOperation.lastStatusError;
+    return this.registry.heartbeat({
+      ...run,
+      activeOperation: observedOperation,
+    });
+  }
+
+  private async recordObservationFailure(
+    run: PlanExecRun,
+    operation: ActiveOperation,
+    error: string,
+  ): Promise<PlanExecRun> {
+    const failures = (operation.statusFailures ?? 0) + 1;
+    const message = `Unable to observe ${operation.service}/${operation.kind} (${failures}/${MAX_STATUS_FAILURES}): ${error}`;
+    if (failures >= MAX_STATUS_FAILURES) return this.fail(run, message);
+    return this.registry.heartbeat({
+      ...run,
+      activeOperation: {
+        ...operation,
+        statusFailures: failures,
+        lastStatusError: error,
+      },
+    });
   }
 
   private async finishImplementation(
@@ -815,7 +869,13 @@ export class PlanExecController {
       operation.service === "bridge"
         ? await this.bridge.status(operation.externalRunId, operation.asyncDir)
         : await this.fusion.status(operation.externalRunId);
-    if (!terminal.success) return this.registry.heartbeat(run);
+    if (!terminal.success)
+      return this.recordObservationFailure(
+        run,
+        operation,
+        terminal.error.message,
+      );
+    const observed = await this.recordObservation(run, operation);
     const bridgeState =
       operation.service === "bridge"
         ? text(terminal.data.state)
@@ -828,9 +888,9 @@ export class PlanExecController {
       bridgeState === "panel" ||
       bridgeState === "judge"
     ) {
-      return this.registry.heartbeat(run);
+      return observed;
     }
-    const cancelled = withoutOperation({ ...run, status: "cancelled" });
+    const cancelled = withoutOperation({ ...observed, status: "cancelled" });
     await appendProgress(
       cancelled,
       `Cancellation completed after ${operation.kind} reached ${bridgeState}.`,
@@ -894,10 +954,16 @@ export class PlanExecController {
     return createWorktree(this.runCommand, repositoryRoot, planPath, branch);
   }
 
-  private fail(run: PlanExecRun, error: string): Promise<PlanExecRun> {
-    return this.registry.update(
+  private async fail(run: PlanExecRun, error: string): Promise<PlanExecRun> {
+    const failed = await this.registry.update(
       withoutOperation({ ...run, status: "failed", error }),
     );
+    try {
+      await appendProgress(failed, `Run failed at ${failed.stage}: ${error}`);
+    } catch {
+      // The registry is authoritative if the optional progress file is unavailable.
+    }
+    return failed;
   }
 }
 
@@ -928,6 +994,8 @@ function workerPrompt(
     `Plan: ${run.planPath}`,
     `Task ${taskId}: ${title}`,
     "Complete only this task. Modify source code as needed, run relevant verification, commit your work, and mark only its completed plan checkboxes [x].",
+    "Change only checkbox markers from [ ] to [x]. Do not change checkbox text, headings, task numbers, or add/remove plan items.",
+    "Record verification in your response and progress artifacts, not by rewriting plan item text.",
     "Do not start later tasks. Do not report success until the checkboxes are updated and verification is complete.",
     "Remaining checkbox items:",
     ...unchecked.map((item) => `- [ ] ${item}`),

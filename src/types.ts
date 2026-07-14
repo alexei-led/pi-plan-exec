@@ -77,6 +77,9 @@ export interface ActiveOperation {
   taskId?: number;
   reviewIteration?: number;
   stopRequested?: boolean;
+  statusFailures?: number;
+  lastObservedAt?: number;
+  lastStatusError?: string;
 }
 
 export interface PlanExecRun {

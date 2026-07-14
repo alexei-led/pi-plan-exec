@@ -1,5 +1,5 @@
-import { join } from "node:path";
-import { TaskStore } from "@tintinweb/pi-tasks/dist/task-store.js";
+import { basename, dirname, join } from "node:path";
+import type { TaskStore } from "@tintinweb/pi-tasks/dist/task-store.js";
 import type { Task, TaskStatus } from "@tintinweb/pi-tasks/dist/types.js";
 import { readPlan } from "./plan.js";
 import { RunRegistry } from "./registry.js";
@@ -42,9 +42,11 @@ export class TaskProjector {
     run: PlanExecRun,
     options: TaskProjectionOptions,
   ): Promise<PlanExecRun> {
+    const current = await this.registry.get(run.id);
+    if (current && current.updatedAt > run.updatedAt) run = current;
     const path = sessionTaskPath(options.cwd, options.sessionId);
-    const store = openCompatibleStore(path);
-    const plan = await readPlan(run.planPath);
+    const store = await openCompatibleStore(path);
+    const plan = await readProjectionPlan(run);
     const existing = new Map(
       store
         .list()
@@ -52,13 +54,20 @@ export class TaskProjector {
         .map((task) => [String(task.metadata.planExecKey), task]),
     );
     const taskIds: Record<string, string> = {};
+    const firstIncompleteTaskId = plan.tasks.find(
+      (task) => task.unchecked.length > 0,
+    )?.id;
     let previousId: string | undefined;
 
     for (const task of plan.tasks) {
       const key = implementationKey(task.id);
       const projected = ensureTask(store, existing.get(key), {
         subject: `Implement Task ${task.id}: ${task.title}`,
-        description: task.items.map((item) => `- [ ] ${item}`).join("\n"),
+        description: implementationDescription(
+          run,
+          task.items,
+          task.id === firstIncompleteTaskId,
+        ),
         metadata: {
           planExecRunId: run.id,
           planExecKey: key,
@@ -73,7 +82,7 @@ export class TaskProjector {
     for (const entry of PIPELINE) {
       const projected = ensureTask(store, existing.get(entry.key), {
         subject: entry.subject,
-        description: `Plan-exec stage: ${entry.key}`,
+        description: stageDescription(run, entry.key),
         metadata: {
           planExecRunId: run.id,
           planExecKey: entry.key,
@@ -101,10 +110,20 @@ export class TaskProjector {
         updateStatus(store, projected, stageStatus(run, entry.key));
     }
 
-    return this.registry.update({
-      ...run,
-      taskProjection: { sessionId: options.sessionId, listPath: path, taskIds },
-    });
+    const persisted = await this.registry.updateIfCurrent(
+      {
+        ...run,
+        taskProjection: {
+          sessionId: options.sessionId,
+          listPath: path,
+          taskIds,
+        },
+      },
+      run.updatedAt,
+    );
+    if (!persisted.applied && persisted.run.updatedAt !== run.updatedAt)
+      return this.sync(persisted.run, options);
+    return persisted.run;
   }
 }
 
@@ -114,8 +133,21 @@ export function sessionTaskPath(cwd: string, sessionId: string): string {
   return join(cwd, ".pi", "tasks", `tasks-${sessionId}.json`);
 }
 
-function openCompatibleStore(path: string): TaskStore {
-  const store: unknown = new TaskStore(path);
+async function readProjectionPlan(run: PlanExecRun) {
+  try {
+    return await readPlan(run.planPath);
+  } catch (error: unknown) {
+    if (!isTerminal(run.status) || !isNodeError(error, "ENOENT")) throw error;
+    return readPlan(
+      join(dirname(run.planPath), "completed", basename(run.planPath)),
+    );
+  }
+}
+
+async function openCompatibleStore(path: string): Promise<TaskStore> {
+  const { TaskStore: TaskStoreConstructor } =
+    await import("@tintinweb/pi-tasks/dist/task-store.js");
+  const store: unknown = new TaskStoreConstructor(path);
   if (!hasTaskStoreContract(store)) {
     throw new Error(
       "Installed pi-tasks TaskStore is incompatible with plan-exec projection.",
@@ -177,6 +209,7 @@ function implementationStatus(
   complete: boolean,
 ): TaskStatus {
   if (complete) return "completed";
+  if (run.status !== "starting" && run.status !== "running") return "pending";
   const current = run.activeOperation?.taskId;
   return run.stage === "implementation" && current === taskId
     ? "in_progress"
@@ -189,6 +222,47 @@ function stageStatus(run: PlanExecRun, stage: RunStage): TaskStatus {
   if (run.status === "completed" || run.status === "completed_with_findings")
     return "completed";
   if (currentIndex > stageIndex) return "completed";
+  if (run.status !== "starting" && run.status !== "running") return "pending";
   if (run.stage === stage) return "in_progress";
   return "pending";
+}
+
+function isTerminal(status: PlanExecRun["status"]): boolean {
+  return (
+    status === "completed" ||
+    status === "completed_with_findings" ||
+    status === "failed" ||
+    status === "cancelled"
+  );
+}
+
+function isNodeError(error: unknown, code: string): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    error.code === code
+  );
+}
+
+function implementationDescription(
+  run: PlanExecRun,
+  items: string[],
+  isCurrent: boolean,
+): string {
+  const description = items.map((item) => `- [ ] ${item}`).join("\n");
+  if (isCurrent && run.status === "failed" && run.error)
+    return `${description}\n\nPlan-exec failed: ${run.error}`;
+  if (isCurrent && run.status === "cancelled")
+    return `${description}\n\nPlan-exec cancelled; its worktree is preserved.`;
+  return description;
+}
+
+function stageDescription(run: PlanExecRun, stage: RunStage): string {
+  const description = `Plan-exec stage: ${stage}`;
+  if (run.stage === stage && run.status === "failed" && run.error)
+    return `${description}\n\nPlan-exec failed: ${run.error}`;
+  if (run.stage === stage && run.status === "cancelled")
+    return `${description}\n\nPlan-exec cancelled; its worktree is preserved.`;
+  return description;
 }

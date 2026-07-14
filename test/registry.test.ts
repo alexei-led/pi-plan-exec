@@ -58,6 +58,34 @@ test("registry persists runs, protects path traversal, and reclaims stale leases
   assert.equal(adopted.lease?.sessionId, "session-2");
 });
 
+test("registry rejects stale compare-and-set updates", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-plan-exec-registry-"));
+  const registry = new RunRegistry(directory);
+  const run = await registry.create({
+    schemaVersion: 1,
+    repositoryRoot: "/repo",
+    planPath: "/repo/plan.md",
+    planHash: "hash",
+    worktreeCwd: "/repo",
+    branch: "feature",
+    defaultBranch: "main",
+    status: "running",
+    stage: "resolve",
+    taskAttempts: {},
+    stageAttempts: {},
+    reviewFindings: [],
+    unresolvedFindings: [],
+    config,
+  });
+  const newer = await registry.update({ ...run, status: "paused" });
+  const result = await registry.updateIfCurrent(
+    { ...run, status: "cancel_pending" },
+    run.updatedAt,
+  );
+  assert.equal(result.applied, false);
+  assert.equal(result.run.status, newer.status);
+});
+
 test("registry migrates vertical-slice runs missing review metadata", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-plan-exec-registry-"));
   const runId = "11111111-1111-4111-8111-111111111111";

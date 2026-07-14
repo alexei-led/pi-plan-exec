@@ -138,6 +138,42 @@ test("paused runs finish an active child without advancing the stage", async () 
   assert.equal(paused.stage, "implementation");
 });
 
+test("controller fails after repeated status-observation errors", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
+  const planPath = join(root, "plan.md");
+  await writeFile(planPath, "### Task 1: Implement\n- [ ] Do the work\n");
+  const registry = new RunRegistry(join(root, "runs"));
+  const controller = new PlanExecController(
+    registry,
+    new UnavailableBridge(join(root, "none.json")),
+    new FakeFusion(),
+    fakeGit(root),
+  );
+  let run = await registry.create({
+    ...baseRun(root, planPath),
+    stage: "implementation",
+    activeOperation: {
+      operationId: "operation-1",
+      service: "bridge",
+      kind: "implementation",
+      externalRunId: "run-1",
+      taskId: 1,
+    },
+  });
+
+  run = await controller.advance(run);
+  assert.equal(run.activeOperation?.statusFailures, 1);
+  assert.match(run.activeOperation?.lastStatusError ?? "", /unavailable/);
+  run = await controller.advance(run);
+  assert.equal(run.activeOperation?.statusFailures, 2);
+  run = await controller.advance(run);
+  assert.equal(run.status, "failed");
+  assert.match(
+    run.error ?? "",
+    /Unable to observe bridge\/implementation \(3\/3\)/,
+  );
+});
+
 test("controller replays a persisted bridge operation after a crash before spawn reply", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
   const planPath = join(root, "plan.md");
@@ -246,7 +282,10 @@ class FakeBridge {
     this.current += 1;
     return success({ runId: `run-${this.current}`, asyncDir: "/tmp/async" });
   }
-  async status() {
+  async status(): Promise<
+    | { success: true; data: Record<string, unknown> }
+    | { success: false; error: { message: string } }
+  > {
     return success({ state: "complete" });
   }
   async result() {
@@ -257,6 +296,15 @@ class FakeBridge {
   }
   async stop() {
     return success({ state: "stopping" });
+  }
+}
+
+class UnavailableBridge extends FakeBridge {
+  override async status() {
+    return {
+      success: false as const,
+      error: { message: "bridge unavailable" },
+    };
   }
 }
 

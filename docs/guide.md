@@ -11,11 +11,11 @@ contracts and component ownership.
 - Pi in an **interactive** session. `/exec` asks whether to use a worktree.
 - A Git repository with a non-detached `HEAD`.
 - A plan file inside that repository.
-- These installed Pi packages:
-  - `pi-subagents` `0.34.0` or later;
-  - `@tintinweb/pi-tasks` `0.7.1` or later;
-  - `@alexeiled/pi-subagents-bridge` `0.1.6` or later;
-  - `@alexeiled/pi-fusion` `0.5.1` or later;
+- These independently installed Pi packages, at compatible versions:
+  - `pi-subagents`;
+  - `@tintinweb/pi-tasks`;
+  - `@alexeiled/pi-subagents-bridge`;
+  - `@alexeiled/pi-fusion`;
   - `@alexeiled/pi-plan-exec`.
 
 `pi-plan-exec` uses pi-subagents’ built-in `worker` and `reviewer` agents. It
@@ -141,16 +141,31 @@ No stage pushes or merges a branch.
 
 ## Commands
 
+Use `/exec help` for the same hint inside Pi. Run IDs are optional for normal
+use: when one run matches the current repository or worktree, `/exec status`,
+`pause`, `resume`, `adopt`, and `cancel` select it automatically. If several
+runs match, Pi opens a picker; headless mode asks for the full ID shown by
+`/exec runs`.
+
 ```text
-/exec <plan>            Start a run
-/exec                   Select and start a plan
-/exec runs              List recent runs
-/exec status <run-id>   Show status, stage, branch, and worktree
-/exec pause <run-id>    Let the active child finish, then stop advancing
-/exec resume <run-id>   Continue a paused run
-/exec adopt <run-id>    Claim a stale or released cross-session run
-/exec cancel <run-id>   Stop when safe and preserve the worktree
+/exec [plan]            Start a run; bare /exec opens the plan picker
+/exec start [plan]      Start a run explicitly
+/exec setup             Show required packages and install commands
+/exec help              Show commands, progress, and recovery hints
+/exec runs              List recent runs and full IDs
+/exec status [run-id]   Show status, active worker, progress path, and error
+/exec pause [run-id]    Let the active child finish, then stop advancing
+/exec resume [run-id]   Continue a paused run
+/exec adopt [run-id]    Claim a stale or released cross-session run
+/exec cancel [run-id]   Stop when safe and preserve the worktree
 ```
+
+The footer shows the current stage and active worker while a run is polling.
+Stage transitions, observation degradation, and terminal states generate
+notifications. `/exec status` shows the last successful observation and retry
+count; three failed observations stop the run plainly instead of implying it is
+still progressing. A failed run preserves its worktree and remains visible in
+`/exec status` and the projected task description.
 
 ## Run lifecycle
 
