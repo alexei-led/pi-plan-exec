@@ -14,6 +14,8 @@
 A capable agent can lose context, repeat work, skip verification, or start a
 second writer after a restart. This extension moves task order, retry limits,
 worktree checks, and recovery out of prompt prose into durable controller state.
+It has been exercised in runs lasting a few hours; the controller keeps polling
+instead of asking one chat prompt to remember the whole job.
 
 It executes one checked-list task at a time in a Git checkout you choose, then
 runs review and fix stages with fresh Pi subagents and Fusion. A worker saying
@@ -28,9 +30,10 @@ runs review and fix stages with fresh Pi subagents and Fusion. A worker saying
   session into that worktree, so its tools and footer use the execution branch.
 - **Executes plans deterministically.** It selects the first incomplete task,
   starts a fresh worker, and verifies completion from the plan checkboxes.
-- **Recovers deliberately.** Compare-and-set run records, operation IDs,
-  controller locks, leases, and adoption prevent reloads and ambiguous provider
-  replies from intentionally starting another writer or losing cancellation.
+- **Recovers deliberately.** A reload reattaches a matching run owned by the
+  returning session. `/exec adopt` takes over a stale cross-session run.
+  Compare-and-set records, operation IDs, controller locks, and leases avoid
+  intentionally starting another writer or losing a pause or cancellation.
 - **Reviews before it finishes.** It runs comprehensive, smells, Fusion, and
   critical review/fix phases. Unresolved findings remain visible in the final
   `completed_with_findings` state.
@@ -61,11 +64,12 @@ plan:
 ```
 
 While it runs, Pi shows the execution-worktree path, branch, stage, and worker.
-Use `/exec status` without a run ID for the current repository; use `/exec runs`
-only when several runs need disambiguation. A worker that exhausts its turn
-budget with an unchecked task can be retried from the worktree with `/exec resume`.
-The installed `exec-plan` skill is also available as `/skill:exec-plan` for the
-plan format and recovery rules.
+`/exec status` only observes the run; it does not interrupt or restart it. Use
+it without a run ID for the current repository, and use `/exec runs` when several
+runs need disambiguation. `/exec pause` stops after the active child; `/exec
+resume` continues a paused run or retries an exhausted worker with an unchecked
+task. The installed `exec-plan` skill is also available as `/skill:exec-plan`
+for the plan format and recovery rules.
 
 The **[Guide](docs/guide.md#executable-plan-format)** defines the accepted plan
 format, including the exact heading and checkbox rules. Omit the path to select

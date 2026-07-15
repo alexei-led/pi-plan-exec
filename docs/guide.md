@@ -175,6 +175,29 @@ unchecked implementation task can be retried with interactive `/exec resume`; it
 preserves the worktree and raises the worker budget to 75 turns. Other failures
 require fixing the cause before starting or retrying.
 
+## Watching and recovering a long run
+
+The controller polls an active worker or review operation every second. It does
+not impose a wall-clock limit of its own, and it has been exercised in runs
+lasting a few hours. You do not need to keep reissuing `/exec` while it works.
+Use this sequence instead:
+
+1. Run `/exec status` to inspect the stage, active operation, worktree, branch,
+   progress path, and any error. It only observes the run.
+2. Run `/exec pause` when you want the active child to finish but do not want the
+   controller to advance. Run `/exec resume` when you are ready to continue.
+3. Run `/exec runs` when more than one run may match the repository. Use the full
+   ID with another command when Pi cannot choose unambiguously.
+4. After a reload, return to the execution worktree and use `/exec status`. A
+   matching run owned by the returning session reattaches automatically. Use
+   `/exec adopt` to explicitly take over an unfinished stale run from another
+   session.
+
+Do not start the same plan again after an interruption. Inspect the existing run
+first. If the selected run uses a different worktree, `/exec resume` hands the Pi
+session into that worktree before it continues, so subsequent tools use the
+correct branch.
+
 ## Run lifecycle
 
 A run:
