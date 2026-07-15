@@ -83,13 +83,13 @@ test("runtime prerequisite check identifies missing provider extensions", () => 
 
 test("help and setup explain the installed command surface", () => {
   assert.match(execHelp(), /\/exec status \[run-id\]/);
-  assert.match(execHelp(), /plan-structure recovery/);
+  assert.match(execHelp(), /recover plan structure/);
   assert.match(execHelp(), /\/skill:exec-plan/);
   assert.match(execSetup(), /pi install npm:@alexeiled\/pi-fusion/);
   assert.match(execSetup(), /pi install npm:@alexeiled\/pi-plan-exec/);
 });
 
-test("only plan-structure failures are eligible for legacy resume recovery", () => {
+test("only structured recovery failures are eligible for resume", () => {
   assert.equal(
     isRecoverableFailure(
       run({
@@ -108,6 +108,12 @@ test("only plan-structure failures are eligible for legacy resume recovery", () 
     ),
     true,
   );
+  const exhaustedWorker = run({
+    status: "failed",
+    error: "Worker run-2 ended as failed and left task 1 checkboxes unchecked.",
+  });
+  delete exhaustedWorker.activeOperation;
+  assert.equal(isRecoverableFailure(exhaustedWorker), true);
   assert.equal(
     isRecoverableFailure(run({ status: "failed", error: "worker crashed" })),
     false,
@@ -131,6 +137,13 @@ test("run status includes live operation, progress, and recovery hints", () => {
     }),
   );
   assert.match(recoverable, /interactive \/exec resume/);
+
+  const failedWorker = run({
+    status: "failed",
+    error: "Worker run-2 ended as failed and left task 1 checkboxes unchecked.",
+  });
+  delete failedWorker.activeOperation;
+  assert.match(formatRunStatus(failedWorker), /retry the incomplete task/);
 
   const paused = formatRunStatus(
     run({

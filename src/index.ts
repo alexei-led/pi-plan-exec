@@ -1,14 +1,17 @@
 import { readdir } from "node:fs/promises";
 import { basename, relative, resolve, sep } from "node:path";
-import type {
-  ExtensionAPI,
-  ExtensionContext,
+import {
+  SessionManager,
+  type ExtensionAPI,
+  type ExtensionCommandContext,
+  type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { BridgeClient } from "./bridge.js";
 import {
   PLAN_STRUCTURE_CHANGED_ERROR,
   PlanExecController,
+  isRecoverableImplementationFailure,
 } from "./controller.js";
 import { FusionClient } from "./fusion.js";
 import { RunRegistry } from "./registry.js";
@@ -132,6 +135,10 @@ export default function planExecExtension(pi: ExtensionAPI): void {
   const lastStates = new Map<string, RunState>();
   const setStatus = (run: PlanExecRun, ctx: ExtensionContext): void => {
     ctx.ui.setStatus(STATUS_KEY, compactRunStatus(run));
+    ctx.ui.setWidget(STATUS_KEY, [
+      `Plan worktree: ${run.worktreeCwd}`,
+      `Git branch: ${run.branch}  ·  use !git status --short --branch for details`,
+    ]);
   };
   const stopBackgroundController = (runId: string): void => {
     const timer = activeControllers.get(runId);
@@ -273,7 +280,7 @@ export default function planExecExtension(pi: ExtensionAPI): void {
           syncProjection,
           checkRuntime,
         );
-        ctx.ui.notify(message, "info");
+        if (message) ctx.ui.notify(message, "info");
       } catch (error: unknown) {
         ctx.ui.notify(
           error instanceof Error ? error.message : String(error),
@@ -364,7 +371,9 @@ export function formatRunStatus(run: PlanExecRun): string {
   } else if (isTerminal(run.status)) {
     lines.push(
       run.status === "failed"
-        ? "next: worktree preserved; inspect the error, then use /exec runs."
+        ? isRecoverableImplementationFailure(run)
+          ? "next: use interactive /exec resume to retry the incomplete task in its worktree."
+          : "next: worktree preserved; inspect the error, then use /exec runs."
         : "next: run is terminal; use /exec runs to inspect other runs.",
     );
   } else {
@@ -387,12 +396,12 @@ export function formatRunList(runs: PlanExecRun[]): string {
 
 async function handleCommand(
   args: string,
-  ctx: ExtensionContext,
+  ctx: ExtensionCommandContext,
   controller: PlanExecController,
   startBackgroundController: StartBackgroundController,
   syncProjection: SyncProjection,
   checkRuntime: RuntimeCheck,
-): Promise<string> {
+): Promise<string | undefined> {
   const [subcommand, ...rest] = args.split(/\s+/).filter(Boolean);
   if (subcommand === "help") return execHelp();
   if (subcommand === "setup") return execSetup();
@@ -408,6 +417,13 @@ async function handleCommand(
     const run = await resolveRunForAction(action, rest[0], ctx);
     if (action === "status") return formatRunStatus(run);
     if (action === "resume" || action === "adopt") {
+      const handedOff = await handoffToWorktree(
+        ctx,
+        run,
+        syncProjection,
+        action === "resume" ? `resume ${run.id}` : undefined,
+      );
+      if (handedOff) return undefined;
       const reviewedPlanHash =
         action === "resume"
           ? await reviewedPlanHashForResume(run, ctx)
@@ -452,15 +468,17 @@ async function handleCommand(
       : args || (await selectPlan(ctx));
   await checkRuntime();
   const useWorktree = await chooseIsolation(ctx);
-  const run = await syncProjection(
-    await controller.start({
-      cwd: ctx.cwd,
-      planPath,
-      useWorktree,
-      sessionId: ctx.sessionManager.getSessionId(),
-    }),
-    { cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId() },
-  );
+  const started = await controller.start({
+    cwd: ctx.cwd,
+    planPath,
+    useWorktree,
+    sessionId: ctx.sessionManager.getSessionId(),
+  });
+  if (await handoffToWorktree(ctx, started, syncProjection)) return undefined;
+  const run = await syncProjection(started, {
+    cwd: ctx.cwd,
+    sessionId: ctx.sessionManager.getSessionId(),
+  });
   startBackgroundController(
     run,
     ctx.sessionManager.getSessionId(),
@@ -535,6 +553,67 @@ export function prioritizeRunCandidates(
   return exactWorktree.length > 0 ? exactWorktree : pool;
 }
 
+async function handoffToWorktree(
+  ctx: ExtensionCommandContext,
+  run: PlanExecRun,
+  syncProjection: SyncProjection,
+  followUp?: string,
+): Promise<boolean> {
+  if (resolve(run.worktreeCwd) === resolve(ctx.cwd)) return false;
+  const sourceSessionFile = ctx.sessionManager.getSessionFile();
+  if (!sourceSessionFile) return false;
+
+  const sourceSessionId = ctx.sessionManager.getSessionId();
+  const targetSession = SessionManager.forkFrom(
+    sourceSessionFile,
+    run.worktreeCwd,
+  );
+  const targetSessionFile = targetSession.getSessionFile();
+  if (!targetSessionFile) {
+    throw new Error("Could not create a worktree Pi session.");
+  }
+
+  let claimed = await registry.claim(
+    await registry.release(run),
+    targetSession.getSessionId(),
+  );
+  claimed = await syncProjection(claimed, {
+    cwd: targetSession.getCwd(),
+    sessionId: targetSession.getSessionId(),
+  });
+  let switched = false;
+  try {
+    const result = await ctx.switchSession(targetSessionFile, {
+      withSession: async (worktreeCtx) => {
+        switched = true;
+        process.chdir(claimed.worktreeCwd);
+        worktreeCtx.ui.notify(
+          `Plan-exec switched to its worktree:\n${claimed.worktreeCwd}\nBranch: ${claimed.branch}`,
+          "info",
+        );
+        if (followUp) await worktreeCtx.sendUserMessage(`/exec ${followUp}`);
+      },
+    });
+    if (!result.cancelled) return true;
+  } catch (error: unknown) {
+    if (switched) throw error;
+    await restoreSourceLease(run.id, sourceSessionId);
+    throw error;
+  }
+
+  await restoreSourceLease(run.id, sourceSessionId);
+  return false;
+}
+
+async function restoreSourceLease(
+  runId: string,
+  sourceSessionId: string,
+): Promise<void> {
+  const current = await registry.get(runId);
+  if (!current) return;
+  await registry.claim(await registry.release(current), sourceSessionId);
+}
+
 function matchesContext(run: PlanExecRun, cwd: string): boolean {
   const current = resolve(cwd);
   return (
@@ -560,7 +639,9 @@ function isActionAllowed(
 }
 
 export function isRecoverableFailure(run: PlanExecRun): boolean {
-  return run.status === "failed" && needsPlanStructureReview(run);
+  return (
+    needsPlanStructureReview(run) || isRecoverableImplementationFailure(run)
+  );
 }
 
 export function needsPlanStructureReview(run: PlanExecRun): boolean {
@@ -719,14 +800,15 @@ export function execHelp(): string {
     "/exec status [run-id]   Show progress; run-id is optional when unambiguous.",
     "/exec runs              List runs and their full IDs.",
     "/exec pause [run-id]    Pause after the active child finishes.",
-    "/exec resume [run-id]   Resume a paused run or review plan-structure recovery.",
+    "/exec resume [run-id]   Resume a paused run, recover plan structure, or retry an exhausted worker.",
     "/exec adopt [run-id]    Adopt a stale run from another session.",
     "/exec cancel [run-id]   Cancel safely and preserve the worktree.",
     "",
     "Hints:",
     "- Prefer Worktree (isolated) when asked.",
     "- The footer shows live stage and worker progress.",
-    "- Failures notify you and preserve the worktree; /exec status needs no ID when one run matches.",
+    "- A failed worker that leaves its task unchecked can be retried with /exec resume; its worktree is preserved.",
+    "- Worktree runs fork this Pi session into the worktree so the footer and tools use the execution directory.",
     "- Use /skill:exec-plan for the executable-plan format and recovery rules.",
   ].join("\n");
 }

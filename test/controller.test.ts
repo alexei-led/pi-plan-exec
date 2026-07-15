@@ -116,6 +116,36 @@ test("plan structure drift pauses for review and resumes after repair", async ()
   assert.equal(resumed.activeOperation?.kind, "implementation");
 });
 
+test("explicit resume retries a worker after its task retry limit", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
+  const planPath = join(root, "plan.md");
+  const plan = "### Task 1: Implement\n- [ ] Do the work\n";
+  await writeFile(planPath, plan);
+  const registry = new RunRegistry(join(root, "runs"));
+  const controller = new PlanExecController(
+    registry,
+    new FakeBridge(join(root, "none.json")),
+    new FakeFusion(),
+    fakeGit(root),
+  );
+  const failed = await registry.create({
+    ...baseRun(root, planPath),
+    planHash: parsePlan(planPath, plan).hash,
+    status: "failed",
+    stage: "implementation",
+    taskAttempts: { "1": 2 },
+    error: "Worker run-2 ended as failed and left task 1 checkboxes unchecked.",
+  });
+
+  const resumed = await controller.resume(failed.id, "session-1");
+
+  assert.equal(resumed.status, "running");
+  assert.equal(resumed.error, undefined);
+  assert.equal(resumed.taskAttempts["1"], 0);
+  assert.equal(resumed.config.workerMaxTurns, 75);
+  assert.equal(resumed.activeOperation?.kind, "implementation");
+});
+
 test("legacy structure failure adopts reviewed hash after claiming the run", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
   const planPath = join(root, "plan.md");

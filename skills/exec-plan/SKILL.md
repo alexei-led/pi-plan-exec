@@ -21,7 +21,9 @@ review subagents for an active plan-exec run.
 ```
 
 The command asks whether to use an isolated worktree. Prefer `Worktree
-(isolated)` unless the user explicitly requests in-place execution.
+(isolated)` unless the user explicitly requests in-place execution. When chosen,
+Pi forks the current session into the execution worktree so its tools and footer
+use that directory and branch.
 
 ## Inspect and control
 
@@ -33,13 +35,14 @@ shows full IDs for explicit selection and headless recovery.
 /exec status                      Show live stage, worker, error, and worktree
 /exec runs                        List recent runs and full IDs
 /exec pause                       Pause after the active child finishes
-/exec resume                      Continue a paused run or review plan-structure recovery
+/exec resume                      Continue a paused run, review plan structure, or retry an exhausted worker
 /exec adopt                       Claim a stale cross-session run
 /exec cancel                      Stop safely and preserve the worktree
 ```
 
-The footer shows the current stage and active worker while polling. Stage
-transitions, failures, cancellation, and completion are notified in Pi.
+Pi shows the execution worktree and branch alongside the current stage and active
+worker while polling. Stage transitions, failures, cancellation, and completion
+are notified in Pi.
 
 ## Rules
 
@@ -56,6 +59,9 @@ transitions, failures, cancellation, and completion are notified in Pi.
 - Failed or cancelled runs preserve their worktrees. Inspect with `/exec status`
   before changing anything manually. A legacy run failed by a plan-structure
   mismatch can be resumed interactively after confirming the current structure.
+  A worker that exhausts its turn budget with an unchecked task can be retried
+  with interactive `/exec resume`; it preserves existing work and raises the
+  worker budget to 75 turns.
 
 ## Completion truth
 

@@ -33,6 +33,7 @@ import type {
 const MAX_STATUS_FAILURES = 3;
 const OPERATION_RECOVERY_DELAY_MS = 35_000;
 const SPAWN_CONTENTION_RETRY_MS = 5_000;
+const RECOVERY_WORKER_MAX_TURNS = 75;
 export const PLAN_STRUCTURE_CHANGED_ERROR =
   "Plan task structure changed outside checkbox completion.";
 
@@ -43,7 +44,7 @@ const INITIAL_CONFIG: FrozenRunConfig = {
   fusionIterations: 10,
   finalizeEnabled: true,
   workerAgent: "worker",
-  workerMaxTurns: 50,
+  workerMaxTurns: RECOVERY_WORKER_MAX_TURNS,
   reviewerAgent: "reviewer",
   reviewerMaxTurns: 30,
   statsAgent: "reviewer",
@@ -183,7 +184,9 @@ export class PlanExecController {
       if (!adopted.applied) return adopted.run;
       prepared = adopted.run;
     }
-    if (explicit && prepared.status === "paused") {
+    if (explicit && isRecoverableImplementationFailure(prepared)) {
+      prepared = await this.recoverFailedImplementation(prepared);
+    } else if (explicit && prepared.status === "paused") {
       const resumed = await this.registry.updateIfCurrent(
         clearError({ ...prepared, status: "running" }),
         prepared.updatedAt,
@@ -755,6 +758,42 @@ export class PlanExecController {
     });
   }
 
+  private async recoverFailedImplementation(
+    run: PlanExecRun,
+  ): Promise<PlanExecRun> {
+    const plan = await readPlan(run.planPath);
+    if (plan.hash !== run.planHash)
+      return this.pauseForReview(run, PLAN_STRUCTURE_CHANGED_ERROR);
+    const task = plan.tasks.find((candidate) => candidate.unchecked.length > 0);
+    const recovered = await this.registry.updateIfCurrent(
+      clearError({
+        ...run,
+        status: "running",
+        config: {
+          ...run.config,
+          workerMaxTurns: Math.max(
+            run.config.workerMaxTurns,
+            RECOVERY_WORKER_MAX_TURNS,
+          ),
+        },
+        ...(task
+          ? {
+              taskAttempts: { ...run.taskAttempts, [String(task.id)]: 0 },
+            }
+          : {}),
+      }),
+      run.updatedAt,
+    );
+    if (!recovered.applied) return recovered.run;
+    await appendProgress(
+      recovered.run,
+      task
+        ? `Manual recovery reset Task ${task.id} after worker exhaustion.`
+        : "Manual recovery resumed after worker exhaustion.",
+    );
+    return recovered.run;
+  }
+
   private async pauseForReview(
     run: PlanExecRun,
     error: string,
@@ -1164,7 +1203,7 @@ function workerPrompt(
     `Run: ${run.id}`,
     `Plan: ${run.planPath}`,
     `Task ${taskId}: ${title}`,
-    "Complete only this task. Modify source code as needed, run relevant verification, commit your work, and mark only its completed plan checkboxes [x].",
+    "Complete only this task. Inspect and preserve valid work already present in the worktree before making changes, then run relevant verification, commit your work, and mark only its completed plan checkboxes [x].",
     "Change only checkbox markers from [ ] to [x]. Do not change checkbox text, headings, task numbers, or add/remove plan items.",
     "Record verification in your response and progress artifacts, not by rewriting plan item text.",
     "Do not start later tasks. Do not report success until the checkboxes are updated and verification is complete.",
@@ -1288,6 +1327,17 @@ function isAmbiguousLaunchFailure(error: {
 function isSpawnContention(message: string): boolean {
   return /subagent call is already in progress|exactly ONE subagent call per turn/i.test(
     message,
+  );
+}
+
+export function isRecoverableImplementationFailure(run: PlanExecRun): boolean {
+  return (
+    run.status === "failed" &&
+    run.stage === "implementation" &&
+    run.activeOperation === undefined &&
+    /^Worker .+ ended as .+ and left task \d+ checkboxes unchecked\.$/.test(
+      run.error ?? "",
+    )
   );
 }
 

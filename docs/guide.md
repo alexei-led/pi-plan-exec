@@ -132,7 +132,9 @@ To choose a Markdown plan beneath `docs/plans/`, excluding directories named
 ```
 
 The extension always asks whether to use the current checkout or an isolated
-Git worktree. Prefer the worktree. Worktrees live outside the source repository:
+Git worktree. Prefer the worktree. On selection, Pi forks the current session
+into the worktree; its tools, footer, and task projection then use the execution
+branch. Worktrees live outside the source repository:
 
 ```text
 ~/.pi/plan-exec/worktrees/
@@ -156,19 +158,22 @@ runs match, Pi opens a picker; headless mode asks for the full ID shown by
 /exec runs              List recent runs and full IDs
 /exec status [run-id]   Show status, active worker, progress path, and error
 /exec pause [run-id]    Let the active child finish, then stop advancing
-/exec resume [run-id]   Continue a paused run or recover a reviewed plan-structure failure
+/exec resume [run-id]   Continue a paused run, recover reviewed plan structure, or retry an exhausted worker
 /exec adopt [run-id]    Claim a stale or released cross-session run
 /exec cancel [run-id]   Stop when safe and preserve the worktree
 ```
 
-The footer shows the current stage and active worker while a run is polling.
-Stage transitions, observation degradation, and terminal states generate
-notifications. `/exec status` shows the last successful observation and retry
-count; three failed observations stop the run plainly instead of implying it is
-still progressing. A failed run preserves its worktree and remains visible in
-`/exec status` and the projected task description. Legacy runs stopped by a plan
-structure mismatch can be resumed interactively after confirming the current
-structure; other failures require fixing the cause before starting or retrying.
+Pi shows the execution-worktree path and branch with the current stage and active
+worker while a run is polling. Stage transitions, observation degradation, and
+terminal states generate notifications. `/exec status` shows the last successful
+observation and retry count; three failed observations stop the run plainly
+instead of implying it is still progressing. A failed run preserves its worktree
+and remains visible in `/exec status` and the projected task description. Legacy
+runs stopped by a plan structure mismatch can be resumed interactively after
+confirming the current structure. A worker that exhausts its turn budget with an
+unchecked implementation task can be retried with interactive `/exec resume`; it
+preserves the worktree and raises the worker budget to 75 turns. Other failures
+require fixing the cause before starting or retrying.
 
 ## Run lifecycle
 

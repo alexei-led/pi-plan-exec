@@ -24,7 +24,8 @@ runs review and fix stages with fresh Pi subagents and Fusion. A worker saying
 ## What it does
 
 - **Keeps one writer in one checkout.** `/exec` always asks whether to use an
-  isolated Git worktree or work in place.
+  isolated Git worktree or work in place. Isolated runs move the interactive Pi
+  session into that worktree, so its tools and footer use the execution branch.
 - **Executes plans deterministically.** It selects the first incomplete task,
   starts a fresh worker, and verifies completion from the plan checkboxes.
 - **Recovers deliberately.** Compare-and-set run records, operation IDs,
@@ -59,10 +60,12 @@ plan:
 /exec docs/plans/20260713-add-greeting.md
 ```
 
-While it runs, the footer shows the current stage and worker. Use
-`/exec status` without a run ID for the current repository; use `/exec runs`
-only when several runs need disambiguation. The installed `exec-plan` skill is
-also available as `/skill:exec-plan` for the plan format and recovery rules.
+While it runs, Pi shows the execution-worktree path, branch, stage, and worker.
+Use `/exec status` without a run ID for the current repository; use `/exec runs`
+only when several runs need disambiguation. A worker that exhausts its turn
+budget with an unchecked task can be retried from the worktree with `/exec resume`.
+The installed `exec-plan` skill is also available as `/skill:exec-plan` for the
+plan format and recovery rules.
 
 The **[Guide](docs/guide.md#executable-plan-format)** defines the accepted plan
 format, including the exact heading and checkbox rules. Omit the path to select
