@@ -45,14 +45,14 @@ Install the prerequisites, then plan-exec:
 ```bash
 pi install npm:pi-subagents
 pi install npm:@tintinweb/pi-tasks
-pi install npm:@alexeiled/pi-subagents-bridge
+pi install npm:@alexeiled/pi-subagents-bridge@^0.2.0
 pi install npm:@alexeiled/pi-fusion
 pi install npm:@alexeiled/pi-plan-exec
 ```
 
-The providers remain independent Pi packages. `pi-plan-exec` probes the bridge
-and Fusion capabilities before it creates a run and tells you how to recover if
-they are unavailable.
+The providers remain independent Pi packages. `pi-plan-exec` requires Bridge
+`0.2.0` or later for safe operation lookup, probes Bridge and Fusion capabilities
+before it creates a run, and tells you how to recover if they are unavailable.
 
 Reload Pi. From an interactive session in a Git repository, run an executable
 plan:
@@ -67,9 +67,11 @@ While it runs, Pi shows the execution-worktree path, branch, stage, and worker.
 `/exec status` only observes the run; it does not interrupt or restart it. Use
 it without a run ID for the current repository, and use `/exec runs` when several
 runs need disambiguation. `/exec pause` stops after the active child; `/exec
-resume` continues a paused run or retries an exhausted worker with an unchecked
-task. The installed `exec-plan` skill is also available as `/skill:exec-plan`
-for the plan format and recovery rules.
+resume` continues paused work or recovers a recorded failure in the same stage
+and preserved worktree. When a provider operation may still exist, plan-exec
+keeps its identity and adopts it before any retry. The installed `exec-plan`
+skill is also available as `/skill:exec-plan` for the plan format and recovery
+rules.
 
 The **[Guide](docs/guide.md#executable-plan-format)** defines the accepted plan
 format, including the exact heading and checkbox rules. Omit the path to select
@@ -100,6 +102,7 @@ ownership of subagent execution, task UI, and multi-model review.
 - **[Architecture](docs/architecture.md)** — component ownership, state, RPC
   contracts, stages, and trust boundaries.
 - [Development](DEVELOPMENT.md) — local verification and release process.
+- [Changelog](CHANGELOG.md) — release history and compatibility changes.
 - [Original design record](docs/plans/2026-07-12-pi-plan-exec-design.md) —
   design decisions and intended behavior.
 

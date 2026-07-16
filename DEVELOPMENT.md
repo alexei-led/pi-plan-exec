@@ -35,13 +35,20 @@ Target package:
 @alexeiled/pi-plan-exec
 ```
 
-Normal releases are tag-driven:
+Normal releases are tag-driven. Decide patch versus minor first, update
+`package.json`, `package-lock.json`, and `CHANGELOG.md`, then commit the release
+version before tagging:
 
 ```bash
 npm run test:all
-npm version patch
+git commit -am "chore: release <version>"
+git tag v<version>
 git push origin main --follow-tags
 ```
+
+Use `npm version patch` or `npm version minor` only when it is the command that
+makes the intended version change; do not bump an already versioned release a
+second time.
 
 The release workflow runs only for pushed `v*` tags. It rejects a tag that does
 not match `package.json` or is not on `main`, runs the validation gate, publishes

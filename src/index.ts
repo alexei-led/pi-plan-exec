@@ -11,9 +11,9 @@ import { BridgeClient } from "./bridge.js";
 import {
   PLAN_STRUCTURE_CHANGED_ERROR,
   PlanExecController,
-  isRecoverableImplementationFailure,
 } from "./controller.js";
 import { FusionClient } from "./fusion.js";
+import { isRecoverableRun, isTerminalStatus } from "./lifecycle.js";
 import { RunRegistry } from "./registry.js";
 import { readPlan } from "./plan.js";
 import { TaskProjector } from "./task-projection.js";
@@ -21,12 +21,6 @@ import type { PlanExecRun } from "./types.js";
 
 const registry = new RunRegistry();
 const STATUS_KEY = "plan-exec";
-const TERMINAL_STATUSES = new Set([
-  "completed",
-  "completed_with_findings",
-  "failed",
-  "cancelled",
-]);
 const REQUIRED_RUNTIME_TOOLS: Record<string, string> = {
   subagent: "pi-subagents",
   TaskCreate: "@tintinweb/pi-tasks",
@@ -66,7 +60,7 @@ const EXEC_COMMANDS: AutocompleteItem[] = [
   {
     value: "resume",
     label: "resume",
-    description: "Resume a paused run or review plan-structure recovery",
+    description: "Resume or retry a failed run in its preserved worktree",
   },
   {
     value: "adopt",
@@ -210,11 +204,20 @@ export default function planExecExtension(pi: ExtensionAPI): void {
       new FusionClient(pi.events, 1_500).ping(),
     ]);
     const missing: string[] = [];
+    const incompatible: string[] = [];
     if (!bridgeReply.success) missing.push("@alexeiled/pi-subagents-bridge");
+    else if (!hasBridgeOperationMethod(bridgeReply.data))
+      incompatible.push("@alexeiled/pi-subagents-bridge >=0.2.0");
     if (!fusionReply.success) missing.push("@alexeiled/pi-fusion");
-    if (missing.length > 0) {
+    if (missing.length > 0 || incompatible.length > 0) {
+      const problems = [
+        ...(missing.length > 0 ? [`missing: ${missing.join(", ")}`] : []),
+        ...(incompatible.length > 0
+          ? [`incompatible: ${incompatible.join(", ")}`]
+          : []),
+      ];
       throw new Error(
-        `Missing plan-exec provider${missing.length === 1 ? "" : "s"}: ${missing.join(", ")}. Run /exec setup, install the packages, then /reload.`,
+        `Plan-exec provider ${problems.join("; ")}. Run /exec setup, install compatible packages, then /reload.`,
       );
     }
   };
@@ -292,7 +295,13 @@ export default function planExecExtension(pi: ExtensionAPI): void {
 
   pi.on("session_start", async (_event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId();
-    const runs = await registry.list();
+    const { runs, errors } = await registry.listWithErrors();
+    if (errors.length > 0)
+      notify(
+        ctx,
+        `Ignored ${errors.length} corrupt plan-exec run record${errors.length === 1 ? "" : "s"}: ${errors.map((error) => shortRunId(error.runId)).join(", ")}.`,
+        "warning",
+      );
     for (const run of runs) {
       if (
         !isTerminal(run.status) &&
@@ -311,6 +320,13 @@ export default function planExecExtension(pi: ExtensionAPI): void {
     lastStates.clear();
     // Status is session-scoped in Pi, so the next session starts clean.
   });
+}
+
+export function hasBridgeOperationMethod(data: unknown): boolean {
+  if (typeof data !== "object" || data === null || !("methods" in data))
+    return false;
+  const methods = data.methods;
+  return Array.isArray(methods) && methods.includes("operation");
 }
 
 export function missingRuntimeTools(available: string[]): string[] {
@@ -349,6 +365,9 @@ export function formatRunStatus(run: PlanExecRun): string {
     `worktree: ${run.worktreeCwd}`,
     `updated: ${new Date(run.updatedAt).toISOString()}`,
   ];
+  if (operation) lines.push(`operation ID: ${operation.operationId}`);
+  if (operation?.externalRunId)
+    lines.push(`external run ID: ${operation.externalRunId}`);
   if (run.progressPath) lines.push(`progress: ${run.progressPath}`);
   if (operation?.lastObservedAt)
     lines.push(
@@ -371,8 +390,8 @@ export function formatRunStatus(run: PlanExecRun): string {
   } else if (isTerminal(run.status)) {
     lines.push(
       run.status === "failed"
-        ? isRecoverableImplementationFailure(run)
-          ? "next: use interactive /exec resume to retry the incomplete task in its worktree."
+        ? isRecoverableFailure(run)
+          ? "next: use interactive /exec resume to retry this stage in its preserved worktree."
           : "next: worktree preserved; inspect the error, then use /exec runs."
         : "next: run is terminal; use /exec runs to inspect other runs.",
     );
@@ -417,6 +436,7 @@ async function handleCommand(
     const run = await resolveRunForAction(action, rest[0], ctx);
     if (action === "status") return formatRunStatus(run);
     if (action === "resume" || action === "adopt") {
+      await checkRuntime();
       const handedOff = await handoffToWorktree(
         ctx,
         run,
@@ -635,13 +655,13 @@ function isActionAllowed(
   if (action === "adopt") {
     return !isTerminal(run.status) && run.lease?.sessionId !== sessionId;
   }
-  return !isTerminal(run.status) && run.status !== "cancel_pending";
+  if (action === "cancel")
+    return !isTerminal(run.status) || run.status === "failed";
+  return false;
 }
 
 export function isRecoverableFailure(run: PlanExecRun): boolean {
-  return (
-    needsPlanStructureReview(run) || isRecoverableImplementationFailure(run)
-  );
+  return needsPlanStructureReview(run) || isRecoverableRun(run);
 }
 
 export function needsPlanStructureReview(run: PlanExecRun): boolean {
@@ -783,7 +803,7 @@ export function execSetup(): string {
     "Install the plan-exec prerequisites at compatible versions:",
     "pi install npm:pi-subagents",
     "pi install npm:@tintinweb/pi-tasks",
-    "pi install npm:@alexeiled/pi-subagents-bridge",
+    "pi install npm:@alexeiled/pi-subagents-bridge@^0.2.0",
     "pi install npm:@alexeiled/pi-fusion",
     "pi install npm:@alexeiled/pi-plan-exec",
     "",
@@ -800,21 +820,21 @@ export function execHelp(): string {
     "/exec status [run-id]   Show progress; run-id is optional when unambiguous.",
     "/exec runs              List runs and their full IDs.",
     "/exec pause [run-id]    Pause after the active child finishes.",
-    "/exec resume [run-id]   Resume a paused run, recover plan structure, or retry an exhausted worker.",
+    "/exec resume [run-id]   Resume or retry a failed run in its preserved worktree.",
     "/exec adopt [run-id]    Adopt a stale run from another session.",
     "/exec cancel [run-id]   Cancel safely and preserve the worktree.",
     "",
     "Hints:",
     "- Prefer Worktree (isolated) when asked.",
     "- The footer shows live stage and worker progress.",
-    "- A failed worker that leaves its task unchecked can be retried with /exec resume; its worktree is preserved.",
+    "- /exec resume preserves the stage and worktree, and reconciles a known Bridge operation before retrying it.",
     "- Worktree runs fork this Pi session into the worktree so the footer and tools use the execution directory.",
     "- Use /skill:exec-plan for the executable-plan format and recovery rules.",
   ].join("\n");
 }
 
-function isTerminal(status: string): boolean {
-  return TERMINAL_STATUSES.has(status);
+function isTerminal(status: PlanExecRun["status"]): boolean {
+  return isTerminalStatus(status);
 }
 
 function shortRunId(id: string): string {

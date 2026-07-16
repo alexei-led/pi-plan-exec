@@ -9,6 +9,7 @@ import {
   formatRunList,
   formatRunStatus,
   getExecArgumentCompletions,
+  hasBridgeOperationMethod,
   isRecoverableFailure,
   missingRuntimeTools,
   needsPlanStructureReview,
@@ -61,6 +62,16 @@ function run(overrides: Partial<PlanExecRun> = {}): PlanExecRun {
   };
 }
 
+test("bridge runtime compatibility requires the operation lookup method", () => {
+  assert.equal(
+    hasBridgeOperationMethod({ methods: ["ping", "operation"] }),
+    true,
+  );
+  assert.equal(hasBridgeOperationMethod({ methods: ["ping", "spawn"] }), false);
+  assert.equal(hasBridgeOperationMethod({ methods: "operation" }), false);
+  assert.equal(hasBridgeOperationMethod(undefined), false);
+});
+
 test("exec command completions explain the command family", () => {
   const items = getExecArgumentCompletions("st");
   assert.deepEqual(
@@ -72,7 +83,7 @@ test("exec command completions explain the command family", () => {
   assert.match(allItems.map((item) => item.value).join(" "), /setup/);
   assert.match(
     allItems.find((item) => item.value === "resume")?.description ?? "",
-    /plan-structure recovery/,
+    /retry a failed run/,
   );
 });
 
@@ -83,13 +94,17 @@ test("runtime prerequisite check identifies missing provider extensions", () => 
 
 test("help and setup explain the installed command surface", () => {
   assert.match(execHelp(), /\/exec status \[run-id\]/);
-  assert.match(execHelp(), /recover plan structure/);
+  assert.match(execHelp(), /retry a failed run/);
   assert.match(execHelp(), /\/skill:exec-plan/);
+  assert.match(
+    execSetup(),
+    /pi install npm:@alexeiled\/pi-subagents-bridge@\^0\.2\.0/,
+  );
   assert.match(execSetup(), /pi install npm:@alexeiled\/pi-fusion/);
   assert.match(execSetup(), /pi install npm:@alexeiled\/pi-plan-exec/);
 });
 
-test("only structured recovery failures are eligible for resume", () => {
+test("failed and cancellation-pending runs are eligible for recovery", () => {
   assert.equal(
     isRecoverableFailure(
       run({
@@ -114,21 +129,50 @@ test("only structured recovery failures are eligible for resume", () => {
   });
   delete exhaustedWorker.activeOperation;
   assert.equal(isRecoverableFailure(exhaustedWorker), true);
+  const crashedWorker = run({
+    status: "failed",
+    error: "worker crashed",
+  });
+  delete crashedWorker.activeOperation;
+  assert.equal(isRecoverableFailure(crashedWorker), true);
   assert.equal(
-    isRecoverableFailure(run({ status: "failed", error: "worker crashed" })),
-    false,
+    isRecoverableFailure(
+      run({
+        status: "failed",
+        error: "worker crashed",
+        activeOperation: {
+          operationId: "still-running",
+          service: "bridge",
+          kind: "review",
+        },
+      }),
+    ),
+    true,
   );
+  assert.equal(isRecoverableFailure(run({ status: "cancel_pending" })), true);
 });
 
 test("run status includes live operation, progress, and recovery hints", () => {
   const status = formatRunStatus(
-    run({ status: "failed", error: "Plan structure changed" }),
+    run({
+      status: "failed",
+      error: "Plan structure changed",
+      activeOperation: {
+        operationId: "operation-1",
+        service: "bridge",
+        kind: "implementation",
+        taskId: 1,
+        externalRunId: "worker-run-1",
+      },
+    }),
   );
   assert.match(status, /status: failed/);
   assert.match(status, /operation: bridge\/implementation \(Task 1\)/);
+  assert.match(status, /operation ID: operation-1/);
+  assert.match(status, /external run ID: worker-run-1/);
   assert.match(status, /progress: \/repo\/\.ralphex\/progress\.txt/);
   assert.match(status, /error: Plan structure changed/);
-  assert.match(status, /worktree preserved/);
+  assert.match(status, /preserved worktree/);
 
   const recoverable = formatRunStatus(
     run({
@@ -143,7 +187,7 @@ test("run status includes live operation, progress, and recovery hints", () => {
     error: "Worker run-2 ended as failed and left task 1 checkboxes unchecked.",
   });
   delete failedWorker.activeOperation;
-  assert.match(formatRunStatus(failedWorker), /retry the incomplete task/);
+  assert.match(formatRunStatus(failedWorker), /retry this stage/);
 
   const paused = formatRunStatus(
     run({

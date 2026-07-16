@@ -1,38 +1,41 @@
 ---
 name: exec-plan
-description: Plan, run, inspect, pause, resume, adopt, or recover a checked Markdown implementation plan through pi-plan-exec. Use when the user asks to create an executable plan for `/exec`, start or control a plan-exec run, check its progress, or recover it after a reload or worker failure; use `/exec help` for the live command list.
+description: Plan, run, inspect, pause, resume, adopt, or recover a checked Markdown implementation plan through pi-plan-exec. Use when a plan-exec run is active, stuck, failed, detached after reload, cancel-pending, or `/exec resume` does not work. Do not bypass the controller by launching or resuming implementation/review subagents manually.
 ---
 
 <!-- markdownlint-disable MD013 -->
 
 # Plan Execution
 
-Use `/exec` for an active plan-exec workflow. Do not manually launch
-implementation, review, or fix subagents for that run. The controller owns its
-one-writer rule, task order, retries, recovery, and review stages.
+Use `/exec` for a plan-exec workflow. The controller owns the worktree writer,
+task order, retries, recovery, and review stages. Never replace controller
+recovery with a manually launched subagent.
 
 ## Choose the job
 
-| User need                                              | Action                                                                             |
-| ------------------------------------------------------ | ---------------------------------------------------------------------------------- |
-| Write a plan to run later                              | Create a strict executable plan under `docs/plans/`; do not start it unless asked. |
-| Start a named plan                                     | `/exec path/to/plan.md` or `/exec start path/to/plan.md`                           |
-| Pick a plan                                            | `/exec`                                                                            |
-| See a live run                                         | `/exec status`                                                                     |
-| Find or identify runs                                  | `/exec runs`                                                                       |
-| Stop after the active child                            | `/exec pause`                                                                      |
-| Continue a paused or recoverable run                   | `/exec resume`                                                                     |
-| Take over an unfinished stale run from another session | `/exec adopt`                                                                      |
-| Stop safely and keep the worktree                      | `/exec cancel`                                                                     |
-| Missing packages or unclear command behavior           | `/exec setup` or `/exec help`                                                      |
+- Create a plan: write a strict Markdown plan under `docs/plans/`. Do not start
+  it unless asked.
+- Start a named plan: `/exec start path/to/plan.md`.
+- Pick a plan interactively: `/exec`.
+- List durable runs: `/exec runs`.
+- Inspect one run: `/exec status <full-run-id>`.
+- Request a pause for a starting or running run: `/exec pause <full-run-id>`.
+- Continue or recover: `/exec resume <full-run-id>`.
+- Claim an unfinished stale run: `/exec adopt <full-run-id>`.
+- Request safe cancellation: `/exec cancel <full-run-id>`.
+- Inspect live command support: `/exec help`.
+- Repair missing packages: `/exec setup`, install the reported packages, then
+  `/reload`.
 
-Run IDs are optional when exactly one allowed run matches the current repository
-or worktree. If Pi cannot choose, use `/exec runs`, then pass the full ID.
+Use the full run ID whenever more than one run exists, after a reload, or when
+working outside the execution worktree. Do not rely on implicit run selection in
+those cases.
 
 ## Write an executable plan
 
-A plan is a Markdown file with contiguous numbered `### Task N:` or
-`### Iteration N:` headings. Every task needs at least one checkbox.
+Use contiguous `### Task N:` or `### Iteration N:` headings. Start at `1`; do
+not skip or duplicate numbers. Every task needs a non-empty title and at least
+one concrete, verifiable checkbox.
 
 ```markdown
 # Add greeting
@@ -48,98 +51,98 @@ A plan is a Markdown file with contiguous numbered `### Task N:` or
 - [ ] Run the relevant docs check.
 ```
 
-Before starting, check these rules:
-
-- Number tasks from `1` with no duplicates or gaps.
-- Use heading level `###` exactly.
-- Give each task a non-empty title and one or more checkbox items.
-- Keep the plan inside the Git repository.
-- Make checkboxes concrete and verifiable. One task should be one coherent unit
-  of work, not an entire feature plus every possible cleanup.
-
-Once a run is active, change only checkbox state. Do not change task headings,
-numbers, checkbox text, or item count. A structural change pauses the run for
-review.
+Keep the plan inside the Git repository. Once a run exists, change only
+checkbox markers from `[ ]` to `[x]` or `[X]`. Do not change headings, numbers,
+checkbox text, or checkbox count. A structural change requires interactive
+review before resume.
 
 ## Start safely
 
-```text
-/exec help
-/exec                              Pick a plan under docs/plans/
-/exec path/to/plan.md              Start a named plan
-/exec start path/to/plan.md        Explicit start form
-/exec setup                        Show provider install commands
-```
+Prefer **Worktree (isolated)** unless the user explicitly requests in-place
+execution. Pi forks the session into the execution worktree. Continue there; do
+not switch to the source checkout and run another worker against the same plan.
 
-Prefer **Worktree (isolated)** unless the user explicitly asks for in-place
-execution. Pi forks the session into the execution worktree; its shell, tools,
-footer, and task projection then use the execution branch. Do not switch back to
-the source checkout and manually run agents against the same plan.
+Before starting, use `/exec runs` to ensure the same plan is not already active.
+A slow or silent run is not a reason to start the plan again.
 
-## Watch a long run
+## Observe before controlling
 
-A run can last for hours. Leave the controller alone while it polls; do not run
-`/exec <plan>` again just because it has been running for a while.
+For every control or recovery request:
 
-```text
-/exec status                      Show stage, operation, progress, error, and worktree
-/exec runs                        List recent runs and full IDs
-```
+1. Run `/exec runs` and select the durable run ID.
+2. Run `/exec status <full-run-id>`.
+3. Record the status, stage, worktree, branch, active operation, progress path,
+   last observation, and error.
+4. Choose exactly one action from that evidence.
+5. Run `/exec status <full-run-id>` again and verify the same run moved to the
+   expected state.
 
-`/exec status` is safe to run repeatedly. It observes the run; it does not pause,
-restart, or duplicate work. Pi shows the current worktree, branch, stage, and
-active worker while polling, and announces stage changes, failures, cancellation,
-and completion.
+`/exec status` is observational. A healthy active operation should normally be
+left alone while the controller polls it.
 
-## Pause, resume, and recover
+## Recover a stuck run
 
-```text
-/exec pause                       Let the active child finish, then hold progress
-/exec resume                      Continue a paused run, review changed plan structure, or retry an exhausted worker
-/exec adopt                       Take over an unfinished stale run from another session
-/exec cancel                      Stop safely and preserve the worktree
-```
+Read [references/recovery.md](references/recovery.md) whenever any of these is
+true:
 
-Use the smallest action that matches the situation:
+- `/exec resume` fails, refuses the state, or returns without progress;
+- Pi reloaded, changed session, or handed off to another worktree;
+- the run is failed, paused, cancel-pending, or owned by another session;
+- Bridge, Fusion, pi-subagents, or pi-tasks is missing or unavailable;
+- the plan structure changed or archive failed;
+- `/exec runs` cannot find a known run or reports a corrupt record;
+- child output suggests `subagent resume` instead of plan-run recovery.
 
-1. **Need a break:** use `/exec pause`; do not cancel a healthy run.
-2. **Ready to continue:** use `/exec resume` from the execution worktree. If
-   entered from the source checkout, Pi hands the session into the run’s
-   worktree first.
-3. **Pi reloaded:** inspect with `/exec status`. A matching run owned by the
-   returning session reattaches automatically. Do not start a duplicate plan.
-4. **Run belongs to a stale or other session:** use `/exec adopt`, then inspect
-   its status.
-5. **Worker exhausted its budget with unchecked implementation items:** use
-   interactive `/exec resume`. The run keeps its worktree and retries with a
-   75-turn worker budget.
-6. **Plan structure changed:** restore its original structure, or review the
-   current plan and explicitly confirm adoption through interactive `/exec
-resume`.
-7. **Need to stop:** use `/exec cancel`. It waits for the external operation to
-   stop safely and preserves the worktree.
+The recovery reference is the decision tree. Do not improvise around a preserved
+active operation. If its identity cannot be reconciled, stop rather than risk a
+second writer.
 
-A failed run is not an invitation to edit its worktree blindly. Start with
-`/exec status`. Fix the named cause before retrying failures that are not a
-paused plan, reviewed structure change, or exhausted implementation worker.
+## Safety invariants
+
+- Resume the **plan run ID**, never the reviewer/worker child run ID.
+- Do not use `subagent resume` for a child owned by plan-exec.
+- Do not run `/exec start` as a substitute for `/exec resume`.
+- Do not hand-edit `~/.pi/plan-exec/runs/<id>/run.json`.
+- Do not edit the worktree until status evidence rules out a live writer.
+- `/exec adopt` is an active takeover that may advance work. Inspect first.
+- `/exec cancel` records `cancel_pending`; cancellation is complete only when
+  status says `cancelled`.
+- Preserve the worktree and run artifacts on every failed recovery attempt.
+- Changing globally installed Pi packages requires explicit user approval.
 
 ## Completion truth
 
-Plan checkboxes are the implementation record. A worker report alone does not
-complete a task. Review output is either `NO_FINDINGS` or structured
-`FINDING: CRITICAL|MAJOR|MINOR | ...` records. `completed_with_findings` means
-the workflow finished with known findings left after the review cap; say that
-plainly.
+Plan checkboxes are implementation truth. Worker prose alone does not complete
+a task. Review output is either `NO_FINDINGS` or structured
+`FINDING: CRITICAL|MAJOR|MINOR | ...` records.
+
+Do not report success until `/exec status <id>` is terminal and the worktree is
+verified. `completed_with_findings` is terminal, not clean, and cannot be
+resumed. Report unresolved findings and create a new scoped plan only when the
+user asks.
+
+## Recovery report
+
+After recovery, report:
+
+```text
+PLAN RECOVERY
+Run: <full ID>
+Action: <wait|resume|adopt|cancel|repair extension|blocked>
+Before: <status/stage/operation/error>
+After: <status/stage/operation>
+Worktree: <path and git state>
+Verification: <status/checks actually run>
+Remaining risk: <none or exact blocker>
+```
+
+If recovery is unsafe or unsupported, use `Action: blocked`. State the exact
+record, worktree, active-operation evidence, and approval or runtime fix needed.
 
 ## Prerequisites
 
-`pi-plan-exec` uses compatible independently installed Pi packages:
-
-- `pi-subagents`
-- `@tintinweb/pi-tasks`
-- `@alexeiled/pi-subagents-bridge`
-- `@alexeiled/pi-fusion`
-
-Run `/exec setup` for install commands, then `/reload`. `/exec` probes the
-bridge and Fusion before it creates a run and fails clearly when they are
-unavailable. The package installs only `/exec` and this `exec-plan` skill.
+`pi-plan-exec` requires compatible installations of `pi-subagents`,
+`@tintinweb/pi-tasks`, `@alexeiled/pi-subagents-bridge` `0.2.0` or later, and
+`@alexeiled/pi-fusion`. Use `/exec setup`, install what it reports, run
+`/reload`, then return to the same run ID. Installing dependencies does not
+replace or complete the preserved run.

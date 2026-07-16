@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { access, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { basename, dirname, join, relative, sep } from "node:path";
 import { readSubagentArtifact } from "./artifact.js";
 import { fusionState } from "./fusion.js";
 import {
@@ -14,6 +14,12 @@ import {
   worktreePlanPath,
   type RunCommand,
 } from "./git.js";
+import {
+  isRecoverableRun,
+  isReviewStage,
+  isTerminalStatus,
+  nextStage,
+} from "./lifecycle.js";
 import { readPlan } from "./plan.js";
 import { appendProgress, initializeProgress } from "./progress.js";
 import { RunRegistry } from "./registry.js";
@@ -32,8 +38,8 @@ import type {
 
 const MAX_STATUS_FAILURES = 3;
 const OPERATION_RECOVERY_DELAY_MS = 35_000;
-const SPAWN_CONTENTION_RETRY_MS = 5_000;
 const RECOVERY_WORKER_MAX_TURNS = 75;
+const RECOVERY_REVIEWER_MAX_TURNS = 75;
 export const PLAN_STRUCTURE_CHANGED_ERROR =
   "Plan task structure changed outside checkbox completion.";
 
@@ -60,6 +66,7 @@ interface BridgeLike {
     operationId: string,
     params: Record<string, unknown>,
   ): Promise<ServiceReply>;
+  operation(operationId: string): Promise<ServiceReply>;
   status(runId: string, asyncDir?: string): Promise<ServiceReply>;
   result(runId: string, asyncDir?: string): Promise<ServiceReply>;
   adopt(runId: string, asyncDir?: string): Promise<ServiceReply>;
@@ -144,10 +151,11 @@ export class PlanExecController {
     error: unknown,
   ): Promise<PlanExecRun | undefined> {
     const run = await this.registry.get(runId);
-    if (!run || isTerminal(run.status)) return run;
+    if (!run || isTerminalStatus(run.status)) return run;
     return this.fail(
       run,
       error instanceof Error ? error.message : String(error),
+      run.activeOperation !== undefined,
     );
   }
 
@@ -184,8 +192,8 @@ export class PlanExecController {
       if (!adopted.applied) return adopted.run;
       prepared = adopted.run;
     }
-    if (explicit && isRecoverableImplementationFailure(prepared)) {
-      prepared = await this.recoverFailedImplementation(prepared);
+    if (explicit && isRecoverableFailure(prepared)) {
+      prepared = await this.recoverFailedRun(prepared);
     } else if (explicit && prepared.status === "paused") {
       const resumed = await this.registry.updateIfCurrent(
         clearError({ ...prepared, status: "running" }),
@@ -206,7 +214,7 @@ export class PlanExecController {
   }
 
   private async advanceUnlocked(run: PlanExecRun): Promise<PlanExecRun> {
-    if (isTerminal(run.status)) return run;
+    if (isTerminalStatus(run.status)) return run;
     if (run.status === "cancel_pending") return this.cancel(run);
     if (run.status === "paused") {
       return run.activeOperation ? this.observePausedOperation(run) : run;
@@ -344,6 +352,13 @@ export class PlanExecController {
           kind: "fusion",
           reviewIteration: iteration,
           launchStartedAt,
+          recovery: "replay",
+          params: {
+            prompt: fusionPrompt(run),
+            ...(run.config.fusionProfile
+              ? { profile: run.config.fusionProfile }
+              : {}),
+          },
         },
       },
       run.updatedAt,
@@ -352,18 +367,17 @@ export class PlanExecController {
     const intended = persisted.run;
     const reply = await this.fusion.start(
       operationId,
-      fusionPrompt(intended),
-      intended.config.fusionProfile,
+      text(intended.activeOperation?.params?.prompt) ?? fusionPrompt(intended),
+      text(intended.activeOperation?.params?.profile) ??
+        intended.config.fusionProfile,
     );
-    if (!reply.success) {
-      return isAmbiguousLaunchFailure(reply.error)
-        ? this.deferActiveOperationRetry(intended, operationId)
-        : this.fail(intended, reply.error.message);
-    }
+    if (!reply.success) return this.fail(intended, reply.error.message, true);
     const state = fusionState(reply.data);
-    if (!state) return this.deferActiveOperationRetry(intended, operationId);
+    if (!state)
+      return this.fail(intended, "Fusion start returned no run ID.", true);
     return this.updateActiveOperation(intended, operationId, {
       externalRunId: state.runId,
+      recovery: "observe",
     });
   }
 
@@ -418,6 +432,7 @@ export class PlanExecController {
           kind: input.kind,
           params,
           launchStartedAt,
+          recovery: "replay",
           ...(input.taskId ? { taskId: input.taskId } : {}),
           ...(input.reviewIteration
             ? { reviewIteration: input.reviewIteration }
@@ -429,21 +444,14 @@ export class PlanExecController {
     if (!persisted.applied) return persisted.run;
     const intended = persisted.run;
     const reply = await this.bridge.spawn(operationId, params);
-    if (!reply.success) {
-      if (
-        isSpawnContention(reply.error.message) ||
-        isAmbiguousLaunchFailure(reply.error)
-      ) {
-        return this.deferActiveOperationRetry(intended, operationId);
-      }
-      return this.fail(intended, reply.error.message);
-    }
+    if (!reply.success) return this.fail(intended, reply.error.message, true);
     const externalRunId = text(reply.data.runId);
     if (!externalRunId)
-      return this.deferActiveOperationRetry(intended, operationId);
+      return this.fail(intended, "Bridge spawn returned no run ID.", true);
     const asyncDir = text(reply.data.asyncDir);
     return this.updateActiveOperation(intended, operationId, {
       externalRunId,
+      recovery: "observe",
       ...(asyncDir ? { asyncDir } : {}),
     });
   }
@@ -455,59 +463,63 @@ export class PlanExecController {
     if (
       operation.launchStartedAt !== undefined &&
       Date.now() - operation.launchStartedAt < OPERATION_RECOVERY_DELAY_MS
-    ) {
+    )
       return run;
-    }
     if (operation.service === "bridge") {
-      const params =
-        operation.params ??
-        (await this.reconstructBridgeParams(run, operation));
-      const reply = await this.bridge.spawn(operation.operationId, params);
-      if (!reply.success) {
-        if (
-          isSpawnContention(reply.error.message) ||
-          isAmbiguousLaunchFailure(reply.error)
-        ) {
-          return this.deferActiveOperationRetry(run, operation.operationId);
-        }
-        return this.fail(run, reply.error.message);
+      const lookup = await this.bridge.operation(operation.operationId);
+      if (!lookup.success)
+        return this.fail(
+          run,
+          `Unable to look up bridge operation: ${lookup.error.message}`,
+          true,
+        );
+      const lookupState = text(lookup.data.state);
+      if (lookupState === "found") {
+        const externalRunId = text(lookup.data.runId);
+        if (!externalRunId)
+          return this.fail(
+            run,
+            "Bridge operation lookup omitted a run ID.",
+            true,
+          );
+        const asyncDir = text(lookup.data.asyncDir);
+        return this.updateActiveOperation(run, operation.operationId, {
+          externalRunId,
+          recovery: "observe",
+          ...(asyncDir ? { asyncDir } : {}),
+        });
       }
-      const externalRunId = text(reply.data.runId);
-      if (!externalRunId)
-        return this.deferActiveOperationRetry(run, operation.operationId);
-      const asyncDir = text(reply.data.asyncDir);
-      return this.updateActiveOperation(run, operation.operationId, {
-        params,
-        externalRunId,
-        ...(asyncDir ? { asyncDir } : {}),
-      });
+      if (lookupState === "pending") return run;
+      if (lookupState === "unknown")
+        return this.fail(
+          run,
+          "Bridge operation lookup is unresolved; retry /exec resume after the provider recovers.",
+          true,
+        );
+      if (lookupState === "absent")
+        return this.fail(
+          run,
+          "Bridge has no record of this operation; refusing to launch a possible duplicate worker.",
+          true,
+        );
+      return this.fail(
+        run,
+        "Bridge operation lookup returned an invalid state.",
+        true,
+      );
     }
 
     const reply = await this.fusion.start(
       operation.operationId,
-      fusionPrompt(run),
-      run.config.fusionProfile,
+      text(operation.params?.prompt) ?? fusionPrompt(run),
+      text(operation.params?.profile) ?? run.config.fusionProfile,
     );
-    if (!reply.success) {
-      return isAmbiguousLaunchFailure(reply.error)
-        ? this.deferActiveOperationRetry(run, operation.operationId)
-        : this.fail(run, reply.error.message);
-    }
+    if (!reply.success) return this.fail(run, reply.error.message, true);
     const state = fusionState(reply.data);
-    if (!state)
-      return this.deferActiveOperationRetry(run, operation.operationId);
+    if (!state) return this.fail(run, "Fusion start returned no run ID.", true);
     return this.updateActiveOperation(run, operation.operationId, {
       externalRunId: state.runId,
-    });
-  }
-
-  private deferActiveOperationRetry(
-    run: PlanExecRun,
-    operationId: string,
-  ): Promise<PlanExecRun> {
-    return this.updateActiveOperation(run, operationId, {
-      launchStartedAt:
-        Date.now() - (OPERATION_RECOVERY_DELAY_MS - SPAWN_CONTENTION_RETRY_MS),
+      recovery: "observe",
     });
   }
 
@@ -617,9 +629,9 @@ export class PlanExecController {
     }
     await appendProgress(
       observed,
-      `Paused after active ${operation.kind} operation reached ${state}.`,
+      `Paused after active ${operation.kind} operation reached ${state}; completion will be applied on resume.`,
     );
-    return this.registry.update(withoutOperation(observed));
+    return observed;
   }
 
   private async observeActiveOperation(run: PlanExecRun): Promise<PlanExecRun> {
@@ -696,7 +708,7 @@ export class PlanExecController {
     const state = fusionState(status.data);
     if (!state || !state.terminal) return observed;
     const result = await this.fusion.result(state.runId);
-    if (!result.success) return this.fail(run, result.error.message);
+    if (!result.success) return this.fail(observed, result.error.message, true);
     const current = (await this.registry.get(run.id)) ?? observed;
     if (!sameOperationState(observed, current, operation)) return current;
     const final = fusionState(result.data);
@@ -728,15 +740,17 @@ export class PlanExecController {
   ): Promise<PlanExecRun> {
     const failures = (operation.statusFailures ?? 0) + 1;
     const message = `Unable to observe ${operation.service}/${operation.kind} (${failures}/${MAX_STATUS_FAILURES}): ${error}`;
-    if (failures >= MAX_STATUS_FAILURES) return this.fail(run, message);
-    return this.registry.heartbeat({
+    const failedRun = {
       ...run,
       activeOperation: {
         ...operation,
         statusFailures: failures,
         lastStatusError: error,
       },
-    });
+    };
+    if (failures >= MAX_STATUS_FAILURES)
+      return this.fail(failedRun, message, true);
+    return this.registry.heartbeat(failedRun);
   }
 
   private recordCancellationFailure(
@@ -744,54 +758,98 @@ export class PlanExecController {
     operation: ActiveOperation,
     error: string,
   ): Promise<PlanExecRun> {
-    const failures = Math.min(
-      (operation.statusFailures ?? 0) + 1,
-      MAX_STATUS_FAILURES,
-    );
-    return this.registry.heartbeat({
+    const failures = (operation.statusFailures ?? 0) + 1;
+    const message = `Unable to cancel ${operation.service}/${operation.kind} (${failures}/${MAX_STATUS_FAILURES}): ${error}`;
+    const failedRun = {
       ...run,
       activeOperation: {
         ...operation,
+        recovery: "cancel" as const,
         statusFailures: failures,
         lastStatusError: error,
       },
-    });
+    };
+    if (failures >= MAX_STATUS_FAILURES)
+      return this.fail(failedRun, message, true);
+    return this.registry.heartbeat(failedRun);
   }
 
-  private async recoverFailedImplementation(
-    run: PlanExecRun,
-  ): Promise<PlanExecRun> {
-    const plan = await readPlan(run.planPath);
-    if (plan.hash !== run.planHash)
+  private async recoverFailedRun(run: PlanExecRun): Promise<PlanExecRun> {
+    const plan =
+      run.stage === "archive" ? undefined : await readPlan(run.planPath);
+    if (plan && plan.hash !== run.planHash)
       return this.pauseForReview(run, PLAN_STRUCTURE_CHANGED_ERROR);
-    const task = plan.tasks.find((candidate) => candidate.unchecked.length > 0);
+
+    const task =
+      run.stage === "implementation"
+        ? plan?.tasks.find((candidate) => candidate.unchecked.length > 0)
+        : undefined;
+    const config = recoveryConfig(run);
+    const retryFailedReview =
+      isReviewStage(run.stage) &&
+      (run.failedOperation?.kind === "review" ||
+        run.failedOperation?.kind === "fusion");
     const recovered = await this.registry.updateIfCurrent(
       clearError({
         ...run,
-        status: "running",
-        config: {
-          ...run.config,
-          workerMaxTurns: Math.max(
-            run.config.workerMaxTurns,
-            RECOVERY_WORKER_MAX_TURNS,
-          ),
-        },
-        ...(task
+        status:
+          run.activeOperation?.recovery === "cancel"
+            ? "cancel_pending"
+            : "running",
+        config,
+        ...(retryFailedReview
           ? {
-              taskAttempts: { ...run.taskAttempts, [String(task.id)]: 0 },
+              stageAttempts: {
+                ...run.stageAttempts,
+                [run.stage]: Math.max(
+                  (run.stageAttempts[run.stage] ?? 1) - 1,
+                  0,
+                ),
+              },
+            }
+          : {}),
+        ...(run.stage === "implementation" && task
+          ? {
+              taskAttempts: {
+                ...run.taskAttempts,
+                [String(task.id)]: 0,
+              },
             }
           : {}),
       }),
       run.updatedAt,
     );
     if (!recovered.applied) return recovered.run;
+    const retryFailedFix =
+      (run.failedOperation?.kind === "fix" ||
+        /^Fix operation ended as .+\.$/.test(run.error ?? "")) &&
+      isReviewStage(run.stage) &&
+      run.reviewFindings.length > 0;
     await appendProgress(
       recovered.run,
       task
-        ? `Manual recovery reset Task ${task.id} after worker exhaustion.`
-        : "Manual recovery resumed after worker exhaustion.",
+        ? `Manual recovery reset Task ${task.id} and retried the failed implementation stage.`
+        : retryFailedFix
+          ? `Manual recovery retried the failed ${run.stage} fix operation.`
+          : retryFailedReview
+            ? `Manual recovery reset the failed ${run.stage} review attempt.`
+            : `Manual recovery retried the failed ${run.stage} stage.`,
     );
-    return recovered.run;
+    if (!retryFailedFix) return recovered.run;
+    return this.launchBridge(recovered.run, {
+      kind: "fix",
+      reviewIteration:
+        run.failedOperation?.reviewIteration ??
+        run.stageAttempts[run.stage] ??
+        1,
+      agent: recovered.run.config.workerAgent,
+      maxTurns: recovered.run.config.workerMaxTurns,
+      task: fixerPrompt(
+        recovered.run,
+        recovered.run.reviewFindings,
+        formatFindings(recovered.run.reviewFindings),
+      ),
+    });
   }
 
   private async pauseForReview(
@@ -857,7 +915,7 @@ export class PlanExecController {
       run.stage === "comprehensive_review" ? run.config.reviewIterations : 1;
     if (iteration >= limit) {
       return this.fail(
-        cleared,
+        run,
         `Review result output was unavailable after ${iteration} attempt(s): ${error}`,
       );
     }
@@ -935,7 +993,7 @@ export class PlanExecController {
   ): Promise<PlanExecRun> {
     const cleared = withoutOperation(run);
     if (state !== "complete")
-      return this.fail(cleared, `Fix operation ended as ${state}.`);
+      return this.fail(run, `Fix operation ended as ${state}.`);
     await appendProgress(
       cleared,
       `Applied fixes for ${run.stage} iteration ${operation.reviewIteration ?? 1}.`,
@@ -970,6 +1028,8 @@ export class PlanExecController {
     state: string,
     next: RunStage,
   ): Promise<PlanExecRun> {
+    if (state !== "complete" && state !== "done")
+      return this.fail(run, `${operation.kind} operation ended as ${state}.`);
     const cleared = withoutOperation(run);
     await appendProgress(
       cleared,
@@ -986,32 +1046,71 @@ export class PlanExecController {
       "completed",
       basename(run.planPath),
     );
+    const status =
+      run.unresolvedFindings.length > 0
+        ? "completed_with_findings"
+        : "completed";
     try {
       await mkdir(dirname(destination), { recursive: true });
-      await rename(run.planPath, destination);
-      const relative = destination.slice(run.worktreeCwd.length + 1);
+      const sourceExists = await pathExists(run.planPath);
+      const destinationExists = await pathExists(destination);
+      if (sourceExists && destinationExists)
+        throw new Error(
+          `Completed plan destination already exists: ${destination}.`,
+        );
+      if (sourceExists) await rename(run.planPath, destination);
+      else if (!destinationExists)
+        throw new Error(`Plan to archive is missing: ${run.planPath}.`);
+      await appendProgress(run, `Archived plan to ${destination}.`);
+      await appendProgress(run, `Run completed as ${status}.`);
+      const paths = [
+        relative(run.worktreeCwd, run.planPath),
+        relative(run.worktreeCwd, destination),
+      ];
+      if (run.progressPath) {
+        const progress = relative(run.worktreeCwd, run.progressPath);
+        if (progress !== ".." && !progress.startsWith(`..${sep}`))
+          paths.push(progress);
+      }
       const add = await this.runCommand(
         "git",
-        ["add", "-A", "--", relative],
+        ["add", "-A", "--", ...paths],
         run.worktreeCwd,
       );
-      if (add.code === 0) {
-        await this.runCommand(
+      if (add.code !== 0)
+        throw new Error(add.stderr.trim() || "Could not stage archived plan.");
+      const pending = await this.runCommand(
+        "git",
+        ["status", "--porcelain", "--", ...paths],
+        run.worktreeCwd,
+      );
+      if (pending.code !== 0)
+        throw new Error(
+          pending.stderr.trim() || "Could not verify archived plan state.",
+        );
+      if (pending.stdout.trim()) {
+        const commit = await this.runCommand(
           "git",
           ["commit", "-m", `chore: archive ${basename(destination)}`],
           run.worktreeCwd,
         );
+        if (commit.code !== 0)
+          throw new Error(
+            commit.stderr.trim() || "Could not commit archived plan.",
+          );
       }
-      await appendProgress(run, `Archived plan to ${destination}.`);
+      const completed = await this.registry.update({
+        ...run,
+        status,
+        stage: "complete",
+      });
+      return this.registry.release(completed);
     } catch (error: unknown) {
-      await appendProgress(
+      return this.fail(
         run,
         `Plan archival failed: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
-    return this.complete(
-      await this.registry.update({ ...run, stage: "complete" }),
-    );
   }
 
   private async complete(run: PlanExecRun): Promise<PlanExecRun> {
@@ -1053,12 +1152,12 @@ export class PlanExecController {
       return this.registry.release(
         await this.registry.update({ ...run, status: "cancelled" }),
       );
-    if (!operation.externalRunId) {
-      const recovered = await this.recoverActiveOperation(run, operation);
-      return recovered.activeOperation?.externalRunId
-        ? this.cancel(recovered)
-        : recovered;
-    }
+    if (!operation.externalRunId)
+      return this.fail(
+        run,
+        "Cannot confirm cancellation before the provider assigned a run ID.",
+        true,
+      );
     if (!operation.stopRequested) {
       const stopped =
         operation.service === "bridge"
@@ -1120,13 +1219,29 @@ export class PlanExecController {
         const asyncDir = text(adopted.data.asyncDir);
         return this.registry.update({
           ...run,
-          activeOperation: { ...operation, ...(asyncDir ? { asyncDir } : {}) },
+          activeOperation: {
+            ...operation,
+            recovery: "observe",
+            ...(asyncDir ? { asyncDir } : {}),
+          },
         });
       }
-      return run;
+      return this.fail(
+        run,
+        `Unable to adopt bridge operation: ${adopted.error.message}`,
+        true,
+      );
     }
     const adopted = await this.fusion.adopt(operation.externalRunId);
-    return adopted.success ? run : run;
+    return adopted.success
+      ? this.updateActiveOperation(run, operation.operationId, {
+          recovery: "observe",
+        })
+      : this.fail(
+          run,
+          `Unable to adopt Fusion operation: ${adopted.error.message}`,
+          true,
+        );
   }
 
   private async bridgeOutput(operation: ActiveOperation): Promise<string> {
@@ -1164,10 +1279,17 @@ export class PlanExecController {
     return createWorktree(this.runCommand, repositoryRoot, planPath, branch);
   }
 
-  private async fail(run: PlanExecRun, error: string): Promise<PlanExecRun> {
-    const failed = await this.registry.update(
-      withoutOperation({ ...run, status: "failed", error }),
-    );
+  private async fail(
+    run: PlanExecRun,
+    error: string,
+    preserveOperation = false,
+  ): Promise<PlanExecRun> {
+    const failedOperation = run.activeOperation ?? run.failedOperation;
+    const failed = await this.registry.update({
+      ...withoutOperation({ ...run, status: "failed", error }),
+      ...(failedOperation ? { failedOperation } : {}),
+      ...(preserveOperation ? { activeOperation: run.activeOperation } : {}),
+    });
     try {
       await appendProgress(failed, `Run failed at ${failed.stage}: ${error}`);
     } catch {
@@ -1177,19 +1299,32 @@ export class PlanExecController {
   }
 }
 
-function nextStage(stage: RunStage): RunStage {
-  const next: Partial<Record<RunStage, RunStage>> = {
-    comprehensive_review: "smells_review",
-    smells_review: "fusion_review",
-    fusion_review: "critical_review",
-    critical_review: "finalize",
-    finalize: "stats",
-    stats: "archive",
-    archive: "complete",
-  };
-  const resolved = next[stage];
-  if (!resolved) throw new Error(`No next stage after ${stage}.`);
-  return resolved;
+function recoveryConfig(run: PlanExecRun): FrozenRunConfig {
+  if (run.stage === "implementation" || run.stage === "finalize")
+    return {
+      ...run.config,
+      workerMaxTurns: Math.max(
+        run.config.workerMaxTurns,
+        RECOVERY_WORKER_MAX_TURNS,
+      ),
+    };
+  if (run.stage === "stats")
+    return {
+      ...run.config,
+      statsMaxTurns: Math.max(
+        run.config.statsMaxTurns,
+        RECOVERY_REVIEWER_MAX_TURNS,
+      ),
+    };
+  if (isReviewStage(run.stage))
+    return {
+      ...run.config,
+      reviewerMaxTurns: Math.max(
+        run.config.reviewerMaxTurns,
+        RECOVERY_REVIEWER_MAX_TURNS,
+      ),
+    };
+  return run.config;
 }
 
 function workerPrompt(
@@ -1299,6 +1434,7 @@ function withoutOperation(run: PlanExecRun): PlanExecRun {
 function clearError(run: PlanExecRun): PlanExecRun {
   const next = { ...run };
   delete next.error;
+  delete next.failedOperation;
   return next;
 }
 
@@ -1313,23 +1449,6 @@ function sameOperationState(
   );
 }
 
-function isAmbiguousLaunchFailure(error: {
-  code?: string;
-  message: string;
-}): boolean {
-  return (
-    error.code === "timeout" ||
-    error.code === "malformed" ||
-    /timed out|malformed reply/i.test(error.message)
-  );
-}
-
-function isSpawnContention(message: string): boolean {
-  return /subagent call is already in progress|exactly ONE subagent call per turn/i.test(
-    message,
-  );
-}
-
 export function isRecoverableImplementationFailure(run: PlanExecRun): boolean {
   return (
     run.status === "failed" &&
@@ -1341,13 +1460,17 @@ export function isRecoverableImplementationFailure(run: PlanExecRun): boolean {
   );
 }
 
-function isTerminal(status: PlanExecRun["status"]): boolean {
-  return (
-    status === "completed" ||
-    status === "completed_with_findings" ||
-    status === "cancelled" ||
-    status === "failed"
-  );
+export function isRecoverableFailure(run: PlanExecRun): boolean {
+  return isRecoverableRun(run);
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function text(value: unknown): string | undefined {

@@ -10,7 +10,13 @@ import {
 } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { RUN_STAGES, type PlanExecRun, type RunStage } from "./types.js";
+import {
+  RUN_STAGES,
+  RUN_STATUSES,
+  type ActiveOperation,
+  type PlanExecRun,
+  type RunStage,
+} from "./types.js";
 
 const RUNS_DIRECTORY = join(homedir(), ".pi", "plan-exec", "runs");
 const LEASE_STALE_MS = 30_000;
@@ -54,19 +60,41 @@ export class RunRegistry {
   }
 
   async list(): Promise<PlanExecRun[]> {
+    return (await this.listWithErrors()).runs;
+  }
+
+  async listWithErrors(): Promise<{
+    runs: PlanExecRun[];
+    errors: Array<{ runId: string; message: string }>;
+  }> {
     try {
       const { readdir } = await import("node:fs/promises");
       const entries = await readdir(this.directory, { withFileTypes: true });
-      const runs = await Promise.all(
+      const loaded = await Promise.all(
         entries
           .filter((entry) => entry.isDirectory() && RUN_ID.test(entry.name))
-          .map((entry) => this.get(entry.name)),
+          .map(async (entry) => {
+            try {
+              return { run: await this.get(entry.name) };
+            } catch (error: unknown) {
+              return {
+                error: {
+                  runId: entry.name,
+                  message:
+                    error instanceof Error ? error.message : String(error),
+                },
+              };
+            }
+          }),
       );
-      return runs
-        .filter((run): run is PlanExecRun => run !== undefined)
-        .sort((a, b) => b.updatedAt - a.updatedAt);
+      return {
+        runs: loaded
+          .flatMap((item) => (item.run ? [item.run] : []))
+          .sort((a, b) => b.updatedAt - a.updatedAt),
+        errors: loaded.flatMap((item) => (item.error ? [item.error] : [])),
+      };
     } catch (error: unknown) {
-      if (isNodeError(error, "ENOENT")) return [];
+      if (isNodeError(error, "ENOENT")) return { runs: [], errors: [] };
       throw error;
     }
   }
@@ -310,9 +338,13 @@ function migrateLegacyRun(value: Record<string, unknown>): PlanExecRun {
       : [],
     config: {
       ...config,
+      taskRetries: numberOr(config.taskRetries, 1),
+      maxTaskIterations: numberOr(config.maxTaskIterations, 50),
       reviewIterations: numberOr(config.reviewIterations, 5),
       fusionIterations: numberOr(config.fusionIterations, 10),
       finalizeEnabled: booleanOr(config.finalizeEnabled, true),
+      workerAgent: stringOr(config.workerAgent, "worker"),
+      workerMaxTurns: numberOr(config.workerMaxTurns, 75),
       reviewerAgent: stringOr(config.reviewerAgent, "reviewer"),
       reviewerMaxTurns: numberOr(config.reviewerMaxTurns, 30),
       statsAgent: stringOr(config.statsAgent, "reviewer"),
@@ -325,11 +357,53 @@ function assertRun(run: PlanExecRun): void {
   assertRunId(run.id);
   if (
     !RUN_STAGES.includes(run.stage) ||
+    !RUN_STATUSES.includes(run.status) ||
     !Number.isFinite(run.createdAt) ||
-    !Number.isFinite(run.updatedAt)
+    !Number.isFinite(run.updatedAt) ||
+    !isFrozenConfig(run.config) ||
+    !isValidOperationForStage(run.activeOperation, run.stage) ||
+    !isValidOperationForStage(run.failedOperation, run.stage)
   ) {
     throw new Error(`Invalid plan-exec run registry entry: ${run.id}`);
   }
+}
+
+function isFrozenConfig(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  return (
+    typeof value.taskRetries === "number" &&
+    typeof value.maxTaskIterations === "number" &&
+    typeof value.reviewIterations === "number" &&
+    typeof value.fusionIterations === "number" &&
+    typeof value.finalizeEnabled === "boolean" &&
+    typeof value.workerAgent === "string" &&
+    typeof value.workerMaxTurns === "number" &&
+    typeof value.reviewerAgent === "string" &&
+    typeof value.reviewerMaxTurns === "number" &&
+    typeof value.statsAgent === "string" &&
+    typeof value.statsMaxTurns === "number"
+  );
+}
+
+function isValidOperationForStage(
+  operation: ActiveOperation | undefined,
+  stage: RunStage,
+): boolean {
+  if (!operation) return true;
+  const stages: Record<ActiveOperation["kind"], readonly RunStage[]> = {
+    implementation: ["implementation"],
+    review: ["comprehensive_review", "smells_review", "critical_review"],
+    fix: [
+      "comprehensive_review",
+      "smells_review",
+      "fusion_review",
+      "critical_review",
+    ],
+    fusion: ["fusion_review"],
+    finalize: ["finalize"],
+    stats: ["stats"],
+  };
+  return stages[operation.kind].includes(stage);
 }
 
 function nextUpdatedAt(previous: number): number {

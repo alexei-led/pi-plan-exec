@@ -19,6 +19,56 @@ test("uses pi-subagents status recentOutput when no configured result path exist
   );
 });
 
+test("uses the durable async output before truncated status recentOutput", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-artifact-"));
+  const asyncDir = join(root, "async");
+  const artifactsDir = join(root, "artifacts");
+  await mkdir(asyncDir);
+  await mkdir(artifactsDir);
+  await writeFile(
+    join(artifactsDir, "review-run_reviewer_output.md"),
+    "FINDING: MAJOR | first finding\nEvidence: complete output",
+  );
+  await writeFile(
+    join(asyncDir, "status.json"),
+    JSON.stringify({
+      runId: "review-run",
+      artifactsDir,
+      steps: [{ recentOutput: ["Evidence: complete output"] }],
+    }),
+  );
+  assert.equal(
+    await readSubagentArtifact(undefined, asyncDir),
+    "FINDING: MAJOR | first finding\nEvidence: complete output",
+  );
+});
+
+test("uses the latest durable output when a retry produced multiple artifacts", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-artifact-"));
+  const asyncDir = join(root, "async");
+  const artifactsDir = join(root, "artifacts");
+  await mkdir(asyncDir);
+  await mkdir(artifactsDir);
+  await writeFile(join(artifactsDir, "review-run_01_output.md"), "old");
+  await writeFile(
+    join(artifactsDir, "review-run_02_output.md"),
+    "FINDING: MAJOR | complete retry output",
+  );
+  await writeFile(
+    join(asyncDir, "status.json"),
+    JSON.stringify({
+      runId: "review-run",
+      artifactsDir,
+      steps: [{ recentOutput: ["truncated tail"] }],
+    }),
+  );
+
+  assert.equal(
+    await readSubagentArtifact(undefined, asyncDir),
+    "FINDING: MAJOR | complete retry output",
+  );
+});
+
 test("falls back when an explicit result artifact is metadata-only", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-artifact-"));
   const asyncDir = join(root, "async");

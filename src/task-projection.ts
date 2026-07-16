@@ -1,30 +1,25 @@
 import { basename, dirname, join } from "node:path";
 import type { TaskStore } from "@tintinweb/pi-tasks/dist/task-store.js";
 import type { Task, TaskStatus } from "@tintinweb/pi-tasks/dist/types.js";
+import { PIPELINE_STAGES, isTerminalStatus, stageIndex } from "./lifecycle.js";
 import { readPlan } from "./plan.js";
 import { RunRegistry } from "./registry.js";
 import type { PlanExecRun, RunStage } from "./types.js";
 
-const PIPELINE: Array<{ key: RunStage; subject: string }> = [
-  { key: "comprehensive_review", subject: "Run comprehensive review" },
-  { key: "smells_review", subject: "Run smells review" },
-  { key: "fusion_review", subject: "Run Fusion review" },
-  { key: "critical_review", subject: "Run critical review" },
-  { key: "finalize", subject: "Finalize branch" },
-  { key: "stats", subject: "Collect execution statistics" },
-  { key: "archive", subject: "Archive completed plan" },
-];
+const STAGE_SUBJECT: Record<(typeof PIPELINE_STAGES)[number], string> = {
+  comprehensive_review: "Run comprehensive review",
+  smells_review: "Run smells review",
+  fusion_review: "Run Fusion review",
+  critical_review: "Run critical review",
+  finalize: "Finalize branch",
+  stats: "Collect execution statistics",
+  archive: "Archive completed plan",
+};
 
-const STAGE_ORDER: RunStage[] = [
-  "resolve",
-  "isolation",
-  "project_tasks",
-  "branch",
-  "progress",
-  "implementation",
-  ...PIPELINE.map((entry) => entry.key),
-  "complete",
-];
+const PIPELINE = PIPELINE_STAGES.map((key) => ({
+  key,
+  subject: STAGE_SUBJECT[key],
+}));
 
 export interface TaskProjectionOptions {
   cwd: string;
@@ -137,7 +132,8 @@ async function readProjectionPlan(run: PlanExecRun) {
   try {
     return await readPlan(run.planPath);
   } catch (error: unknown) {
-    if (!isTerminal(run.status) || !isNodeError(error, "ENOENT")) throw error;
+    if (!isTerminalStatus(run.status) || !isNodeError(error, "ENOENT"))
+      throw error;
     return readPlan(
       join(dirname(run.planPath), "completed", basename(run.planPath)),
     );
@@ -217,23 +213,14 @@ function implementationStatus(
 }
 
 function stageStatus(run: PlanExecRun, stage: RunStage): TaskStatus {
-  const currentIndex = STAGE_ORDER.indexOf(run.stage);
-  const stageIndex = STAGE_ORDER.indexOf(stage);
+  const currentIndex = stageIndex(run.stage);
+  const projectedIndex = stageIndex(stage);
   if (run.status === "completed" || run.status === "completed_with_findings")
     return "completed";
-  if (currentIndex > stageIndex) return "completed";
+  if (currentIndex > projectedIndex) return "completed";
   if (run.status !== "starting" && run.status !== "running") return "pending";
   if (run.stage === stage) return "in_progress";
   return "pending";
-}
-
-function isTerminal(status: PlanExecRun["status"]): boolean {
-  return (
-    status === "completed" ||
-    status === "completed_with_findings" ||
-    status === "failed" ||
-    status === "cancelled"
-  );
 }
 
 function isNodeError(error: unknown, code: string): boolean {

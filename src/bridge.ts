@@ -1,13 +1,10 @@
-import { randomUUID } from "node:crypto";
+import { requestRpc, type EventBus } from "./rpc.js";
 import type { BridgeResult } from "./types.js";
+
+export type { EventBus } from "./rpc.js";
 
 export const BRIDGE_REQUEST_EVENT = "plan-exec:bridge:v1:request";
 const BRIDGE_REPLY_PREFIX = "plan-exec:bridge:v1:reply:";
-
-export interface EventBus {
-  on(event: string, handler: (payload: unknown) => void): (() => void) | void;
-  emit(event: string, payload: unknown): void;
-}
 
 export class BridgeClient {
   constructor(
@@ -29,6 +26,10 @@ export class BridgeClient {
       ...(typeof cwd === "string" ? { cwd } : {}),
       params: spawnParams,
     });
+  }
+
+  operation(operationId: string): Promise<BridgeResult> {
+    return this.request("operation", { operationId });
   }
 
   status(runId: string, asyncDir?: string): Promise<BridgeResult> {
@@ -61,35 +62,19 @@ export class BridgeClient {
     method: string,
     body: Record<string, unknown>,
   ): Promise<BridgeResult> {
-    const requestId = randomUUID();
-    return new Promise((resolve) => {
-      const state: { timeout?: ReturnType<typeof setTimeout> } = {};
-      const registered = this.events.on(
-        `${BRIDGE_REPLY_PREFIX}${requestId}`,
-        (payload: unknown) => {
-          if (state.timeout) clearTimeout(state.timeout);
-          unsubscribe();
-          resolve(parseReply(payload));
-        },
-      );
-      const unsubscribe =
-        typeof registered === "function" ? registered : () => undefined;
-      state.timeout = setTimeout(() => {
-        unsubscribe();
-        resolve({
-          success: false,
-          error: {
-            code: "timeout",
-            message: `Bridge ${method} timed out after ${this.timeoutMs}ms.`,
-          },
-        });
-      }, this.timeoutMs);
-      this.events.emit(BRIDGE_REQUEST_EVENT, {
-        version: 1,
-        requestId,
-        method,
-        ...body,
-      });
+    return requestRpc({
+      events: this.events,
+      requestEvent: BRIDGE_REQUEST_EVENT,
+      replyPrefix: BRIDGE_REPLY_PREFIX,
+      timeoutMs: this.timeoutMs,
+      method,
+      label: `Bridge ${method}`,
+      body,
+      parseReply,
+      failure: (code, message) => ({
+        success: false,
+        error: { code, message },
+      }),
     });
   }
 }

@@ -11,7 +11,8 @@ contracts and component ownership.
 - Pi in an **interactive** session. `/exec` asks whether to use a worktree.
 - A Git repository with a non-detached `HEAD`.
 - A plan file inside that repository.
-- These independently installed Pi packages, at compatible versions:
+- These independently installed Pi packages, at compatible versions. In
+  particular, `@alexeiled/pi-subagents-bridge` must be `0.2.0` or later:
   - `pi-subagents`;
   - `@tintinweb/pi-tasks`;
   - `@alexeiled/pi-subagents-bridge`;
@@ -26,7 +27,7 @@ does not require cc-thingz agents.
 ```bash
 pi install npm:pi-subagents
 pi install npm:@tintinweb/pi-tasks
-pi install npm:@alexeiled/pi-subagents-bridge
+pi install npm:@alexeiled/pi-subagents-bridge@^0.2.0
 pi install npm:@alexeiled/pi-fusion
 pi install npm:@alexeiled/pi-plan-exec
 ```
@@ -158,7 +159,7 @@ runs match, Pi opens a picker; headless mode asks for the full ID shown by
 /exec runs              List recent runs and full IDs
 /exec status [run-id]   Show status, active worker, progress path, and error
 /exec pause [run-id]    Let the active child finish, then stop advancing
-/exec resume [run-id]   Continue a paused run, recover reviewed plan structure, or retry an exhausted worker
+/exec resume [run-id]   Continue or retry a failed run in its preserved worktree
 /exec adopt [run-id]    Claim a stale or released cross-session run
 /exec cancel [run-id]   Stop when safe and preserve the worktree
 ```
@@ -166,14 +167,16 @@ runs match, Pi opens a picker; headless mode asks for the full ID shown by
 Pi shows the execution-worktree path and branch with the current stage and active
 worker while a run is polling. Stage transitions, observation degradation, and
 terminal states generate notifications. `/exec status` shows the last successful
-observation and retry count; three failed observations stop the run plainly
-instead of implying it is still progressing. A failed run preserves its worktree
-and remains visible in `/exec status` and the projected task description. Legacy
-runs stopped by a plan structure mismatch can be resumed interactively after
-confirming the current structure. A worker that exhausts its turn budget with an
-unchecked implementation task can be retried with interactive `/exec resume`; it
-preserves the worktree and raises the worker budget to 75 turns. Other failures
-require fixing the cause before starting or retrying.
+observation and retry count. After repeated provider-observation failures,
+plan-exec records the failure without discarding the external operation identity.
+A failed run preserves its worktree and remains visible in `/exec status` and the
+projected task description. `/exec resume` adopts that known operation before
+retrying the stage; it does not create a duplicate worker. If the provider has
+no record of an operation whose launch outcome is unknown, plan-exec stops
+rather than guessing and creating a duplicate worker. Legacy runs stopped by a
+plan structure mismatch can be resumed interactively after confirming the
+current structure. Implementation workers and reviewers get a 75-turn recovery
+budget. A plan structure mismatch still requires review before retrying.
 
 ## Watching and recovering a long run
 

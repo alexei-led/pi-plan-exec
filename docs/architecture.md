@@ -107,9 +107,11 @@ External starts follow this order:
 4. Persist the returned external run ID.
 
 If Pi stops between steps 2 and 4, or a start reply times out or is malformed,
-recovery repeats the same operation ID. Bridge and Fusion return the existing run
-instead of starting another. Active foreign-session runs are observed rather
-than replaced.
+recovery reconciles the same operation ID. Bridge `0.2.0` or later reports an
+operation as `found`, `pending`, `unknown`, or `absent`; the controller only
+attaches `found` work and refuses a blind replay for every other uncertain
+outcome. Fusion retries its persisted operation ID. Active foreign-session runs
+are observed rather than replaced.
 
 ## Stage pipeline
 

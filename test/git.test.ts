@@ -3,7 +3,19 @@ import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, resolve } from "node:path";
 import test from "node:test";
-import { createWorktree } from "../src/git.js";
+import { branchNameFromPlan, createWorktree } from "../src/git.js";
+
+test("plan-derived branches include a stable path hash to avoid collisions", () => {
+  const first = branchNameFromPlan("/repo/docs/plans/20260712-example.md");
+  const second = branchNameFromPlan("/repo/other/20260712-example.md");
+
+  assert.match(first, /^example-[0-9a-f]{8}$/);
+  assert.notEqual(first, second);
+  assert.equal(
+    first,
+    branchNameFromPlan("/repo/docs/plans/20260712-example.md"),
+  );
+});
 
 test("creates plan-exec worktrees outside the source repository", async () => {
   const repositoryRoot = "/tmp/example-repository";

@@ -16,15 +16,17 @@ export const RUN_STAGES = [
 ] as const;
 
 export type RunStage = (typeof RUN_STAGES)[number];
-export type RunStatus =
-  | "starting"
-  | "running"
-  | "paused"
-  | "cancel_pending"
-  | "cancelled"
-  | "failed"
-  | "completed"
-  | "completed_with_findings";
+export const RUN_STATUSES = [
+  "starting",
+  "running",
+  "paused",
+  "cancel_pending",
+  "cancelled",
+  "failed",
+  "completed",
+  "completed_with_findings",
+] as const;
+export type RunStatus = (typeof RUN_STATUSES)[number];
 
 export interface PlanTask {
   id: number;
@@ -78,6 +80,9 @@ export interface ActiveOperation {
   taskId?: number;
   reviewIteration?: number;
   stopRequested?: boolean;
+  recovery?: "observe" | "replay" | "cancel";
+  launchFailures?: number;
+  lastLaunchError?: string;
   statusFailures?: number;
   lastObservedAt?: number;
   lastStatusError?: string;
@@ -104,6 +109,7 @@ export interface PlanExecRun {
     taskIds: Record<string, string>;
   };
   activeOperation?: ActiveOperation;
+  failedOperation?: ActiveOperation;
   config: FrozenRunConfig;
   createdAt: number;
   updatedAt: number;

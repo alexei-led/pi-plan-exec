@@ -355,7 +355,90 @@ test("registry migrates vertical-slice runs missing review metadata", async () =
   const registry = new RunRegistry(directory);
   const migrated = await registry.get(runId);
   assert.equal(migrated?.stage, "project_tasks");
+  assert.equal(migrated?.config.taskRetries, 1);
+  assert.equal(migrated?.config.maxTaskIterations, 50);
+  assert.equal(migrated?.config.workerAgent, "worker");
+  assert.equal(migrated?.config.workerMaxTurns, 50);
   assert.equal(migrated?.config.reviewIterations, 5);
   assert.deepEqual(migrated?.reviewFindings, []);
   assert.equal(JSON.parse(await readFile(path, "utf8")).stage, "tasks");
+});
+
+test("registry rejects invalid persisted lifecycle shapes", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-plan-exec-registry-"));
+  const registry = new RunRegistry(directory);
+  const run = await registry.create({
+    schemaVersion: 1,
+    repositoryRoot: "/repo",
+    planPath: "/repo/plan.md",
+    planHash: "hash",
+    worktreeCwd: "/repo",
+    branch: "feature",
+    defaultBranch: "main",
+    status: "running",
+    stage: "implementation",
+    taskAttempts: {},
+    stageAttempts: {},
+    reviewFindings: [],
+    unresolvedFindings: [],
+    config,
+  });
+  const missingConfig = structuredClone(run) as unknown as PlanExecRun;
+  delete (missingConfig.config as Partial<typeof config>).workerAgent;
+
+  await assert.rejects(
+    registry.update({
+      ...run,
+      status: "not-a-status" as PlanExecRun["status"],
+    }),
+    /Invalid plan-exec run registry entry/,
+  );
+  await assert.rejects(
+    registry.update(missingConfig),
+    /Invalid plan-exec run registry entry/,
+  );
+  await assert.rejects(
+    registry.update({
+      ...run,
+      activeOperation: {
+        operationId: "review-at-implementation",
+        service: "bridge",
+        kind: "review",
+      },
+    }),
+    /Invalid plan-exec run registry entry/,
+  );
+});
+
+test("registry lists healthy runs when a sibling entry is corrupt", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-plan-exec-registry-"));
+  const registry = new RunRegistry(directory);
+  const healthy = await registry.create({
+    schemaVersion: 1,
+    repositoryRoot: "/repo",
+    planPath: "/repo/plan.md",
+    planHash: "hash",
+    worktreeCwd: "/repo",
+    branch: "feature",
+    defaultBranch: "main",
+    status: "running",
+    stage: "resolve",
+    taskAttempts: {},
+    stageAttempts: {},
+    reviewFindings: [],
+    unresolvedFindings: [],
+    config,
+  });
+  const corruptId = "22222222-2222-4222-8222-222222222222";
+  await mkdir(join(directory, corruptId), { recursive: true });
+  await writeFile(join(directory, corruptId, "run.json"), "{not-json\n");
+
+  const result = await registry.listWithErrors();
+
+  assert.deepEqual(
+    result.runs.map((run) => run.id),
+    [healthy.id],
+  );
+  assert.equal(result.errors[0]?.runId, corruptId);
+  assert.notEqual(result.errors[0]?.message, "");
 });

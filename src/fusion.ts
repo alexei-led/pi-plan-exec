@@ -1,5 +1,4 @@
-import { randomUUID } from "node:crypto";
-import type { EventBus } from "./bridge.js";
+import { requestRpc, type EventBus } from "./rpc.js";
 
 export const FUSION_REQUEST_EVENT = "fusion:rpc:v1:request";
 const FUSION_REPLY_PREFIX = "fusion:rpc:v1:reply:";
@@ -82,35 +81,19 @@ export class FusionClient {
     method: string,
     body: Record<string, unknown>,
   ): Promise<FusionResult> {
-    const requestId = randomUUID();
-    return new Promise((resolve) => {
-      const state: { timeout?: ReturnType<typeof setTimeout> } = {};
-      const registered = this.events.on(
-        `${FUSION_REPLY_PREFIX}${requestId}`,
-        (payload: unknown) => {
-          if (state.timeout) clearTimeout(state.timeout);
-          unsubscribe();
-          resolve(parseReply(payload));
-        },
-      );
-      const unsubscribe =
-        typeof registered === "function" ? registered : () => undefined;
-      state.timeout = setTimeout(() => {
-        unsubscribe();
-        resolve({
-          success: false,
-          error: {
-            code: "timeout",
-            message: `Fusion ${method} timed out after ${this.timeoutMs}ms.`,
-          },
-        });
-      }, this.timeoutMs);
-      this.events.emit(FUSION_REQUEST_EVENT, {
-        version: 1,
-        requestId,
-        method,
-        ...body,
-      });
+    return requestRpc({
+      events: this.events,
+      requestEvent: FUSION_REQUEST_EVENT,
+      replyPrefix: FUSION_REPLY_PREFIX,
+      timeoutMs: this.timeoutMs,
+      method,
+      label: `Fusion ${method}`,
+      body,
+      parseReply,
+      failure: (code, message) => ({
+        success: false,
+        error: { code, message },
+      }),
     });
   }
 }

@@ -90,7 +90,11 @@ export function branchNameFromPlan(planPath: string): string {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-|-$/g, "");
   if (!branch) throw new Error("Plan filename cannot produce a branch name.");
-  return branch;
+  const identity = createHash("sha256")
+    .update(resolve(planPath))
+    .digest("hex")
+    .slice(0, 8);
+  return `${branch}-${identity}`;
 }
 
 export async function createWorktree(

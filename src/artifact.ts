@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 
 /**
@@ -14,7 +14,7 @@ export async function readSubagentArtifact(
     if (output) return output;
   }
   if (asyncDir) {
-    const output = await readRecentOutput(join(asyncDir, "status.json"));
+    const output = await readAsyncOutput(join(asyncDir, "status.json"));
     if (output) return output;
   }
   throw new Error("Subagent result output was unavailable.");
@@ -34,10 +34,13 @@ async function readOutputFile(path: string): Promise<string | undefined> {
   }
 }
 
-async function readRecentOutput(path: string): Promise<string | undefined> {
+async function readAsyncOutput(path: string): Promise<string | undefined> {
   try {
     const value: unknown = JSON.parse(await readFile(path, "utf8"));
-    if (!isRecord(value) || !Array.isArray(value.steps)) return undefined;
+    if (!isRecord(value)) return undefined;
+    const durable = await readDurableOutput(value);
+    if (durable) return durable;
+    if (!Array.isArray(value.steps)) return undefined;
     const step = [...value.steps].reverse().find(isRecord);
     if (!step || !Array.isArray(step.recentOutput)) return undefined;
     const output = step.recentOutput
@@ -48,6 +51,22 @@ async function readRecentOutput(path: string): Promise<string | undefined> {
   } catch {
     return undefined;
   }
+}
+
+async function readDurableOutput(
+  status: Record<string, unknown>,
+): Promise<string | undefined> {
+  if (
+    typeof status.artifactsDir !== "string" ||
+    typeof status.runId !== "string"
+  )
+    return undefined;
+  const prefix = `${status.runId}_`;
+  const candidates = (await readdir(status.artifactsDir))
+    .filter((name) => name.startsWith(prefix) && name.endsWith("_output.md"))
+    .sort();
+  if (candidates.length === 0) return undefined;
+  return readOutputFile(join(status.artifactsDir, candidates.at(-1)!));
 }
 
 function extractText(value: unknown): string {

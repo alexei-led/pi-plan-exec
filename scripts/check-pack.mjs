@@ -6,9 +6,13 @@ const REQUIRED = new Set([
   "README.md",
   "package.json",
   "skills/exec-plan/SKILL.md",
+  "skills/exec-plan/references/recovery.md",
   "src/index.ts",
 ]);
-const RUNTIME_PATHS = [/^src\/[^/]+\.ts$/, /^skills\/exec-plan\/SKILL\.md$/];
+const RUNTIME_PATHS = [
+  /^src\/[^/]+\.ts$/,
+  /^skills\/exec-plan\/(?:SKILL\.md|references\/[^/]+\.md)$/,
+];
 
 const output = execFileSync(
   "npm",
