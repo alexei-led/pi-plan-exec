@@ -148,3 +148,97 @@ test("failed runs are visible without leaving projected work in progress", async
 
   assert.throws(() => sessionTaskPath("/repo", ""), /session ID/);
 });
+
+test("projection removes stale tasks and their blockers", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-projection-"));
+  const planPath = join(root, "plan.md");
+  await writeFile(
+    planPath,
+    "### Task 1: First\n- [x] Finished\n\n### Task 2: Removed\n- [ ] Old\n",
+  );
+  const registry = new RunRegistry(join(root, "runs"));
+  const run = await registry.create({
+    schemaVersion: 1,
+    repositoryRoot: root,
+    planPath,
+    planHash: "ignored-by-projection",
+    worktreeCwd: root,
+    branch: "feature",
+    defaultBranch: "main",
+    status: "running",
+    stage: "comprehensive_review",
+    taskAttempts: {},
+    stageAttempts: {},
+    reviewFindings: [],
+    unresolvedFindings: [],
+    config,
+  });
+  const projector = new TaskProjector(registry);
+  const first = await projector.sync(run, {
+    cwd: root,
+    sessionId: "session-1",
+  });
+  await writeFile(planPath, "### Task 1: First\n- [x] Finished\n");
+
+  await projector.sync(first, { cwd: root, sessionId: "session-1" });
+
+  const tasks = new TaskStore(sessionTaskPath(root, "session-1")).list();
+  assert.equal(
+    tasks.some((task) => task.metadata.planExecKey === "implementation:2"),
+    false,
+  );
+  const implementation = tasks.find(
+    (task) => task.metadata.planExecKey === "implementation:1",
+  );
+  const review = tasks.find(
+    (task) => task.metadata.planExecKey === "comprehensive_review",
+  );
+  assert.deepEqual(review?.blockedBy, [implementation?.id]);
+});
+
+test("force-skipped stages remain auditable while unblocking the next stage", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-projection-"));
+  const planPath = join(root, "plan.md");
+  await writeFile(planPath, "### Task 1: First\n- [x] Finished\n");
+  const registry = new RunRegistry(join(root, "runs"));
+  const run = await registry.create({
+    schemaVersion: 1,
+    repositoryRoot: root,
+    planPath,
+    planHash: "ignored-by-projection",
+    worktreeCwd: root,
+    branch: "feature",
+    defaultBranch: "main",
+    status: "running",
+    stage: "smells_review",
+    taskAttempts: {},
+    stageAttempts: {},
+    reviewFindings: [],
+    unresolvedFindings: [],
+    skippedStages: [
+      {
+        stage: "comprehensive_review",
+        reason: "operator accepted the remaining review risk",
+        requestedAt: 1,
+        requestedBy: "session-1",
+        completedAt: 2,
+      },
+    ],
+    config,
+  });
+  const projector = new TaskProjector(registry);
+  await projector.sync(run, { cwd: root, sessionId: "session-1" });
+
+  const tasks = new TaskStore(sessionTaskPath(root, "session-1")).list();
+  const skipped = tasks.find(
+    (task) => task.metadata.planExecKey === "comprehensive_review",
+  );
+  const next = tasks.find(
+    (task) => task.metadata.planExecKey === "smells_review",
+  );
+  assert.equal(skipped?.status, "completed");
+  assert.match(skipped?.subject ?? "", /FORCE-SKIPPED/);
+  assert.match(skipped?.description ?? "", /remaining review risk/);
+  assert.equal(next?.status, "in_progress");
+  assert.deepEqual(next?.blockedBy, [skipped?.id]);
+});

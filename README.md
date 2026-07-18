@@ -69,9 +69,15 @@ it without a run ID for the current repository, and use `/exec runs` when severa
 runs need disambiguation. `/exec pause` stops after the active child; `/exec
 resume` continues paused work or recovers a recorded failure in the same stage
 and preserved worktree. When a provider operation may still exist, plan-exec
-keeps its identity and adopts it before any retry. The installed `exec-plan`
-skill is also available as `/skill:exec-plan` for the plan format and recovery
-rules.
+keeps its identity and adopts it before any retry. If a review, finalization, or
+statistics stage cannot recover, `/exec skip <full-run-id> --reason <text>`
+stops the tracked child before recording an explicit waiver and advancing. It
+never skips implementation or archival, and the run finishes as
+`completed_with_findings`. If external work moved the execution tree to another
+branch, `/exec resume <full-run-id> --adopt-current-branch` provides an
+interactive, audited rebind after verifying the same repository and no active
+child. The installed `exec-plan` skill is also available as
+`/skill:exec-plan` for the plan format and recovery rules.
 
 The **[Guide](docs/guide.md#executable-plan-format)** defines the accepted plan
 format, including the exact heading and checkbox rules. Omit the path to select

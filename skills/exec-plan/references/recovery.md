@@ -66,6 +66,21 @@ Budget exhaustion is a plan-run failure. Resume the plan run ID, not the child
 ID shown in pi-subagents output. Recovery raises implementation and review
 budgets where supported.
 
+## Force-skip a blocked stage
+
+Use this only after inspecting the findings and active operation:
+
+```text
+/exec skip <full-run-id> --reason "<why the residual risk is accepted>"
+```
+
+Pi asks for interactive confirmation. The controller records `skip_pending`,
+stops any tracked Bridge/Fusion child, and waits for terminal provider evidence
+before it advances. Do not retry, start, or manually stop a child while that
+state is pending. A skipped review/finalize/stats stage is visibly audited,
+known findings remain unresolved, and the final run becomes
+`completed_with_findings`. Implementation and archive cannot be skipped.
+
 ## Cancel pending or failed cancellation
 
 `/exec cancel <id>` only requests cancellation. It does not prove that the child
@@ -108,6 +123,21 @@ Choose one:
    adopting its new structure.
 
 Headless recovery cannot approve a changed plan structure.
+
+## Execution branch changed
+
+If status or resume reports `Execution directory is on <current>, expected
+<recorded>`, inspect the current branch and worktree first. When the current
+named branch is authoritative, has no tracked child, and belongs to the same
+repository, use:
+
+```text
+/exec resume <full-run-id> --adopt-current-branch
+```
+
+Pi requires interactive confirmation, records the old/new branch, and resumes
+the same run. Do not hand-edit the durable branch or switch branches while a
+child is live.
 
 ## Provider or command unavailable
 

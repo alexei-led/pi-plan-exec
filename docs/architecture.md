@@ -89,6 +89,8 @@ includes:
 - task and stage attempt counters;
 - active operation ID, external run ID, parameters, and result location;
 - review and unresolved findings;
+- pending and completed force-skip audit records;
+- explicit execution-branch rebindings;
 - frozen role/model limits;
 - session lease and heartbeat.
 
@@ -139,7 +141,7 @@ one worker. Comprehensive and Fusion review can loop through findings and a sole
 fixer. Smells and critical review are single-pass review/fix stages. Known
 findings that survive caps are retained and produce `completed_with_findings`.
 
-## Cancellation and pause
+## Cancellation, pause, and force-skip
 
 - `pause` allows the active external operation to finish, then removes it without
   advancing the stage.
@@ -147,6 +149,13 @@ findings that survive caps are retained and produce `completed_with_findings`.
   `cancel_pending`, retries provider errors without discarding operation state,
   and ends at `cancelled` only after the operation is terminal.
 - Both preserve the execution worktree.
+- `resume --adopt-current-branch` verifies the same repository, requires no
+  active operation, and records an explicit branch rebind before resuming.
+- `skip` is an interactive, auditable waiver for review, finalization, and
+  statistics only. It first persists `skip_pending`, then stops and terminally
+  reconciles any tracked operation before clearing it and advancing exactly one
+  stage. Skipped stages retain current findings as unresolved and cause
+  `completed_with_findings`; implementation and archive are not skippable.
 
 The background loop serializes ticks per run. It temporarily hides active tools
 from the main agent so projected pi-tasks rows are not interpreted as a second
@@ -162,6 +171,9 @@ Untrusted boundaries are validated at entry:
 - Bridge/Fusion replies are parsed from `unknown`.
 - Reviewer output must be `NO_FINDINGS` or structured findings.
 - Git common-directory and branch checks protect writer stages.
+- `src/types.ts` owns persisted run/status/stage/operation constants. ESLint
+  rejects raw domain values in control-flow comparisons and non-trivial magic
+  numbers in runtime source, keeping state-machine changes reviewable.
 
 ## Further design record
 

@@ -361,6 +361,8 @@ test("registry migrates vertical-slice runs missing review metadata", async () =
   assert.equal(migrated?.config.workerMaxTurns, 50);
   assert.equal(migrated?.config.reviewIterations, 5);
   assert.deepEqual(migrated?.reviewFindings, []);
+  assert.deepEqual(migrated?.skippedStages, []);
+  assert.deepEqual(migrated?.branchRebindings, []);
   assert.equal(JSON.parse(await readFile(path, "utf8")).stage, "tasks");
 });
 
@@ -406,6 +408,41 @@ test("registry rejects invalid persisted lifecycle shapes", async () => {
         kind: "review",
       },
     }),
+    /Invalid plan-exec run registry entry/,
+  );
+  await assert.rejects(
+    registry.update({
+      ...run,
+      status: "skip_pending",
+      pendingStageSkip: {
+        stage: "implementation",
+        reason: "unsafe waiver",
+        requestedAt: 1,
+        requestedBy: "session-1",
+      },
+    }),
+    /Invalid plan-exec run registry entry/,
+  );
+  await assert.rejects(
+    registry.update({
+      ...run,
+      skippedStages: [
+        {
+          stage: "archive",
+          reason: "unsafe waiver",
+          requestedAt: 1,
+          requestedBy: "session-1",
+          completedAt: 2,
+        },
+      ],
+    }),
+    /Invalid plan-exec run registry entry/,
+  );
+
+  const path = join(directory, run.id, "run.json");
+  await writeFile(path, JSON.stringify({ ...run, skippedStages: {} }));
+  await assert.rejects(
+    registry.get(run.id),
     /Invalid plan-exec run registry entry/,
   );
 });

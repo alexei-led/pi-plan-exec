@@ -21,7 +21,9 @@ recovery with a manually launched subagent.
 - Inspect one run: `/exec status <full-run-id>`.
 - Request a pause for a starting or running run: `/exec pause <full-run-id>`.
 - Continue or recover: `/exec resume <full-run-id>`.
+- Adopt a verified current execution branch: `/exec resume <full-run-id> --adopt-current-branch`.
 - Claim an unfinished stale run: `/exec adopt <full-run-id>`.
+- Force-skip a blocked review/finalize/stats stage: `/exec skip <full-run-id> --reason <text>`.
 - Request safe cancellation: `/exec cancel <full-run-id>`.
 - Inspect live command support: `/exec help`.
 - Repair missing packages: `/exec setup`, install the reported packages, then
@@ -100,6 +102,13 @@ second writer.
 ## Safety invariants
 
 - Resume the **plan run ID**, never the reviewer/worker child run ID.
+- `--adopt-current-branch` requires interactive confirmation and no active
+  child. It verifies the same repository and records the branch change before
+  resuming.
+- `/exec skip` is a last-resort waiver, not a review pass. It requires an
+  interactive confirmation and reason, stops any tracked child before advancing,
+  and ends as `completed_with_findings`. Never use it for implementation or
+  archive stages.
 - Do not use `subagent resume` for a child owned by plan-exec.
 - Do not run `/exec start` as a substitute for `/exec resume`.
 - Do not hand-edit `~/.pi/plan-exec/runs/<id>/run.json`.

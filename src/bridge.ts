@@ -5,11 +5,12 @@ export type { EventBus } from "./rpc.js";
 
 export const BRIDGE_REQUEST_EVENT = "plan-exec:bridge:v1:request";
 const BRIDGE_REPLY_PREFIX = "plan-exec:bridge:v1:reply:";
+const DEFAULT_BRIDGE_TIMEOUT_MS = 30_000;
 
 export class BridgeClient {
   constructor(
     private readonly events: EventBus,
-    private readonly timeoutMs = 30_000,
+    private readonly timeoutMs = DEFAULT_BRIDGE_TIMEOUT_MS,
   ) {}
 
   ping(): Promise<BridgeResult> {

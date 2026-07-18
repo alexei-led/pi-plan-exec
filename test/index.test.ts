@@ -10,9 +10,12 @@ import {
   formatRunStatus,
   getExecArgumentCompletions,
   hasBridgeOperationMethod,
+  isActionAllowed,
   isRecoverableFailure,
   missingRuntimeTools,
   needsPlanStructureReview,
+  parseResumeOptions,
+  parseSkipReason,
   prioritizeRunCandidates,
   reviewedPlanHashForResume,
 } from "../src/index.js";
@@ -47,6 +50,8 @@ function run(overrides: Partial<PlanExecRun> = {}): PlanExecRun {
     taskAttempts: {},
     stageAttempts: {},
     reviewFindings: [],
+    skippedStages: [],
+    branchRebindings: [],
     progressPath: "/repo/.ralphex/progress.txt",
     activeOperation: {
       operationId: "operation-1",
@@ -85,6 +90,10 @@ test("exec command completions explain the command family", () => {
     allItems.find((item) => item.value === "resume")?.description ?? "",
     /retry a failed run/,
   );
+  assert.match(
+    allItems.find((item) => item.value === "skip")?.description ?? "",
+    /Force-skip/,
+  );
 });
 
 test("runtime prerequisite check identifies missing provider extensions", () => {
@@ -95,6 +104,8 @@ test("runtime prerequisite check identifies missing provider extensions", () => 
 test("help and setup explain the installed command surface", () => {
   assert.match(execHelp(), /\/exec status \[run-id\]/);
   assert.match(execHelp(), /retry a failed run/);
+  assert.match(execHelp(), /\/exec skip <full-run-id> --reason <text>/);
+  assert.match(execHelp(), /completed_with_findings/);
   assert.match(execHelp(), /\/skill:exec-plan/);
   assert.match(
     execSetup(),
@@ -102,6 +113,59 @@ test("help and setup explain the installed command surface", () => {
   );
   assert.match(execSetup(), /pi install npm:@alexeiled\/pi-fusion/);
   assert.match(execSetup(), /pi install npm:@alexeiled\/pi-plan-exec/);
+});
+
+test("cancel cannot bypass a pending force-skip", () => {
+  const pending = run({
+    status: "skip_pending",
+    stage: "comprehensive_review",
+    pendingStageSkip: {
+      stage: "comprehensive_review",
+      reason: "operator waiver",
+      requestedAt: 1,
+      requestedBy: "session-1",
+    },
+  });
+
+  assert.equal(isActionAllowed("cancel", pending, "session-1"), false);
+  assert.equal(isActionAllowed("resume", pending, "session-1"), false);
+  assert.equal(isActionAllowed("skip", pending, "session-1"), true);
+});
+
+test("resume branch-adoption option is explicit", () => {
+  assert.deepEqual(parseResumeOptions([]), { adoptCurrentBranch: false });
+  assert.deepEqual(parseResumeOptions(["--adopt-current-branch"]), {
+    adoptCurrentBranch: true,
+  });
+  assert.throws(() => parseResumeOptions(["--force"]), /Usage/);
+
+  const running = run({ status: "running" });
+  delete running.activeOperation;
+  assert.equal(isActionAllowed("resume", running, "session-1"), false);
+  assert.equal(isActionAllowed("resume", running, "session-1", true), true);
+  const failed = run({ status: "failed" });
+  delete failed.activeOperation;
+  assert.equal(isActionAllowed("resume", failed, "session-1", true), true);
+  const busy = run({
+    status: "running",
+    activeOperation: {
+      operationId: "live-review",
+      service: "bridge",
+      kind: "review",
+      externalRunId: "live-run",
+    },
+  });
+  assert.equal(isActionAllowed("resume", busy, "session-1", true), false);
+});
+
+test("force-skip reason parsing requires the explicit option and text", () => {
+  assert.equal(
+    parseSkipReason(["--reason", "review", "loop", "is", "stuck"]),
+    "review loop is stuck",
+  );
+  assert.throws(() => parseSkipReason([]), /Usage/);
+  assert.throws(() => parseSkipReason(["--reason"]), /Usage/);
+  assert.throws(() => parseSkipReason(["because"]), /Usage/);
 });
 
 test("failed and cancellation-pending runs are eligible for recovery", () => {
@@ -197,6 +261,25 @@ test("run status includes live operation, progress, and recovery hints", () => {
   );
   assert.match(paused, /interactive \/exec resume/);
   assert.doesNotMatch(paused, /next: \/exec status/);
+
+  const skippedRun = run({
+    status: "completed_with_findings",
+    stage: "complete",
+    skippedStages: [
+      {
+        stage: "comprehensive_review",
+        reason: "operator waiver",
+        requestedAt: 1,
+        requestedBy: "session-1",
+        completedAt: 2,
+        terminalOperationState: "stopped",
+      },
+    ],
+  });
+  delete skippedRun.activeOperation;
+  const skipped = formatRunStatus(skippedRun);
+  assert.match(skipped, /force-skipped stages/);
+  assert.match(skipped, /operator waiver/);
 });
 
 test("run status distinguishes unavailable observation from normal polling", () => {

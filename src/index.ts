@@ -9,18 +9,35 @@ import {
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { BridgeClient } from "./bridge.js";
 import {
+  MAX_STATUS_FAILURES,
   PLAN_STRUCTURE_CHANGED_ERROR,
   PlanExecController,
 } from "./controller.js";
 import { FusionClient } from "./fusion.js";
-import { isRecoverableRun, isTerminalStatus } from "./lifecycle.js";
+import {
+  isRecoverableRun,
+  isSkippableStage,
+  isTerminalStatus,
+} from "./lifecycle.js";
 import { RunRegistry } from "./registry.js";
 import { readPlan } from "./plan.js";
 import { TaskProjector } from "./task-projection.js";
-import type { PlanExecRun } from "./types.js";
+import {
+  COMPLETED_PLANS_DIRECTORY,
+  EXEC_ACTION,
+  RUN_STATUS,
+  type PlanExecRun,
+  type RunAction,
+} from "./types.js";
 
 const registry = new RunRegistry();
 const STATUS_KEY = "plan-exec";
+const PROVIDER_PROBE_TIMEOUT_MS = 1_500;
+const CONTROLLER_POLL_INTERVAL_MS = 1_000;
+const COMMAND_CAS_RETRIES = 5;
+const MILLISECONDS_PER_SECOND = 1_000;
+const SECONDS_PER_MINUTE = 60;
+const DISPLAY_RUN_ID_LENGTH = 8;
 const REQUIRED_RUNTIME_TOOLS: Record<string, string> = {
   subagent: "pi-subagents",
   TaskCreate: "@tintinweb/pi-tasks",
@@ -28,53 +45,57 @@ const REQUIRED_RUNTIME_TOOLS: Record<string, string> = {
 
 const EXEC_COMMANDS: AutocompleteItem[] = [
   {
-    value: "help",
-    label: "help",
+    value: EXEC_ACTION.HELP,
+    label: EXEC_ACTION.HELP,
     description: "Show /exec commands and recovery hints",
   },
   {
-    value: "start",
-    label: "start",
+    value: EXEC_ACTION.START,
+    label: EXEC_ACTION.START,
     description: "Start a plan; bare /exec is an alias",
   },
   {
-    value: "setup",
-    label: "setup",
+    value: EXEC_ACTION.SETUP,
+    label: EXEC_ACTION.SETUP,
     description: "Show required Pi packages and install commands",
   },
   {
-    value: "runs",
-    label: "runs",
+    value: EXEC_ACTION.RUNS,
+    label: EXEC_ACTION.RUNS,
     description: "List recent plan execution runs",
   },
   {
-    value: "status",
-    label: "status",
+    value: EXEC_ACTION.STATUS,
+    label: EXEC_ACTION.STATUS,
     description: "Show the current run status",
   },
   {
-    value: "pause",
-    label: "pause",
+    value: EXEC_ACTION.PAUSE,
+    label: EXEC_ACTION.PAUSE,
     description: "Pause advancing after the active child",
   },
   {
-    value: "resume",
-    label: "resume",
+    value: EXEC_ACTION.RESUME,
+    label: EXEC_ACTION.RESUME,
     description: "Resume or retry a failed run in its preserved worktree",
   },
   {
-    value: "adopt",
-    label: "adopt",
+    value: EXEC_ACTION.ADOPT,
+    label: EXEC_ACTION.ADOPT,
     description: "Adopt a stale run from another session",
   },
   {
-    value: "cancel",
-    label: "cancel",
+    value: EXEC_ACTION.SKIP,
+    label: EXEC_ACTION.SKIP,
+    description: "Force-skip a blocked non-implementation stage with a reason",
+  },
+  {
+    value: EXEC_ACTION.CANCEL,
+    label: EXEC_ACTION.CANCEL,
     description: "Cancel safely and preserve the worktree",
   },
 ];
 
-type RunAction = "status" | "pause" | "resume" | "adopt" | "cancel";
 type NotificationLevel = "info" | "warning" | "error";
 type RunState = Pick<PlanExecRun, "status" | "stage"> & {
   operation?: string;
@@ -200,8 +221,8 @@ export default function planExecExtension(pi: ExtensionAPI): void {
       );
     }
     const [bridgeReply, fusionReply] = await Promise.all([
-      new BridgeClient(pi.events, 1_500).ping(),
-      new FusionClient(pi.events, 1_500).ping(),
+      new BridgeClient(pi.events, PROVIDER_PROBE_TIMEOUT_MS).ping(),
+      new FusionClient(pi.events, PROVIDER_PROBE_TIMEOUT_MS).ping(),
     ]);
     const missing: string[] = [];
     const incompatible: string[] = [];
@@ -244,9 +265,9 @@ export default function planExecExtension(pi: ExtensionAPI): void {
           if (isTerminal(run.status)) {
             stopBackgroundController(runId);
             const level: NotificationLevel =
-              run.status === "failed" ? "error" : "info";
+              run.status === RUN_STATUS.FAILED ? "error" : "info";
             notify(ctx, terminalMessage(run), level);
-          } else if (run.status === "paused") {
+          } else if (run.status === RUN_STATUS.PAUSED) {
             stopBackgroundController(runId);
             notify(
               ctx,
@@ -264,7 +285,7 @@ export default function planExecExtension(pi: ExtensionAPI): void {
           void handleBackgroundFailure(runId, sessionId, cwd, ctx, error);
         })
         .finally(() => inFlightControllers.delete(runId));
-    }, 1_000);
+    }, CONTROLLER_POLL_INTERVAL_MS);
     timer.unref();
     activeControllers.set(runId, timer);
   };
@@ -375,21 +396,48 @@ export function formatRunStatus(run: PlanExecRun): string {
     );
   if (operation?.statusFailures) {
     lines.push(
-      `observation: unavailable (${operation.statusFailures}/3); retrying${operation.lastStatusError ? ` — ${operation.lastStatusError}` : ""}`,
+      `observation: unavailable (${operation.statusFailures}/${MAX_STATUS_FAILURES}); retrying${operation.lastStatusError ? ` — ${operation.lastStatusError}` : ""}`,
     );
-  } else if (operation) {
+  }
+  if (operation?.skipFailures) {
+    lines.push(
+      `force-skip reconciliation: failed (${operation.skipFailures}/${MAX_STATUS_FAILURES}); retrying${operation.lastSkipError ? ` — ${operation.lastSkipError}` : ""}`,
+    );
+  } else if (operation && !operation.statusFailures) {
     lines.push(
       "observation: polling continues; worker output is available when its operation completes.",
     );
   }
+  if (run.branchRebindings.length > 0) {
+    lines.push("branch rebindings:");
+    for (const rebinding of run.branchRebindings)
+      lines.push(
+        `- ${rebinding.from} -> ${rebinding.to} by ${rebinding.requestedBy}`,
+      );
+  }
   if (run.error) lines.push(`error: ${run.error}`);
-  if (needsPlanStructureReview(run)) {
+  if (run.pendingStageSkip)
+    lines.push(
+      `force-skip pending: ${run.pendingStageSkip.stage} — ${run.pendingStageSkip.reason}`,
+    );
+  if (run.skippedStages.length > 0) {
+    lines.push("force-skipped stages:");
+    for (const skip of run.skippedStages)
+      lines.push(
+        `- ${skip.stage} by ${skip.requestedBy}: ${skip.reason}${skip.terminalOperationState ? ` (operation: ${skip.terminalOperationState})` : ""}`,
+      );
+  }
+  if (run.status === RUN_STATUS.SKIP_PENDING) {
+    lines.push(
+      "next: waiting for the tracked child to become terminal before advancing the force-skip.",
+    );
+  } else if (needsPlanStructureReview(run)) {
     lines.push(
       "next: use interactive /exec resume to restore or explicitly adopt the reviewed plan structure.",
     );
   } else if (isTerminal(run.status)) {
     lines.push(
-      run.status === "failed"
+      run.status === RUN_STATUS.FAILED
         ? isRecoverableFailure(run)
           ? "next: use interactive /exec resume to retry this stage in its preserved worktree."
           : "next: worktree preserved; inspect the error, then use /exec runs."
@@ -409,7 +457,7 @@ export function formatRunList(runs: PlanExecRun[]): string {
       (run) =>
         `${run.id} ${basename(run.planPath)} ${run.status}/${run.stage} ${activeOperationLabel(run)} updated ${relativeTime(run.updatedAt)}`,
     ),
-    "Use /exec status, pause, resume, adopt, or cancel without a run ID when one run is in context.",
+    "Use /exec status, pause, resume, adopt, skip, or cancel. Force-skip requires a full run ID and reason.",
   ].join("\n");
 }
 
@@ -422,60 +470,127 @@ async function handleCommand(
   checkRuntime: RuntimeCheck,
 ): Promise<string | undefined> {
   const [subcommand, ...rest] = args.split(/\s+/).filter(Boolean);
-  if (subcommand === "help") return execHelp();
-  if (subcommand === "setup") return execSetup();
-  if (subcommand === "runs") return formatRunList(await registry.list());
+  if (subcommand === EXEC_ACTION.HELP) return execHelp();
+  if (subcommand === EXEC_ACTION.SETUP) return execSetup();
+  if (subcommand === EXEC_ACTION.RUNS) return formatRunList(await registry.list());
   if (
-    subcommand === "status" ||
-    subcommand === "pause" ||
-    subcommand === "resume" ||
-    subcommand === "adopt" ||
-    subcommand === "cancel"
+    subcommand === EXEC_ACTION.STATUS ||
+    subcommand === EXEC_ACTION.PAUSE ||
+    subcommand === EXEC_ACTION.RESUME ||
+    subcommand === EXEC_ACTION.ADOPT ||
+    subcommand === EXEC_ACTION.SKIP ||
+    subcommand === EXEC_ACTION.CANCEL
   ) {
-    const action = subcommand;
-    const run = await resolveRunForAction(action, rest[0], ctx);
-    if (action === "status") return formatRunStatus(run);
-    if (action === "resume" || action === "adopt") {
+    const action = subcommand as RunAction;
+    const adoptCurrentBranch =
+      action === EXEC_ACTION.RESUME
+        ? parseResumeOptions(rest.slice(1)).adoptCurrentBranch
+        : false;
+    if (
+      action === EXEC_ACTION.SKIP &&
+      (!rest[0] || rest[0] === "--reason")
+    )
+      throw new Error(
+        "Usage: /exec skip <full-run-id> --reason <non-empty reason>",
+      );
+    const run = await resolveRunForAction(
+      action,
+      rest[0],
+      ctx,
+      adoptCurrentBranch,
+    );
+    if (action === EXEC_ACTION.STATUS) return formatRunStatus(run);
+    if (
+      action === EXEC_ACTION.RESUME ||
+      action === EXEC_ACTION.ADOPT ||
+      action === EXEC_ACTION.SKIP
+    ) {
       await checkRuntime();
+      const skipReason =
+        action === EXEC_ACTION.SKIP ? parseSkipReason(rest.slice(1)) : undefined;
       const handedOff = await handoffToWorktree(
         ctx,
         run,
         syncProjection,
-        action === "resume" ? `resume ${run.id}` : undefined,
+        action === EXEC_ACTION.RESUME
+          ? `resume ${run.id}${adoptCurrentBranch ? " --adopt-current-branch" : ""}`
+          : action === EXEC_ACTION.SKIP
+            ? `skip ${run.id} --reason ${skipReason}`
+            : undefined,
       );
       if (handedOff) return undefined;
+      const sessionId = ctx.sessionManager.getSessionId();
+      if (action === EXEC_ACTION.SKIP) {
+        if (!ctx.hasUI)
+          throw new Error("Force-skip requires interactive confirmation.");
+        const operation = run.activeOperation;
+        const accepted = await ctx.ui.confirm(
+          `Force-skip ${run.stage}?`,
+          [
+            `Run: ${run.id}`,
+            `Reason: ${skipReason}`,
+            operation
+              ? `Active operation: ${operation.service}/${operation.kind} ${operation.externalRunId ?? operation.operationId}`
+              : "Active operation: none",
+            `Known findings: ${run.reviewFindings.length}`,
+            "The controller will stop any tracked child before advancing.",
+            "Final status will be completed_with_findings.",
+          ].join("\n"),
+        );
+        if (!accepted) throw new Error("Force-skip cancelled.");
+        const skipped = await syncProjection(
+          await controller.skip(run.id, sessionId, skipReason!),
+          { cwd: ctx.cwd, sessionId },
+        );
+        startBackgroundController(skipped, sessionId, ctx.cwd, ctx);
+        return `Run ${shortRunId(skipped.id)} force-skip requested: ${skipped.status} (${skipped.stage}).\nUse /exec status for live progress.`;
+      }
+      if (adoptCurrentBranch) {
+        if (!ctx.hasUI)
+          throw new Error("Branch adoption requires interactive confirmation.");
+        if (run.activeOperation)
+          throw new Error(
+            "Cannot adopt the current branch while an external operation is tracked.",
+          );
+        const accepted = await ctx.ui.confirm(
+          "Adopt current execution branch?",
+          [
+            `Run: ${run.id}`,
+            `Recorded branch: ${run.branch}`,
+            `Worktree: ${run.worktreeCwd}`,
+            "The controller will verify the repository, record the actual named branch, and resume the same run.",
+          ].join("\n"),
+        );
+        if (!accepted) throw new Error("Branch adoption cancelled.");
+        const rebound = await syncProjection(
+          await controller.rebindBranchAndResume(run.id, sessionId),
+          { cwd: ctx.cwd, sessionId },
+        );
+        startBackgroundController(rebound, sessionId, ctx.cwd, ctx);
+        return `Run ${shortRunId(rebound.id)} adopted branch ${rebound.branch}: ${rebound.status} (${rebound.stage}).\nUse /exec status for live progress.`;
+      }
       const reviewedPlanHash =
-        action === "resume"
+        action === EXEC_ACTION.RESUME
           ? await reviewedPlanHashForResume(run, ctx)
           : undefined;
       const resumed = await syncProjection(
-        await controller.resume(
-          run.id,
-          ctx.sessionManager.getSessionId(),
-          true,
-          reviewedPlanHash,
-        ),
-        { cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId() },
+        await controller.resume(run.id, sessionId, true, reviewedPlanHash),
+        { cwd: ctx.cwd, sessionId },
       );
-      startBackgroundController(
-        resumed,
-        ctx.sessionManager.getSessionId(),
-        ctx.cwd,
-        ctx,
-      );
+      startBackgroundController(resumed, sessionId, ctx.cwd, ctx);
       return `Run ${shortRunId(resumed.id)} resumed: ${resumed.status} (${resumed.stage}).\nUse /exec status for live progress.`;
     }
     const sessionId = ctx.sessionManager.getSessionId();
     const claimed = await registry.claim(run, sessionId);
-    if (action === "pause") {
+    if (action === EXEC_ACTION.PAUSE) {
       const paused = await syncProjection(
-        await requestStatus(claimed, "pause", sessionId),
+        await requestStatus(claimed, EXEC_ACTION.PAUSE, sessionId),
         { cwd: ctx.cwd, sessionId },
       );
       return `Run ${shortRunId(paused.id)} paused after its active operation. Use /exec resume to continue.`;
     }
     const cancelled = await syncProjection(
-      await requestStatus(claimed, "cancel", sessionId),
+      await requestStatus(claimed, EXEC_ACTION.CANCEL, sessionId),
       { cwd: ctx.cwd, sessionId },
     );
     startBackgroundController(cancelled, sessionId, ctx.cwd, ctx);
@@ -483,7 +598,7 @@ async function handleCommand(
   }
 
   const planPath =
-    subcommand === "start"
+    subcommand === EXEC_ACTION.START
       ? rest.join(" ") || (await selectPlan(ctx))
       : args || (await selectPlan(ctx));
   await checkRuntime();
@@ -512,24 +627,31 @@ async function resolveRunForAction(
   action: RunAction,
   selector: string | undefined,
   ctx: ExtensionContext,
+  adoptCurrentBranch = false,
 ): Promise<PlanExecRun> {
   if (selector) {
     const run = await registry.get(selector);
     if (!run) throw new Error(`Plan execution run not found: ${selector}`);
-    assertActionAllowed(action, run, ctx.sessionManager.getSessionId());
+    assertActionAllowed(
+      action,
+      run,
+      ctx.sessionManager.getSessionId(),
+      adoptCurrentBranch,
+    );
     return run;
   }
 
   const sessionId = ctx.sessionManager.getSessionId();
   const candidates = (await registry.list()).filter(
     (run) =>
-      matchesContext(run, ctx.cwd) && isActionAllowed(action, run, sessionId),
+      matchesContext(run, ctx.cwd) &&
+      isActionAllowed(action, run, sessionId, adoptCurrentBranch),
   );
   if (candidates.length === 0) {
     const verb =
-      action === "status"
+      action === EXEC_ACTION.STATUS
         ? "matching"
-        : action === "resume"
+        : action === EXEC_ACTION.RESUME
           ? "resumable"
           : `${action}able`;
     throw new Error(
@@ -539,7 +661,7 @@ async function resolveRunForAction(
   const preferred = prioritizeRunCandidates(
     candidates,
     ctx.cwd,
-    action === "status",
+    action === EXEC_ACTION.STATUS,
   );
   if (preferred.length === 1) return preferred[0]!;
   if (!ctx.hasUI) {
@@ -642,21 +764,37 @@ function matchesContext(run: PlanExecRun, cwd: string): boolean {
   );
 }
 
-function isActionAllowed(
+export function isActionAllowed(
   action: RunAction,
   run: PlanExecRun,
   sessionId: string,
+  adoptCurrentBranch = false,
 ): boolean {
-  if (action === "status") return true;
-  if (action === "pause")
-    return run.status === "starting" || run.status === "running";
-  if (action === "resume")
-    return run.status === "paused" || isRecoverableFailure(run);
-  if (action === "adopt") {
+  if (action === EXEC_ACTION.STATUS) return true;
+  if (action === EXEC_ACTION.PAUSE)
+    return (
+      run.status === RUN_STATUS.STARTING || run.status === RUN_STATUS.RUNNING
+    );
+  if (action === EXEC_ACTION.RESUME)
+    return adoptCurrentBranch
+      ? (!isTerminal(run.status) || run.status === RUN_STATUS.FAILED) &&
+          run.activeOperation === undefined
+      : run.status === RUN_STATUS.PAUSED || isRecoverableFailure(run);
+  if (action === EXEC_ACTION.ADOPT) {
     return !isTerminal(run.status) && run.lease?.sessionId !== sessionId;
   }
-  if (action === "cancel")
-    return !isTerminal(run.status) || run.status === "failed";
+  if (action === EXEC_ACTION.SKIP)
+    return (
+      isSkippableStage(run.stage) &&
+      (run.status === RUN_STATUS.FAILED ||
+        run.status === RUN_STATUS.PAUSED ||
+        run.status === RUN_STATUS.SKIP_PENDING)
+    );
+  if (action === EXEC_ACTION.CANCEL)
+    return (
+      run.pendingStageSkip === undefined &&
+      (!isTerminal(run.status) || run.status === RUN_STATUS.FAILED)
+    );
   return false;
 }
 
@@ -666,9 +804,33 @@ export function isRecoverableFailure(run: PlanExecRun): boolean {
 
 export function needsPlanStructureReview(run: PlanExecRun): boolean {
   return (
-    (run.status === "paused" || run.status === "failed") &&
+    (run.status === RUN_STATUS.PAUSED || run.status === RUN_STATUS.FAILED) &&
     run.error === PLAN_STRUCTURE_CHANGED_ERROR
   );
+}
+
+export function parseResumeOptions(args: string[]): {
+  adoptCurrentBranch: boolean;
+} {
+  if (args.length === 0) return { adoptCurrentBranch: false };
+  if (args.length === 1 && args[0] === "--adopt-current-branch")
+    return { adoptCurrentBranch: true };
+  throw new Error(
+    "Usage: /exec resume <full-run-id> [--adopt-current-branch]",
+  );
+}
+
+export function parseSkipReason(args: string[]): string {
+  if (args[0] !== "--reason")
+    throw new Error(
+      "Usage: /exec skip <full-run-id> --reason <non-empty reason>",
+    );
+  const reason = args.slice(1).join(" ").trim();
+  if (!reason)
+    throw new Error(
+      "Usage: /exec skip <full-run-id> --reason <non-empty reason>",
+    );
+  return reason;
 }
 
 export async function reviewedPlanHashForResume(
@@ -699,16 +861,19 @@ export async function reviewedPlanHashForResume(
 
 async function requestStatus(
   run: PlanExecRun,
-  action: "pause" | "cancel",
+  action: typeof EXEC_ACTION.PAUSE | typeof EXEC_ACTION.CANCEL,
   sessionId: string,
 ): Promise<PlanExecRun> {
   let current = run;
-  for (let attempt = 0; attempt < 5; attempt += 1) {
+  for (let attempt = 0; attempt < COMMAND_CAS_RETRIES; attempt += 1) {
     assertActionAllowed(action, current, sessionId);
     const requested = await registry.updateIfCurrent(
       {
         ...current,
-        status: action === "pause" ? "paused" : "cancel_pending",
+        status:
+          action === EXEC_ACTION.PAUSE
+            ? RUN_STATUS.PAUSED
+            : RUN_STATUS.CANCEL_PENDING,
       },
       current.updatedAt,
     );
@@ -724,8 +889,9 @@ function assertActionAllowed(
   action: RunAction,
   run: PlanExecRun,
   sessionId: string,
+  adoptCurrentBranch = false,
 ): void {
-  if (!isActionAllowed(action, run, sessionId)) {
+  if (!isActionAllowed(action, run, sessionId, adoptCurrentBranch)) {
     throw new Error(
       `Run ${shortRunId(run.id)} cannot be ${actionPastTense(action)} while ${run.status}.`,
     );
@@ -734,11 +900,12 @@ function assertActionAllowed(
 
 function actionPastTense(action: RunAction): string {
   return {
-    status: "inspected",
-    pause: "paused",
-    resume: "resumed",
-    adopt: "adopted",
-    cancel: "cancelled",
+    [EXEC_ACTION.STATUS]: "inspected",
+    [EXEC_ACTION.PAUSE]: "paused",
+    [EXEC_ACTION.RESUME]: "resumed",
+    [EXEC_ACTION.ADOPT]: "adopted",
+    [EXEC_ACTION.SKIP]: "force-skipped",
+    [EXEC_ACTION.CANCEL]: "cancelled",
   }[action];
 }
 
@@ -789,11 +956,11 @@ function compactRunStatus(run: PlanExecRun): string {
 }
 
 function terminalMessage(run: PlanExecRun): string {
-  if (run.status === "failed")
+  if (run.status === RUN_STATUS.FAILED)
     return `Plan execution ${shortRunId(run.id)} failed at ${run.stage}: ${run.error ?? "unknown error"}. Worktree preserved; use /exec status.`;
-  if (run.status === "completed_with_findings")
+  if (run.status === RUN_STATUS.COMPLETED_WITH_FINDINGS)
     return `Plan execution ${shortRunId(run.id)} completed with findings. Use /exec status for details.`;
-  if (run.status === "cancelled")
+  if (run.status === RUN_STATUS.CANCELLED)
     return `Plan execution ${shortRunId(run.id)} cancelled. Its worktree was preserved.`;
   return `Plan execution ${shortRunId(run.id)} completed.`;
 }
@@ -820,14 +987,19 @@ export function execHelp(): string {
     "/exec status [run-id]   Show progress; run-id is optional when unambiguous.",
     "/exec runs              List runs and their full IDs.",
     "/exec pause [run-id]    Pause after the active child finishes.",
-    "/exec resume [run-id]   Resume or retry a failed run in its preserved worktree.",
+    "/exec resume [run-id] [--adopt-current-branch]",
+    "                        Resume or retry a failed run, or explicitly adopt a verified current execution branch.",
     "/exec adopt [run-id]    Adopt a stale run from another session.",
+    "/exec skip <full-run-id> --reason <text>",
+    "                        Stop any tracked child, force-skip a blocked review/finalize/stats stage, and record the waiver.",
     "/exec cancel [run-id]   Cancel safely and preserve the worktree.",
     "",
     "Hints:",
     "- Prefer Worktree (isolated) when asked.",
     "- The footer shows live stage and worker progress.",
     "- /exec resume preserves the stage and worktree, and reconciles a known Bridge operation before retrying it.",
+    "- --adopt-current-branch requires confirmation, no active child, and the same Git repository.",
+    "- /exec skip never skips implementation or archive; skipped runs finish as completed_with_findings.",
     "- Worktree runs fork this Pi session into the worktree so the footer and tools use the execution directory.",
     "- Use /skill:exec-plan for the executable-plan format and recovery rules.",
   ].join("\n");
@@ -838,15 +1010,18 @@ function isTerminal(status: PlanExecRun["status"]): boolean {
 }
 
 function shortRunId(id: string): string {
-  return id.slice(0, 8);
+  return id.slice(0, DISPLAY_RUN_ID_LENGTH);
 }
 
 function relativeTime(timestamp: number): string {
-  const seconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1_000));
-  if (seconds < 60) return `${seconds}s ago`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m ago`;
-  return `${Math.floor(minutes / 60)}h ago`;
+  const seconds = Math.max(
+    0,
+    Math.floor((Date.now() - timestamp) / MILLISECONDS_PER_SECOND),
+  );
+  if (seconds < SECONDS_PER_MINUTE) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / SECONDS_PER_MINUTE);
+  if (minutes < SECONDS_PER_MINUTE) return `${minutes}m ago`;
+  return `${Math.floor(minutes / SECONDS_PER_MINUTE)}h ago`;
 }
 
 function isPathWithin(root: string, path: string): boolean {
@@ -897,7 +1072,7 @@ async function findPlanFiles(root: string): Promise<string[]> {
       throw error;
     }
     for (const entry of entries) {
-      if (entry.name === "completed") continue;
+      if (entry.name === COMPLETED_PLANS_DIRECTORY) continue;
       const path = resolve(directory, entry.name);
       if (entry.isDirectory()) await visit(path);
       else if (entry.isFile() && entry.name.toLowerCase().endsWith(".md"))

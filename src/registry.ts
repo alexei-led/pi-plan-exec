@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { isSkippableStage } from "./lifecycle.js";
 import {
   mkdir,
   open,
@@ -11,6 +12,10 @@ import {
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import {
+  DEFAULT_FROZEN_RUN_CONFIG,
+  OPERATION_KIND,
+  RUN_STAGE,
+  RUN_STATUS,
   RUN_STAGES,
   RUN_STATUSES,
   type ActiveOperation,
@@ -25,6 +30,7 @@ const LOCK_MAX_RETRIES = 100;
 const LOCK_STALE_MS = 10_000;
 const CONTROLLER_LOCK_MAX_RETRIES = 20;
 const CONTROLLER_LOCK_STALE_MS = 120_000;
+const CLAIM_CAS_RETRIES = 5;
 const RUN_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -36,11 +42,23 @@ export class RunRegistry {
   constructor(private readonly directory = RUNS_DIRECTORY) {}
 
   async create(
-    run: Omit<PlanExecRun, "id" | "createdAt" | "updatedAt">,
+    run: Omit<
+      PlanExecRun,
+      | "id"
+      | "createdAt"
+      | "updatedAt"
+      | "skippedStages"
+      | "branchRebindings"
+    > & {
+      skippedStages?: PlanExecRun["skippedStages"];
+      branchRebindings?: PlanExecRun["branchRebindings"];
+    },
   ): Promise<PlanExecRun> {
     const now = Date.now();
     const created: PlanExecRun = {
       ...run,
+      skippedStages: run.skippedStages ?? [],
+      branchRebindings: run.branchRebindings ?? [],
       id: randomUUID(),
       createdAt: now,
       updatedAt: now,
@@ -139,7 +157,7 @@ export class RunRegistry {
     if (!sessionId.trim())
       throw new Error("A Pi session ID is required to claim a run.");
     let current = run;
-    for (let attempt = 0; attempt < 5; attempt += 1) {
+    for (let attempt = 0; attempt < CLAIM_CAS_RETRIES; attempt += 1) {
       const now = Date.now();
       const lease = current.lease;
       if (
@@ -322,7 +340,8 @@ function parseRun(raw: string, runId: string): PlanExecRun {
 }
 
 function migrateLegacyRun(value: Record<string, unknown>): PlanExecRun {
-  const stage = value.stage === "tasks" ? "project_tasks" : value.stage;
+  const stage =
+    value.stage === "tasks" ? RUN_STAGE.PROJECT_TASKS : value.stage;
   const config = isRecord(value.config) ? value.config : {};
   return {
     ...(value as unknown as PlanExecRun),
@@ -336,19 +355,60 @@ function migrateLegacyRun(value: Record<string, unknown>): PlanExecRun {
     unresolvedFindings: Array.isArray(value.unresolvedFindings)
       ? (value.unresolvedFindings as PlanExecRun["unresolvedFindings"])
       : [],
+    skippedStages:
+      value.skippedStages === undefined
+        ? []
+        : (value.skippedStages as PlanExecRun["skippedStages"]),
+    branchRebindings:
+      value.branchRebindings === undefined
+        ? []
+        : (value.branchRebindings as PlanExecRun["branchRebindings"]),
     config: {
       ...config,
-      taskRetries: numberOr(config.taskRetries, 1),
-      maxTaskIterations: numberOr(config.maxTaskIterations, 50),
-      reviewIterations: numberOr(config.reviewIterations, 5),
-      fusionIterations: numberOr(config.fusionIterations, 10),
-      finalizeEnabled: booleanOr(config.finalizeEnabled, true),
-      workerAgent: stringOr(config.workerAgent, "worker"),
-      workerMaxTurns: numberOr(config.workerMaxTurns, 75),
-      reviewerAgent: stringOr(config.reviewerAgent, "reviewer"),
-      reviewerMaxTurns: numberOr(config.reviewerMaxTurns, 30),
-      statsAgent: stringOr(config.statsAgent, "reviewer"),
-      statsMaxTurns: numberOr(config.statsMaxTurns, 30),
+      taskRetries: numberOr(
+        config.taskRetries,
+        DEFAULT_FROZEN_RUN_CONFIG.taskRetries,
+      ),
+      maxTaskIterations: numberOr(
+        config.maxTaskIterations,
+        DEFAULT_FROZEN_RUN_CONFIG.maxTaskIterations,
+      ),
+      reviewIterations: numberOr(
+        config.reviewIterations,
+        DEFAULT_FROZEN_RUN_CONFIG.reviewIterations,
+      ),
+      fusionIterations: numberOr(
+        config.fusionIterations,
+        DEFAULT_FROZEN_RUN_CONFIG.fusionIterations,
+      ),
+      finalizeEnabled: booleanOr(
+        config.finalizeEnabled,
+        DEFAULT_FROZEN_RUN_CONFIG.finalizeEnabled,
+      ),
+      workerAgent: stringOr(
+        config.workerAgent,
+        DEFAULT_FROZEN_RUN_CONFIG.workerAgent,
+      ),
+      workerMaxTurns: numberOr(
+        config.workerMaxTurns,
+        DEFAULT_FROZEN_RUN_CONFIG.workerMaxTurns,
+      ),
+      reviewerAgent: stringOr(
+        config.reviewerAgent,
+        DEFAULT_FROZEN_RUN_CONFIG.reviewerAgent,
+      ),
+      reviewerMaxTurns: numberOr(
+        config.reviewerMaxTurns,
+        DEFAULT_FROZEN_RUN_CONFIG.reviewerMaxTurns,
+      ),
+      statsAgent: stringOr(
+        config.statsAgent,
+        DEFAULT_FROZEN_RUN_CONFIG.statsAgent,
+      ),
+      statsMaxTurns: numberOr(
+        config.statsMaxTurns,
+        DEFAULT_FROZEN_RUN_CONFIG.statsMaxTurns,
+      ),
     } as PlanExecRun["config"],
   };
 }
@@ -361,6 +421,23 @@ function assertRun(run: PlanExecRun): void {
     !Number.isFinite(run.createdAt) ||
     !Number.isFinite(run.updatedAt) ||
     !isFrozenConfig(run.config) ||
+    !Array.isArray(run.skippedStages) ||
+    !run.skippedStages.every(
+      (skip) =>
+        isValidStageSkip(skip, true) &&
+        isSkippableStage(skip.stage as RunStage),
+    ) ||
+    !Array.isArray(run.branchRebindings) ||
+    !run.branchRebindings.every(isValidBranchRebinding) ||
+    (run.pendingStageSkip !== undefined &&
+      (!isValidStageSkip(run.pendingStageSkip, false) ||
+        run.pendingStageSkip.stage !== run.stage ||
+        !isSkippableStage(run.pendingStageSkip.stage) ||
+        (run.status !== RUN_STATUS.SKIP_PENDING &&
+          run.status !== RUN_STATUS.FAILED &&
+          run.status !== RUN_STATUS.PAUSED))) ||
+    (run.status === RUN_STATUS.SKIP_PENDING &&
+      run.pendingStageSkip === undefined) ||
     !isValidOperationForStage(run.activeOperation, run.stage) ||
     !isValidOperationForStage(run.failedOperation, run.stage)
   ) {
@@ -385,23 +462,58 @@ function isFrozenConfig(value: unknown): boolean {
   );
 }
 
+function isValidBranchRebinding(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  return (
+    typeof value.from === "string" &&
+    value.from.trim().length > 0 &&
+    typeof value.to === "string" &&
+    value.to.trim().length > 0 &&
+    value.from !== value.to &&
+    typeof value.requestedBy === "string" &&
+    value.requestedBy.trim().length > 0 &&
+    typeof value.requestedAt === "number" &&
+    Number.isFinite(value.requestedAt)
+  );
+}
+
+function isValidStageSkip(value: unknown, completed: boolean): boolean {
+  if (!isRecord(value)) return false;
+  return (
+    RUN_STAGES.includes(value.stage as RunStage) &&
+    typeof value.reason === "string" &&
+    value.reason.trim().length > 0 &&
+    typeof value.requestedBy === "string" &&
+    value.requestedBy.trim().length > 0 &&
+    typeof value.requestedAt === "number" &&
+    Number.isFinite(value.requestedAt) &&
+    (!completed ||
+      (typeof value.completedAt === "number" &&
+        Number.isFinite(value.completedAt)))
+  );
+}
+
 function isValidOperationForStage(
   operation: ActiveOperation | undefined,
   stage: RunStage,
 ): boolean {
   if (!operation) return true;
   const stages: Record<ActiveOperation["kind"], readonly RunStage[]> = {
-    implementation: ["implementation"],
-    review: ["comprehensive_review", "smells_review", "critical_review"],
-    fix: [
-      "comprehensive_review",
-      "smells_review",
-      "fusion_review",
-      "critical_review",
+    [OPERATION_KIND.IMPLEMENTATION]: [RUN_STAGE.IMPLEMENTATION],
+    [OPERATION_KIND.REVIEW]: [
+      RUN_STAGE.COMPREHENSIVE_REVIEW,
+      RUN_STAGE.SMELLS_REVIEW,
+      RUN_STAGE.CRITICAL_REVIEW,
     ],
-    fusion: ["fusion_review"],
-    finalize: ["finalize"],
-    stats: ["stats"],
+    [OPERATION_KIND.FIX]: [
+      RUN_STAGE.COMPREHENSIVE_REVIEW,
+      RUN_STAGE.SMELLS_REVIEW,
+      RUN_STAGE.FUSION_REVIEW,
+      RUN_STAGE.CRITICAL_REVIEW,
+    ],
+    [OPERATION_KIND.FUSION]: [RUN_STAGE.FUSION_REVIEW],
+    [OPERATION_KIND.FINALIZE]: [RUN_STAGE.FINALIZE],
+    [OPERATION_KIND.STATS]: [RUN_STAGE.STATS],
   };
   return stages[operation.kind].includes(stage);
 }

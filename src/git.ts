@@ -2,6 +2,9 @@ import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, dirname, resolve } from "node:path";
 
+const PLAN_BRANCH_HASH_LENGTH = 8;
+const REPOSITORY_HASH_LENGTH = 12;
+
 export interface CommandResult {
   stdout: string;
   stderr: string;
@@ -93,7 +96,7 @@ export function branchNameFromPlan(planPath: string): string {
   const identity = createHash("sha256")
     .update(resolve(planPath))
     .digest("hex")
-    .slice(0, 8);
+    .slice(0, PLAN_BRANCH_HASH_LENGTH);
   return `${branch}-${identity}`;
 }
 
@@ -106,7 +109,7 @@ export async function createWorktree(
   const repositoryId = createHash("sha256")
     .update(resolve(repositoryRoot))
     .digest("hex")
-    .slice(0, 12);
+    .slice(0, REPOSITORY_HASH_LENGTH);
   const target = resolve(
     homedir(),
     ".pi",
@@ -134,11 +137,10 @@ export async function createWorktree(
   return target;
 }
 
-export async function verifyExecutionTree(
+export async function verifyExecutionRepository(
   run: RunCommand,
   cwd: string,
   expectedRepository: string,
-  expectedBranch: string,
 ): Promise<void> {
   const commonDirectory = await gitCommonDirectory(run, cwd);
   const expectedCommonDirectory = await gitCommonDirectory(
@@ -150,6 +152,15 @@ export async function verifyExecutionTree(
       "Execution directory no longer belongs to the expected repository.",
     );
   }
+}
+
+export async function verifyExecutionTree(
+  run: RunCommand,
+  cwd: string,
+  expectedRepository: string,
+  expectedBranch: string,
+): Promise<void> {
+  await verifyExecutionRepository(run, cwd, expectedRepository);
   const branch = await currentBranch(run, cwd);
   if (branch !== expectedBranch) {
     throw new Error(

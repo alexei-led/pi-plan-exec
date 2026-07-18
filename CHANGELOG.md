@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+## 0.4.0 - 2026-07-18
+
+- Fixed failed-fixer recovery so it reconciles a preserved operation before any
+  retry, and never adopts a child it launched in the same resume call.
+- Disabled the subagent mutation completion guard for review fixers; an
+  independently verified false-positive finding may correctly need no edit.
+- Added `/exec resume <full-run-id> --adopt-current-branch` for an interactive,
+  repository-verified, audited recovery when the execution tree moved branches.
+- Added `/exec skip <full-run-id> --reason <text>` for interactive, durable
+  review/finalize/stats waivers. It stops tracked children before advancing,
+  records the audit trail, and completes honestly with findings.
+- Centralized persisted state-machine constants and added ESLint guards for
+  magic runtime numbers and raw domain literals in control flow.
+
 ## 0.3.0 - 2026-07-16
 
 - Made failed-run recovery preserve and reconcile operation identity before any

@@ -1,48 +1,60 @@
-import type { PlanExecRun, RunStage, RunStatus } from "./types.js";
+import {
+  RUN_STAGE,
+  RUN_STATUS,
+  type PlanExecRun,
+  type RunStage,
+  type RunStatus,
+} from "./types.js";
 
 export const PIPELINE_STAGES = [
-  "comprehensive_review",
-  "smells_review",
-  "fusion_review",
-  "critical_review",
-  "finalize",
-  "stats",
-  "archive",
+  RUN_STAGE.COMPREHENSIVE_REVIEW,
+  RUN_STAGE.SMELLS_REVIEW,
+  RUN_STAGE.FUSION_REVIEW,
+  RUN_STAGE.CRITICAL_REVIEW,
+  RUN_STAGE.FINALIZE,
+  RUN_STAGE.STATS,
+  RUN_STAGE.ARCHIVE,
 ] as const satisfies readonly RunStage[];
 
 export const STAGE_ORDER = [
-  "resolve",
-  "isolation",
-  "project_tasks",
-  "branch",
-  "progress",
-  "implementation",
+  RUN_STAGE.RESOLVE,
+  RUN_STAGE.ISOLATION,
+  RUN_STAGE.PROJECT_TASKS,
+  RUN_STAGE.BRANCH,
+  RUN_STAGE.PROGRESS,
+  RUN_STAGE.IMPLEMENTATION,
   ...PIPELINE_STAGES,
-  "complete",
+  RUN_STAGE.COMPLETE,
 ] as const satisfies readonly RunStage[];
 
 const TERMINAL_STATUSES = new Set<RunStatus>([
-  "completed",
-  "completed_with_findings",
-  "cancelled",
-  "failed",
+  RUN_STATUS.COMPLETED,
+  RUN_STATUS.COMPLETED_WITH_FINDINGS,
+  RUN_STATUS.CANCELLED,
+  RUN_STATUS.FAILED,
 ]);
 
 const REVIEW_STAGES = new Set<RunStage>([
-  "comprehensive_review",
-  "smells_review",
-  "fusion_review",
-  "critical_review",
+  RUN_STAGE.COMPREHENSIVE_REVIEW,
+  RUN_STAGE.SMELLS_REVIEW,
+  RUN_STAGE.FUSION_REVIEW,
+  RUN_STAGE.CRITICAL_REVIEW,
+]);
+
+const SKIPPABLE_STAGES = new Set<RunStage>([
+  ...REVIEW_STAGES,
+  RUN_STAGE.FINALIZE,
+  RUN_STAGE.STATS,
 ]);
 
 const NEXT_STAGES: Partial<Record<RunStage, RunStage>> = {
-  comprehensive_review: "smells_review",
-  smells_review: "fusion_review",
-  fusion_review: "critical_review",
-  critical_review: "finalize",
-  finalize: "stats",
-  stats: "archive",
-  archive: "complete",
+  [RUN_STAGE.COMPREHENSIVE_REVIEW]: RUN_STAGE.SMELLS_REVIEW,
+  [RUN_STAGE.SMELLS_REVIEW]: RUN_STAGE.FUSION_REVIEW,
+  [RUN_STAGE.FUSION_REVIEW]: RUN_STAGE.CRITICAL_REVIEW,
+  [RUN_STAGE.CRITICAL_REVIEW]: RUN_STAGE.FINALIZE,
+  [RUN_STAGE.FINALIZE]: RUN_STAGE.STATS,
+  [RUN_STAGE.STATS]: RUN_STAGE.ARCHIVE,
+  [RUN_STAGE.ARCHIVE]: RUN_STAGE.COMPLETE,
 };
 
 export function isTerminalStatus(status: RunStatus): boolean {
@@ -51,6 +63,10 @@ export function isTerminalStatus(status: RunStatus): boolean {
 
 export function isReviewStage(stage: RunStage): boolean {
   return REVIEW_STAGES.has(stage);
+}
+
+export function isSkippableStage(stage: RunStage): boolean {
+  return SKIPPABLE_STAGES.has(stage);
 }
 
 export function nextStage(stage: RunStage): RunStage {
@@ -64,5 +80,8 @@ export function stageIndex(stage: RunStage): number {
 }
 
 export function isRecoverableRun(run: PlanExecRun): boolean {
-  return run.status === "failed" || run.status === "cancel_pending";
+  return (
+    run.status === RUN_STATUS.FAILED ||
+    run.status === RUN_STATUS.CANCEL_PENDING
+  );
 }

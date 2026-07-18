@@ -2,9 +2,20 @@ import { requestRpc, type EventBus } from "./rpc.js";
 
 export const FUSION_REQUEST_EVENT = "fusion:rpc:v1:request";
 const FUSION_REPLY_PREFIX = "fusion:rpc:v1:reply:";
+const DEFAULT_FUSION_TIMEOUT_MS = 30_000;
+
+export const FUSION_PHASE = {
+  CHAIN: "chain",
+  PANEL: "panel",
+  JUDGE: "judge",
+  DONE: "done",
+  FAILED: "failed",
+  CANCELLED: "cancelled",
+} as const;
 
 export type FusionPhase =
-  "chain" | "panel" | "judge" | "done" | "failed" | "cancelled";
+  (typeof FUSION_PHASE)[keyof typeof FUSION_PHASE];
+const FUSION_PHASES = new Set<FusionPhase>(Object.values(FUSION_PHASE));
 
 export interface FusionRunState {
   runId: string;
@@ -22,7 +33,7 @@ export type FusionResult =
 export class FusionClient {
   constructor(
     private readonly events: EventBus,
-    private readonly timeoutMs = 30_000,
+    private readonly timeoutMs = DEFAULT_FUSION_TIMEOUT_MS,
   ) {}
 
   ping(): Promise<FusionResult> {
@@ -157,9 +168,7 @@ function parseReply(value: unknown): FusionResult {
 }
 
 function isFusionPhase(value: string): value is FusionPhase {
-  return ["chain", "panel", "judge", "done", "failed", "cancelled"].includes(
-    value,
-  );
+  return FUSION_PHASES.has(value as FusionPhase);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

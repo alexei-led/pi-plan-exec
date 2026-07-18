@@ -10,6 +10,7 @@ import {
   defaultBranch,
   ensureCleanForWorktree,
   requireGitRepository,
+  verifyExecutionRepository,
   verifyExecutionTree,
   worktreePlanPath,
   type RunCommand,
@@ -17,6 +18,7 @@ import {
 import {
   isRecoverableRun,
   isReviewStage,
+  isSkippableStage,
   isTerminalStatus,
   nextStage,
 } from "./lifecycle.js";
@@ -28,34 +30,37 @@ import {
   hasBlockingFindings,
   parseReviewFindings,
 } from "./review.js";
-import type {
-  ActiveOperation,
-  FrozenRunConfig,
-  PlanExecRun,
-  ReviewFinding,
-  RunStage,
+import {
+  COMPLETED_PLANS_DIRECTORY,
+  DEFAULT_FROZEN_RUN_CONFIG,
+  EXTERNAL_OPERATION_STATE,
+  OPERATION_KIND,
+  OPERATION_RECOVERY,
+  OPERATION_SERVICE,
+  RUN_STAGE,
+  RUN_STATUS,
+  type ActiveOperation,
+  type FrozenRunConfig,
+  type PlanExecRun,
+  type ReviewFinding,
+  type RunStage,
 } from "./types.js";
 
-const MAX_STATUS_FAILURES = 3;
+export const MAX_STATUS_FAILURES = 3;
+const TERMINAL_BRIDGE_OPERATION_STATES = new Set<string>([
+  EXTERNAL_OPERATION_STATE.COMPLETE,
+  EXTERNAL_OPERATION_STATE.DONE,
+  EXTERNAL_OPERATION_STATE.FAILED,
+  EXTERNAL_OPERATION_STATE.STOPPED,
+  EXTERNAL_OPERATION_STATE.PAUSED,
+  EXTERNAL_OPERATION_STATE.ABORTED,
+]);
+const OPERATION_UPDATE_CAS_RETRIES = 5;
 const OPERATION_RECOVERY_DELAY_MS = 35_000;
 const RECOVERY_WORKER_MAX_TURNS = 75;
 const RECOVERY_REVIEWER_MAX_TURNS = 75;
 export const PLAN_STRUCTURE_CHANGED_ERROR =
   "Plan task structure changed outside checkbox completion.";
-
-const INITIAL_CONFIG: FrozenRunConfig = {
-  taskRetries: 1,
-  maxTaskIterations: 50,
-  reviewIterations: 5,
-  fusionIterations: 10,
-  finalizeEnabled: true,
-  workerAgent: "worker",
-  workerMaxTurns: RECOVERY_WORKER_MAX_TURNS,
-  reviewerAgent: "reviewer",
-  reviewerMaxTurns: 30,
-  statsAgent: "reviewer",
-  statsMaxTurns: 30,
-};
 
 type ServiceReply =
   | { success: true; data: Record<string, unknown> }
@@ -135,13 +140,15 @@ export class PlanExecController {
       worktreeCwd,
       branch,
       defaultBranch: baseBranch,
-      status: "starting",
-      stage: "resolve",
+      status: RUN_STATUS.STARTING,
+      stage: RUN_STAGE.RESOLVE,
       taskAttempts: {},
       stageAttempts: {},
       reviewFindings: [],
-      config: INITIAL_CONFIG,
+      config: DEFAULT_FROZEN_RUN_CONFIG,
       unresolvedFindings: [],
+      skippedStages: [],
+      branchRebindings: [],
     });
     return this.advance(await this.registry.claim(run, options.sessionId));
   }
@@ -186,23 +193,176 @@ export class PlanExecController {
     let prepared = claimed;
     if (reviewedPlanHash !== undefined) {
       const adopted = await this.registry.updateIfCurrent(
-        { ...claimed, planHash: reviewedPlanHash, status: "paused" },
+        {
+          ...claimed,
+          planHash: reviewedPlanHash,
+          status: RUN_STATUS.PAUSED,
+        },
         claimed.updatedAt,
       );
       if (!adopted.applied) return adopted.run;
       prepared = adopted.run;
     }
+    const preservedOperationId = prepared.activeOperation?.operationId;
     if (explicit && isRecoverableFailure(prepared)) {
       prepared = await this.recoverFailedRun(prepared);
-    } else if (explicit && prepared.status === "paused") {
+    } else if (explicit && prepared.status === RUN_STATUS.PAUSED) {
       const resumed = await this.registry.updateIfCurrent(
-        clearError({ ...prepared, status: "running" }),
+        clearError({ ...prepared, status: RUN_STATUS.RUNNING }),
         prepared.updatedAt,
       );
       if (!resumed.applied) return resumed.run;
       prepared = resumed.run;
     }
-    return this.advanceUnlocked(await this.adoptActiveOperation(prepared));
+    const shouldAdoptPreservedOperation =
+      preservedOperationId !== undefined &&
+      prepared.activeOperation?.operationId === preservedOperationId;
+    return this.advanceUnlocked(
+      shouldAdoptPreservedOperation
+        ? await this.adoptActiveOperation(prepared)
+        : prepared,
+    );
+  }
+
+  async rebindBranchAndResume(
+    runId: string,
+    sessionId: string,
+  ): Promise<PlanExecRun> {
+    const coordinated = await this.registry.withControllerLock(runId, () =>
+      this.rebindBranchAndResumeLocked(runId, sessionId),
+    );
+    if (coordinated) return coordinated;
+    const current = await this.registry.get(runId);
+    if (!current) throw new Error(`Plan execution run not found: ${runId}`);
+    return current;
+  }
+
+  private async rebindBranchAndResumeLocked(
+    runId: string,
+    sessionId: string,
+  ): Promise<PlanExecRun> {
+    const existing = await this.registry.get(runId);
+    if (!existing) throw new Error(`Plan execution run not found: ${runId}`);
+    const claimed = await this.registry.claim(existing, sessionId);
+    if (
+      isTerminalStatus(claimed.status) &&
+      claimed.status !== RUN_STATUS.FAILED
+    )
+      throw new Error(`Run ${runId} is already ${claimed.status}.`);
+    if (claimed.activeOperation)
+      throw new Error(
+        "Cannot adopt the current branch while an external operation is tracked.",
+      );
+    await verifyExecutionRepository(
+      this.runCommand,
+      claimed.worktreeCwd,
+      claimed.repositoryRoot,
+    );
+    const branch = await currentBranch(this.runCommand, claimed.worktreeCwd);
+    if (branch === claimed.branch)
+      throw new Error(`Execution branch is already ${branch}.`);
+    const requestedAt = Date.now();
+    const rebound = await this.registry.updateIfCurrent(
+      {
+        ...claimed,
+        branch,
+        branchRebindings: [
+          ...claimed.branchRebindings,
+          {
+            from: claimed.branch,
+            to: branch,
+            requestedAt,
+            requestedBy: sessionId,
+          },
+        ],
+      },
+      claimed.updatedAt,
+    );
+    if (!rebound.applied) return rebound.run;
+    await appendProgressBestEffort(
+      rebound.run,
+      `Execution branch rebound by ${sessionId}: ${claimed.branch} -> ${branch}`,
+    );
+    if (
+      rebound.run.status === RUN_STATUS.FAILED ||
+      rebound.run.status === RUN_STATUS.PAUSED ||
+      rebound.run.status === RUN_STATUS.CANCEL_PENDING
+    )
+      return this.resumeLocked(runId, sessionId, true);
+    return this.advanceUnlocked(rebound.run);
+  }
+
+  async skip(
+    runId: string,
+    sessionId: string,
+    reason: string,
+  ): Promise<PlanExecRun> {
+    const coordinated = await this.registry.withControllerLock(runId, () =>
+      this.skipLocked(runId, sessionId, reason),
+    );
+    if (coordinated) return coordinated;
+    const current = await this.registry.get(runId);
+    if (!current) throw new Error(`Plan execution run not found: ${runId}`);
+    return current;
+  }
+
+  private async skipLocked(
+    runId: string,
+    sessionId: string,
+    reason: string,
+  ): Promise<PlanExecRun> {
+    const trimmedReason = reason.trim();
+    if (!trimmedReason) throw new Error("Force-skip requires a reason.");
+    const existing = await this.registry.get(runId);
+    if (!existing) throw new Error(`Plan execution run not found: ${runId}`);
+    const claimed = await this.registry.claim(existing, sessionId);
+    if (!isSkippableStage(claimed.stage))
+      throw new Error(`Stage ${claimed.stage} cannot be force-skipped.`);
+    if (
+      claimed.status !== RUN_STATUS.FAILED &&
+      claimed.status !== RUN_STATUS.PAUSED &&
+      claimed.status !== RUN_STATUS.SKIP_PENDING
+    ) {
+      throw new Error(
+        `Stage ${claimed.stage} cannot be force-skipped while the run is ${claimed.status}.`,
+      );
+    }
+    let requested = claimed;
+    if (!claimed.pendingStageSkip) {
+      const requestedAt = Date.now();
+      const persisted = await this.registry.updateIfCurrent(
+        {
+          ...claimed,
+          status: RUN_STATUS.SKIP_PENDING,
+          pendingStageSkip: {
+            stage: claimed.stage,
+            reason: trimmedReason,
+            requestedAt,
+            requestedBy: sessionId,
+          },
+        },
+        claimed.updatedAt,
+      );
+      if (!persisted.applied) return persisted.run;
+      requested = persisted.run;
+      await appendProgressBestEffort(
+        requested,
+        `Force-skip requested for ${requested.stage} by ${sessionId}: ${trimmedReason}`,
+      );
+    } else if (claimed.status !== RUN_STATUS.SKIP_PENDING) {
+      const resetOperation = resetOperationFailures(claimed.activeOperation);
+      const persisted = await this.registry.updateIfCurrent(
+        clearError({
+          ...claimed,
+          status: RUN_STATUS.SKIP_PENDING,
+          ...(resetOperation ? { activeOperation: resetOperation } : {}),
+        }),
+        claimed.updatedAt,
+      );
+      if (!persisted.applied) return persisted.run;
+      requested = persisted.run;
+    }
+    return this.advanceUnlocked(requested);
   }
 
   async advance(run: PlanExecRun): Promise<PlanExecRun> {
@@ -215,8 +375,10 @@ export class PlanExecController {
 
   private async advanceUnlocked(run: PlanExecRun): Promise<PlanExecRun> {
     if (isTerminalStatus(run.status)) return run;
-    if (run.status === "cancel_pending") return this.cancel(run);
-    if (run.status === "paused") {
+    if (run.status === RUN_STATUS.CANCEL_PENDING) return this.cancel(run);
+    if (run.status === RUN_STATUS.SKIP_PENDING)
+      return this.advanceStageSkip(run);
+    if (run.status === RUN_STATUS.PAUSED) {
       return run.activeOperation ? this.observePausedOperation(run) : run;
     }
     if (run.activeOperation) return this.observeActiveOperation(run);
@@ -228,49 +390,53 @@ export class PlanExecController {
       run.branch,
     );
     switch (run.stage) {
-      case "resolve":
+      case RUN_STAGE.RESOLVE:
         return this.transition(
           run,
-          "project_tasks",
+          RUN_STAGE.PROJECT_TASKS,
           "Plan validated; projecting task list.",
         );
-      case "project_tasks":
-        return this.transition(run, "branch", "Task projection created.");
-      case "branch":
+      case RUN_STAGE.PROJECT_TASKS:
         return this.transition(
           run,
-          "progress",
+          RUN_STAGE.BRANCH,
+          "Task projection created.",
+        );
+      case RUN_STAGE.BRANCH:
+        return this.transition(
+          run,
+          RUN_STAGE.PROGRESS,
           `Execution branch ready: ${run.branch}.`,
         );
-      case "progress": {
+      case RUN_STAGE.PROGRESS: {
         const progressPath = await initializeProgress(run);
         return this.transition(
           { ...run, progressPath },
-          "implementation",
+          RUN_STAGE.IMPLEMENTATION,
           "Progress log initialized.",
         );
       }
-      case "implementation":
+      case RUN_STAGE.IMPLEMENTATION:
         return this.advanceImplementation(run);
-      case "comprehensive_review":
-      case "smells_review":
-      case "critical_review":
+      case RUN_STAGE.COMPREHENSIVE_REVIEW:
+      case RUN_STAGE.SMELLS_REVIEW:
+      case RUN_STAGE.CRITICAL_REVIEW:
         return this.launchReview(run);
-      case "fusion_review":
+      case RUN_STAGE.FUSION_REVIEW:
         return this.launchFusion(run);
-      case "finalize":
+      case RUN_STAGE.FINALIZE:
         return this.launchFinalizer(run);
-      case "stats":
+      case RUN_STAGE.STATS:
         return this.launchStats(run);
-      case "archive":
+      case RUN_STAGE.ARCHIVE:
         return this.archive(run);
-      case "isolation":
+      case RUN_STAGE.ISOLATION:
         return this.transition(
           run,
-          "project_tasks",
+          RUN_STAGE.PROJECT_TASKS,
           "Isolation was selected before run creation.",
         );
-      case "complete":
+      case RUN_STAGE.COMPLETE:
         return this.complete(run);
     }
   }
@@ -284,7 +450,7 @@ export class PlanExecController {
     if (!task)
       return this.transition(
         run,
-        "comprehensive_review",
+        RUN_STAGE.COMPREHENSIVE_REVIEW,
         "All plan checkboxes are complete.",
       );
     const attempts = run.taskAttempts[String(task.id)] ?? 0;
@@ -301,7 +467,7 @@ export class PlanExecController {
       );
     }
     return this.launchBridge(run, {
-      kind: "implementation",
+      kind: OPERATION_KIND.IMPLEMENTATION,
       taskId: task.id,
       agent: run.config.workerAgent,
       maxTurns: run.config.workerMaxTurns,
@@ -312,7 +478,9 @@ export class PlanExecController {
   private async launchReview(run: PlanExecRun): Promise<PlanExecRun> {
     const iteration = (run.stageAttempts[run.stage] ?? 0) + 1;
     const limit =
-      run.stage === "comprehensive_review" ? run.config.reviewIterations : 1;
+      run.stage === RUN_STAGE.COMPREHENSIVE_REVIEW
+        ? run.config.reviewIterations
+        : 1;
     if (iteration > limit) {
       return this.advanceUnlocked(
         await this.recordUnresolvedAndAdvance(run, run.reviewFindings),
@@ -324,7 +492,7 @@ export class PlanExecController {
       reviewFindings: [],
     };
     return this.launchBridge(updated, {
-      kind: "review",
+      kind: OPERATION_KIND.REVIEW,
       reviewIteration: iteration,
       agent: updated.config.reviewerAgent,
       maxTurns: updated.config.reviewerMaxTurns,
@@ -333,7 +501,8 @@ export class PlanExecController {
   }
 
   private async launchFusion(run: PlanExecRun): Promise<PlanExecRun> {
-    const iteration = (run.stageAttempts.fusion_review ?? 0) + 1;
+    const iteration =
+      (run.stageAttempts[RUN_STAGE.FUSION_REVIEW] ?? 0) + 1;
     if (iteration > run.config.fusionIterations) {
       return this.advanceUnlocked(
         await this.recordUnresolvedAndAdvance(run, run.reviewFindings),
@@ -344,15 +513,18 @@ export class PlanExecController {
     const persisted = await this.registry.updateIfCurrent(
       {
         ...run,
-        stageAttempts: { ...run.stageAttempts, fusion_review: iteration },
+        stageAttempts: {
+          ...run.stageAttempts,
+          [RUN_STAGE.FUSION_REVIEW]: iteration,
+        },
         reviewFindings: [],
         activeOperation: {
           operationId,
-          service: "fusion",
-          kind: "fusion",
+          service: OPERATION_SERVICE.FUSION,
+          kind: OPERATION_KIND.FUSION,
           reviewIteration: iteration,
           launchStartedAt,
-          recovery: "replay",
+          recovery: OPERATION_RECOVERY.REPLAY,
           params: {
             prompt: fusionPrompt(run),
             ...(run.config.fusionProfile
@@ -377,15 +549,19 @@ export class PlanExecController {
       return this.fail(intended, "Fusion start returned no run ID.", true);
     return this.updateActiveOperation(intended, operationId, {
       externalRunId: state.runId,
-      recovery: "observe",
+      recovery: OPERATION_RECOVERY.OBSERVE,
     });
   }
 
   private launchFinalizer(run: PlanExecRun): Promise<PlanExecRun> {
     if (!run.config.finalizeEnabled)
-      return this.transition(run, "stats", "Finalization disabled.");
+      return this.transition(
+        run,
+        RUN_STAGE.STATS,
+        "Finalization disabled.",
+      );
     return this.launchBridge(run, {
-      kind: "finalize",
+      kind: OPERATION_KIND.FINALIZE,
       agent: run.config.workerAgent,
       maxTurns: run.config.workerMaxTurns,
       task: finalizerPrompt(run),
@@ -394,7 +570,7 @@ export class PlanExecController {
 
   private launchStats(run: PlanExecRun): Promise<PlanExecRun> {
     return this.launchBridge(run, {
-      kind: "stats",
+      kind: OPERATION_KIND.STATS,
       agent: run.config.statsAgent,
       maxTurns: run.config.statsMaxTurns,
       task: statsPrompt(run),
@@ -421,18 +597,21 @@ export class PlanExecController {
       context: "fresh",
       turnBudget: { maxTurns: input.maxTurns },
       acceptance: false,
+      ...(input.kind === OPERATION_KIND.FIX
+        ? { completionGuard: false }
+        : {}),
     };
     const persisted = await this.registry.updateIfCurrent(
       {
         ...run,
-        status: "running",
+        status: RUN_STATUS.RUNNING,
         activeOperation: {
           operationId,
-          service: "bridge",
+          service: OPERATION_SERVICE.BRIDGE,
           kind: input.kind,
           params,
           launchStartedAt,
-          recovery: "replay",
+          recovery: OPERATION_RECOVERY.REPLAY,
           ...(input.taskId ? { taskId: input.taskId } : {}),
           ...(input.reviewIteration
             ? { reviewIteration: input.reviewIteration }
@@ -451,7 +630,7 @@ export class PlanExecController {
     const asyncDir = text(reply.data.asyncDir);
     return this.updateActiveOperation(intended, operationId, {
       externalRunId,
-      recovery: "observe",
+      recovery: OPERATION_RECOVERY.OBSERVE,
       ...(asyncDir ? { asyncDir } : {}),
     });
   }
@@ -465,7 +644,7 @@ export class PlanExecController {
       Date.now() - operation.launchStartedAt < OPERATION_RECOVERY_DELAY_MS
     )
       return run;
-    if (operation.service === "bridge") {
+    if (operation.service === OPERATION_SERVICE.BRIDGE) {
       const lookup = await this.bridge.operation(operation.operationId);
       if (!lookup.success)
         return this.fail(
@@ -474,7 +653,7 @@ export class PlanExecController {
           true,
         );
       const lookupState = text(lookup.data.state);
-      if (lookupState === "found") {
+      if (lookupState === EXTERNAL_OPERATION_STATE.FOUND) {
         const externalRunId = text(lookup.data.runId);
         if (!externalRunId)
           return this.fail(
@@ -485,18 +664,18 @@ export class PlanExecController {
         const asyncDir = text(lookup.data.asyncDir);
         return this.updateActiveOperation(run, operation.operationId, {
           externalRunId,
-          recovery: "observe",
+          recovery: OPERATION_RECOVERY.OBSERVE,
           ...(asyncDir ? { asyncDir } : {}),
         });
       }
-      if (lookupState === "pending") return run;
-      if (lookupState === "unknown")
+      if (lookupState === EXTERNAL_OPERATION_STATE.PENDING) return run;
+      if (lookupState === EXTERNAL_OPERATION_STATE.UNKNOWN)
         return this.fail(
           run,
           "Bridge operation lookup is unresolved; retry /exec resume after the provider recovers.",
           true,
         );
-      if (lookupState === "absent")
+      if (lookupState === EXTERNAL_OPERATION_STATE.ABSENT)
         return this.fail(
           run,
           "Bridge has no record of this operation; refusing to launch a possible duplicate worker.",
@@ -519,7 +698,7 @@ export class PlanExecController {
     if (!state) return this.fail(run, "Fusion start returned no run ID.", true);
     return this.updateActiveOperation(run, operation.operationId, {
       externalRunId: state.runId,
-      recovery: "observe",
+      recovery: OPERATION_RECOVERY.OBSERVE,
     });
   }
 
@@ -529,7 +708,7 @@ export class PlanExecController {
     patch: Partial<ActiveOperation>,
   ): Promise<PlanExecRun> {
     let current = (await this.registry.get(run.id)) ?? run;
-    for (let attempt = 0; attempt < 5; attempt += 1) {
+    for (let attempt = 0; attempt < OPERATION_UPDATE_CAS_RETRIES; attempt += 1) {
       if (current.activeOperation?.operationId !== operationId) return current;
       const updated = await this.registry.updateIfCurrent(
         {
@@ -549,7 +728,7 @@ export class PlanExecController {
     operation: ActiveOperation,
   ): Promise<Record<string, unknown>> {
     let task: string;
-    if (operation.kind === "implementation") {
+    if (operation.kind === OPERATION_KIND.IMPLEMENTATION) {
       const plan = await readPlan(run.planPath);
       const taskData = plan.tasks.find(
         (candidate) => candidate.id === operation.taskId,
@@ -559,17 +738,17 @@ export class PlanExecController {
           "Cannot recover an implementation task that no longer exists.",
         );
       task = workerPrompt(run, taskData.id, taskData.title, taskData.unchecked);
-    } else if (operation.kind === "review") {
+    } else if (operation.kind === OPERATION_KIND.REVIEW) {
       task = reviewerPrompt(run);
-    } else if (operation.kind === "fix") {
+    } else if (operation.kind === OPERATION_KIND.FIX) {
       task = fixerPrompt(
         run,
         run.reviewFindings,
         formatFindings(run.reviewFindings),
       );
-    } else if (operation.kind === "finalize") {
+    } else if (operation.kind === OPERATION_KIND.FINALIZE) {
       task = finalizerPrompt(run);
-    } else if (operation.kind === "stats") {
+    } else if (operation.kind === OPERATION_KIND.STATS) {
       task = statsPrompt(run);
     } else {
       throw new Error(
@@ -578,9 +757,9 @@ export class PlanExecController {
     }
     return {
       agent:
-        operation.kind === "stats"
+        operation.kind === OPERATION_KIND.STATS
           ? run.config.statsAgent
-          : operation.kind === "review"
+          : operation.kind === OPERATION_KIND.REVIEW
             ? run.config.reviewerAgent
             : run.config.workerAgent,
       task,
@@ -588,13 +767,16 @@ export class PlanExecController {
       context: "fresh",
       turnBudget: {
         maxTurns:
-          operation.kind === "stats"
+          operation.kind === OPERATION_KIND.STATS
             ? run.config.statsMaxTurns
-            : operation.kind === "review"
+            : operation.kind === OPERATION_KIND.REVIEW
               ? run.config.reviewerMaxTurns
               : run.config.workerMaxTurns,
       },
       acceptance: false,
+      ...(operation.kind === OPERATION_KIND.FIX
+        ? { completionGuard: false }
+        : {}),
     };
   }
 
@@ -602,7 +784,7 @@ export class PlanExecController {
     const operation = run.activeOperation;
     if (!operation?.externalRunId) return run;
     const status =
-      operation.service === "bridge"
+      operation.service === OPERATION_SERVICE.BRIDGE
         ? await this.bridge.status(operation.externalRunId, operation.asyncDir)
         : await this.fusion.status(operation.externalRunId);
     if (!status.success)
@@ -614,16 +796,16 @@ export class PlanExecController {
     const observed = await this.recordObservation(run, operation);
     if (!sameOperationState(run, observed, operation)) return observed;
     const state =
-      operation.service === "bridge"
+      operation.service === OPERATION_SERVICE.BRIDGE
         ? text(status.data.state)
         : fusionState(status.data)?.phase;
     if (
       !state ||
-      state === "running" ||
-      state === "stopping" ||
-      state === "chain" ||
-      state === "panel" ||
-      state === "judge"
+      state === EXTERNAL_OPERATION_STATE.RUNNING ||
+      state === EXTERNAL_OPERATION_STATE.STOPPING ||
+      state === EXTERNAL_OPERATION_STATE.CHAIN ||
+      state === EXTERNAL_OPERATION_STATE.PANEL ||
+      state === EXTERNAL_OPERATION_STATE.JUDGE
     ) {
       return observed;
     }
@@ -639,7 +821,7 @@ export class PlanExecController {
     if (!operation) return this.fail(run, "Active operation is missing.");
     if (!operation.externalRunId)
       return this.recoverActiveOperation(run, operation);
-    if (operation.service === "fusion")
+    if (operation.service === OPERATION_SERVICE.FUSION)
       return this.observeFusion(run, operation);
     return this.observeBridge(run, operation);
   }
@@ -661,11 +843,16 @@ export class PlanExecController {
     const observed = await this.recordObservation(run, operation);
     if (!sameOperationState(run, observed, operation)) return observed;
     const state = text(status.data.state);
-    if (!state || state === "running" || state === "stopping") return observed;
+    if (
+      !state ||
+      state === EXTERNAL_OPERATION_STATE.RUNNING ||
+      state === EXTERNAL_OPERATION_STATE.STOPPING
+    )
+      return observed;
 
-    if (operation.kind === "implementation")
+    if (operation.kind === OPERATION_KIND.IMPLEMENTATION)
       return this.finishImplementation(observed, operation, state);
-    if (operation.kind === "review") {
+    if (operation.kind === OPERATION_KIND.REVIEW) {
       let output: string;
       try {
         output = await this.bridgeOutput(operation);
@@ -680,12 +867,22 @@ export class PlanExecController {
       if (!sameOperationState(observed, current, operation)) return current;
       return this.finishReview(current, operation, state, output);
     }
-    if (operation.kind === "fix")
+    if (operation.kind === OPERATION_KIND.FIX)
       return this.finishFix(observed, operation, state);
-    if (operation.kind === "finalize")
-      return this.finishBestEffort(observed, operation, state, "stats");
-    if (operation.kind === "stats")
-      return this.finishBestEffort(observed, operation, state, "archive");
+    if (operation.kind === OPERATION_KIND.FINALIZE)
+      return this.finishBestEffort(
+        observed,
+        operation,
+        state,
+        RUN_STAGE.STATS,
+      );
+    if (operation.kind === OPERATION_KIND.STATS)
+      return this.finishBestEffort(
+        observed,
+        operation,
+        state,
+        RUN_STAGE.ARCHIVE,
+      );
     return this.fail(
       run,
       `Unexpected bridge operation kind: ${operation.kind}.`,
@@ -764,7 +961,7 @@ export class PlanExecController {
       ...run,
       activeOperation: {
         ...operation,
-        recovery: "cancel" as const,
+        recovery: OPERATION_RECOVERY.CANCEL,
         statusFailures: failures,
         lastStatusError: error,
       },
@@ -776,26 +973,45 @@ export class PlanExecController {
 
   private async recoverFailedRun(run: PlanExecRun): Promise<PlanExecRun> {
     const plan =
-      run.stage === "archive" ? undefined : await readPlan(run.planPath);
+      run.stage === RUN_STAGE.ARCHIVE
+        ? undefined
+        : await readPlan(run.planPath);
     if (plan && plan.hash !== run.planHash)
       return this.pauseForReview(run, PLAN_STRUCTURE_CHANGED_ERROR);
+    if (run.pendingStageSkip) {
+      const resetOperation = resetOperationFailures(run.activeOperation);
+      const recovered = await this.registry.updateIfCurrent(
+        clearError({
+          ...run,
+          status: RUN_STATUS.SKIP_PENDING,
+          ...(resetOperation ? { activeOperation: resetOperation } : {}),
+        }),
+        run.updatedAt,
+      );
+      if (!recovered.applied) return recovered.run;
+      await appendProgressBestEffort(
+        recovered.run,
+        `Manual recovery continued the pending force-skip for ${run.pendingStageSkip.stage}.`,
+      );
+      return recovered.run;
+    }
 
     const task =
-      run.stage === "implementation"
+      run.stage === RUN_STAGE.IMPLEMENTATION
         ? plan?.tasks.find((candidate) => candidate.unchecked.length > 0)
         : undefined;
     const config = recoveryConfig(run);
     const retryFailedReview =
       isReviewStage(run.stage) &&
-      (run.failedOperation?.kind === "review" ||
-        run.failedOperation?.kind === "fusion");
+      (run.failedOperation?.kind === OPERATION_KIND.REVIEW ||
+        run.failedOperation?.kind === OPERATION_KIND.FUSION);
     const recovered = await this.registry.updateIfCurrent(
       clearError({
         ...run,
         status:
-          run.activeOperation?.recovery === "cancel"
-            ? "cancel_pending"
-            : "running",
+          run.activeOperation?.recovery === OPERATION_RECOVERY.CANCEL
+            ? RUN_STATUS.CANCEL_PENDING
+            : RUN_STATUS.RUNNING,
         config,
         ...(retryFailedReview
           ? {
@@ -808,7 +1024,7 @@ export class PlanExecController {
               },
             }
           : {}),
-        ...(run.stage === "implementation" && task
+        ...(run.stage === RUN_STAGE.IMPLEMENTATION && task
           ? {
               taskAttempts: {
                 ...run.taskAttempts,
@@ -821,7 +1037,7 @@ export class PlanExecController {
     );
     if (!recovered.applied) return recovered.run;
     const retryFailedFix =
-      (run.failedOperation?.kind === "fix" ||
+      (run.failedOperation?.kind === OPERATION_KIND.FIX ||
         /^Fix operation ended as .+\.$/.test(run.error ?? "")) &&
       isReviewStage(run.stage) &&
       run.reviewFindings.length > 0;
@@ -835,9 +1051,9 @@ export class PlanExecController {
             ? `Manual recovery reset the failed ${run.stage} review attempt.`
             : `Manual recovery retried the failed ${run.stage} stage.`,
     );
-    if (!retryFailedFix) return recovered.run;
+    if (!retryFailedFix || recovered.run.activeOperation) return recovered.run;
     return this.launchBridge(recovered.run, {
-      kind: "fix",
+      kind: OPERATION_KIND.FIX,
       reviewIteration:
         run.failedOperation?.reviewIteration ??
         run.stageAttempts[run.stage] ??
@@ -857,7 +1073,7 @@ export class PlanExecController {
     error: string,
   ): Promise<PlanExecRun> {
     const paused = await this.registry.updateIfCurrent(
-      withoutOperation({ ...run, status: "paused", error }),
+      withoutOperation({ ...run, status: RUN_STATUS.PAUSED, error }),
       run.updatedAt,
     );
     if (!paused.applied) return paused.run;
@@ -912,7 +1128,9 @@ export class PlanExecController {
     const cleared = withoutOperation(run);
     const iteration = operation.reviewIteration ?? 1;
     const limit =
-      run.stage === "comprehensive_review" ? run.config.reviewIterations : 1;
+      run.stage === RUN_STAGE.COMPREHENSIVE_REVIEW
+        ? run.config.reviewIterations
+        : 1;
     if (iteration >= limit) {
       return this.fail(
         run,
@@ -939,7 +1157,7 @@ export class PlanExecController {
     state: string,
     output: string,
   ): Promise<PlanExecRun> {
-    if (state !== "complete" && state !== "done")
+    if (!isSuccessfulOperationState(state))
       return this.fail(run, `Review operation ended as ${state}.`);
     let findings: ReviewFinding[];
     try {
@@ -963,22 +1181,23 @@ export class PlanExecController {
     }
     const iteration = operation.reviewIteration ?? 1;
     const limit =
-      run.stage === "comprehensive_review"
+      run.stage === RUN_STAGE.COMPREHENSIVE_REVIEW
         ? run.config.reviewIterations
-        : run.stage === "fusion_review"
+        : run.stage === RUN_STAGE.FUSION_REVIEW
           ? run.config.fusionIterations
           : 1;
     const singlePass =
-      run.stage === "smells_review" || run.stage === "critical_review";
+      run.stage === RUN_STAGE.SMELLS_REVIEW ||
+      run.stage === RUN_STAGE.CRITICAL_REVIEW;
     const minorOnlyFusion =
-      run.stage === "fusion_review" && !hasBlockingFindings(findings);
+      run.stage === RUN_STAGE.FUSION_REVIEW && !hasBlockingFindings(findings);
     if (!singlePass && !minorOnlyFusion && iteration >= limit) {
       return this.advanceUnlocked(
         await this.recordUnresolvedAndAdvance(cleared, findings),
       );
     }
     return this.launchBridge(cleared, {
-      kind: "fix",
+      kind: OPERATION_KIND.FIX,
       reviewIteration: iteration,
       agent: cleared.config.workerAgent,
       maxTurns: cleared.config.workerMaxTurns,
@@ -992,13 +1211,16 @@ export class PlanExecController {
     state: string,
   ): Promise<PlanExecRun> {
     const cleared = withoutOperation(run);
-    if (state !== "complete")
+    if (state !== EXTERNAL_OPERATION_STATE.COMPLETE)
       return this.fail(run, `Fix operation ended as ${state}.`);
     await appendProgress(
       cleared,
       `Applied fixes for ${run.stage} iteration ${operation.reviewIteration ?? 1}.`,
     );
-    if (run.stage === "smells_review" || run.stage === "critical_review") {
+    if (
+      run.stage === RUN_STAGE.SMELLS_REVIEW ||
+      run.stage === RUN_STAGE.CRITICAL_REVIEW
+    ) {
       return this.advanceUnlocked(
         await this.transition(
           cleared,
@@ -1008,7 +1230,7 @@ export class PlanExecController {
       );
     }
     if (
-      run.stage === "fusion_review" &&
+      run.stage === RUN_STAGE.FUSION_REVIEW &&
       !hasBlockingFindings(run.reviewFindings)
     ) {
       return this.advanceUnlocked(
@@ -1028,7 +1250,7 @@ export class PlanExecController {
     state: string,
     next: RunStage,
   ): Promise<PlanExecRun> {
-    if (state !== "complete" && state !== "done")
+    if (!isSuccessfulOperationState(state))
       return this.fail(run, `${operation.kind} operation ended as ${state}.`);
     const cleared = withoutOperation(run);
     await appendProgress(
@@ -1043,13 +1265,10 @@ export class PlanExecController {
   private async archive(run: PlanExecRun): Promise<PlanExecRun> {
     const destination = join(
       dirname(run.planPath),
-      "completed",
+      COMPLETED_PLANS_DIRECTORY,
       basename(run.planPath),
     );
-    const status =
-      run.unresolvedFindings.length > 0
-        ? "completed_with_findings"
-        : "completed";
+    const status = completionStatus(run);
     try {
       await mkdir(dirname(destination), { recursive: true });
       const sourceExists = await pathExists(run.planPath);
@@ -1102,7 +1321,7 @@ export class PlanExecController {
       const completed = await this.registry.update({
         ...run,
         status,
-        stage: "complete",
+        stage: RUN_STAGE.COMPLETE,
       });
       return this.registry.release(completed);
     } catch (error: unknown) {
@@ -1114,14 +1333,11 @@ export class PlanExecController {
   }
 
   private async complete(run: PlanExecRun): Promise<PlanExecRun> {
-    const status =
-      run.unresolvedFindings.length > 0
-        ? "completed_with_findings"
-        : "completed";
+    const status = completionStatus(run);
     const completed = await this.registry.update({
       ...run,
       status,
-      stage: "complete",
+      stage: RUN_STAGE.COMPLETE,
     });
     await appendProgress(completed, `Run completed as ${status}.`);
     return this.registry.release(completed);
@@ -1146,11 +1362,240 @@ export class PlanExecController {
     );
   }
 
+  private async advanceStageSkip(run: PlanExecRun): Promise<PlanExecRun> {
+    const request = run.pendingStageSkip;
+    if (!request || request.stage !== run.stage)
+      return this.fail(run, "Force-skip state does not match the current stage.");
+    const operation = run.activeOperation;
+    if (!operation) return this.finishStageSkip(run, "no active operation");
+
+    if (!operation.externalRunId) {
+      if (operation.service === OPERATION_SERVICE.FUSION) {
+        const params = operation.params ?? {};
+        const prompt = text(params.prompt);
+        if (!prompt)
+          return this.recordStageSkipFailure(
+            run,
+            operation,
+            "Fusion recovery is missing its launch prompt during force-skip.",
+          );
+        const launched = await this.fusion.start(
+          operation.operationId,
+          prompt,
+          text(params.profile),
+        );
+        if (!launched.success)
+          return this.recordStageSkipFailure(
+            run,
+            operation,
+            `Unable to recover Fusion operation before force-skip: ${launched.error.message}`,
+          );
+        const state = fusionState(launched.data);
+        if (!state)
+          return this.recordStageSkipFailure(
+            run,
+            operation,
+            "Fusion recovery omitted the run ID or phase during force-skip.",
+          );
+        const attached = await this.updateActiveOperation(
+          run,
+          operation.operationId,
+          {
+            externalRunId: state.runId,
+            recovery: OPERATION_RECOVERY.OBSERVE,
+          },
+        );
+        return this.advanceStageSkip(attached);
+      }
+      const lookup = await this.bridge.operation(operation.operationId);
+      if (!lookup.success)
+        return this.recordStageSkipFailure(
+          run,
+          operation,
+          `Unable to look up bridge operation: ${lookup.error.message}`,
+        );
+      const lookupState = text(lookup.data.state);
+      if (lookupState === EXTERNAL_OPERATION_STATE.PENDING)
+        return this.registry.heartbeat(run);
+      if (
+        lookupState === EXTERNAL_OPERATION_STATE.ABSENT ||
+        lookupState === EXTERNAL_OPERATION_STATE.UNKNOWN
+      )
+        return this.recordStageSkipFailure(
+          run,
+          operation,
+          `Bridge operation lookup is ${lookupState}; force-skip cannot prove the worker is terminal.`,
+        );
+      if (lookupState !== EXTERNAL_OPERATION_STATE.FOUND)
+        return this.recordStageSkipFailure(
+          run,
+          operation,
+          "Bridge operation lookup returned an invalid state during force-skip.",
+        );
+      const externalRunId = text(lookup.data.runId);
+      if (!externalRunId)
+        return this.fail(
+          run,
+          "Bridge operation lookup omitted a run ID during force-skip.",
+          true,
+        );
+      const asyncDir = text(lookup.data.asyncDir);
+      const attached = await this.updateActiveOperation(
+        run,
+        operation.operationId,
+        {
+          externalRunId,
+          recovery: OPERATION_RECOVERY.OBSERVE,
+          ...(asyncDir ? { asyncDir } : {}),
+        },
+      );
+      return this.advanceStageSkip(attached);
+    }
+
+    const status =
+      operation.service === OPERATION_SERVICE.BRIDGE
+        ? await this.bridge.status(operation.externalRunId, operation.asyncDir)
+        : await this.fusion.status(operation.externalRunId);
+    if (!status.success)
+      return this.recordStageSkipFailure(
+        run,
+        operation,
+        `Unable to observe ${operation.service}/${operation.kind}: ${status.error.message}`,
+      );
+    const observed = await this.updateActiveOperation(
+      run,
+      operation.operationId,
+      { lastObservedAt: Date.now() },
+    );
+    if (!sameOperationState(run, observed, operation)) return observed;
+    const fusion =
+      operation.service === OPERATION_SERVICE.FUSION
+        ? fusionState(status.data)
+        : undefined;
+    const state =
+      operation.service === OPERATION_SERVICE.BRIDGE
+        ? text(status.data.state)
+        : fusion?.phase;
+    if (!state)
+      return this.recordStageSkipFailure(
+        observed,
+        observed.activeOperation ?? operation,
+        `${operation.service} status omitted the operation state`,
+      );
+    const terminal =
+      operation.service === OPERATION_SERVICE.BRIDGE
+        ? isTerminalBridgeOperationState(state)
+        : fusion?.terminal === true;
+    if (terminal) return this.finishStageSkip(observed, state);
+    if (operation.service === OPERATION_SERVICE.BRIDGE) {
+      if (state === EXTERNAL_OPERATION_STATE.PENDING) return observed;
+      if (!isActiveBridgeOperationState(state))
+        return this.recordStageSkipFailure(
+          observed,
+          observed.activeOperation ?? operation,
+          `Bridge returned unrecognized non-terminal state during force-skip: ${state}`,
+        );
+    }
+    if (operation.stopRequested) return observed;
+
+    const stopped =
+      operation.service === OPERATION_SERVICE.BRIDGE
+        ? await this.bridge.stop(operation.externalRunId, operation.asyncDir)
+        : await this.fusion.cancel(operation.externalRunId);
+    if (!stopped.success)
+      return this.recordStageSkipFailure(
+        observed,
+        observed.activeOperation ?? operation,
+        `Unable to stop ${operation.service}/${operation.kind}: ${stopped.error.message}`,
+      );
+    return this.updateActiveOperation(observed, operation.operationId, {
+      stopRequested: true,
+      recovery: OPERATION_RECOVERY.CANCEL,
+    });
+  }
+
+  private recordStageSkipFailure(
+    run: PlanExecRun,
+    operation: ActiveOperation,
+    error: string,
+  ): Promise<PlanExecRun> {
+    const failures = (operation.skipFailures ?? 0) + 1;
+    const failedRun = {
+      ...run,
+      activeOperation: {
+        ...operation,
+        skipFailures: failures,
+        lastSkipError: error,
+      },
+    };
+    if (failures >= MAX_STATUS_FAILURES)
+      return this.fail(
+        failedRun,
+        `Unable to finish force-skip (${failures}/${MAX_STATUS_FAILURES}): ${error}`,
+        true,
+      );
+    return this.registry.heartbeat(failedRun);
+  }
+
+  private async finishStageSkip(
+    run: PlanExecRun,
+    terminalOperationState: string,
+  ): Promise<PlanExecRun> {
+    const request = run.pendingStageSkip;
+    if (!request) return this.fail(run, "Force-skip request is missing.");
+    const operation = run.activeOperation;
+    const existingFindingIds = new Set(
+      run.unresolvedFindings.map((finding) => finding.id),
+    );
+    const unresolvedFindings = [
+      ...run.unresolvedFindings,
+      ...run.reviewFindings.filter(
+        (finding) => !existingFindingIds.has(finding.id),
+      ),
+    ];
+    const next = nextStage(request.stage);
+    const ready = clearError(
+      withoutOperation({
+        ...run,
+        status: RUN_STATUS.RUNNING,
+        stage: next,
+        reviewFindings: [],
+        unresolvedFindings,
+        skippedStages: [
+          ...run.skippedStages,
+          {
+            ...request,
+            completedAt: Date.now(),
+            ...(operation
+              ? {
+                  operationId: operation.operationId,
+                  ...(operation.externalRunId
+                    ? { externalRunId: operation.externalRunId }
+                    : {}),
+                }
+              : {}),
+            terminalOperationState,
+          },
+        ],
+      }),
+    );
+    delete ready.pendingStageSkip;
+    const persisted = await this.registry.update(ready);
+    await appendProgressBestEffort(
+      persisted,
+      `FORCE-SKIPPED ${request.stage} by ${request.requestedBy}: ${request.reason}\nOperation state: ${terminalOperationState}\nNext stage: ${next}`,
+    );
+    return this.advanceUnlocked(persisted);
+  }
+
   private async cancel(run: PlanExecRun): Promise<PlanExecRun> {
     const operation = run.activeOperation;
     if (!operation)
       return this.registry.release(
-        await this.registry.update({ ...run, status: "cancelled" }),
+        await this.registry.update({
+          ...run,
+          status: RUN_STATUS.CANCELLED,
+        }),
       );
     if (!operation.externalRunId)
       return this.fail(
@@ -1160,7 +1605,7 @@ export class PlanExecController {
       );
     if (!operation.stopRequested) {
       const stopped =
-        operation.service === "bridge"
+        operation.service === OPERATION_SERVICE.BRIDGE
           ? await this.bridge.stop(operation.externalRunId, operation.asyncDir)
           : await this.fusion.cancel(operation.externalRunId);
       if (!stopped.success)
@@ -1175,7 +1620,7 @@ export class PlanExecController {
       });
     }
     const terminal =
-      operation.service === "bridge"
+      operation.service === OPERATION_SERVICE.BRIDGE
         ? await this.bridge.status(operation.externalRunId, operation.asyncDir)
         : await this.fusion.status(operation.externalRunId);
     if (!terminal.success)
@@ -1186,20 +1631,16 @@ export class PlanExecController {
       );
     const observed = await this.recordObservation(run, operation);
     const bridgeState =
-      operation.service === "bridge"
+      operation.service === OPERATION_SERVICE.BRIDGE
         ? text(terminal.data.state)
         : fusionState(terminal.data)?.phase;
-    if (
-      !bridgeState ||
-      bridgeState === "running" ||
-      bridgeState === "stopping" ||
-      bridgeState === "chain" ||
-      bridgeState === "panel" ||
-      bridgeState === "judge"
-    ) {
+    if (!bridgeState || isActiveExternalOperationState(bridgeState)) {
       return observed;
     }
-    const cancelled = withoutOperation({ ...observed, status: "cancelled" });
+    const cancelled = withoutOperation({
+      ...observed,
+      status: RUN_STATUS.CANCELLED,
+    });
     await appendProgress(
       cancelled,
       `Cancellation completed after ${operation.kind} reached ${bridgeState}.`,
@@ -1210,7 +1651,7 @@ export class PlanExecController {
   private async adoptActiveOperation(run: PlanExecRun): Promise<PlanExecRun> {
     const operation = run.activeOperation;
     if (!operation?.externalRunId) return run;
-    if (operation.service === "bridge") {
+    if (operation.service === OPERATION_SERVICE.BRIDGE) {
       const adopted = await this.bridge.adopt(
         operation.externalRunId,
         operation.asyncDir,
@@ -1221,26 +1662,26 @@ export class PlanExecController {
           ...run,
           activeOperation: {
             ...operation,
-            recovery: "observe",
+            recovery: OPERATION_RECOVERY.OBSERVE,
             ...(asyncDir ? { asyncDir } : {}),
           },
         });
       }
-      return this.fail(
+      return this.recordObservationFailure(
         run,
+        operation,
         `Unable to adopt bridge operation: ${adopted.error.message}`,
-        true,
       );
     }
     const adopted = await this.fusion.adopt(operation.externalRunId);
     return adopted.success
       ? this.updateActiveOperation(run, operation.operationId, {
-          recovery: "observe",
+          recovery: OPERATION_RECOVERY.OBSERVE,
         })
-      : this.fail(
+      : this.recordObservationFailure(
           run,
+          operation,
           `Unable to adopt Fusion operation: ${adopted.error.message}`,
-          true,
         );
   }
 
@@ -1264,7 +1705,7 @@ export class PlanExecController {
     const transitioned = await this.registry.update({
       ...withoutOperation(run),
       stage,
-      status: "running",
+      status: RUN_STATUS.RUNNING,
     });
     await appendProgress(transitioned, message);
     return transitioned;
@@ -1286,7 +1727,7 @@ export class PlanExecController {
   ): Promise<PlanExecRun> {
     const failedOperation = run.activeOperation ?? run.failedOperation;
     const failed = await this.registry.update({
-      ...withoutOperation({ ...run, status: "failed", error }),
+      ...withoutOperation({ ...run, status: RUN_STATUS.FAILED, error }),
       ...(failedOperation ? { failedOperation } : {}),
       ...(preserveOperation ? { activeOperation: run.activeOperation } : {}),
     });
@@ -1299,8 +1740,68 @@ export class PlanExecController {
   }
 }
 
+function isSuccessfulOperationState(state: string): boolean {
+  return (
+    state === EXTERNAL_OPERATION_STATE.COMPLETE ||
+    state === EXTERNAL_OPERATION_STATE.DONE
+  );
+}
+
+function isActiveBridgeOperationState(state: string): boolean {
+  return (
+    state === EXTERNAL_OPERATION_STATE.RUNNING ||
+    state === EXTERNAL_OPERATION_STATE.STOPPING
+  );
+}
+
+function isTerminalBridgeOperationState(state: string): boolean {
+  return TERMINAL_BRIDGE_OPERATION_STATES.has(state);
+}
+
+function isActiveExternalOperationState(state: string): boolean {
+  return (
+    isActiveBridgeOperationState(state) ||
+    state === EXTERNAL_OPERATION_STATE.CHAIN ||
+    state === EXTERNAL_OPERATION_STATE.PANEL ||
+    state === EXTERNAL_OPERATION_STATE.JUDGE
+  );
+}
+
+function resetOperationFailures(
+  operation: ActiveOperation | undefined,
+): ActiveOperation | undefined {
+  if (!operation) return undefined;
+  const reset = { ...operation };
+  delete reset.statusFailures;
+  delete reset.lastStatusError;
+  delete reset.skipFailures;
+  delete reset.lastSkipError;
+  return reset;
+}
+
+async function appendProgressBestEffort(
+  run: PlanExecRun,
+  message: string,
+): Promise<void> {
+  try {
+    await appendProgress(run, message);
+  } catch {
+    // The durable run record is authoritative. Progress logging must not split a
+    // completed state transition into a second partially applied operation.
+  }
+}
+
+function completionStatus(run: PlanExecRun) {
+  return run.unresolvedFindings.length > 0 || run.skippedStages.length > 0
+    ? RUN_STATUS.COMPLETED_WITH_FINDINGS
+    : RUN_STATUS.COMPLETED;
+}
+
 function recoveryConfig(run: PlanExecRun): FrozenRunConfig {
-  if (run.stage === "implementation" || run.stage === "finalize")
+  if (
+    run.stage === RUN_STAGE.IMPLEMENTATION ||
+    run.stage === RUN_STAGE.FINALIZE
+  )
     return {
       ...run.config,
       workerMaxTurns: Math.max(
@@ -1308,7 +1809,7 @@ function recoveryConfig(run: PlanExecRun): FrozenRunConfig {
         RECOVERY_WORKER_MAX_TURNS,
       ),
     };
-  if (run.stage === "stats")
+  if (run.stage === RUN_STAGE.STATS)
     return {
       ...run.config,
       statsMaxTurns: Math.max(
@@ -1349,9 +1850,9 @@ function workerPrompt(
 
 function reviewerPrompt(run: PlanExecRun): string {
   const focus =
-    run.stage === "comprehensive_review"
+    run.stage === RUN_STAGE.COMPREHENSIVE_REVIEW
       ? "quality, implementation correctness, testing, simplification, and documentation"
-      : run.stage === "smells_review"
+      : run.stage === RUN_STAGE.SMELLS_REVIEW
         ? "code smells, accidental complexity, dead code, leaky abstractions, and fragile seams"
         : "only CRITICAL and MAJOR correctness, safety, and reliability defects";
   return [
@@ -1451,8 +1952,8 @@ function sameOperationState(
 
 export function isRecoverableImplementationFailure(run: PlanExecRun): boolean {
   return (
-    run.status === "failed" &&
-    run.stage === "implementation" &&
+    run.status === RUN_STATUS.FAILED &&
+    run.stage === RUN_STAGE.IMPLEMENTATION &&
     run.activeOperation === undefined &&
     /^Worker .+ ended as .+ and left task \d+ checkboxes unchecked\.$/.test(
       run.error ?? "",

@@ -147,9 +147,10 @@ No stage pushes or merges a branch.
 
 Use `/exec help` for the same hint inside Pi. Run IDs are optional for normal
 use: when one run matches the current repository or worktree, `/exec status`,
-`pause`, `resume`, `adopt`, and `cancel` select it automatically. If several
-runs match, Pi opens a picker; headless mode asks for the full ID shown by
-`/exec runs`.
+`pause`, `resume`, `adopt`, and `cancel` select it automatically. Force-skip is
+intentionally different: it always requires a full run ID, reason, and
+interactive confirmation. If several runs match, Pi opens a picker; headless
+mode asks for the full ID shown by `/exec runs`.
 
 ```text
 /exec [plan]            Start a run; bare /exec opens the plan picker
@@ -159,8 +160,11 @@ runs match, Pi opens a picker; headless mode asks for the full ID shown by
 /exec runs              List recent runs and full IDs
 /exec status [run-id]   Show status, active worker, progress path, and error
 /exec pause [run-id]    Let the active child finish, then stop advancing
-/exec resume [run-id]   Continue or retry a failed run in its preserved worktree
+/exec resume [run-id] [--adopt-current-branch]
+                        Resume/retry, or explicitly adopt the verified current execution branch
 /exec adopt [run-id]    Claim a stale or released cross-session run
+/exec skip <full-run-id> --reason <text>
+                        Stop the tracked child, waive a blocked review/finalize/stats stage, and continue
 /exec cancel [run-id]   Stop when safe and preserve the worktree
 ```
 
@@ -177,6 +181,21 @@ rather than guessing and creating a duplicate worker. Legacy runs stopped by a
 plan structure mismatch can be resumed interactively after confirming the
 current structure. Implementation workers and reviewers get a 75-turn recovery
 budget. A plan structure mismatch still requires review before retrying.
+
+`/exec skip` is a last-resort waiver, not a pass. It is available only while a
+review, finalization, or statistics stage is failed, paused, or already
+skip-pending. If a Bridge/Fusion operation is tracked, the controller requests
+stop and remains `skip_pending` until the provider proves that operation is
+terminal. The skipped stage remains visible in status and projected tasks, its
+known findings remain unresolved, and final completion is
+`completed_with_findings`. Implementation and archive stages cannot be skipped.
+
+If the execution directory was moved to another named branch outside plan-exec,
+the normal branch guard stops the run. Use `/exec resume <full-run-id>
+--adopt-current-branch` only after reviewing that branch. Pi requires interactive
+confirmation and no active child, verifies that the worktree still belongs to
+the same Git repository, records the old/new branch in the durable run, and then
+resumes the same stage.
 
 ## Watching and recovering a long run
 
@@ -195,6 +214,9 @@ Use this sequence instead:
    matching run owned by the returning session reattaches automatically. Use
    `/exec adopt` to explicitly take over an unfinished stale run from another
    session.
+5. If repeated recovery cannot finish a skippable stage, inspect the known
+   findings and active operation, then use `/exec skip <full-run-id> --reason
+   <text>`. Do not use it to hide unimplemented plan work.
 
 Do not start the same plan again after an interruption. Inspect the existing run
 first. If the selected run uses a different worktree, `/exec resume` hands the Pi
@@ -234,8 +256,8 @@ Fix: Reject empty input at the boundary.
 ```
 
 Supported severities are `CRITICAL`, `MAJOR`, and `MINOR`. If known findings
-survive configured review caps, the result is `completed_with_findings`. The
-controller does not claim that reviews passed.
+survive configured review caps, or any stage is force-skipped, the result is
+`completed_with_findings`. The controller does not claim that reviews passed.
 
 ## Recovery and safety
 
@@ -246,7 +268,7 @@ Authoritative records live at:
 ```
 
 They store stage, attempts, active Bridge/Fusion operation, worktree, branch,
-findings, and lease. Durable operation IDs let the controller replay an
+findings, force-skip audit records, and lease. Durable operation IDs let the controller replay an
 ambiguous or interrupted start without intentionally launching a second writer.
 Registry compare-and-set updates and controller locks keep stale reload instances
 from overwriting cancellation, pause, or operation state.
