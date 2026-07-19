@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.4.1 - 2026-07-19
+
+- Made `/exec status` classify recovery and give the next safe action for
+  active, blocked, stale, mismatched, paused, cancellation, and terminal runs.
+- Require explicit `--retry-task` before retrying exhausted or externally
+  blocked implementation work; omitted run IDs now accept that option.
+- Clarified changed-plan recovery and corrected stale failed-run guidance.
+
 ## 0.4.0 - 2026-07-18
 
 - Fixed failed-fixer recovery so it reconciles a preserved operation before any
