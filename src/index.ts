@@ -383,7 +383,7 @@ export function recoveryGuidance(run: PlanExecRun): RecoveryGuidance {
       classification: "terminal",
       action: "Run is terminal; no recovery action is available.",
     };
-  if (isStaleOwner(run))
+  if (isStaleOwner(run) && run.status !== RUN_STATUS.FAILED)
     return {
       classification: "stale owner",
       action: `Confirm the prior session stopped, then use /exec adopt ${run.id}; do not resume from this session.`,
@@ -541,7 +541,7 @@ export function formatRunStatus(run: PlanExecRun): string {
   lines.push(`recovery: ${guidance.classification}`);
   if (isStaleOwner(run))
     lines.push(
-      `owner: stale lease for ${run.lease?.sessionId ?? "unknown session"}; verify it is stopped before adoption.`,
+      `owner: stale lease for ${run.lease?.sessionId ?? "unknown session"}; verify it is stopped before ${run.status === RUN_STATUS.FAILED ? "recovery" : "adoption"}.`,
     );
   lines.push(`next safe action: ${guidance.action}`);
   return lines.join("\n");
@@ -580,11 +580,15 @@ async function handleCommand(
     subcommand === EXEC_ACTION.CANCEL
   ) {
     const action = subcommand as RunAction;
-    const resumeOptions =
+    const resumeArguments =
       action === EXEC_ACTION.RESUME
-        ? parseResumeOptions(rest.slice(1))
-        : { adoptCurrentBranch: false, retryTask: false };
-    const adoptCurrentBranch = resumeOptions.adoptCurrentBranch;
+        ? parseResumeArguments(rest)
+        : {
+            selector: rest[0],
+            adoptCurrentBranch: false,
+            retryTask: false,
+          };
+    const adoptCurrentBranch = resumeArguments.adoptCurrentBranch;
     if (
       action === EXEC_ACTION.SKIP &&
       (!rest[0] || rest[0] === "--reason")
@@ -594,7 +598,7 @@ async function handleCommand(
       );
     const run = await resolveRunForAction(
       action,
-      rest[0],
+      resumeArguments.selector,
       ctx,
       adoptCurrentBranch,
     );
@@ -612,7 +616,7 @@ async function handleCommand(
         run,
         syncProjection,
         action === EXEC_ACTION.RESUME
-          ? `resume ${run.id}${adoptCurrentBranch ? " --adopt-current-branch" : ""}${resumeOptions.retryTask ? ` ${TASK_RETRY_OPTION}` : ""}`
+          ? `resume ${run.id}${adoptCurrentBranch ? " --adopt-current-branch" : ""}${resumeArguments.retryTask ? ` ${TASK_RETRY_OPTION}` : ""}`
           : action === EXEC_ACTION.SKIP
             ? `skip ${run.id} --reason ${skipReason}`
             : undefined,
@@ -678,7 +682,7 @@ async function handleCommand(
           sessionId,
           true,
           reviewedPlanHash,
-          resumeOptions.retryTask,
+          resumeArguments.retryTask,
         ),
         { cwd: ctx.cwd, sessionId },
       );
@@ -912,6 +916,19 @@ export function needsPlanStructureReview(run: PlanExecRun): boolean {
     (run.status === RUN_STATUS.PAUSED || run.status === RUN_STATUS.FAILED) &&
     run.error === PLAN_STRUCTURE_CHANGED_ERROR
   );
+}
+
+export function parseResumeArguments(args: string[]): {
+  selector: string | undefined;
+  adoptCurrentBranch: boolean;
+  retryTask: boolean;
+} {
+  const first = args[0];
+  const selector = first?.startsWith("--") ? undefined : first;
+  return {
+    selector,
+    ...parseResumeOptions(selector === undefined ? args : args.slice(1)),
+  };
 }
 
 export function parseResumeOptions(args: string[]): {

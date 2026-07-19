@@ -14,6 +14,7 @@ import {
   isRecoverableFailure,
   missingRuntimeTools,
   needsPlanStructureReview,
+  parseResumeArguments,
   parseResumeOptions,
   parseSkipReason,
   resumeResultMessage,
@@ -131,6 +132,18 @@ test("cancel cannot bypass a pending force-skip", () => {
   assert.equal(isActionAllowed("cancel", pending, "session-1"), false);
   assert.equal(isActionAllowed("resume", pending, "session-1"), false);
   assert.equal(isActionAllowed("skip", pending, "session-1"), true);
+});
+
+test("resume accepts options without an explicit run ID", () => {
+  assert.deepEqual(parseResumeArguments(["--retry-task"]), {
+    selector: undefined,
+    adoptCurrentBranch: false,
+    retryTask: true,
+  });
+  assert.deepEqual(
+    parseResumeArguments(["run-id", "--adopt-current-branch", "--retry-task"]),
+    { selector: "run-id", adoptCurrentBranch: true, retryTask: true },
+  );
 });
 
 test("resume branch-adoption option is explicit", () => {
@@ -293,14 +306,17 @@ test("run status classifies recovery and gives one safe next action", () => {
   assert.match(cancelling, /recovery: cancel-pending/);
   assert.match(cancelling, /resume .* retries cancellation only/);
 
-  const staleOwner = formatRunStatus(
-    run({
-      status: "failed",
-      lease: { sessionId: "old-session", pid: 1, heartbeatAt: 0 },
-    }),
-  );
+  const staleOwnerRun = run({
+    status: "failed",
+    lease: { sessionId: "old-session", pid: 1, heartbeatAt: 0 },
+  });
+  delete staleOwnerRun.activeOperation;
+  const staleOwner = formatRunStatus(staleOwnerRun);
   assert.match(staleOwner, /owner: stale lease/);
-  assert.match(staleOwner, /\/exec adopt/);
+  assert.match(staleOwner, /\/exec resume/);
+  assert.doesNotMatch(staleOwner, /\/exec adopt/);
+  assert.equal(isActionAllowed("resume", staleOwnerRun, "session-1"), true);
+  assert.equal(isActionAllowed("adopt", staleOwnerRun, "session-1"), false);
 
   const branchMismatch = formatRunStatus(
     run({
