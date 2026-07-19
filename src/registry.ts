@@ -24,7 +24,7 @@ import {
 } from "./types.js";
 
 const RUNS_DIRECTORY = join(homedir(), ".pi", "plan-exec", "runs");
-const LEASE_STALE_MS = 30_000;
+export const LEASE_STALE_MS = 30_000;
 const LOCK_RETRY_MS = 50;
 const LOCK_MAX_RETRIES = 100;
 const LOCK_STALE_MS = 10_000;

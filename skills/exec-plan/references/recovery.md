@@ -52,7 +52,9 @@ not resume the child directly.
 Inspect the stage, error, and active-operation fields first.
 
 - No active operation: `/exec resume <id>` retries the same stage in the same
-  worktree.
+  worktree, except a retry-exhausted or externally blocked implementation task.
+  Fix or verify that blocker, then explicitly opt in with `/exec resume <id>
+  --retry-task`. Implementation is sequential; it cannot be skipped.
 - Preserved active operation: `/exec resume <id>` adopts or looks up that exact
   operation before retrying.
 - Operation lookup is `pending`: wait, reload if needed, then resume again.
@@ -64,7 +66,9 @@ Inspect the stage, error, and active-operation fields first.
 
 Budget exhaustion is a plan-run failure. Resume the plan run ID, not the child
 ID shown in pi-subagents output. Recovery raises implementation and review
-budgets where supported.
+budgets where supported. A task retry limit is different: normal resume refuses
+to reset it. Status labels it `retry-exhausted or no-progress task` or
+`external/manual blocker` and prints the exact `--retry-task` command.
 
 ## Force-skip a blocked stage
 
@@ -113,7 +117,10 @@ the execution worktree, continue recovery in that forked session.
 
 ## Plan structure changed
 
-Do not silently accept changed task structure.
+Do not silently accept changed task structure. Status says `plan-structure review
+required` and explains whether the first resume only records `paused`; if so,
+review the plan and run the interactive resume a second time. This is deliberate
+for legacy records and is safer than silently adopting a new task contract.
 
 Choose one:
 

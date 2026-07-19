@@ -116,6 +116,39 @@ test("plan structure drift pauses for review and resumes after repair", async ()
   assert.equal(resumed.activeOperation?.kind, "implementation");
 });
 
+test("resume refuses an exhausted worker without explicit task retry", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
+  const planPath = join(root, "plan.md");
+  const plan = "### Task 1: Implement\n- [ ] Do the work\n";
+  await writeFile(planPath, plan);
+  const registry = new RunRegistry(join(root, "runs"));
+  const bridge = new FakeBridge(join(root, "none.json"));
+  const controller = new PlanExecController(
+    registry,
+    bridge,
+    new FakeFusion(),
+    fakeGit(root),
+  );
+  const failed = await registry.create({
+    ...baseRun(root, planPath),
+    planHash: parsePlan(planPath, plan).hash,
+    status: "failed",
+    stage: "implementation",
+    taskAttempts: { "1": 2 },
+    error: "Task 1 exhausted its retry limit. Provider billing unavailable.",
+  });
+
+  await assert.rejects(
+    controller.resume(failed.id, "session-1"),
+    /--retry-task/,
+  );
+
+  const preserved = await registry.get(failed.id);
+  assert.equal(preserved?.taskAttempts["1"], 2);
+  assert.equal(preserved?.activeOperation, undefined);
+  assert.equal(bridge.spawnCount, 0);
+});
+
 test("explicit resume retries a worker after its task retry limit", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
   const planPath = join(root, "plan.md");
@@ -137,7 +170,13 @@ test("explicit resume retries a worker after its task retry limit", async () => 
     error: "Worker run-2 ended as failed and left task 1 checkboxes unchecked.",
   });
 
-  const resumed = await controller.resume(failed.id, "session-1");
+  const resumed = await controller.resume(
+    failed.id,
+    "session-1",
+    true,
+    undefined,
+    true,
+  );
 
   assert.equal(resumed.status, "running");
   assert.equal(resumed.error, undefined);

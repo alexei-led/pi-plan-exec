@@ -160,8 +160,8 @@ mode asks for the full ID shown by `/exec runs`.
 /exec runs              List recent runs and full IDs
 /exec status [run-id]   Show status, active worker, progress path, and error
 /exec pause [run-id]    Let the active child finish, then stop advancing
-/exec resume [run-id] [--adopt-current-branch]
-                        Resume/retry, or explicitly adopt the verified current execution branch
+/exec resume [run-id] [--adopt-current-branch] [--retry-task]
+                        Resume safely; explicitly retry an exhausted implementation task only with --retry-task
 /exec adopt [run-id]    Claim a stale or released cross-session run
 /exec skip <full-run-id> --reason <text>
                         Stop the tracked child, waive a blocked review/finalize/stats stage, and continue
@@ -171,7 +171,8 @@ mode asks for the full ID shown by `/exec runs`.
 Pi shows the execution-worktree path and branch with the current stage and active
 worker while a run is polling. Stage transitions, observation degradation, and
 terminal states generate notifications. `/exec status` shows the last successful
-observation and retry count. After repeated provider-observation failures,
+observation and retry count, then labels the exact recovery classification and
+one safe next action. After repeated provider-observation failures,
 plan-exec records the failure without discarding the external operation identity.
 A failed run preserves its worktree and remains visible in `/exec status` and the
 projected task description. `/exec resume` adopts that known operation before
@@ -179,8 +180,11 @@ retrying the stage; it does not create a duplicate worker. If the provider has
 no record of an operation whose launch outcome is unknown, plan-exec stops
 rather than guessing and creating a duplicate worker. Legacy runs stopped by a
 plan structure mismatch can be resumed interactively after confirming the
-current structure. Implementation workers and reviewers get a 75-turn recovery
-budget. A plan structure mismatch still requires review before retrying.
+current structure. The first resume may only transition a legacy mismatch to
+`paused`; status explains that a second interactive resume is required after
+review. Implementation workers and reviewers get a 75-turn recovery budget. A
+retry-exhausted or external/manual-blocked implementation task requires
+`/exec resume <run-id> --retry-task`; it cannot be skipped or retried implicitly.
 
 `/exec skip` is a last-resort waiver, not a pass. It is available only while a
 review, finalization, or statistics stage is failed, paused, or already

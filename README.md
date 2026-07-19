@@ -64,12 +64,18 @@ plan:
 ```
 
 While it runs, Pi shows the execution-worktree path, branch, stage, and worker.
-`/exec status` only observes the run; it does not interrupt or restart it. Use
-it without a run ID for the current repository, and use `/exec runs` when several
-runs need disambiguation. `/exec pause` stops after the active child; `/exec
-resume` continues paused work or recovers a recorded failure in the same stage
-and preserved worktree. When a provider operation may still exist, plan-exec
-keeps its identity and adopts it before any retry. If a review, finalization, or
+`/exec status` only observes the run; it does not interrupt or restart it. It
+also reports the recovery classification and one safe next action: wait for a
+healthy operation, reconcile a preserved operation, retry a failed stage, adopt
+a stale owner, or review a plan/branch mismatch. Use it without a run ID for the
+current repository, and use `/exec runs` when several runs need disambiguation.
+`/exec pause` stops after the active child; `/exec resume` continues paused work
+or recovers a recorded failure in the same stage and preserved worktree. A
+retry-exhausted or externally blocked implementation task is never retried
+implicitly; fix the blocker, then use `/exec resume <run-id> --retry-task`.
+Implementation checkboxes remain sequential and cannot be force-skipped. When a
+provider operation may still exist, plan-exec keeps its identity and adopts it
+before any retry. If a review, finalization, or
 statistics stage cannot recover, `/exec skip <full-run-id> --reason <text>`
 stops the tracked child before recording an explicit waiver and advancing. It
 never skips implementation or archival, and the run finishes as

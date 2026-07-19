@@ -9,9 +9,13 @@ import {
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { BridgeClient } from "./bridge.js";
 import {
+  isExternalManualBlocker,
+  isTaskRetryConfirmationRequired,
   MAX_STATUS_FAILURES,
   PLAN_STRUCTURE_CHANGED_ERROR,
   PlanExecController,
+  TASK_RETRY_OPTION,
+  taskRetryRequiredMessage,
 } from "./controller.js";
 import { FusionClient } from "./fusion.js";
 import {
@@ -19,7 +23,7 @@ import {
   isSkippableStage,
   isTerminalStatus,
 } from "./lifecycle.js";
-import { RunRegistry } from "./registry.js";
+import { LEASE_STALE_MS, RunRegistry } from "./registry.js";
 import { readPlan } from "./plan.js";
 import { TaskProjector } from "./task-projection.js";
 import {
@@ -77,7 +81,7 @@ const EXEC_COMMANDS: AutocompleteItem[] = [
   {
     value: EXEC_ACTION.RESUME,
     label: EXEC_ACTION.RESUME,
-    description: "Resume or retry a failed run in its preserved worktree",
+    description: "Resume or retry a failed run safely; use --retry-task for exhausted implementation tasks",
   },
   {
     value: EXEC_ACTION.ADOPT,
@@ -365,6 +369,112 @@ export function getExecArgumentCompletions(
   return EXEC_COMMANDS.filter((command) => command.value.startsWith(trimmed));
 }
 
+type RecoveryGuidance = {
+  classification: string;
+  action: string;
+};
+
+export function recoveryGuidance(run: PlanExecRun): RecoveryGuidance {
+  if (
+    isTerminal(run.status) &&
+    run.status !== RUN_STATUS.FAILED
+  )
+    return {
+      classification: "terminal",
+      action: "Run is terminal; no recovery action is available.",
+    };
+  if (isStaleOwner(run))
+    return {
+      classification: "stale owner",
+      action: `Confirm the prior session stopped, then use /exec adopt ${run.id}; do not resume from this session.`,
+    };
+  if (hasExecutionBranchMismatch(run))
+    return {
+      classification: "execution-branch mismatch",
+      action: `Review the current branch, then use interactive /exec resume ${run.id} --adopt-current-branch; normal resume will not rebind it.`,
+    };
+  if (needsPlanStructureReview(run))
+    return {
+      classification: "plan-structure review required",
+      action: `Restore the original structure, or use interactive /exec resume ${run.id} to adopt the current plan. If the first resume only records this pause, a second resume is required after review.`,
+    };
+  if (run.status === RUN_STATUS.SKIP_PENDING)
+    return {
+      classification: "force-skip reconciliation pending",
+      action:
+        "Wait for the tracked child to become terminal; use /exec status. Do not resume or start another child.",
+    };
+  if (run.status === RUN_STATUS.CANCEL_PENDING)
+    return {
+      classification: "cancel-pending",
+      action: `Wait and use /exec status ${run.id}; /exec resume ${run.id} retries cancellation only and cannot launch plan work.`,
+    };
+  if (run.activeOperation && !run.activeOperation.externalRunId)
+    return {
+      classification: "preserved unknown operation",
+      action:
+        "Repair the provider and reconcile the preserved operation; never launch a replacement worker while its outcome is unknown. Do not resume blindly.",
+    };
+  if (run.status === RUN_STATUS.RUNNING || run.status === RUN_STATUS.STARTING) {
+    if (run.activeOperation?.statusFailures)
+      return {
+        classification: "active operation observation unavailable",
+        action:
+          "Repair the provider and wait for observation to recover; do not resume while the operation identity is preserved.",
+      };
+    if (run.activeOperation)
+      return {
+        classification: "healthy active operation",
+        action:
+          "wait; the controller is polling this operation. do not resume or start another run.",
+      };
+    return {
+      classification: "controller advancing",
+      action: "Wait for the next controller tick, then use /exec status.",
+    };
+  }
+  if (run.status === RUN_STATUS.PAUSED)
+    return {
+      classification: "paused review",
+      action: `Use /exec resume ${run.id}; it applies the paused stage or its terminal child without starting a second writer.`,
+    };
+  if (run.status === RUN_STATUS.FAILED) {
+    if (isExternalManualBlocker(run))
+      return {
+        classification: "external/manual blocker",
+        action: `${taskRetryRequiredMessage(run)} Do not use force-skip: implementation is sequential.`,
+      };
+    if (isTaskRetryConfirmationRequired(run))
+      return {
+        classification: "retry-exhausted or no-progress task",
+        action: taskRetryRequiredMessage(run),
+      };
+    if (run.activeOperation?.externalRunId)
+      return {
+        classification: "preserved operation needs reconciliation",
+        action: `Use /exec resume ${run.id}; it reconciles ${run.activeOperation.service}/${run.activeOperation.kind} before any retry in the preserved worktree.`,
+      };
+    return {
+      classification: "failed with no active operation",
+      action: `Use /exec resume ${run.id}; it retries the same stage (${run.stage}) in the preserved worktree.`,
+    };
+  }
+  return {
+    classification: "unclassified",
+    action: "Use /exec status again or /exec help; no recovery action is inferred.",
+  };
+}
+
+function isStaleOwner(run: PlanExecRun): boolean {
+  return Boolean(
+    run.lease && Date.now() - run.lease.heartbeatAt >= LEASE_STALE_MS,
+  );
+}
+
+function hasExecutionBranchMismatch(run: PlanExecRun): boolean {
+  return /Execution directory is on .+, expected .+\./.test(run.error ?? "");
+}
+
 export function formatRunStatus(run: PlanExecRun): string {
   const operation = run.activeOperation;
   const operationText = operation
@@ -427,25 +537,13 @@ export function formatRunStatus(run: PlanExecRun): string {
         `- ${skip.stage} by ${skip.requestedBy}: ${skip.reason}${skip.terminalOperationState ? ` (operation: ${skip.terminalOperationState})` : ""}`,
       );
   }
-  if (run.status === RUN_STATUS.SKIP_PENDING) {
+  const guidance = recoveryGuidance(run);
+  lines.push(`recovery: ${guidance.classification}`);
+  if (isStaleOwner(run))
     lines.push(
-      "next: waiting for the tracked child to become terminal before advancing the force-skip.",
+      `owner: stale lease for ${run.lease?.sessionId ?? "unknown session"}; verify it is stopped before adoption.`,
     );
-  } else if (needsPlanStructureReview(run)) {
-    lines.push(
-      "next: use interactive /exec resume to restore or explicitly adopt the reviewed plan structure.",
-    );
-  } else if (isTerminal(run.status)) {
-    lines.push(
-      run.status === RUN_STATUS.FAILED
-        ? isRecoverableFailure(run)
-          ? "next: use interactive /exec resume to retry this stage in its preserved worktree."
-          : "next: worktree preserved; inspect the error, then use /exec runs."
-        : "next: run is terminal; use /exec runs to inspect other runs.",
-    );
-  } else {
-    lines.push("next: /exec status (run ID is optional) or /exec help");
-  }
+  lines.push(`next safe action: ${guidance.action}`);
   return lines.join("\n");
 }
 
@@ -482,10 +580,11 @@ async function handleCommand(
     subcommand === EXEC_ACTION.CANCEL
   ) {
     const action = subcommand as RunAction;
-    const adoptCurrentBranch =
+    const resumeOptions =
       action === EXEC_ACTION.RESUME
-        ? parseResumeOptions(rest.slice(1)).adoptCurrentBranch
-        : false;
+        ? parseResumeOptions(rest.slice(1))
+        : { adoptCurrentBranch: false, retryTask: false };
+    const adoptCurrentBranch = resumeOptions.adoptCurrentBranch;
     if (
       action === EXEC_ACTION.SKIP &&
       (!rest[0] || rest[0] === "--reason")
@@ -513,7 +612,7 @@ async function handleCommand(
         run,
         syncProjection,
         action === EXEC_ACTION.RESUME
-          ? `resume ${run.id}${adoptCurrentBranch ? " --adopt-current-branch" : ""}`
+          ? `resume ${run.id}${adoptCurrentBranch ? " --adopt-current-branch" : ""}${resumeOptions.retryTask ? ` ${TASK_RETRY_OPTION}` : ""}`
           : action === EXEC_ACTION.SKIP
             ? `skip ${run.id} --reason ${skipReason}`
             : undefined,
@@ -574,11 +673,17 @@ async function handleCommand(
           ? await reviewedPlanHashForResume(run, ctx)
           : undefined;
       const resumed = await syncProjection(
-        await controller.resume(run.id, sessionId, true, reviewedPlanHash),
+        await controller.resume(
+          run.id,
+          sessionId,
+          true,
+          reviewedPlanHash,
+          resumeOptions.retryTask,
+        ),
         { cwd: ctx.cwd, sessionId },
       );
       startBackgroundController(resumed, sessionId, ctx.cwd, ctx);
-      return `Run ${shortRunId(resumed.id)} resumed: ${resumed.status} (${resumed.stage}).\nUse /exec status for live progress.`;
+      return resumeResultMessage(resumed);
     }
     const sessionId = ctx.sessionManager.getSessionId();
     const claimed = await registry.claim(run, sessionId);
@@ -811,13 +916,33 @@ export function needsPlanStructureReview(run: PlanExecRun): boolean {
 
 export function parseResumeOptions(args: string[]): {
   adoptCurrentBranch: boolean;
+  retryTask: boolean;
 } {
-  if (args.length === 0) return { adoptCurrentBranch: false };
-  if (args.length === 1 && args[0] === "--adopt-current-branch")
-    return { adoptCurrentBranch: true };
-  throw new Error(
-    "Usage: /exec resume <full-run-id> [--adopt-current-branch]",
-  );
+  const options = {
+    adoptCurrentBranch: false,
+    retryTask: false,
+  };
+  for (const arg of args) {
+    if (arg === "--adopt-current-branch") options.adoptCurrentBranch = true;
+    else if (arg === TASK_RETRY_OPTION) options.retryTask = true;
+    else
+      throw new Error(
+        `Usage: /exec resume <full-run-id> [--adopt-current-branch] [${TASK_RETRY_OPTION}]`,
+      );
+  }
+  return options;
+}
+
+export function resumeResultMessage(run: PlanExecRun): string {
+  if (needsPlanStructureReview(run))
+    return [
+      `Run ${shortRunId(run.id)} paused for plan-structure review: ${run.status} (${run.stage}).`,
+      `The first resume only recorded the pause. Review ${run.planPath}, restore the original structure or confirm adoption, then run interactive /exec resume ${run.id} again.`,
+    ].join("\n");
+  return [
+    `Run ${shortRunId(run.id)} resumed: ${run.status} (${run.stage}).`,
+    "Use /exec status for live progress.",
+  ].join("\n");
 }
 
 export function parseSkipReason(args: string[]): string {
@@ -987,8 +1112,8 @@ export function execHelp(): string {
     "/exec status [run-id]   Show progress; run-id is optional when unambiguous.",
     "/exec runs              List runs and their full IDs.",
     "/exec pause [run-id]    Pause after the active child finishes.",
-    "/exec resume [run-id] [--adopt-current-branch]",
-    "                        Resume or retry a failed run, or explicitly adopt a verified current execution branch.",
+    `/exec resume [run-id] [--adopt-current-branch] [${TASK_RETRY_OPTION}]`,
+    "                        Reconcile, resume, or retry a failed run safely; exhausted implementation tasks require the explicit flag.",
     "/exec adopt [run-id]    Adopt a stale run from another session.",
     "/exec skip <full-run-id> --reason <text>",
     "                        Stop any tracked child, force-skip a blocked review/finalize/stats stage, and record the waiver.",

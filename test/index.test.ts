@@ -16,6 +16,7 @@ import {
   needsPlanStructureReview,
   parseResumeOptions,
   parseSkipReason,
+  resumeResultMessage,
   prioritizeRunCandidates,
   reviewedPlanHashForResume,
 } from "../src/index.js";
@@ -133,10 +134,22 @@ test("cancel cannot bypass a pending force-skip", () => {
 });
 
 test("resume branch-adoption option is explicit", () => {
-  assert.deepEqual(parseResumeOptions([]), { adoptCurrentBranch: false });
+  assert.deepEqual(parseResumeOptions([]), {
+    adoptCurrentBranch: false,
+    retryTask: false,
+  });
   assert.deepEqual(parseResumeOptions(["--adopt-current-branch"]), {
     adoptCurrentBranch: true,
+    retryTask: false,
   });
+  assert.deepEqual(parseResumeOptions(["--retry-task"]), {
+    adoptCurrentBranch: false,
+    retryTask: true,
+  });
+  assert.deepEqual(
+    parseResumeOptions(["--adopt-current-branch", "--retry-task"]),
+    { adoptCurrentBranch: true, retryTask: true },
+  );
   assert.throws(() => parseResumeOptions(["--force"]), /Usage/);
 
   const running = run({ status: "running" });
@@ -214,6 +227,119 @@ test("failed and cancellation-pending runs are eligible for recovery", () => {
     true,
   );
   assert.equal(isRecoverableFailure(run({ status: "cancel_pending" })), true);
+});
+
+test("run status classifies recovery and gives one safe next action", () => {
+  const active = formatRunStatus(
+    run({
+      status: "running",
+      activeOperation: {
+        operationId: "active-operation",
+        service: "bridge",
+        kind: "implementation",
+        taskId: 1,
+        externalRunId: "worker-run-1",
+      },
+    }),
+  );
+  assert.match(active, /recovery: healthy active operation/);
+  assert.match(active, /next safe action: wait/);
+  assert.match(active, /do not resume/);
+
+  const failedRun = run({
+    status: "failed",
+    error: "worker crashed before launch",
+  });
+  delete failedRun.activeOperation;
+  const failed = formatRunStatus(failedRun);
+  assert.match(failed, /recovery: failed with no active operation/);
+  assert.match(failed, /resume .* retries the same stage/);
+
+  const blockedRun = run({
+    status: "failed",
+    taskAttempts: { "1": 2 },
+    error: "Task 1 exhausted its retry limit. Provider billing unavailable.",
+  });
+  delete blockedRun.activeOperation;
+  const blocked = formatRunStatus(blockedRun);
+  assert.match(blocked, /recovery: external\/manual blocker/);
+  assert.match(blocked, /--retry-task/);
+  assert.match(blocked, /cannot bypass an incomplete implementation task/);
+
+  const unknown = formatRunStatus(
+    run({
+      status: "failed",
+      error: "Bridge operation lookup is unresolved",
+      activeOperation: {
+        operationId: "unknown-operation",
+        service: "bridge",
+        kind: "implementation",
+        taskId: 1,
+      },
+    }),
+  );
+  assert.match(unknown, /recovery: preserved unknown operation/);
+  assert.match(unknown, /never launch a replacement worker/);
+
+  const pausedRun = run({ status: "paused", stage: "comprehensive_review" });
+  delete pausedRun.activeOperation;
+  const paused = formatRunStatus(pausedRun);
+  assert.match(paused, /recovery: paused review/);
+  assert.match(paused, /resume .* applies the paused stage/);
+
+  const cancellingRun = run({ status: "cancel_pending" });
+  delete cancellingRun.activeOperation;
+  const cancelling = formatRunStatus(cancellingRun);
+  assert.match(cancelling, /recovery: cancel-pending/);
+  assert.match(cancelling, /resume .* retries cancellation only/);
+
+  const staleOwner = formatRunStatus(
+    run({
+      status: "failed",
+      lease: { sessionId: "old-session", pid: 1, heartbeatAt: 0 },
+    }),
+  );
+  assert.match(staleOwner, /owner: stale lease/);
+  assert.match(staleOwner, /\/exec adopt/);
+
+  const branchMismatch = formatRunStatus(
+    run({
+      status: "failed",
+      error: "Execution directory is on feature/current, expected master.",
+    }),
+  );
+  assert.match(branchMismatch, /recovery: execution-branch mismatch/);
+  assert.match(branchMismatch, /--adopt-current-branch/);
+
+  const planMismatch = formatRunStatus(
+    run({
+      status: "paused",
+      error: "Plan task structure changed outside checkbox completion.",
+    }),
+  );
+  assert.match(planMismatch, /recovery: plan-structure review required/);
+  assert.match(planMismatch, /first resume only records this pause/);
+
+  const terminal = formatRunStatus(
+    run({ status: "completed", stage: "complete" }),
+  );
+  assert.match(terminal, /recovery: terminal/);
+  assert.match(terminal, /no recovery action/);
+});
+
+test("resume output explains a required second plan-structure review", () => {
+  const paused = run({
+    status: "paused",
+    error: "Plan task structure changed outside checkbox completion.",
+  });
+  delete paused.activeOperation;
+  const message = resumeResultMessage(paused);
+  assert.match(message, /first resume only recorded the pause/);
+  assert.match(message, /run interactive \/exec resume/);
+
+  const resumed = resumeResultMessage(run({ status: "running" }));
+  assert.match(resumed, /resumed: running/);
+  assert.doesNotMatch(resumed, /second resume/);
 });
 
 test("run status includes live operation, progress, and recovery hints", () => {

@@ -21,6 +21,7 @@ recovery with a manually launched subagent.
 - Inspect one run: `/exec status <full-run-id>`.
 - Request a pause for a starting or running run: `/exec pause <full-run-id>`.
 - Continue or recover: `/exec resume <full-run-id>`.
+- Retry an exhausted or externally blocked implementation task only after fixing or verifying the blocker: `/exec resume <full-run-id> --retry-task`.
 - Adopt a verified current execution branch: `/exec resume <full-run-id> --adopt-current-branch`.
 - Claim an unfinished stale run: `/exec adopt <full-run-id>`.
 - Force-skip a blocked review/finalize/stats stage: `/exec skip <full-run-id> --reason <text>`.
@@ -79,8 +80,9 @@ For every control or recovery request:
 5. Run `/exec status <full-run-id>` again and verify the same run moved to the
    expected state.
 
-`/exec status` is observational. A healthy active operation should normally be
-left alone while the controller polls it.
+`/exec status` is observational. It reports a recovery classification and one
+safe next action. A healthy active operation should normally be left alone while
+the controller polls it.
 
 ## Recover a stuck run
 
@@ -105,6 +107,9 @@ second writer.
 - `--adopt-current-branch` requires interactive confirmation and no active
   child. It verifies the same repository and records the branch change before
   resuming.
+- A retry-exhausted or external/manual-blocked implementation task requires
+  `--retry-task`; normal resume refuses to reset its attempts. Implementation
+  checkboxes are sequential and cannot be skipped.
 - `/exec skip` is a last-resort waiver, not a review pass. It requires an
   interactive confirmation and reason, stops any tracked child before advancing,
   and ends as `completed_with_findings`. Never use it for implementation or

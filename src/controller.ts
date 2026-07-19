@@ -171,9 +171,16 @@ export class PlanExecController {
     sessionId: string,
     explicit = true,
     reviewedPlanHash?: string,
+    retryTask = false,
   ): Promise<PlanExecRun> {
     const coordinated = await this.registry.withControllerLock(runId, () =>
-      this.resumeLocked(runId, sessionId, explicit, reviewedPlanHash),
+      this.resumeLocked(
+        runId,
+        sessionId,
+        explicit,
+        reviewedPlanHash,
+        retryTask,
+      ),
     );
     if (coordinated) return coordinated;
     const current = await this.registry.get(runId);
@@ -186,6 +193,7 @@ export class PlanExecController {
     sessionId: string,
     explicit: boolean,
     reviewedPlanHash?: string,
+    retryTask = false,
   ): Promise<PlanExecRun> {
     const existing = await this.registry.get(runId);
     if (!existing) throw new Error(`Plan execution run not found: ${runId}`);
@@ -205,7 +213,9 @@ export class PlanExecController {
     }
     const preservedOperationId = prepared.activeOperation?.operationId;
     if (explicit && isRecoverableFailure(prepared)) {
-      prepared = await this.recoverFailedRun(prepared);
+      if (isTaskRetryConfirmationRequired(prepared) && !retryTask)
+        throw new Error(taskRetryRequiredMessage(prepared));
+      prepared = await this.recoverFailedRun(prepared, retryTask);
     } else if (explicit && prepared.status === RUN_STATUS.PAUSED) {
       const resumed = await this.registry.updateIfCurrent(
         clearError({ ...prepared, status: RUN_STATUS.RUNNING }),
@@ -971,7 +981,10 @@ export class PlanExecController {
     return this.registry.heartbeat(failedRun);
   }
 
-  private async recoverFailedRun(run: PlanExecRun): Promise<PlanExecRun> {
+  private async recoverFailedRun(
+    run: PlanExecRun,
+    retryTask = false,
+  ): Promise<PlanExecRun> {
     const plan =
       run.stage === RUN_STAGE.ARCHIVE
         ? undefined
@@ -1000,6 +1013,8 @@ export class PlanExecController {
       run.stage === RUN_STAGE.IMPLEMENTATION
         ? plan?.tasks.find((candidate) => candidate.unchecked.length > 0)
         : undefined;
+    if (isTaskRetryConfirmationRequired(run) && !retryTask)
+      throw new Error(taskRetryRequiredMessage(run));
     const config = recoveryConfig(run);
     const retryFailedReview =
       isReviewStage(run.stage) &&
@@ -1950,15 +1965,59 @@ function sameOperationState(
   );
 }
 
+export const TASK_RETRY_OPTION = "--retry-task";
+
 export function isRecoverableImplementationFailure(run: PlanExecRun): boolean {
   return (
     run.status === RUN_STATUS.FAILED &&
     run.stage === RUN_STAGE.IMPLEMENTATION &&
     run.activeOperation === undefined &&
-    /^Worker .+ ended as .+ and left task \d+ checkboxes unchecked\.$/.test(
+    (/^Worker .+ ended as .+ and left task \d+ checkboxes unchecked\.$/.test(
       run.error ?? "",
-    )
+    ) || /Task \d+ exhausted its retry limit\./.test(run.error ?? ""))
   );
+}
+
+export function isExternalManualBlocker(run: PlanExecRun): boolean {
+  if (run.stage !== RUN_STAGE.IMPLEMENTATION || run.activeOperation)
+    return false;
+  return /\b(billing|payment|quota|rate[- ]limit|provider|credential|authentication|authorization|permission|unavailable|outage|network|manual|external)\b/i.test(
+    recoveryEvidence(run),
+  );
+}
+
+export function isTaskRetryConfirmationRequired(run: PlanExecRun): boolean {
+  return (
+    run.status === RUN_STATUS.FAILED &&
+    run.stage === RUN_STAGE.IMPLEMENTATION &&
+    run.activeOperation === undefined &&
+    (isRecoverableImplementationFailure(run) || isExternalManualBlocker(run))
+  );
+}
+
+export function taskRetryRequiredMessage(run: PlanExecRun): string {
+  const taskId =
+    run.failedOperation?.taskId ??
+    run.error?.match(/Task (\d+)/)?.[1] ??
+    run.error?.match(/task (\d+)/i)?.[1] ??
+    "the incomplete task";
+  return [
+    `Task ${taskId} is retry-exhausted or made no progress; refusing to retry this stage implicitly.`,
+    "Fix or verify the external/manual blocker first.",
+    `Implementation checkboxes are sequential; the controller cannot bypass an incomplete implementation task. Re-run the same task only with /exec resume ${run.id} ${TASK_RETRY_OPTION}.`,
+  ].join(" ");
+}
+
+function recoveryEvidence(run: PlanExecRun): string {
+  return [
+    run.error,
+    run.activeOperation?.lastLaunchError,
+    run.activeOperation?.lastStatusError,
+    run.failedOperation?.lastLaunchError,
+    run.failedOperation?.lastStatusError,
+  ]
+    .filter((value): value is string => Boolean(value))
+    .join(" ");
 }
 
 export function isRecoverableFailure(run: PlanExecRun): boolean {
