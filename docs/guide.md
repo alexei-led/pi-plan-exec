@@ -160,8 +160,8 @@ mode asks for the full ID shown by `/exec runs`.
 /exec runs              List recent runs and full IDs
 /exec status [run-id]   Show status, active worker, progress path, and error
 /exec pause [run-id]    Let the active child finish, then stop advancing
-/exec resume [run-id] [--adopt-current-branch] [--retry-task]
-                        Resume safely; explicitly retry an exhausted implementation task only with --retry-task
+/exec resume [run-id] [--adopt-current-branch] [--retry-task] [--model current|provider/model]
+                        Resume safely; select a recovery model or explicitly retry an exhausted implementation task
 /exec adopt [run-id]    Claim a stale or released cross-session run
 /exec skip <full-run-id> --reason <text>
                         Stop the tracked child, waive a blocked review/finalize/stats stage, and continue
@@ -185,6 +185,14 @@ current structure. The first resume may only transition a legacy mismatch to
 review. Implementation workers and reviewers get a 75-turn recovery budget. A
 retry-exhausted or external/manual-blocked implementation task requires
 `/exec resume <run-id> --retry-task`; it cannot be skipped or retried implicitly.
+
+A terminal model/provider failure is recorded separately from task progress. The
+controller keeps the failed child ID and terminal error and does not consume an
+implementation retry. Interactive `/exec resume <run-id>` opens the authenticated
+model picker. Use `--model current` for the active Pi model or `--model
+provider/model` to pin a replacement for the recovered Bridge role and its later
+launches in the run. A legacy failure without preserved provider diagnostics may
+still classify as retry-exhausted and need both `--retry-task` and `--model`.
 
 `/exec skip` is a last-resort waiver, not a pass. It is available only while a
 review, finalization, or statistics stage is failed, paused, or already
@@ -218,7 +226,10 @@ Use this sequence instead:
    matching run owned by the returning session reattaches automatically. Use
    `/exec adopt` to explicitly take over an unfinished stale run from another
    session.
-5. If repeated recovery cannot finish a skippable stage, inspect the known
+5. For `model/provider failure`, resume interactively to select an authenticated
+   model, or use `/exec resume <run-id> --model current|provider/model`. Do not
+   retry the reported failing model repeatedly.
+6. If repeated recovery cannot finish a skippable stage, inspect the known
    findings and active operation, then use `/exec skip <full-run-id> --reason
    <text>`. Do not use it to hide unimplemented plan work.
 

@@ -185,6 +185,69 @@ test("explicit resume retries a worker after its task retry limit", async () => 
   assert.equal(resumed.activeOperation?.kind, "implementation");
 });
 
+test("model failures preserve diagnostics, retries, and recover with an explicit model", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
+  const planPath = join(root, "plan.md");
+  const plan = "### Task 1: Implement\n- [ ] Do the work\n";
+  await writeFile(planPath, plan);
+  const registry = new RunRegistry(join(root, "runs"));
+  const bridge = new ModelFailureBridge(join(root, "none.json"));
+  const controller = new PlanExecController(
+    registry,
+    bridge,
+    new FakeFusion(),
+    fakeGit(root),
+  );
+  const running = await registry.create({
+    ...baseRun(root, planPath),
+    planHash: parsePlan(planPath, plan).hash,
+    status: "running",
+    stage: "implementation",
+    taskAttempts: { "1": 0 },
+    activeOperation: {
+      operationId: "model-failure-operation",
+      service: "bridge",
+      kind: "implementation",
+      externalRunId: "model-failure-run",
+      asyncDir: "/tmp/model-failure-run",
+      taskId: 1,
+    },
+  });
+
+  const failed = await controller.advance(running);
+
+  assert.equal(failed.status, "failed");
+  assert.equal(failed.taskAttempts["1"], 0);
+  assert.equal(failed.activeOperation, undefined);
+  assert.equal(failed.failedOperation?.externalRunId, "model-failure-run");
+  assert.match(
+    failed.failedOperation?.terminalError ?? "",
+    /OAuth refresh failed/,
+  );
+  assert.match(failed.error ?? "", /model\/provider/);
+
+  bridge.state = "running";
+  const resumed = await controller.resume(
+    failed.id,
+    "session-1",
+    true,
+    undefined,
+    false,
+    "anthropic-work/claude-sonnet-4-6",
+  );
+
+  assert.equal(resumed.status, "running");
+  assert.equal(resumed.taskAttempts["1"], 0);
+  assert.equal(
+    resumed.config.workerModel,
+    "anthropic-work/claude-sonnet-4-6",
+  );
+  assert.equal(
+    resumed.activeOperation?.params?.model,
+    "anthropic-work/claude-sonnet-4-6",
+  );
+});
+
 test("resume retries a failed review in the same stage with a larger review budget", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
   const planPath = join(root, "plan.md");
@@ -205,18 +268,65 @@ test("resume retries a failed review in the same stage with a larger review budg
     error: "Review operation ended as failed.",
   });
 
-  const resumed = await controller.resume(failed.id, "session-1");
+  const resumed = await controller.resume(
+    failed.id,
+    "session-1",
+    true,
+    undefined,
+    false,
+    "anthropic-work/claude-sonnet-4-6",
+  );
 
   assert.equal(resumed.status, "running");
   assert.equal(resumed.stage, "comprehensive_review");
   assert.equal(resumed.error, undefined);
   assert.equal(resumed.config.reviewerMaxTurns, 75);
+  assert.equal(
+    resumed.config.reviewerModel,
+    "anthropic-work/claude-sonnet-4-6",
+  );
   assert.equal(resumed.activeOperation?.kind, "review");
+  assert.equal(
+    resumed.activeOperation?.params?.model,
+    "anthropic-work/claude-sonnet-4-6",
+  );
   assert.equal(resumed.worktreeCwd, failed.worktreeCwd);
   assert.equal(resumed.branch, failed.branch);
   assert.deepEqual(resumed.activeOperation?.params?.turnBudget, {
     maxTurns: 75,
   });
+});
+
+test("stats launches use the frozen stats model", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
+  const planPath = join(root, "plan.md");
+  const plan = "### Task 1: Implement\n- [x] Done\n";
+  await writeFile(planPath, plan);
+  const registry = new RunRegistry(join(root, "runs"));
+  const controller = new PlanExecController(
+    registry,
+    new FakeBridge(join(root, "none.json")),
+    new FakeFusion(),
+    fakeGit(root),
+  );
+  const running = await registry.create({
+    ...baseRun(root, planPath),
+    planHash: parsePlan(planPath, plan).hash,
+    status: "running",
+    stage: "stats",
+    config: {
+      ...baseRun(root, planPath).config,
+      statsModel: "anthropic-work/claude-haiku-4-5",
+    },
+  });
+
+  const launched = await controller.advance(running);
+
+  assert.equal(launched.activeOperation?.kind, "stats");
+  assert.equal(
+    launched.activeOperation?.params?.model,
+    "anthropic-work/claude-haiku-4-5",
+  );
 });
 
 test("resume does not adopt a fixer launched during the same recovery", async () => {
@@ -2132,6 +2242,18 @@ class FakeBridge {
   }
   async stop(): Promise<BridgeResult> {
     return success({ state: "stopping" });
+  }
+}
+
+class ModelFailureBridge extends FakeBridge {
+  state = "failed";
+
+  override async status() {
+    return success({
+      state: this.state,
+      text:
+        'Error: Run failed: OAuth refresh failed for anthropic-work: body={"error":"invalid_grant","error_description":"Refresh token expired"}.',
+    });
   }
 }
 

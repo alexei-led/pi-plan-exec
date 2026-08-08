@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.4.3 - 2026-08-08
+
+- Preserve terminal Bridge diagnostics and failed operation identity for model
+  and provider failures without consuming implementation retry attempts.
+- Add `/exec resume --model current|provider/model`, an interactive recovery
+  model picker, and durable role-specific model overrides for Bridge launches.
+- Document model/provider recovery and clarify that `/exec` is a Pi UI command,
+  not a shell command or agent tool.
+
 ## 0.4.2 - 2026-08-08
 
 - Require `@alexeiled/pi-subagents-bridge` 0.2.2, which translates plan workers

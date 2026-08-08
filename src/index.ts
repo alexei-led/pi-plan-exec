@@ -10,6 +10,7 @@ import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { BridgeClient } from "./bridge.js";
 import {
   isExternalManualBlocker,
+  isModelProviderFailure,
   isTaskRetryConfirmationRequired,
   MAX_STATUS_FAILURES,
   PLAN_STRUCTURE_CHANGED_ERROR,
@@ -42,6 +43,7 @@ const COMMAND_CAS_RETRIES = 5;
 const MILLISECONDS_PER_SECOND = 1_000;
 const SECONDS_PER_MINUTE = 60;
 const DISPLAY_RUN_ID_LENGTH = 8;
+const RECOVERY_MODEL_OPTION = "--model";
 const REQUIRED_RUNTIME_TOOLS: Record<string, string> = {
   subagent: "pi-subagents",
   TaskCreate: "@tintinweb/pi-tasks",
@@ -456,6 +458,11 @@ export function recoveryGuidance(run: PlanExecRun): RecoveryGuidance {
       action: `Use /exec resume ${run.id}; it applies the paused stage or its terminal child without starting a second writer.`,
     };
   if (run.status === RUN_STATUS.FAILED) {
+    if (isModelProviderFailure(run))
+      return {
+        classification: "model/provider failure",
+        action: `Use /exec resume ${run.id} ${RECOVERY_MODEL_OPTION} current|provider/model. Interactive resume prompts for an available model when this option is omitted. The failed child is terminal; under this version, a model/provider failure does not consume another task attempt.`,
+      };
     if (isExternalManualBlocker(run))
       return {
         classification: "external/manual blocker",
@@ -516,6 +523,15 @@ export function formatRunStatus(run: PlanExecRun): string {
   if (operation) lines.push(`operation ID: ${operation.operationId}`);
   if (operation?.externalRunId)
     lines.push(`external run ID: ${operation.externalRunId}`);
+  if (run.failedOperation) {
+    lines.push(
+      `failed operation: ${run.failedOperation.service}/${run.failedOperation.kind}`,
+    );
+    if (run.failedOperation.externalRunId)
+      lines.push(`failed external run ID: ${run.failedOperation.externalRunId}`);
+    if (run.failedOperation.terminalError)
+      lines.push(`failed operation error: ${run.failedOperation.terminalError}`);
+  }
   if (run.progressPath) lines.push(`progress: ${run.progressPath}`);
   if (operation?.lastObservedAt)
     lines.push(
@@ -604,6 +620,7 @@ async function handleCommand(
             selector: rest[0],
             adoptCurrentBranch: false,
             retryTask: false,
+            model: undefined,
           };
     const adoptCurrentBranch = resumeArguments.adoptCurrentBranch;
     if (
@@ -626,6 +643,10 @@ async function handleCommand(
       action === EXEC_ACTION.SKIP
     ) {
       await checkRuntime();
+      const recoveryModel =
+        action === EXEC_ACTION.RESUME
+          ? await recoveryModelForResume(run, resumeArguments.model, ctx)
+          : undefined;
       const skipReason =
         action === EXEC_ACTION.SKIP ? parseSkipReason(rest.slice(1)) : undefined;
       const handedOff = await handoffToWorktree(
@@ -633,7 +654,7 @@ async function handleCommand(
         run,
         syncProjection,
         action === EXEC_ACTION.RESUME
-          ? `resume ${run.id}${adoptCurrentBranch ? " --adopt-current-branch" : ""}${resumeArguments.retryTask ? ` ${TASK_RETRY_OPTION}` : ""}`
+          ? `resume ${run.id}${adoptCurrentBranch ? " --adopt-current-branch" : ""}${resumeArguments.retryTask ? ` ${TASK_RETRY_OPTION}` : ""}${recoveryModel ? ` ${RECOVERY_MODEL_OPTION} ${recoveryModel}` : ""}`
           : action === EXEC_ACTION.SKIP
             ? `skip ${run.id} --reason ${skipReason}`
             : undefined,
@@ -700,6 +721,7 @@ async function handleCommand(
           true,
           reviewedPlanHash,
           resumeArguments.retryTask,
+          recoveryModel,
         ),
         { cwd: ctx.cwd, sessionId },
       );
@@ -935,10 +957,73 @@ export function needsPlanStructureReview(run: PlanExecRun): boolean {
   );
 }
 
+async function recoveryModelForResume(
+  run: PlanExecRun,
+  requested: string | undefined,
+  ctx: ExtensionCommandContext,
+): Promise<string | undefined> {
+  if (requested) {
+    if (run.status !== RUN_STATUS.FAILED)
+      throw new Error(`${RECOVERY_MODEL_OPTION} is only valid for a failed run.`);
+    return resolveRecoveryModel(requested, ctx);
+  }
+  if (!isModelProviderFailure(run)) return undefined;
+  if (!ctx.hasUI)
+    throw new Error(
+      `This run failed at the model/provider boundary. Resume with ${RECOVERY_MODEL_OPTION} provider/model (or ${RECOVERY_MODEL_OPTION} current).`,
+    );
+  const current = ctx.model ? modelReference(ctx.model) : undefined;
+  const available = ctx.modelRegistry.getAvailable();
+  const models = [
+    ...available.filter((model) => modelReference(model) === current),
+    ...available.filter((model) => modelReference(model) !== current),
+  ];
+  const labels = models.map((model) => modelReference(model));
+  if (labels.length === 0)
+    throw new Error("No authenticated recovery model is available.");
+  const choice = await ctx.ui.select(
+    "Select a model for plan-exec recovery",
+    labels,
+  );
+  if (!choice) throw new Error("Model recovery cancelled.");
+  return choice;
+}
+
+function resolveRecoveryModel(
+  requested: string,
+  ctx: ExtensionCommandContext,
+): string {
+  if (requested === "current") {
+    if (!ctx.model) throw new Error("This Pi session has no active model.");
+    return modelReference(ctx.model);
+  }
+  const separator = requested.indexOf("/");
+  if (separator <= 0 || separator === requested.length - 1)
+    throw new Error(
+      `${RECOVERY_MODEL_OPTION} requires current or provider/model.`,
+    );
+  const provider = requested.slice(0, separator);
+  const modelId = requested.slice(separator + 1);
+  if (!ctx.modelRegistry.find(provider, modelId))
+    throw new Error(`Unknown recovery model: ${requested}`);
+  if (
+    !ctx.modelRegistry
+      .getAvailable()
+      .some((model) => model.provider === provider && model.id === modelId)
+  )
+    throw new Error(`Recovery model is not authenticated: ${requested}`);
+  return requested;
+}
+
+function modelReference(model: { provider: string; id: string }): string {
+  return `${model.provider}/${model.id}`;
+}
+
 export function parseResumeArguments(args: string[]): {
   selector: string | undefined;
   adoptCurrentBranch: boolean;
   retryTask: boolean;
+  model: string | undefined;
 } {
   const first = args[0];
   const selector = first?.startsWith("--") ? undefined : first;
@@ -951,20 +1036,35 @@ export function parseResumeArguments(args: string[]): {
 export function parseResumeOptions(args: string[]): {
   adoptCurrentBranch: boolean;
   retryTask: boolean;
+  model: string | undefined;
 } {
-  const options = {
+  const options: {
+    adoptCurrentBranch: boolean;
+    retryTask: boolean;
+    model: string | undefined;
+  } = {
     adoptCurrentBranch: false,
     retryTask: false,
+    model: undefined,
   };
-  for (const arg of args) {
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
     if (arg === "--adopt-current-branch") options.adoptCurrentBranch = true;
     else if (arg === TASK_RETRY_OPTION) options.retryTask = true;
-    else
-      throw new Error(
-        `Usage: /exec resume <full-run-id> [--adopt-current-branch] [${TASK_RETRY_OPTION}]`,
-      );
+    else if (arg === RECOVERY_MODEL_OPTION) {
+      const model = args[index + 1];
+      if (!model || model.startsWith("--")) throw resumeUsageError();
+      options.model = model;
+      index += 1;
+    } else throw resumeUsageError();
   }
   return options;
+}
+
+function resumeUsageError(): Error {
+  return new Error(
+    `Usage: /exec resume <full-run-id> [--adopt-current-branch] [${TASK_RETRY_OPTION}] [${RECOVERY_MODEL_OPTION} current|provider/model]`,
+  );
 }
 
 export function resumeResultMessage(run: PlanExecRun): string {
@@ -1146,8 +1246,8 @@ export function execHelp(): string {
     "/exec status [run-id]   Show progress; run-id is optional when unambiguous.",
     "/exec runs              List runs and their full IDs.",
     "/exec pause [run-id]    Pause after the active child finishes.",
-    `/exec resume [run-id] [--adopt-current-branch] [${TASK_RETRY_OPTION}]`,
-    "                        Reconcile, resume, or retry a failed run safely; exhausted implementation tasks require the explicit flag.",
+    `/exec resume [run-id] [--adopt-current-branch] [${TASK_RETRY_OPTION}] [${RECOVERY_MODEL_OPTION} current|provider/model]`,
+    "                        Reconcile, resume, or retry a failed run safely; model/provider failures prompt for an authenticated recovery model.",
     "/exec adopt [run-id]    Adopt a stale run from another session.",
     "/exec skip <full-run-id> --reason <text>",
     "                        Stop any tracked child, force-skip a blocked review/finalize/stats stage, and record the waiver.",
@@ -1158,6 +1258,7 @@ export function execHelp(): string {
     "- The footer shows live stage and worker progress.",
     "- /exec resume preserves the stage and worktree, and reconciles a known Bridge operation before retrying it.",
     "- --adopt-current-branch requires confirmation, no active child, and the same Git repository.",
+    `- ${RECOVERY_MODEL_OPTION} current uses this Pi session model; provider/model pins the recovered Bridge stage and later launches of the same role.`,
     "- /exec skip never skips implementation or archive; skipped runs finish as completed_with_findings.",
     "- Worktree runs fork this Pi session into the worktree so the footer and tools use the execution directory.",
     "- Use /skill:exec-plan for the executable-plan format and recovery rules.",

@@ -70,6 +70,33 @@ budgets where supported. A task retry limit is different: normal resume refuses
 to reset it. Status labels it `retry-exhausted or no-progress task` or
 `external/manual blocker` and prints the exact `--retry-task` command.
 
+## Model or provider failure
+
+When status classifies `model/provider failure`, the Bridge child is terminal.
+Plan-exec preserves its external run ID and terminal error and does not consume
+an implementation task attempt. Recover the same run with one of:
+
+```text
+/exec resume <full-run-id>
+/exec resume <full-run-id> --model current
+/exec resume <full-run-id> --model <provider/model>
+```
+
+Interactive resume without `--model` opens the authenticated model picker.
+`current` uses the active Pi session model. An explicit model pins the recovered
+Bridge role and later launches of that role in this run. Choose a model whose
+provider is authenticated and does not have the reported incompatibility or
+quota failure. Do not keep retrying the same failing model.
+
+Older records that lack terminal provider diagnostics may still classify as a
+retry-exhausted task and require `--retry-task` together with `--model`. After
+resume, run status again and verify the failed external run ID was replaced only
+after its terminal state was recorded.
+
+`/exec` is a Pi UI command. If the current agent cannot invoke slash commands,
+it must give the user the exact command instead of claiming recovery ran or
+launching a child directly.
+
 ## Force-skip a blocked stage
 
 Use this only after inspecting the findings and active operation:

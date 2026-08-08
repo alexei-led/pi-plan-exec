@@ -198,6 +198,7 @@ export interface ActiveOperation {
   statusFailures?: number;
   lastObservedAt?: number;
   lastStatusError?: string;
+  terminalError?: string;
   skipFailures?: number;
   lastSkipError?: string;
 }

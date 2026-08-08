@@ -74,8 +74,12 @@ current repository, and use `/exec runs` when several runs need disambiguation.
 or recovers a recorded failure in the same stage and preserved worktree. A
 retry-exhausted or externally blocked implementation task is never retried
 implicitly; fix the blocker, then use `/exec resume <run-id> --retry-task`.
-Implementation checkboxes remain sequential and cannot be force-skipped. When a
-provider operation may still exist, plan-exec keeps its identity and adopts it
+A terminal model/provider failure preserves its child error and operation without
+consuming an implementation retry. Interactive resume prompts for an
+authenticated recovery model; use `--model current` or `--model provider/model`
+to select one explicitly. Implementation checkboxes remain sequential and
+cannot be force-skipped. When a provider operation may still exist, plan-exec
+keeps its identity and adopts it
 before any retry. If a review, finalization, or
 statistics stage cannot recover, `/exec skip <full-run-id> --reason <text>`
 stops the tracked child before recording an explicit waiver and advancing. It

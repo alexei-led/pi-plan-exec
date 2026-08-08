@@ -59,6 +59,7 @@ const OPERATION_UPDATE_CAS_RETRIES = 5;
 const OPERATION_RECOVERY_DELAY_MS = 35_000;
 const RECOVERY_WORKER_MAX_TURNS = 75;
 const RECOVERY_REVIEWER_MAX_TURNS = 75;
+const MAX_TERMINAL_ERROR_LENGTH = 2_000;
 export const PLAN_STRUCTURE_CHANGED_ERROR =
   "Plan task structure changed outside checkbox completion.";
 
@@ -172,6 +173,7 @@ export class PlanExecController {
     explicit = true,
     reviewedPlanHash?: string,
     retryTask = false,
+    recoveryModel?: string,
   ): Promise<PlanExecRun> {
     const coordinated = await this.registry.withControllerLock(runId, () =>
       this.resumeLocked(
@@ -180,6 +182,7 @@ export class PlanExecController {
         explicit,
         reviewedPlanHash,
         retryTask,
+        recoveryModel,
       ),
     );
     if (coordinated) return coordinated;
@@ -194,6 +197,7 @@ export class PlanExecController {
     explicit: boolean,
     reviewedPlanHash?: string,
     retryTask = false,
+    recoveryModel?: string,
   ): Promise<PlanExecRun> {
     const existing = await this.registry.get(runId);
     if (!existing) throw new Error(`Plan execution run not found: ${runId}`);
@@ -215,7 +219,11 @@ export class PlanExecController {
     if (explicit && isRecoverableFailure(prepared)) {
       if (isTaskRetryConfirmationRequired(prepared) && !retryTask)
         throw new Error(taskRetryRequiredMessage(prepared));
-      prepared = await this.recoverFailedRun(prepared, retryTask);
+      prepared = await this.recoverFailedRun(
+        prepared,
+        retryTask,
+        recoveryModel,
+      );
     } else if (explicit && prepared.status === RUN_STATUS.PAUSED) {
       const resumed = await this.registry.updateIfCurrent(
         clearError({ ...prepared, status: RUN_STATUS.RUNNING }),
@@ -600,8 +608,10 @@ export class PlanExecController {
   ): Promise<PlanExecRun> {
     const operationId = randomUUID();
     const launchStartedAt = Date.now();
+    const model = bridgeModel(run.config, input.kind);
     const params = {
       agent: input.agent,
+      ...(model ? { model } : {}),
       task: input.task,
       cwd: run.worktreeCwd,
       context: "fresh",
@@ -765,6 +775,7 @@ export class PlanExecController {
         `Cannot recover unsupported bridge operation kind: ${operation.kind}.`,
       );
     }
+    const model = bridgeModel(run.config, operation.kind);
     return {
       agent:
         operation.kind === OPERATION_KIND.STATS
@@ -772,6 +783,7 @@ export class PlanExecController {
           : operation.kind === OPERATION_KIND.REVIEW
             ? run.config.reviewerAgent
             : run.config.workerAgent,
+      ...(model ? { model } : {}),
       task,
       cwd: run.worktreeCwd,
       context: "fresh",
@@ -859,10 +871,24 @@ export class PlanExecController {
       state === EXTERNAL_OPERATION_STATE.STOPPING
     )
       return observed;
+    const terminalError = bridgeTerminalError(status.data);
 
     if (operation.kind === OPERATION_KIND.IMPLEMENTATION)
-      return this.finishImplementation(observed, operation, state);
+      return this.finishImplementation(
+        observed,
+        operation,
+        state,
+        terminalError,
+      );
     if (operation.kind === OPERATION_KIND.REVIEW) {
+      if (!isSuccessfulOperationState(state))
+        return this.finishReview(
+          observed,
+          operation,
+          state,
+          "",
+          terminalError,
+        );
       let output: string;
       try {
         output = await this.bridgeOutput(operation);
@@ -878,13 +904,14 @@ export class PlanExecController {
       return this.finishReview(current, operation, state, output);
     }
     if (operation.kind === OPERATION_KIND.FIX)
-      return this.finishFix(observed, operation, state);
+      return this.finishFix(observed, operation, state, terminalError);
     if (operation.kind === OPERATION_KIND.FINALIZE)
       return this.finishBestEffort(
         observed,
         operation,
         state,
         RUN_STAGE.STATS,
+        terminalError,
       );
     if (operation.kind === OPERATION_KIND.STATS)
       return this.finishBestEffort(
@@ -892,6 +919,7 @@ export class PlanExecController {
         operation,
         state,
         RUN_STAGE.ARCHIVE,
+        terminalError,
       );
     return this.fail(
       run,
@@ -984,6 +1012,7 @@ export class PlanExecController {
   private async recoverFailedRun(
     run: PlanExecRun,
     retryTask = false,
+    recoveryModel?: string,
   ): Promise<PlanExecRun> {
     const plan =
       run.stage === RUN_STAGE.ARCHIVE
@@ -1015,7 +1044,7 @@ export class PlanExecController {
         : undefined;
     if (isTaskRetryConfirmationRequired(run) && !retryTask)
       throw new Error(taskRetryRequiredMessage(run));
-    const config = recoveryConfig(run);
+    const config = recoveryConfig(run, recoveryModel);
     const retryFailedReview =
       isReviewStage(run.stage) &&
       (run.failedOperation?.kind === OPERATION_KIND.REVIEW ||
@@ -1059,7 +1088,7 @@ export class PlanExecController {
     await appendProgress(
       recovered.run,
       task
-        ? `Manual recovery reset Task ${task.id} and retried the failed implementation stage.`
+        ? `Manual recovery reset Task ${task.id} and retried the failed implementation stage${recoveryModel ? ` with model ${recoveryModel}` : ""}.`
         : retryFailedFix
           ? `Manual recovery retried the failed ${run.stage} fix operation.`
           : retryFailedReview
@@ -1104,6 +1133,7 @@ export class PlanExecController {
     run: PlanExecRun,
     operation: ActiveOperation,
     state: string,
+    terminalError?: string,
   ): Promise<PlanExecRun> {
     const taskId = operation.taskId;
     if (!taskId)
@@ -1114,6 +1144,15 @@ export class PlanExecController {
     const task = plan.tasks.find((candidate) => candidate.id === taskId);
     if (!task)
       return this.fail(run, `Task ${taskId} disappeared from the plan.`);
+    if (
+      !isSuccessfulOperationState(state) &&
+      isModelProviderFailureText(terminalError)
+    ) {
+      return this.fail(
+        withTerminalError(run, operation, terminalError),
+        `Worker ${operation.externalRunId} hit a model/provider failure before task ${taskId} completed; its task retry budget was not consumed: ${terminalError}`,
+      );
+    }
     const attempts = (run.taskAttempts[String(taskId)] ?? 0) + 1;
     const cleared = withoutOperation({
       ...run,
@@ -1128,8 +1167,15 @@ export class PlanExecController {
     }
     if (attempts > run.config.taskRetries) {
       return this.fail(
-        cleared,
-        `Worker ${operation.externalRunId} ended as ${state} and left task ${taskId} checkboxes unchecked.`,
+        withTerminalError(
+          { ...run, taskAttempts: cleared.taskAttempts },
+          operation,
+          terminalError,
+        ),
+        operationFailureMessage(
+          `Worker ${operation.externalRunId} ended as ${state} and left task ${taskId} checkboxes unchecked.`,
+          terminalError,
+        ),
       );
     }
     return this.advanceUnlocked(await this.registry.update(cleared));
@@ -1171,9 +1217,16 @@ export class PlanExecController {
     operation: ActiveOperation,
     state: string,
     output: string,
+    terminalError?: string,
   ): Promise<PlanExecRun> {
     if (!isSuccessfulOperationState(state))
-      return this.fail(run, `Review operation ended as ${state}.`);
+      return this.fail(
+        withTerminalError(run, operation, terminalError),
+        operationFailureMessage(
+          `Review operation ended as ${state}.`,
+          terminalError,
+        ),
+      );
     let findings: ReviewFinding[];
     try {
       findings = parseReviewFindings(output);
@@ -1224,10 +1277,17 @@ export class PlanExecController {
     run: PlanExecRun,
     operation: ActiveOperation,
     state: string,
+    terminalError?: string,
   ): Promise<PlanExecRun> {
     const cleared = withoutOperation(run);
     if (state !== EXTERNAL_OPERATION_STATE.COMPLETE)
-      return this.fail(run, `Fix operation ended as ${state}.`);
+      return this.fail(
+        withTerminalError(run, operation, terminalError),
+        operationFailureMessage(
+          `Fix operation ended as ${state}.`,
+          terminalError,
+        ),
+      );
     await appendProgress(
       cleared,
       `Applied fixes for ${run.stage} iteration ${operation.reviewIteration ?? 1}.`,
@@ -1264,9 +1324,16 @@ export class PlanExecController {
     operation: ActiveOperation,
     state: string,
     next: RunStage,
+    terminalError?: string,
   ): Promise<PlanExecRun> {
     if (!isSuccessfulOperationState(state))
-      return this.fail(run, `${operation.kind} operation ended as ${state}.`);
+      return this.fail(
+        withTerminalError(run, operation, terminalError),
+        operationFailureMessage(
+          `${operation.kind} operation ended as ${state}.`,
+          terminalError,
+        ),
+      );
     const cleared = withoutOperation(run);
     await appendProgress(
       cleared,
@@ -1755,6 +1822,37 @@ export class PlanExecController {
   }
 }
 
+function bridgeTerminalError(
+  data: Record<string, unknown>,
+): string | undefined {
+  const statusText = text(data.text);
+  if (!statusText) return undefined;
+  const error = statusText.match(/^Error:\s*(.+)$/m)?.[1] ?? statusText;
+  return error.trim().slice(0, MAX_TERMINAL_ERROR_LENGTH);
+}
+
+function operationFailureMessage(
+  message: string,
+  terminalError?: string,
+): string {
+  return terminalError ? `${message} ${terminalError}` : message;
+}
+
+function withTerminalError(
+  run: PlanExecRun,
+  operation: ActiveOperation,
+  terminalError?: string,
+): PlanExecRun {
+  if (!terminalError) return run;
+  return {
+    ...run,
+    activeOperation: {
+      ...(run.activeOperation ?? operation),
+      terminalError,
+    },
+  };
+}
+
 function isSuccessfulOperationState(state: string): boolean {
   return (
     state === EXTERNAL_OPERATION_STATE.COMPLETE ||
@@ -1812,35 +1910,62 @@ function completionStatus(run: PlanExecRun) {
     : RUN_STATUS.COMPLETED;
 }
 
-function recoveryConfig(run: PlanExecRun): FrozenRunConfig {
+function recoveryConfig(
+  run: PlanExecRun,
+  recoveryModel?: string,
+): FrozenRunConfig {
+  let config = run.config;
   if (
     run.stage === RUN_STAGE.IMPLEMENTATION ||
     run.stage === RUN_STAGE.FINALIZE
   )
-    return {
-      ...run.config,
+    config = {
+      ...config,
       workerMaxTurns: Math.max(
-        run.config.workerMaxTurns,
+        config.workerMaxTurns,
         RECOVERY_WORKER_MAX_TURNS,
       ),
     };
-  if (run.stage === RUN_STAGE.STATS)
-    return {
-      ...run.config,
+  else if (run.stage === RUN_STAGE.STATS)
+    config = {
+      ...config,
       statsMaxTurns: Math.max(
-        run.config.statsMaxTurns,
+        config.statsMaxTurns,
         RECOVERY_REVIEWER_MAX_TURNS,
       ),
     };
-  if (isReviewStage(run.stage))
-    return {
-      ...run.config,
+  else if (isReviewStage(run.stage))
+    config = {
+      ...config,
       reviewerMaxTurns: Math.max(
-        run.config.reviewerMaxTurns,
+        config.reviewerMaxTurns,
         RECOVERY_REVIEWER_MAX_TURNS,
       ),
     };
-  return run.config;
+  if (!recoveryModel) return config;
+  if (
+    run.stage === RUN_STAGE.IMPLEMENTATION ||
+    run.stage === RUN_STAGE.FINALIZE ||
+    run.failedOperation?.kind === OPERATION_KIND.FIX
+  )
+    return { ...config, workerModel: recoveryModel };
+  if (run.stage === RUN_STAGE.STATS)
+    return { ...config, statsModel: recoveryModel };
+  if (
+    isReviewStage(run.stage) &&
+    run.failedOperation?.kind !== OPERATION_KIND.FUSION
+  )
+    return { ...config, reviewerModel: recoveryModel };
+  return config;
+}
+
+function bridgeModel(
+  config: FrozenRunConfig,
+  kind: ActiveOperation["kind"],
+): string | undefined {
+  if (kind === OPERATION_KIND.STATS) return config.statsModel;
+  if (kind === OPERATION_KIND.REVIEW) return config.reviewerModel;
+  return config.workerModel;
 }
 
 function workerPrompt(
@@ -1991,7 +2116,25 @@ export function isTaskRetryConfirmationRequired(run: PlanExecRun): boolean {
     run.status === RUN_STATUS.FAILED &&
     run.stage === RUN_STAGE.IMPLEMENTATION &&
     run.activeOperation === undefined &&
+    !isModelProviderFailure(run) &&
     (isRecoverableImplementationFailure(run) || isExternalManualBlocker(run))
+  );
+}
+
+export function isModelProviderFailure(run: PlanExecRun): boolean {
+  return isModelProviderFailureText(recoveryEvidence(run));
+}
+
+function isModelProviderFailureText(value: string | undefined): boolean {
+  if (!value) return false;
+  return (
+    /string_above_max_length.*call[_ -]?id|call[_ -]?id.*(?:string_above_max_length|maximum length)/i.test(
+      value,
+    ) ||
+    /out of extra usage/i.test(value) ||
+    /model .*(?:not found|does not exist|unavailable)/i.test(value) ||
+    /(?:invalid|missing) api key|authentication failed/i.test(value) ||
+    /invalid_grant|refresh token expired|oauth .*refresh.*failed/i.test(value)
   );
 }
 
@@ -2015,6 +2158,7 @@ function recoveryEvidence(run: PlanExecRun): string {
     run.activeOperation?.lastStatusError,
     run.failedOperation?.lastLaunchError,
     run.failedOperation?.lastStatusError,
+    run.failedOperation?.terminalError,
   ]
     .filter((value): value is string => Boolean(value))
     .join(" ");

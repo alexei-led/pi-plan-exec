@@ -122,6 +122,7 @@ test("help and setup explain the installed command surface", () => {
   assert.match(execHelp(), /\/exec status \[run-id\]/);
   assert.match(execHelp(), /retry a failed run/);
   assert.match(execHelp(), /\/exec skip <full-run-id> --reason <text>/);
+  assert.match(execHelp(), /--model current\|provider\/model/);
   assert.match(execHelp(), /completed_with_findings/);
   assert.match(execHelp(), /\/skill:exec-plan/);
   assert.match(
@@ -154,30 +155,55 @@ test("resume accepts options without an explicit run ID", () => {
     selector: undefined,
     adoptCurrentBranch: false,
     retryTask: true,
+    model: undefined,
   });
   assert.deepEqual(
-    parseResumeArguments(["run-id", "--adopt-current-branch", "--retry-task"]),
-    { selector: "run-id", adoptCurrentBranch: true, retryTask: true },
+    parseResumeArguments([
+      "run-id",
+      "--adopt-current-branch",
+      "--retry-task",
+      "--model",
+      "current",
+    ]),
+    {
+      selector: "run-id",
+      adoptCurrentBranch: true,
+      retryTask: true,
+      model: "current",
+    },
   );
 });
 
-test("resume branch-adoption option is explicit", () => {
+test("resume branch-adoption and recovery-model options are explicit", () => {
   assert.deepEqual(parseResumeOptions([]), {
     adoptCurrentBranch: false,
     retryTask: false,
+    model: undefined,
   });
   assert.deepEqual(parseResumeOptions(["--adopt-current-branch"]), {
     adoptCurrentBranch: true,
     retryTask: false,
+    model: undefined,
   });
   assert.deepEqual(parseResumeOptions(["--retry-task"]), {
     adoptCurrentBranch: false,
     retryTask: true,
+    model: undefined,
   });
   assert.deepEqual(
-    parseResumeOptions(["--adopt-current-branch", "--retry-task"]),
-    { adoptCurrentBranch: true, retryTask: true },
+    parseResumeOptions([
+      "--adopt-current-branch",
+      "--retry-task",
+      "--model",
+      "anthropic-work/claude-sonnet-4-6",
+    ]),
+    {
+      adoptCurrentBranch: true,
+      retryTask: true,
+      model: "anthropic-work/claude-sonnet-4-6",
+    },
   );
+  assert.throws(() => parseResumeOptions(["--model"]), /Usage/);
   assert.throws(() => parseResumeOptions(["--force"]), /Usage/);
 
   const running = run({ status: "running" });
@@ -293,6 +319,27 @@ test("run status classifies recovery and gives one safe next action", () => {
   assert.match(blocked, /recovery: external\/manual blocker/);
   assert.match(blocked, /--retry-task/);
   assert.match(blocked, /cannot bypass an incomplete implementation task/);
+
+  const modelFailureRun = run({
+    status: "failed",
+    error:
+      "Worker failed because the model/provider is unusable: Invalid call_id: maximum length 64.",
+    failedOperation: {
+      operationId: "failed-model-operation",
+      service: "bridge",
+      kind: "implementation",
+      externalRunId: "failed-model-run",
+      taskId: 1,
+      terminalError:
+        "Codex error: [string_above_max_length] Invalid call_id: maximum length 64.",
+    },
+  });
+  delete modelFailureRun.activeOperation;
+  const modelFailure = formatRunStatus(modelFailureRun);
+  assert.match(modelFailure, /recovery: model\/provider failure/);
+  assert.match(modelFailure, /--model current\|provider\/model/);
+  assert.match(modelFailure, /failed-model-run/);
+  assert.match(modelFailure, /string_above_max_length/);
 
   const unknown = formatRunStatus(
     run({

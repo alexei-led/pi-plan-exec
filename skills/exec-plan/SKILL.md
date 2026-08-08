@@ -21,6 +21,7 @@ recovery with a manually launched subagent.
 - Inspect one run: `/exec status <full-run-id>`.
 - Request a pause for a starting or running run: `/exec pause <full-run-id>`.
 - Continue or recover: `/exec resume <full-run-id>`.
+- Recover a terminal model/provider failure: use interactive `/exec resume <full-run-id>` to select an authenticated model, or specify `/exec resume <full-run-id> --model current|provider/model`.
 - Retry an exhausted or externally blocked implementation task only after fixing or verifying the blocker: `/exec resume <full-run-id> --retry-task`.
 - Adopt a verified current execution branch: `/exec resume <full-run-id> --adopt-current-branch`.
 - Claim an unfinished stale run: `/exec adopt <full-run-id>`.
@@ -33,6 +34,12 @@ recovery with a manually launched subagent.
 Use the full run ID whenever more than one run exists, after a reload, or when
 working outside the execution worktree. Do not rely on implicit run selection in
 those cases.
+
+## Command ownership
+
+`/exec` is a Pi UI command, not a shell command or agent tool. If this agent
+cannot invoke Pi slash commands, give the user the exact command and do not claim
+that it ran. Never replace it with a manual subagent launch.
 
 ## Write an executable plan
 
@@ -74,8 +81,8 @@ For every control or recovery request:
 
 1. Run `/exec runs` and select the durable run ID.
 2. Run `/exec status <full-run-id>`.
-3. Record the status, stage, worktree, branch, active operation, progress path,
-   last observation, and error.
+3. Record the status, stage, worktree, branch, active or failed operation,
+   progress path, last observation, terminal child error, and run error.
 4. Choose exactly one action from that evidence.
 5. Run `/exec status <full-run-id>` again and verify the same run moved to the
    expected state.
@@ -110,6 +117,12 @@ second writer.
 - A retry-exhausted or external/manual-blocked implementation task requires
   `--retry-task`; normal resume refuses to reset its attempts. Implementation
   checkboxes are sequential and cannot be skipped.
+- A classified model/provider failure is different: the child is terminal, its
+  error and operation are preserved, and the implementation retry budget is not
+  consumed. Resume with an authenticated replacement model. Do not retry the
+  same unusable model repeatedly.
+- `--model current` uses the active Pi session model. `--model provider/model`
+  pins the recovered Bridge role and its later launches in this run.
 - `/exec skip` is a last-resort waiver, not a review pass. It requires an
   interactive confirmation and reason, stops any tracked child before advancing,
   and ends as `completed_with_findings`. Never use it for implementation or
