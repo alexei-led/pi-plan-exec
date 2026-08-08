@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.4.5 - 2026-08-08
+
+- Clear legacy recovery model pins on an explicit resume without changing a
+  live tracked child, so future workers use the active Pi model.
+
 ## 0.4.4 - 2026-08-08
 
 - Make `/exec resume` idempotently reconcile a running worker and automatically

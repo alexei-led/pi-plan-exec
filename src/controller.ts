@@ -203,6 +203,17 @@ export class PlanExecController {
     if (!existing) throw new Error(`Plan execution run not found: ${runId}`);
     const claimed = await this.registry.claim(existing, sessionId);
     let prepared = claimed;
+    if (explicit) {
+      const unpinned = withoutLegacyRecoveryModelPins(prepared);
+      if (unpinned !== prepared) {
+        const normalized = await this.registry.updateIfCurrent(
+          unpinned,
+          prepared.updatedAt,
+        );
+        if (!normalized.applied) return normalized.run;
+        prepared = normalized.run;
+      }
+    }
     if (reviewedPlanHash !== undefined) {
       const adopted = await this.registry.updateIfCurrent(
         {
@@ -1917,6 +1928,20 @@ function withoutRecoveryModel(run: PlanExecRun): PlanExecRun {
   const copy = { ...run };
   delete copy.recoveryModel;
   return copy;
+}
+
+function withoutLegacyRecoveryModelPins(run: PlanExecRun): PlanExecRun {
+  if (
+    !run.config.workerModel &&
+    !run.config.reviewerModel &&
+    !run.config.statsModel
+  )
+    return run;
+  const config = { ...run.config };
+  delete config.workerModel;
+  delete config.reviewerModel;
+  delete config.statsModel;
+  return { ...run, config };
 }
 
 function recoveryConfig(run: PlanExecRun): FrozenRunConfig {

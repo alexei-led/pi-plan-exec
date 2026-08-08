@@ -116,6 +116,38 @@ test("plan structure drift pauses for review and resumes after repair", async ()
   assert.equal(resumed.activeOperation?.kind, "implementation");
 });
 
+test("plain resume clears legacy recovery model pins before launching", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
+  const planPath = join(root, "plan.md");
+  const plan = "### Task 1: Implement\n- [ ] Do the work\n";
+  await writeFile(planPath, plan);
+  const registry = new RunRegistry(join(root, "runs"));
+  const bridge = new FakeBridge(join(root, "none.json"));
+  const controller = new PlanExecController(
+    registry,
+    bridge,
+    new FakeFusion(),
+    fakeGit(root),
+  );
+  const paused = await registry.create({
+    ...baseRun(root, planPath),
+    planHash: parsePlan(planPath, plan).hash,
+    status: "paused",
+    stage: "implementation",
+    config: {
+      ...baseRun(root, planPath).config,
+      workerModel: "anthropic-work/claude-sonnet-4-6",
+    },
+  });
+
+  const resumed = await controller.resume(paused.id, "session-1");
+
+  assert.equal(resumed.status, "running");
+  assert.equal(resumed.config.workerModel, undefined);
+  assert.equal(resumed.activeOperation?.params?.model, undefined);
+  assert.equal(bridge.spawnCount, 1);
+});
+
 test("resume refuses an exhausted worker without explicit task retry", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
   const planPath = join(root, "plan.md");
