@@ -156,7 +156,7 @@ record, worktree, active-operation evidence, and approval or runtime fix needed.
 ## Prerequisites
 
 `pi-plan-exec` requires compatible installations of `pi-subagents`,
-`@tintinweb/pi-tasks`, `@alexeiled/pi-subagents-bridge` `0.2.0` or later, and
+`@tintinweb/pi-tasks`, `@alexeiled/pi-subagents-bridge` `0.2.2` or later, and
 `@alexeiled/pi-fusion`. Use `/exec setup`, install what it reports, run
 `/reload`, then return to the same run ID. Installing dependencies does not
 replace or complete the preserved run.

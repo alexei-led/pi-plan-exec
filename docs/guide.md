@@ -12,7 +12,7 @@ contracts and component ownership.
 - A Git repository with a non-detached `HEAD`.
 - A plan file inside that repository.
 - These independently installed Pi packages, at compatible versions. In
-  particular, `@alexeiled/pi-subagents-bridge` must be `0.2.0` or later:
+  particular, `@alexeiled/pi-subagents-bridge` must be `0.2.2` or later:
   - `pi-subagents`;
   - `@tintinweb/pi-tasks`;
   - `@alexeiled/pi-subagents-bridge`;
@@ -27,7 +27,7 @@ does not require cc-thingz agents.
 ```bash
 pi install npm:pi-subagents
 pi install npm:@tintinweb/pi-tasks
-pi install npm:@alexeiled/pi-subagents-bridge@^0.2.0
+pi install npm:@alexeiled/pi-subagents-bridge@^0.2.2
 pi install npm:@alexeiled/pi-fusion
 pi install npm:@alexeiled/pi-plan-exec
 ```

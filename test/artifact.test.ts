@@ -84,6 +84,21 @@ test("falls back when an explicit result artifact is metadata-only", async () =>
   assert.equal(await readSubagentArtifact(result, asyncDir), "NO_FINDINGS");
 });
 
+test("uses the single workflow child output instead of the workflow summary", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-artifact-"));
+  const result = join(root, "result.json");
+  await writeFile(
+    result,
+    JSON.stringify({
+      mode: "workflow",
+      output: "Workflow completed successfully (1 child).",
+      results: [{ agent: "main", output: "NO_FINDINGS" }],
+    }),
+  );
+
+  assert.equal(await readSubagentArtifact(result, undefined), "NO_FINDINGS");
+});
+
 test("uses an explicit output artifact before status fallback", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-artifact-"));
   const asyncDir = join(root, "async");

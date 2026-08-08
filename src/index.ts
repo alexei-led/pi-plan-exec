@@ -231,8 +231,11 @@ export default function planExecExtension(pi: ExtensionAPI): void {
     const missing: string[] = [];
     const incompatible: string[] = [];
     if (!bridgeReply.success) missing.push("@alexeiled/pi-subagents-bridge");
-    else if (!hasBridgeOperationMethod(bridgeReply.data))
-      incompatible.push("@alexeiled/pi-subagents-bridge >=0.2.0");
+    else if (
+      !hasBridgeOperationMethod(bridgeReply.data) ||
+      !hasBridgeWorkflowScriptSpawnCapability(bridgeReply.data)
+    )
+      incompatible.push("@alexeiled/pi-subagents-bridge >=0.2.2");
     if (!fusionReply.success) missing.push("@alexeiled/pi-fusion");
     if (missing.length > 0 || incompatible.length > 0) {
       const problems = [
@@ -352,6 +355,20 @@ export function hasBridgeOperationMethod(data: unknown): boolean {
     return false;
   const methods = data.methods;
   return Array.isArray(methods) && methods.includes("operation");
+}
+
+export function hasBridgeWorkflowScriptSpawnCapability(
+  data: unknown,
+): boolean {
+  if (typeof data !== "object" || data === null || !("capabilities" in data))
+    return false;
+  const capabilities = data.capabilities;
+  return (
+    typeof capabilities === "object" &&
+    capabilities !== null &&
+    "workflowScriptSpawn" in capabilities &&
+    capabilities.workflowScriptSpawn === true
+  );
 }
 
 export function missingRuntimeTools(available: string[]): string[] {
@@ -1112,7 +1129,7 @@ export function execSetup(): string {
     "Install the plan-exec prerequisites at compatible versions:",
     "pi install npm:pi-subagents",
     "pi install npm:@tintinweb/pi-tasks",
-    "pi install npm:@alexeiled/pi-subagents-bridge@^0.2.0",
+    "pi install npm:@alexeiled/pi-subagents-bridge@^0.2.2",
     "pi install npm:@alexeiled/pi-fusion",
     "pi install npm:@alexeiled/pi-plan-exec",
     "",

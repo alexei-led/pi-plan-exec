@@ -10,6 +10,7 @@ import {
   formatRunStatus,
   getExecArgumentCompletions,
   hasBridgeOperationMethod,
+  hasBridgeWorkflowScriptSpawnCapability,
   isActionAllowed,
   isRecoverableFailure,
   missingRuntimeTools,
@@ -69,7 +70,7 @@ function run(overrides: Partial<PlanExecRun> = {}): PlanExecRun {
   };
 }
 
-test("bridge runtime compatibility requires the operation lookup method", () => {
+test("bridge runtime compatibility requires recovery and workflow spawn capabilities", () => {
   assert.equal(
     hasBridgeOperationMethod({ methods: ["ping", "operation"] }),
     true,
@@ -77,6 +78,20 @@ test("bridge runtime compatibility requires the operation lookup method", () => 
   assert.equal(hasBridgeOperationMethod({ methods: ["ping", "spawn"] }), false);
   assert.equal(hasBridgeOperationMethod({ methods: "operation" }), false);
   assert.equal(hasBridgeOperationMethod(undefined), false);
+
+  assert.equal(
+    hasBridgeWorkflowScriptSpawnCapability({
+      capabilities: { workflowScriptSpawn: true },
+    }),
+    true,
+  );
+  assert.equal(
+    hasBridgeWorkflowScriptSpawnCapability({
+      capabilities: { workflowScriptSpawn: false },
+    }),
+    false,
+  );
+  assert.equal(hasBridgeWorkflowScriptSpawnCapability(undefined), false);
 });
 
 test("exec command completions explain the command family", () => {
@@ -111,7 +126,7 @@ test("help and setup explain the installed command surface", () => {
   assert.match(execHelp(), /\/skill:exec-plan/);
   assert.match(
     execSetup(),
-    /pi install npm:@alexeiled\/pi-subagents-bridge@\^0\.2\.0/,
+    /pi install npm:@alexeiled\/pi-subagents-bridge@\^0\.2\.2/,
   );
   assert.match(execSetup(), /pi install npm:@alexeiled\/pi-fusion/);
   assert.match(execSetup(), /pi install npm:@alexeiled\/pi-plan-exec/);

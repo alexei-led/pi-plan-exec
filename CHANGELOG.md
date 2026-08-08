@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.4.2 - 2026-08-08
+
+- Require `@alexeiled/pi-subagents-bridge` 0.2.2, which translates plan workers
+  to the workflowScript-only public API introduced by `pi-subagents` 0.43.0.
+- Probe the bridge workflow-spawn capability before creating or resuming a run
+  so the incompatible 0.2.0–0.2.1 bridge releases fail during setup instead of
+  after the first implementation launch.
+- Read the single child output from workflow result artifacts so review findings
+  and worker diagnostics are not replaced by the workflow summary.
+
 ## 0.4.1 - 2026-07-19
 
 - Made `/exec status` classify recovery and give the next safe action for

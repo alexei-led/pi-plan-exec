@@ -45,14 +45,15 @@ Install the prerequisites, then plan-exec:
 ```bash
 pi install npm:pi-subagents
 pi install npm:@tintinweb/pi-tasks
-pi install npm:@alexeiled/pi-subagents-bridge@^0.2.0
+pi install npm:@alexeiled/pi-subagents-bridge@^0.2.2
 pi install npm:@alexeiled/pi-fusion
 pi install npm:@alexeiled/pi-plan-exec
 ```
 
 The providers remain independent Pi packages. `pi-plan-exec` requires Bridge
-`0.2.0` or later for safe operation lookup, probes Bridge and Fusion capabilities
-before it creates a run, and tells you how to recover if they are unavailable.
+`0.2.2` or later for safe operation lookup and pi-subagents workflow execution,
+probes Bridge and Fusion capabilities before it creates a run, and tells you how
+to recover if they are unavailable.
 
 Reload Pi. From an interactive session in a Git repository, run an executable
 plan:

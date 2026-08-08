@@ -73,6 +73,17 @@ function extractText(value: unknown): string {
   if (typeof value === "string") return value;
   if (!isRecord(value))
     throw new Error("Subagent result artifact is malformed.");
+  if (
+    value.mode === "workflow" &&
+    Array.isArray(value.results) &&
+    value.results.length === 1
+  ) {
+    try {
+      return extractText(value.results[0]);
+    } catch {
+      // Failed children can lack output while the workflow summary remains useful.
+    }
+  }
   for (const key of ["output", "result", "text", "summary", "content"]) {
     const candidate = value[key];
     if (typeof candidate === "string" && candidate.trim())
