@@ -105,7 +105,7 @@ test("exec command completions explain the command family", () => {
   assert.match(allItems.map((item) => item.value).join(" "), /setup/);
   assert.match(
     allItems.find((item) => item.value === "resume")?.description ?? "",
-    /retry a failed run/,
+    /Continue the current run safely/,
   );
   assert.match(
     allItems.find((item) => item.value === "skip")?.description ?? "",
@@ -120,7 +120,7 @@ test("runtime prerequisite check identifies missing provider extensions", () => 
 
 test("help and setup explain the installed command surface", () => {
   assert.match(execHelp(), /\/exec status \[run-id\]/);
-  assert.match(execHelp(), /retry a failed run/);
+  assert.match(execHelp(), /Reconcile, resume, or retry safely/);
   assert.match(execHelp(), /\/exec skip <full-run-id> --reason <text>/);
   assert.match(execHelp(), /--model current\|provider\/model/);
   assert.match(execHelp(), /completed_with_findings/);
@@ -208,7 +208,7 @@ test("resume branch-adoption and recovery-model options are explicit", () => {
 
   const running = run({ status: "running" });
   delete running.activeOperation;
-  assert.equal(isActionAllowed("resume", running, "session-1"), false);
+  assert.equal(isActionAllowed("resume", running, "session-1"), true);
   assert.equal(isActionAllowed("resume", running, "session-1", true), true);
   const failed = run({ status: "failed" });
   delete failed.activeOperation;
@@ -337,7 +337,7 @@ test("run status classifies recovery and gives one safe next action", () => {
   delete modelFailureRun.activeOperation;
   const modelFailure = formatRunStatus(modelFailureRun);
   assert.match(modelFailure, /recovery: model\/provider failure/);
-  assert.match(modelFailure, /--model current\|provider\/model/);
+  assert.match(modelFailure, /Use \/exec resume .*current authenticated Pi model/);
   assert.match(modelFailure, /failed-model-run/);
   assert.match(modelFailure, /string_above_max_length/);
 
@@ -416,7 +416,19 @@ test("resume output explains a required second plan-structure review", () => {
   assert.match(message, /run interactive \/exec resume/);
 
   const resumed = resumeResultMessage(run({ status: "running" }));
-  assert.match(resumed, /resumed: running/);
+  assert.match(resumed, /already running; its tracked worker is being reconciled/);
+
+  const reconciling = resumeResultMessage(
+    run({
+      status: "running",
+      activeOperation: {
+        operationId: "live-worker",
+        service: "bridge",
+        kind: "implementation",
+      },
+    }),
+  );
+  assert.match(reconciling, /already running; its tracked worker is being reconciled/);
   assert.doesNotMatch(resumed, /second resume/);
 });
 
@@ -455,7 +467,7 @@ test("run status includes live operation, progress, and recovery hints", () => {
     error: "Worker run-2 ended as failed and left task 1 checkboxes unchecked.",
   });
   delete failedWorker.activeOperation;
-  assert.match(formatRunStatus(failedWorker), /retry this stage/);
+  assert.match(formatRunStatus(failedWorker), /retries the same stage/);
 
   const paused = formatRunStatus(
     run({

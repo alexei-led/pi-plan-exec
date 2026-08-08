@@ -52,9 +52,9 @@ not resume the child directly.
 Inspect the stage, error, and active-operation fields first.
 
 - No active operation: `/exec resume <id>` retries the same stage in the same
-  worktree, except a retry-exhausted or externally blocked implementation task.
-  Fix or verify that blocker, then explicitly opt in with `/exec resume <id>
-  --retry-task`. Implementation is sequential; it cannot be skipped.
+  worktree. It automatically resets a no-progress implementation retry because
+  the user explicitly requested resume. An external/manual blocker asks for
+  interactive confirmation. Implementation is sequential; it cannot be skipped.
 - Preserved active operation: `/exec resume <id>` adopts or looks up that exact
   operation before retrying.
 - Operation lookup is `pending`: wait, reload if needed, then resume again.
@@ -66,9 +66,8 @@ Inspect the stage, error, and active-operation fields first.
 
 Budget exhaustion is a plan-run failure. Resume the plan run ID, not the child
 ID shown in pi-subagents output. Recovery raises implementation and review
-budgets where supported. A task retry limit is different: normal resume refuses
-to reset it. Status labels it `retry-exhausted or no-progress task` or
-`external/manual blocker` and prints the exact `--retry-task` command.
+budgets where supported. A resume is idempotent for a healthy tracked child and
+reconciles it instead of creating another writer.
 
 ## Model or provider failure
 
@@ -82,16 +81,13 @@ an implementation task attempt. Recover the same run with one of:
 /exec resume <full-run-id> --model <provider/model>
 ```
 
-Interactive resume without `--model` opens the authenticated model picker.
-`current` uses the active Pi session model. An explicit model pins the recovered
-Bridge role and later launches of that role in this run. Choose a model whose
-provider is authenticated and does not have the reported incompatibility or
-quota failure. Do not keep retrying the same failing model.
-
-Older records that lack terminal provider diagnostics may still classify as a
-retry-exhausted task and require `--retry-task` together with `--model`. After
-resume, run status again and verify the failed external run ID was replaced only
-after its terminal state was recorded.
+Normal resume uses the active authenticated Pi model. `current` uses that same
+model explicitly. An explicit provider/model override applies only to the
+replacement child; it does not pin later launches. Choose a model whose provider
+is authenticated and does not have the reported incompatibility or quota failure.
+Do not keep retrying the same failing model. After resume, run status again and
+verify the failed external run ID was replaced only after its terminal state was
+recorded.
 
 `/exec` is a Pi UI command. If the current agent cannot invoke slash commands,
 it must give the user the exact command instead of claiming recovery ran or

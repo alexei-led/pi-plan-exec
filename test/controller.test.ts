@@ -185,6 +185,36 @@ test("explicit resume retries a worker after its task retry limit", async () => 
   assert.equal(resumed.activeOperation?.kind, "implementation");
 });
 
+test("resume automatically retries an exhausted worker without an external blocker", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
+  const planPath = join(root, "plan.md");
+  const plan = "### Task 1: Implement\n- [ ] Do the work\n";
+  await writeFile(planPath, plan);
+  const registry = new RunRegistry(join(root, "runs"));
+  const bridge = new FakeBridge(join(root, "none.json"));
+  const controller = new PlanExecController(
+    registry,
+    bridge,
+    new FakeFusion(),
+    fakeGit(root),
+  );
+  const failed = await registry.create({
+    ...baseRun(root, planPath),
+    planHash: parsePlan(planPath, plan).hash,
+    status: "failed",
+    stage: "implementation",
+    taskAttempts: { "1": 2 },
+    error: "Worker run-2 ended as failed and left task 1 checkboxes unchecked.",
+  });
+
+  const resumed = await controller.resume(failed.id, "session-1");
+
+  assert.equal(resumed.status, "running");
+  assert.equal(resumed.taskAttempts["1"], 0);
+  assert.equal(resumed.activeOperation?.kind, "implementation");
+  assert.equal(bridge.spawnCount, 1);
+});
+
 test("model failures preserve diagnostics, retries, and recover with an explicit model", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
   const planPath = join(root, "plan.md");
@@ -238,10 +268,8 @@ test("model failures preserve diagnostics, retries, and recover with an explicit
 
   assert.equal(resumed.status, "running");
   assert.equal(resumed.taskAttempts["1"], 0);
-  assert.equal(
-    resumed.config.workerModel,
-    "anthropic-work/claude-sonnet-4-6",
-  );
+  assert.equal(resumed.config.workerModel, undefined);
+  assert.equal(resumed.recoveryModel, undefined);
   assert.equal(
     resumed.activeOperation?.params?.model,
     "anthropic-work/claude-sonnet-4-6",
@@ -281,10 +309,7 @@ test("resume retries a failed review in the same stage with a larger review budg
   assert.equal(resumed.stage, "comprehensive_review");
   assert.equal(resumed.error, undefined);
   assert.equal(resumed.config.reviewerMaxTurns, 75);
-  assert.equal(
-    resumed.config.reviewerModel,
-    "anthropic-work/claude-sonnet-4-6",
-  );
+  assert.equal(resumed.config.reviewerModel, undefined);
   assert.equal(resumed.activeOperation?.kind, "review");
   assert.equal(
     resumed.activeOperation?.params?.model,

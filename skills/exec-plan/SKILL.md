@@ -20,9 +20,9 @@ recovery with a manually launched subagent.
 - List durable runs: `/exec runs`.
 - Inspect one run: `/exec status <full-run-id>`.
 - Request a pause for a starting or running run: `/exec pause <full-run-id>`.
-- Continue or recover: `/exec resume <full-run-id>`.
-- Recover a terminal model/provider failure: use interactive `/exec resume <full-run-id>` to select an authenticated model, or specify `/exec resume <full-run-id> --model current|provider/model`.
-- Retry an exhausted or externally blocked implementation task only after fixing or verifying the blocker: `/exec resume <full-run-id> --retry-task`.
+- Continue or recover: `/exec resume [full-run-id]`. It reconciles a running child, continues a paused run, or safely retries a recoverable failed run.
+- Recover a terminal model/provider failure: `/exec resume [full-run-id]` uses the active authenticated Pi model. `--model current|provider/model` is an advanced one-replacement-child override.
+- A normal resume retries a no-progress implementation task. An external/manual blocker prompts for confirmation; implementation cannot be skipped.
 - Adopt a verified current execution branch: `/exec resume <full-run-id> --adopt-current-branch`.
 - Claim an unfinished stale run: `/exec adopt <full-run-id>`.
 - Force-skip a blocked review/finalize/stats stage: `/exec skip <full-run-id> --reason <text>`.
@@ -114,15 +114,15 @@ second writer.
 - `--adopt-current-branch` requires interactive confirmation and no active
   child. It verifies the same repository and records the branch change before
   resuming.
-- A retry-exhausted or external/manual-blocked implementation task requires
-  `--retry-task`; normal resume refuses to reset its attempts. Implementation
-  checkboxes are sequential and cannot be skipped.
+- A normal resume resets a no-progress implementation retry and preserves the
+  sequential checkbox contract. An external/manual blocker needs interactive
+  confirmation before retrying; implementation cannot be skipped.
 - A classified model/provider failure is different: the child is terminal, its
   error and operation are preserved, and the implementation retry budget is not
-  consumed. Resume with an authenticated replacement model. Do not retry the
-  same unusable model repeatedly.
-- `--model current` uses the active Pi session model. `--model provider/model`
-  pins the recovered Bridge role and its later launches in this run.
+  consumed. Normal resume uses the current authenticated Pi model. Do not retry
+  the same unusable model repeatedly.
+- `--model current` or `--model provider/model` applies only to the replacement
+  child; it never pins later launches in this run.
 - `/exec skip` is a last-resort waiver, not a review pass. It requires an
   interactive confirmation and reason, stops any tracked child before advancing,
   and ends as `completed_with_findings`. Never use it for implementation or

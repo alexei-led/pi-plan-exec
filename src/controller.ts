@@ -608,7 +608,8 @@ export class PlanExecController {
   ): Promise<PlanExecRun> {
     const operationId = randomUUID();
     const launchStartedAt = Date.now();
-    const model = bridgeModel(run.config, input.kind);
+    const model = run.recoveryModel ?? bridgeModel(run.config, input.kind);
+    const runWithoutRecoveryModel = withoutRecoveryModel(run);
     const params = {
       agent: input.agent,
       ...(model ? { model } : {}),
@@ -623,7 +624,7 @@ export class PlanExecController {
     };
     const persisted = await this.registry.updateIfCurrent(
       {
-        ...run,
+        ...runWithoutRecoveryModel,
         status: RUN_STATUS.RUNNING,
         activeOperation: {
           operationId,
@@ -1044,19 +1045,21 @@ export class PlanExecController {
         : undefined;
     if (isTaskRetryConfirmationRequired(run) && !retryTask)
       throw new Error(taskRetryRequiredMessage(run));
-    const config = recoveryConfig(run, recoveryModel);
+    const config = recoveryConfig(run);
+    const runWithoutRecoveryModel = withoutRecoveryModel(run);
     const retryFailedReview =
       isReviewStage(run.stage) &&
       (run.failedOperation?.kind === OPERATION_KIND.REVIEW ||
         run.failedOperation?.kind === OPERATION_KIND.FUSION);
     const recovered = await this.registry.updateIfCurrent(
       clearError({
-        ...run,
+        ...runWithoutRecoveryModel,
         status:
           run.activeOperation?.recovery === OPERATION_RECOVERY.CANCEL
             ? RUN_STATUS.CANCEL_PENDING
             : RUN_STATUS.RUNNING,
         config,
+        ...(recoveryModel ? { recoveryModel } : {}),
         ...(retryFailedReview
           ? {
               stageAttempts: {
@@ -1910,10 +1913,13 @@ function completionStatus(run: PlanExecRun) {
     : RUN_STATUS.COMPLETED;
 }
 
-function recoveryConfig(
-  run: PlanExecRun,
-  recoveryModel?: string,
-): FrozenRunConfig {
+function withoutRecoveryModel(run: PlanExecRun): PlanExecRun {
+  const copy = { ...run };
+  delete copy.recoveryModel;
+  return copy;
+}
+
+function recoveryConfig(run: PlanExecRun): FrozenRunConfig {
   let config = run.config;
   if (
     run.stage === RUN_STAGE.IMPLEMENTATION ||
@@ -1942,21 +1948,30 @@ function recoveryConfig(
         RECOVERY_REVIEWER_MAX_TURNS,
       ),
     };
-  if (!recoveryModel) return config;
+  if (!isModelProviderFailure(run)) return config;
   if (
     run.stage === RUN_STAGE.IMPLEMENTATION ||
     run.stage === RUN_STAGE.FINALIZE ||
     run.failedOperation?.kind === OPERATION_KIND.FIX
   )
-    return { ...config, workerModel: recoveryModel };
+    return withoutRoleModel(config, "workerModel");
   if (run.stage === RUN_STAGE.STATS)
-    return { ...config, statsModel: recoveryModel };
+    return withoutRoleModel(config, "statsModel");
   if (
     isReviewStage(run.stage) &&
     run.failedOperation?.kind !== OPERATION_KIND.FUSION
   )
-    return { ...config, reviewerModel: recoveryModel };
+    return withoutRoleModel(config, "reviewerModel");
   return config;
+}
+
+function withoutRoleModel(
+  config: FrozenRunConfig,
+  key: "workerModel" | "reviewerModel" | "statsModel",
+): FrozenRunConfig {
+  const copy = { ...config };
+  delete copy[key];
+  return copy;
 }
 
 function bridgeModel(
@@ -2116,8 +2131,7 @@ export function isTaskRetryConfirmationRequired(run: PlanExecRun): boolean {
     run.status === RUN_STATUS.FAILED &&
     run.stage === RUN_STAGE.IMPLEMENTATION &&
     run.activeOperation === undefined &&
-    !isModelProviderFailure(run) &&
-    (isRecoverableImplementationFailure(run) || isExternalManualBlocker(run))
+    !isModelProviderFailure(run) && isExternalManualBlocker(run)
   );
 }
 

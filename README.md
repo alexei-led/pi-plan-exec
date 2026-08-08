@@ -70,14 +70,14 @@ also reports the recovery classification and one safe next action: wait for a
 healthy operation, reconcile a preserved operation, retry a failed stage, adopt
 a stale owner, or review a plan/branch mismatch. Use it without a run ID for the
 current repository, and use `/exec runs` when several runs need disambiguation.
-`/exec pause` stops after the active child; `/exec resume` continues paused work
-or recovers a recorded failure in the same stage and preserved worktree. A
-retry-exhausted or externally blocked implementation task is never retried
-implicitly; fix the blocker, then use `/exec resume <run-id> --retry-task`.
-A terminal model/provider failure preserves its child error and operation without
-consuming an implementation retry. Interactive resume prompts for an
-authenticated recovery model; use `--model current` or `--model provider/model`
-to select one explicitly. Implementation checkboxes remain sequential and
+`/exec pause` stops after the active child; `/exec resume` reconciles a running
+child, continues paused work, or recovers a recorded failure in the same stage
+and preserved worktree. It retries a no-progress implementation task when the
+user explicitly resumes it. Only an external/manual blocker asks for a retry
+confirmation. A terminal model/provider failure preserves its child error and
+operation without consuming an implementation retry, then uses the current
+authenticated Pi model. `--model current` or `--model provider/model` is an
+advanced one-recovery-launch override; it does not pin later workers. Implementation checkboxes remain sequential and
 cannot be force-skipped. When a provider operation may still exist, plan-exec
 keeps its identity and adopts it
 before any retry. If a review, finalization, or

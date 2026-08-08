@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.4.4 - 2026-08-08
+
+- Make `/exec resume` idempotently reconcile a running worker and automatically
+  retry no-progress implementation work after an explicit resume.
+- Recover model/provider failures with the current Pi model and make `--model`
+  a one-replacement-child override instead of a durable role pin.
+- Keep confirmation only for external/manual implementation blockers.
+
 ## 0.4.3 - 2026-08-08
 
 - Preserve terminal Bridge diagnostics and failed operation identity for model

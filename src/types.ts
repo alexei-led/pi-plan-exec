@@ -228,6 +228,8 @@ export interface PlanExecRun {
   };
   activeOperation?: ActiveOperation;
   failedOperation?: ActiveOperation;
+  /** One recovery launch only; consumed when the replacement child is recorded. */
+  recoveryModel?: string;
   config: FrozenRunConfig;
   createdAt: number;
   updatedAt: number;
