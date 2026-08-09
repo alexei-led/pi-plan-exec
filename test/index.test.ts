@@ -862,9 +862,7 @@ test("every recovery classification ends at a primary verb", () => {
 
   // The gone branch needs live evidence, so it carries its own entry.
   const observed: Array<[PlanExecRun, AbandonmentEvidence | undefined]> = [
-    ...shapes.map(
-      (shape) => [shape, undefined] as [PlanExecRun, undefined],
-    ),
+    ...shapes.map((shape) => [shape, undefined] as [PlanExecRun, undefined]),
     [
       run({ activeOperation: launched() }),
       { leaseLive: false, asyncDirPresent: false },
@@ -1346,7 +1344,7 @@ test("doctor groups every in-flight claim and mutates nothing", async () => {
   ]);
   const before = await snapshotRuns(directory);
 
-  const report = ((await execRead(registry, "doctor", [])) ?? "");
+  const report = (await execRead(registry, "doctor", [])) ?? "";
 
   assert.match(report, /Plan execution runs: 4 \(3 claiming work in flight\)/);
   assert.match(
@@ -1614,7 +1612,7 @@ test("cleanup removes a run record the registry cannot parse", async () => {
   await mkdir(join(directory, corruptId), { recursive: true });
   await writeFile(join(directory, corruptId, "run.json"), "{not-json\n");
 
-  const doctored = ((await execRead(registry, "doctor", [])) ?? "");
+  const doctored = (await execRead(registry, "doctor", [])) ?? "";
   assert.match(
     doctored,
     new RegExp(
@@ -2021,8 +2019,14 @@ test("every run whose guidance names resume survives the resume gate", async () 
   // an activeOperation left in place, "cannot check on the worker right now"
   // fires ahead of the paused and failed branches and the loop tests nothing.
   const shapes: Array<[PlanExecRun, AbandonmentEvidence | undefined]> = [
-    [withoutOperation({ status: "paused", stage: "comprehensive_review" }), undefined],
-    [withoutOperation({ status: "failed", error: "worker crashed" }), undefined],
+    [
+      withoutOperation({ status: "paused", stage: "comprehensive_review" }),
+      undefined,
+    ],
+    [
+      withoutOperation({ status: "failed", error: "worker crashed" }),
+      undefined,
+    ],
     [withoutOperation({ status: "running", lease: DEAD_LEASE }), undefined],
     // The one in-flight shape whose guidance names resume: proven gone. It is
     // the only one the gate writes for, so it is the one that is seeded.
@@ -2312,6 +2316,25 @@ test("the detail view checks the worker itself instead of trusting the record", 
       `abandoned — no worker is running:\\n- ${abandoned.id} [^\\n]*Next: /exec resume ${abandoned.id}`,
     ),
   );
+});
+
+test("the two views judge a lease the same way, including this session's own", async () => {
+  // A session claims a run and starts no controller — /exec pause and the
+  // worktree handoff both do. Thirty seconds later its own lease is stale and
+  // nothing is polling. Reading the lease as live because the caller owns it
+  // would put the detail view back at odds with the sweep.
+  const mine = abandonedRun({
+    lease: { ...DEAD_LEASE, sessionId: LIVE_SESSION_ID },
+  });
+  const registry = await seedRegistry([mine]);
+
+  const evidence = await runEvidence(mine, abandonmentProbe());
+  const detail = formatRunStatus(mine, evidence);
+  const sweep = await execStatus(registry);
+
+  assert.match(detail, /recovery: the worker is gone, so nothing is running/);
+  assert.match(sweep, /abandoned — no worker is running/);
+  assert.match(sweep, new RegExp(`Next: /exec resume ${mine.id}`));
 });
 
 test("the sweep reports how far past its budget a run has gone", async () => {

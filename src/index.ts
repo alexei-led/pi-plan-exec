@@ -1054,7 +1054,8 @@ async function cleanupUnreadable(
       "Removal deletes the registry entry only; the worktree, branch, and progress file are left in place.",
       `Use /exec cleanup ${unreadable.runId} ${CLEANUP_APPLY_OPTION} to remove it.`,
     ].join("\n");
-  await registry.remove(unreadable.runId);
+  if (!(await registry.remove(unreadable.runId)))
+    return `Unreadable plan execution run record ${unreadable.runId} was already gone; nothing was deleted.`;
   return `Removed 1 unreadable plan execution run record: ${unreadable.runId}; its worktree, branch, and progress file were left in place.`;
 }
 
@@ -1653,10 +1654,12 @@ async function handleCommand(
     // The detail view probes for itself. Reading the persisted digest alone
     // would render an abandoned run exactly like a healthy one, which is the
     // bug this whole change set exists to remove.
-    return formatRunStatus(
-      target,
-      await runEvidence(target, doctorProbe, ctx.sessionManager.getSessionId()),
-    );
+    //
+    // No session ID, exactly as the sweep gathers it: status describes a lease
+    // from the outside and never assumes ownership. Passing one would make
+    // this session's own stale lease read as live here and dead in the sweep —
+    // the same two views disagreeing, one step narrower.
+    return formatRunStatus(target, await runEvidence(target, doctorProbe));
   }
   // Deleted as the identical code path to bare /exec. Without this the token
   // is read as the first word of a plan path, so the reader gets an isolation

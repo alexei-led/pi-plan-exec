@@ -1384,6 +1384,9 @@ export class PlanExecController {
 
   private async complete(run: PlanExecRun): Promise<PlanExecRun> {
     const status = completionStatus(run);
+    // Merged onto the stored record, not onto `run`: the terminal status is the
+    // only thing this step decides, and anything else it changed in memory
+    // would be dropped here rather than fight a concurrent writer.
     const completed = await this.registry.updateLatest(run.id, (current) => ({
       ...current,
       status,
