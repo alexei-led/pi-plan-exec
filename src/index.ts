@@ -1866,7 +1866,6 @@ async function runAction(
   // ask a picker question first and then refuse anyway.
   if (action === EXEC_ACTION.STOP && !ctx.hasUI)
     throw new Error(STOP_REQUIRES_UI);
-  const sessionId = ctx.sessionManager.getSessionId();
   const resolved = await resolveRunForAction(
     action,
     resumeArguments ? resumeArguments.selector : rest[0],
@@ -1887,6 +1886,7 @@ async function runAction(
     action === EXEC_ACTION.STOP
       ? await chooseStopOutcome(resolved, ctx)
       : action;
+  const sessionId = ctx.sessionManager.getSessionId();
   const claimed = await defaultRegistry.claim(resolved, sessionId);
   if (outcome === EXEC_ACTION.PAUSE) {
     const paused = await syncProjection(
