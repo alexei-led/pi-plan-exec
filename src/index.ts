@@ -83,7 +83,8 @@ const EXEC_COMMANDS: AutocompleteItem[] = [
   {
     value: EXEC_ACTION.RESUME,
     label: EXEC_ACTION.RESUME,
-    description: "Continue the current run safely and reconcile its tracked worker",
+    description:
+      "Continue the current run safely and reconcile its tracked worker",
   },
   {
     value: EXEC_ACTION.ADOPT,
@@ -359,9 +360,7 @@ export function hasBridgeOperationMethod(data: unknown): boolean {
   return Array.isArray(methods) && methods.includes("operation");
 }
 
-export function hasBridgeWorkflowScriptSpawnCapability(
-  data: unknown,
-): boolean {
+export function hasBridgeWorkflowScriptSpawnCapability(data: unknown): boolean {
   if (typeof data !== "object" || data === null || !("capabilities" in data))
     return false;
   const capabilities = data.capabilities;
@@ -394,10 +393,7 @@ type RecoveryGuidance = {
 };
 
 export function recoveryGuidance(run: PlanExecRun): RecoveryGuidance {
-  if (
-    isTerminal(run.status) &&
-    run.status !== RUN_STATUS.FAILED
-  )
+  if (isTerminal(run.status) && run.status !== RUN_STATUS.FAILED)
     return {
       classification: "terminal",
       action: "Run is terminal; no recovery action is available.",
@@ -485,7 +481,8 @@ export function recoveryGuidance(run: PlanExecRun): RecoveryGuidance {
   }
   return {
     classification: "unclassified",
-    action: "Use /exec status again or /exec help; no recovery action is inferred.",
+    action:
+      "Use /exec status again or /exec help; no recovery action is inferred.",
   };
 }
 
@@ -528,9 +525,13 @@ export function formatRunStatus(run: PlanExecRun): string {
       `failed operation: ${run.failedOperation.service}/${run.failedOperation.kind}`,
     );
     if (run.failedOperation.externalRunId)
-      lines.push(`failed external run ID: ${run.failedOperation.externalRunId}`);
+      lines.push(
+        `failed external run ID: ${run.failedOperation.externalRunId}`,
+      );
     if (run.failedOperation.terminalError)
-      lines.push(`failed operation error: ${run.failedOperation.terminalError}`);
+      lines.push(
+        `failed operation error: ${run.failedOperation.terminalError}`,
+      );
   }
   if (run.progressPath) lines.push(`progress: ${run.progressPath}`);
   if (operation?.lastObservedAt)
@@ -603,7 +604,8 @@ async function handleCommand(
   const [subcommand, ...rest] = args.split(/\s+/).filter(Boolean);
   if (subcommand === EXEC_ACTION.HELP) return execHelp();
   if (subcommand === EXEC_ACTION.SETUP) return execSetup();
-  if (subcommand === EXEC_ACTION.RUNS) return formatRunList(await registry.list());
+  if (subcommand === EXEC_ACTION.RUNS)
+    return formatRunList(await registry.list());
   if (
     subcommand === EXEC_ACTION.STATUS ||
     subcommand === EXEC_ACTION.PAUSE ||
@@ -623,10 +625,7 @@ async function handleCommand(
             model: undefined,
           };
     const adoptCurrentBranch = resumeArguments.adoptCurrentBranch;
-    if (
-      action === EXEC_ACTION.SKIP &&
-      (!rest[0] || rest[0] === "--reason")
-    )
+    if (action === EXEC_ACTION.SKIP && (!rest[0] || rest[0] === "--reason"))
       throw new Error(
         "Usage: /exec skip <full-run-id> --reason <non-empty reason>",
       );
@@ -662,7 +661,9 @@ async function handleCommand(
         retryTask = true;
       }
       const skipReason =
-        action === EXEC_ACTION.SKIP ? parseSkipReason(rest.slice(1)) : undefined;
+        action === EXEC_ACTION.SKIP
+          ? parseSkipReason(rest.slice(1))
+          : undefined;
       const handedOff = await handoffToWorktree(
         ctx,
         run,
@@ -981,11 +982,14 @@ async function recoveryModelForResume(
 ): Promise<string | undefined> {
   if (requested) {
     if (run.status !== RUN_STATUS.FAILED)
-      throw new Error(`${RECOVERY_MODEL_OPTION} is only valid for a failed run.`);
+      throw new Error(
+        `${RECOVERY_MODEL_OPTION} is only valid for a failed run.`,
+      );
     return resolveRecoveryModel(requested, ctx);
   }
   if (!isModelProviderFailure(run)) return undefined;
-  if (!ctx.model) throw new Error("No active Pi model is available for recovery.");
+  if (!ctx.model)
+    throw new Error("No active Pi model is available for recovery.");
   const current = modelReference(ctx.model);
   if (
     !ctx.modelRegistry
@@ -1240,7 +1244,7 @@ export function execSetup(): string {
     "Install the plan-exec prerequisites at compatible versions:",
     "pi install npm:pi-subagents",
     "pi install npm:@tintinweb/pi-tasks",
-    "pi install npm:@alexeiled/pi-subagents-bridge@^0.2.2",
+    "pi install npm:@alexeiled/pi-subagents-bridge@>=0.2.2",
     "pi install npm:@alexeiled/pi-fusion",
     "pi install npm:@alexeiled/pi-plan-exec",
     "",

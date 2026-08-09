@@ -127,10 +127,15 @@ test("help and setup explain the installed command surface", () => {
   assert.match(execHelp(), /\/skill:exec-plan/);
   assert.match(
     execSetup(),
-    /pi install npm:@alexeiled\/pi-subagents-bridge@\^0\.2\.2/,
+    /pi install npm:@alexeiled\/pi-subagents-bridge@>=0\.2\.2/,
   );
   assert.match(execSetup(), /pi install npm:@alexeiled\/pi-fusion/);
   assert.match(execSetup(), /pi install npm:@alexeiled\/pi-plan-exec/);
+});
+
+test("setup install commands carry no caret version pin", () => {
+  assert.doesNotMatch(execSetup(), /@\^/);
+  assert.match(execSetup(), /^pi install npm:pi-subagents$/m);
 });
 
 test("cancel cannot bypass a pending force-skip", () => {
@@ -337,7 +342,10 @@ test("run status classifies recovery and gives one safe next action", () => {
   delete modelFailureRun.activeOperation;
   const modelFailure = formatRunStatus(modelFailureRun);
   assert.match(modelFailure, /recovery: model\/provider failure/);
-  assert.match(modelFailure, /Use \/exec resume .*current authenticated Pi model/);
+  assert.match(
+    modelFailure,
+    /Use \/exec resume .*current authenticated Pi model/,
+  );
   assert.match(modelFailure, /failed-model-run/);
   assert.match(modelFailure, /string_above_max_length/);
 
@@ -416,7 +424,10 @@ test("resume output explains a required second plan-structure review", () => {
   assert.match(message, /run interactive \/exec resume/);
 
   const resumed = resumeResultMessage(run({ status: "running" }));
-  assert.match(resumed, /already running; its tracked worker is being reconciled/);
+  assert.match(
+    resumed,
+    /already running; its tracked worker is being reconciled/,
+  );
 
   const reconciling = resumeResultMessage(
     run({
@@ -428,7 +439,10 @@ test("resume output explains a required second plan-structure review", () => {
       },
     }),
   );
-  assert.match(reconciling, /already running; its tracked worker is being reconciled/);
+  assert.match(
+    reconciling,
+    /already running; its tracked worker is being reconciled/,
+  );
   assert.doesNotMatch(resumed, /second resume/);
 });
 
