@@ -1572,7 +1572,10 @@ async function runAction(
           ? `skip ${run.id} --reason ${skipReason}`
           : undefined,
     );
-    if (handedOff) return undefined;
+    // The forked session re-enters the gate on an already-reset run, so the
+    // note has no second chance to be printed: it is what the source session
+    // still has to say.
+    if (handedOff) return recovered.note;
     if (action === EXEC_ACTION.SKIP) {
       if (!ctx.hasUI)
         throw new Error("Force-skip requires interactive confirmation.");
