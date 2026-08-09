@@ -137,6 +137,25 @@ provider; the controller resumes polling on its own. Then re-check:
 /exec status <full-run-id>
 ```
 
+### `its lease names a machine that is not this one`
+
+The host is stamped on the lease when the run is claimed and never re-stamped,
+and only its first label identifies the machine — `foo.local`, `foo.lan`, and
+`foo.corp.example.com` are all `foo`. A rename that changes that label leaves
+the lease naming a machine this one is not. The operation directory and the
+bridge here belong to this machine, so nothing local can speak for the run:
+status reports it and never resets it, and resume refuses it.
+
+Only the operator knows whether that name was this machine. When it was, say so:
+
+```text
+/exec resume <full-run-id> --same-machine
+```
+
+That supplies the machine, not the verdict. Resume then gathers the same
+evidence it always does, so a worker still writing here keeps the run refused.
+When the lease really does name a different machine, recover the run there.
+
 ### Why no per-turn activity signal exists
 
 The bridge spawns workflow-mode runs. pi-subagents anchors the `Activity:` age

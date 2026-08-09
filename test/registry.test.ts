@@ -17,6 +17,7 @@ import {
   type AbandonmentEvidence,
 } from "../src/lifecycle.js";
 import {
+  asLocalRun,
   isLeaseLive,
   isLocalRun,
   LEASE_STALE_MS,
@@ -97,6 +98,7 @@ test("lease liveness weighs session, heartbeat, hostname, and pid", () => {
   const fresh = Date.now();
   const stale = Date.now() - LEASE_STALE_MS;
   const here = hostname();
+  const shortHere = here.split(".")[0]!;
   const cases: Array<{
     name: string;
     lease: RunLease;
@@ -135,6 +137,39 @@ test("lease liveness weighs session, heartbeat, hostname, and pid", () => {
         hostname: here,
       },
       live: false,
+    },
+    {
+      name: "the same machine under a different network suffix checks its pid",
+      lease: {
+        sessionId: "s1",
+        pid: gone,
+        heartbeatAt: fresh,
+        hostname: `${shortHere}.corp.example.com`,
+      },
+      sessionId: "s2",
+      live: false,
+    },
+    {
+      name: "hostname case is not machine identity",
+      lease: {
+        sessionId: "s1",
+        pid: gone,
+        heartbeatAt: fresh,
+        hostname: shortHere.toUpperCase(),
+      },
+      sessionId: "s2",
+      live: false,
+    },
+    {
+      name: "an mDNS collision rename is a different machine",
+      lease: {
+        sessionId: "s1",
+        pid: gone,
+        heartbeatAt: fresh,
+        hostname: `${shortHere}-2.local`,
+      },
+      sessionId: "s2",
+      live: true,
     },
     {
       name: "another host falls back to heartbeat freshness",
@@ -1052,5 +1087,57 @@ test("only this host's evidence speaks for a run", () => {
       local({ sessionId: "s", pid: 1, heartbeatAt: 0, hostname: "other-host" }),
     ),
     false,
+  );
+  const shortHere = hostname().split(".")[0]!;
+  assert.equal(
+    isLocalRun(
+      local({
+        sessionId: "s",
+        pid: 1,
+        heartbeatAt: 0,
+        hostname: `${shortHere.toUpperCase()}.lan`,
+      }),
+    ),
+    true,
+    "a network rename of this machine is still this machine",
+  );
+  assert.equal(
+    isLocalRun(
+      local({
+        sessionId: "s",
+        pid: 1,
+        heartbeatAt: 0,
+        hostname: `${shortHere}-2.local`,
+      }),
+    ),
+    false,
+    "the suffix mDNS adds to avoid a collision names a different machine",
+  );
+});
+
+test("--same-machine asserts the host and touches nothing else", () => {
+  const lease = {
+    sessionId: "s",
+    pid: 1,
+    heartbeatAt: 7,
+    hostname: "renamed-by-dhcp",
+  };
+  const run = {
+    id: "11111111-1111-4111-8111-111111111111",
+    status: "running",
+    lease,
+  } as PlanExecRun;
+
+  const asserted = asLocalRun(run);
+
+  assert.equal(isLocalRun(run), false, "the stored run is left alone");
+  assert.equal(isLocalRun(asserted), true);
+  assert.equal(asserted.lease?.sessionId, "s");
+  assert.equal(asserted.lease?.pid, 1);
+  assert.equal(asserted.lease?.heartbeatAt, 7);
+  assert.deepEqual(
+    asLocalRun({ id: run.id } as PlanExecRun),
+    { id: run.id },
+    "a run with no lease has no host to assert",
   );
 });

@@ -78,6 +78,10 @@ Flags that answer a prompt in advance:
   something outside the run.
 - `/exec resume <full-run-id> --adopt-current-branch` confirms rebinding the run
   to the verified current execution branch.
+- `/exec resume <full-run-id> --same-machine` states that the host frozen on the
+  lease was this machine under an older name. Only use it when that is a fact;
+  it unblocks the local checks and nothing else, so a worker still running keeps
+  the run refused.
 - `/exec resume <full-run-id> --model current|provider/model` overrides the
   model for one replacement child after a model or provider failure.
 - `/exec cleanup <full-run-id> --apply` removes one named record;

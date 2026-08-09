@@ -111,6 +111,13 @@ no host at all — the shape of every record written before the field existed �
 no pid this machine can check, so its fresh heartbeat is the only evidence
 available and it counts as live.
 
+`claim` stamps the host once and `heartbeat` never re-stamps it, so the name is
+frozen for the run's whole life while `os.hostname()` moves with the network.
+Only the first label of either name identifies the machine, case-folded:
+`foo.local`, `foo.lan`, and `foo.corp.example.com` are one host. The suffix mDNS
+adds to break a collision — `foo-2.local` — survives that reduction, so two
+machines that can see each other still differ.
+
 A session may claim a run when no lease exists, the lease belongs to that
 session, or the prior lease is not live by that rule. A dead local pid therefore
 frees the run at once instead of after the heartbeat window. The lease controls
@@ -169,7 +176,16 @@ liveness is persisted, because the record is only refreshed while its owning
 session polls — the instant that stops being true is the instant the question
 matters. Evidence measured here is also discarded for a run whose lease names
 another host: its directory and its bridge are on that machine, and an absence
-observed locally would be an absence of the wrong thing.
+observed locally would be an absence of the wrong thing. A rename that changes
+the machine label is indistinguishable from a genuinely foreign host, so nothing
+observable can settle such a run and it would stay `ambiguous` forever. The
+operator breaks that tie: `/exec resume <id> --same-machine` asserts that the
+frozen name was this machine, unblocks the local checks, and changes nothing
+else — the abandonment conjunction still decides, so a worker still writing here
+keeps the run `ambiguous` and resume still refuses. The assertion is never
+written back; the reset's own `claim` re-stamps the current host. It is refused
+on a run this machine can already observe, and `/exec doctor --reconcile` has no
+equivalent: a registry-wide host assertion would speak for every run at once.
 
 One writer performs every reset, so both callers inherit its exclusions.
 A `cancel_pending` run is never reset however dead its worker: `failed` would

@@ -246,6 +246,11 @@ absence of a signal as health. Every in-flight situation reads differently:
   without starting a second one.
 - `cannot check on the worker right now` — the provider could not be reached, or
   the worker was launched and never named. Repair the provider and re-check.
+- `its lease names a machine that is not this one` — the host frozen on the
+  lease when the run was claimed is not the host this machine answers to now, so
+  every local check would measure the wrong machine. If that name was this
+  machine before it was renamed, say so with
+  `/exec resume <full-run-id> --same-machine`.
 - `between steps` — nothing is tracked because the controller is between two
   stages. Its next tick opens the next one.
 
@@ -263,6 +268,19 @@ and — on this host, where the pid means something — that process still exist
 lease whose pid is dead on this host is stale at once, so `/exec resume` takes
 the run over with no wait. A lease recorded before the hostname field existed is
 judged by its 30-second heartbeat window alone.
+
+The host on a lease is frozen when the run is claimed, and only the first label
+of it identifies the machine: a Mac that republishes itself as `foo.local`,
+`foo.lan`, or `foo.corp.example.com` is still `foo`, and still this machine. A
+rename that changes that label — a DHCP-assigned corporate name — makes the
+lease name a machine this one is not, and then no local check can speak for the
+run: the operation directory and the bridge here belong to this machine, and an
+absence measured against the wrong one would start a second worker over a live
+one. `/exec status` says so and names the way out. Only you know whether that
+name was this machine, so `/exec resume <run-id> --same-machine` is how you say
+it. The flag supplies the machine, not the verdict: resume then checks the
+worker here as usual and still refuses while one is running. It is refused
+outright on a run this machine can already observe.
 
 ### Recovering a failure
 

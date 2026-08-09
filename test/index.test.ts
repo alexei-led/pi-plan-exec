@@ -38,6 +38,7 @@ import {
   parseStatusArguments,
   reconcileForResume,
   runActionFor,
+  sameMachineRefusal,
   settledRunLines,
   resumeResultMessage,
   prioritizeRunCandidates,
@@ -49,7 +50,10 @@ import {
   EXEC_ALIAS_ACTIONS,
   type PlanExecRun,
 } from "../src/types.js";
-import type { AbandonmentEvidence } from "../src/lifecycle.js";
+import {
+  longRunningOperation,
+  type AbandonmentEvidence,
+} from "../src/lifecycle.js";
 
 // Three distinct turn budgets on purpose: with reviewer and stats equal, a
 // stats operation routed to the reviewer budget would be invisible.
@@ -147,6 +151,11 @@ async function snapshotRuns(
       "utf8",
     );
   return snapshot;
+}
+
+/** The label a lease's hostname is reduced to before it is compared. */
+function thisHost(): string {
+  return hostname().split(".")[0]!;
 }
 
 const DEAD_LEASE = {
@@ -288,6 +297,7 @@ test("resume accepts options without an explicit run ID", () => {
     selector: undefined,
     adoptCurrentBranch: false,
     retryTask: true,
+    sameMachine: false,
     model: undefined,
   });
   assert.deepEqual(
@@ -295,6 +305,7 @@ test("resume accepts options without an explicit run ID", () => {
       "run-id",
       "--adopt-current-branch",
       "--retry-task",
+      "--same-machine",
       "--model",
       "current",
     ]),
@@ -302,6 +313,7 @@ test("resume accepts options without an explicit run ID", () => {
       selector: "run-id",
       adoptCurrentBranch: true,
       retryTask: true,
+      sameMachine: true,
       model: "current",
     },
   );
@@ -311,16 +323,19 @@ test("resume branch-adoption and recovery-model options are explicit", () => {
   assert.deepEqual(parseResumeOptions([]), {
     adoptCurrentBranch: false,
     retryTask: false,
+    sameMachine: false,
     model: undefined,
   });
   assert.deepEqual(parseResumeOptions(["--adopt-current-branch"]), {
     adoptCurrentBranch: true,
     retryTask: false,
+    sameMachine: false,
     model: undefined,
   });
   assert.deepEqual(parseResumeOptions(["--retry-task"]), {
     adoptCurrentBranch: false,
     retryTask: true,
+    sameMachine: false,
     model: undefined,
   });
   assert.deepEqual(
@@ -333,6 +348,7 @@ test("resume branch-adoption and recovery-model options are explicit", () => {
     {
       adoptCurrentBranch: true,
       retryTask: true,
+      sameMachine: false,
       model: "anthropic-work/claude-sonnet-4-6",
     },
   );
@@ -656,11 +672,6 @@ test("an overdue operation is classified without being called dead", () => {
       active(101),
       "running longer than its budget allows",
     ],
-    [
-      "exactly on the worker bound is not past it",
-      active(100),
-      "running, but nothing proves the worker is alive",
-    ],
     // Same elapsed time, different stage budget: the bound is derived, not flat.
     [
       "past the reviewer bound but inside the worker bound",
@@ -733,6 +744,21 @@ test("an overdue operation is classified without being called dead", () => {
       classification,
       name,
     );
+
+  // The bound is exclusive, and only `longRunningOperation` can be asked that:
+  // `recoveryGuidance` reads its own clock, so a run built to sit exactly on
+  // the bound is already past it by the time the classification runs.
+  const launchStartedAt = Date.parse("2026-08-09T12:00:00Z");
+  const onTheBound = active(undefined, { launchStartedAt });
+  assert.equal(
+    longRunningOperation(onTheBound, launchStartedAt + 100 * MINUTE_MS),
+    undefined,
+    "exactly on the worker bound is not past it",
+  );
+  assert.ok(
+    longRunningOperation(onTheBound, launchStartedAt + 100 * MINUTE_MS + 1),
+    "one millisecond past it is",
+  );
 
   // Decisive death still wins over a mere bound breach — but only live
   // evidence can establish it, never a flag some earlier poll left behind.
@@ -1900,8 +1926,20 @@ test("help drops both interactive flags but keeps them working", () => {
   // Both flags stay parseable for a caller with no human to ask.
   assert.deepEqual(
     parseResumeOptions(["--adopt-current-branch", "--retry-task"]),
-    { adoptCurrentBranch: true, retryTask: true, model: undefined },
+    {
+      adoptCurrentBranch: true,
+      retryTask: true,
+      sameMachine: false,
+      model: undefined,
+    },
   );
+  assert.deepEqual(parseResumeOptions(["--same-machine"]), {
+    adoptCurrentBranch: false,
+    retryTask: false,
+    sameMachine: true,
+    model: undefined,
+  });
+  assert.throws(() => parseResumeOptions(["--same-host"]), /Usage: \/exec resume/);
 });
 
 test("resume reconciles a provably abandoned run, then continues", async () => {
@@ -2036,6 +2074,10 @@ test("every run whose guidance names resume survives the resume gate", async () 
   let exercised = 0;
   for (const [shape, evidence] of shapes) {
     const guidance = recoveryGuidance(shape, evidence);
+    // A resume the guidance qualifies is not the bare resume this gate takes:
+    // `--same-machine` names a fact the operator supplies, and the gate is
+    // meant to refuse without it. Such a shape does not belong in `shapes`.
+    if (guidance.action.includes(`${shape.id} --`)) continue;
     if (!guidance.action.includes(`/exec resume ${shape.id}`)) continue;
     exercised += 1;
     await assert.doesNotReject(
@@ -2373,11 +2415,152 @@ test("evidence gathered here says nothing about a run on another host", async ()
   const report = await execReconcile(registry, probe);
 
   assert.match(report, /No run is provably abandoned, so nothing was reset\./);
+  assert.match(
+    report,
+    /lease names another-host, not this machine/,
+    "the doctor report names the blocker rather than an unexplained unknown",
+  );
   assert.equal((await registry.get(remote.id))?.status, "running");
   assert.deepEqual(asked, [], "no local bridge lookup for a remote worker");
   await assert.rejects(
     reconcileForResume(registry, remote, "session-new", probe),
+    /evidence is incomplete[\s\S]*lease names another-host, not this machine/,
+  );
+});
+
+test("a renamed machine can still diagnose and resume its own run", async () => {
+  // Not a suffix `hostIdentity` can absorb: this is the DHCP rename that leaves
+  // the lease naming something no probe can connect back to this machine.
+  const renamed = abandonedRun({
+    lease: { ...DEAD_LEASE, hostname: `${thisHost()}-corp-dhcp` },
+  });
+  const { registry, directory } = await seedDirectory([renamed]);
+  const before = await snapshotRuns(directory);
+
+  const guidance = recoveryGuidance(renamed, await runEvidence(renamed));
+
+  assert.equal(
+    guidance.classification,
+    "its lease names a machine that is not this one",
+  );
+  assert.match(
+    guidance.action,
+    new RegExp(`/exec resume ${renamed.id} --same-machine`),
+    "status names the one command that can move this run",
+  );
+  // Refused without the assertion — but the refusal names the way out.
+  await assert.rejects(
+    reconcileForResume(registry, renamed, "session-new"),
+    new RegExp(`/exec resume ${renamed.id} --same-machine`),
+  );
+  assert.deepEqual(
+    await snapshotRuns(directory),
+    before,
+    "a refused resume writes nothing",
+  );
+
+  const recovered = await reconcileForResume(
+    registry,
+    renamed,
+    "session-new",
+    abandonmentProbe(),
+    true,
+  );
+
+  assert.equal(recovered.run.status, "failed");
+  assert.equal(recovered.run.activeOperation, undefined);
+  assert.match(recovered.note ?? "", /was abandoned/);
+  assert.equal(isActionAllowed("resume", recovered.run, "session-new"), true);
+  assert.equal(
+    (await registry.get(renamed.id))?.lease?.hostname,
+    `${thisHost()}-corp-dhcp`,
+    "the assertion is not written back; the next claim re-stamps the host",
+  );
+});
+
+test("a network rename of this machine needs no assertion at all", async () => {
+  const churned = abandonedRun({
+    lease: { ...DEAD_LEASE, hostname: `${thisHost()}.lan` },
+  });
+  const registry = await seedRegistry([churned]);
+
+  const recovered = await reconcileForResume(registry, churned, "session-new");
+
+  assert.equal(
+    recovered.run.status,
+    "failed",
+    "a lease from foo.local is the same machine as foo.lan",
+  );
+  assert.match(
+    sameMachineRefusal(churned) ?? "",
+    /only applies to a run whose lease names another host/,
+    "and the override is refused, because there is nothing to override",
+  );
+});
+
+test("--same-machine supplies a machine, never a verdict", async () => {
+  const asyncDir = await mkdtemp(join(tmpdir(), "pi-plan-exec-async-alive-"));
+  const foreignLease = { ...DEAD_LEASE, hostname: `${thisHost()}-corp-dhcp` };
+  const stillWriting = abandonedRun({
+    lease: foreignLease,
+    activeOperation: {
+      operationId: "operation-1",
+      service: "bridge",
+      kind: "implementation",
+      externalRunId: "external-1",
+      asyncDir,
+    },
+  });
+  const { registry, directory } = await seedDirectory([stillWriting]);
+  const before = await snapshotRuns(directory);
+
+  // The assertion only unblocks the evidence. What that evidence then says is
+  // unchanged, so a worker still writing here keeps the run ambiguous.
+  await assert.rejects(
+    reconcileForResume(
+      registry,
+      stillWriting,
+      "session-new",
+      abandonmentProbe(),
+      true,
+    ),
+    /evidence is incomplete[\s\S]*operation directory is still on disk/,
+  );
+  assert.deepEqual(await snapshotRuns(directory), before);
+
+  // Same for the other half of the conjunction: a bridge that still knows the
+  // operation is not an absence, whoever asserted the machine.
+  const bridgeKnowsIt = abandonedRun({
+    lease: foreignLease,
+    activeOperation: {
+      operationId: "operation-1",
+      service: "bridge",
+      kind: "implementation",
+      externalRunId: "external-1",
+    },
+  });
+  const seeded = await seedDirectory([bridgeKnowsIt]);
+
+  await assert.rejects(
+    reconcileForResume(
+      seeded.registry,
+      bridgeKnowsIt,
+      "session-new",
+      abandonmentProbe(async () => "running"),
+      true,
+    ),
     /evidence is incomplete/,
+  );
+  assert.equal((await seeded.registry.get(bridgeKnowsIt.id))?.status, "running");
+  // And it is refused outright on a run this machine can already observe, so
+  // it cannot be reached for by an operator who just wants resume to proceed.
+  assert.match(
+    sameMachineRefusal(abandonedRun()) ?? "",
+    /only applies to a run whose lease names another host/,
+  );
+  assert.equal(
+    sameMachineRefusal(abandonedRun({ lease: foreignLease })),
+    undefined,
   );
 });
 

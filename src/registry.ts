@@ -38,6 +38,23 @@ const RUN_ID =
 type RunLease = NonNullable<PlanExecRun["lease"]>;
 
 /**
+ * The part of a hostname that names the machine rather than the network it is
+ * on. The same Mac republishes itself as `foo.local`, `foo.lan`, or a
+ * DHCP-assigned FQDN as it moves between networks, while a lease keeps the name
+ * frozen from claim time, so only the first label decides, case-folded.
+ * Widening this far stays safe: mDNS renames a colliding host to `foo-2.local`,
+ * so two machines that can see each other still reduce to different names.
+ */
+function hostIdentity(name: string): string {
+  const [label] = name.toLowerCase().split(".");
+  return label ?? name.toLowerCase();
+}
+
+function isThisHost(name: string): boolean {
+  return hostIdentity(name) === hostIdentity(hostname());
+}
+
+/**
  * A stored lease is a claim, not evidence. It is live only when the caller owns
  * it, or its heartbeat is fresh and — on this host, where the pid means
  * something — the process still exists. A lease with no hostname was written
@@ -47,7 +64,7 @@ type RunLease = NonNullable<PlanExecRun["lease"]>;
 export function isLeaseLive(lease: RunLease, sessionId?: string): boolean {
   if (sessionId !== undefined && lease.sessionId === sessionId) return true;
   if (Date.now() - lease.heartbeatAt >= LEASE_STALE_MS) return false;
-  if (lease.hostname !== hostname()) return true;
+  if (lease.hostname === undefined || !isThisHost(lease.hostname)) return true;
   return isProcessRunning(lease.pid);
 }
 
@@ -60,7 +77,22 @@ export function isLeaseLive(lease: RunLease, sessionId?: string): boolean {
  */
 export function isLocalRun(run: PlanExecRun): boolean {
   const host = run.lease?.hostname;
-  return host === undefined || host === hostname();
+  return host === undefined || isThisHost(host);
+}
+
+/**
+ * The run with the host on its lease read as this machine. A rename no
+ * `hostIdentity` can absorb — a DHCP-assigned corporate name — otherwise leaves
+ * the run undiagnosable here forever, and no probe can tell that apart from a
+ * genuinely foreign host. `/exec resume --same-machine` lets the operator
+ * supply that one fact; everything downstream then gathers evidence normally.
+ * It asserts a machine, never a verdict: a worker still writing here keeps the
+ * run ambiguous and resume still refuses.
+ */
+export function asLocalRun(run: PlanExecRun): PlanExecRun {
+  return run.lease
+    ? { ...run, lease: { ...run.lease, hostname: hostname() } }
+    : run;
 }
 
 /**

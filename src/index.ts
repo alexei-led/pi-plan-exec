@@ -1,4 +1,5 @@
 import { access, readdir } from "node:fs/promises";
+import { hostname } from "node:os";
 import { basename, relative, resolve, sep } from "node:path";
 import {
   SessionManager,
@@ -31,6 +32,7 @@ import {
   type AbandonmentEvidence,
 } from "./lifecycle.js";
 import {
+  asLocalRun,
   isLeaseLive,
   isLocalRun,
   LEASE_STALE_MS,
@@ -64,6 +66,7 @@ const SECONDS_PER_MINUTE = 60;
 const MINUTES_PER_HOUR = 60;
 const DISPLAY_RUN_ID_LENGTH = 8;
 const RECOVERY_MODEL_OPTION = "--model";
+const SAME_MACHINE_OPTION = "--same-machine";
 const CLEANUP_APPLY_OPTION = "--apply";
 const CLEANUP_INCLUDE_FAILED_OPTION = "--include-failed";
 const CLEANUP_RETENTION_DAYS = 7;
@@ -540,6 +543,18 @@ export function recoveryGuidance(
       classification: "waiting for the stop you asked for",
       action: `Run /exec status ${run.id} until it reads cancelled or failed. If the stop itself failed, /exec resume ${run.id} retries only the stop and cannot start plan work.`,
     };
+  // Ahead of every other unknown, because it is the one that blocks all of
+  // them: a lease frozen with a name this machine no longer answers to makes
+  // the directory stat and the bridge lookup describe the wrong machine, so
+  // nothing local can ever settle this run. Only the operator knows whether
+  // that name was this machine, so naming the override is the sole action that
+  // can move it. The run with nothing tracked is left to the takeover branch
+  // above, which already recovers it without an override.
+  if (leaseNamesAnotherHost(run) && run.activeOperation)
+    return {
+      classification: "its lease names a machine that is not this one",
+      action: `The lease was stamped on ${run.lease?.hostname} and this machine answers to ${hostname()}, so nothing here can observe its worker. If that name was this machine before it was renamed, run /exec resume ${run.id} ${SAME_MACHINE_OPTION}; it checks the worker here and still refuses while one is running. If it was a different machine, recover the run there.`,
+    };
   if (run.activeOperation && !run.activeOperation.externalRunId)
     return {
       classification: "cannot check on the worker right now",
@@ -623,6 +638,23 @@ export function recoveryGuidance(
     classification: "not recognised",
     action: `Run /exec status ${run.id} again; no next step could be worked out from this state.`,
   };
+}
+
+/**
+ * Why `--same-machine` does not apply to this run, or undefined when it does.
+ * Scoped to the one thing the flag asserts so it can never widen into a general
+ * force: a run this machine can already observe has no frozen host to correct,
+ * and saying so beats accepting a flag that would change nothing.
+ */
+export function sameMachineRefusal(run: PlanExecRun): string | undefined {
+  return isLocalRun(run)
+    ? `${SAME_MACHINE_OPTION} only applies to a run whose lease names another host; run ${shortRunId(run.id)} is already observable here.`
+    : undefined;
+}
+
+/** A dead lease naming a host this machine is not: no local check can speak. */
+function leaseNamesAnotherHost(run: PlanExecRun): boolean {
+  return isStaleOwner(run) && !isLocalRun(run);
 }
 
 function isStaleOwner(run: PlanExecRun): boolean {
@@ -1500,15 +1532,27 @@ function reconcileReason(diagnosis: RunDiagnosis, actor: string): string {
  * double-write when no operation exists, and claiming it is what the retired
  * `/exec adopt` did. What is refused is the one shape that could add a second
  * writer: an unresolved operation that could not be proven gone.
+ *
+ * `sameMachine` is the operator asserting that the host frozen on the lease was
+ * this machine under an older name. It unblocks evidence gathering and nothing
+ * else — the conjunction below is unchanged, so an assertion cannot force a
+ * resume past a worker that is still writing. It is never written back either:
+ * the reset's own `claim` re-stamps the current host, and an assertion that
+ * ends ambiguous must leave the record exactly as it found it.
  */
 export async function reconcileForResume(
   registry: RunRegistry,
   run: PlanExecRun,
   sessionId: string,
   probe: EvidenceProbe = abandonmentProbe(),
+  sameMachine = false,
 ): Promise<{ run: PlanExecRun; note?: string }> {
   if (!isInFlightStatus(run.status) || isRecoverableRun(run)) return { run };
-  const evidence = await runEvidence(run, probe, sessionId);
+  const evidence = await runEvidence(
+    sameMachine ? asLocalRun(run) : run,
+    probe,
+    sessionId,
+  );
   const diagnosis: RunDiagnosis = {
     run,
     evidence,
@@ -1517,8 +1561,12 @@ export async function reconcileForResume(
   if (diagnosis.classification === ABANDONMENT.LIVE) return { run };
   if (diagnosis.classification === ABANDONMENT.AMBIGUOUS) {
     if (!run.activeOperation) return { run };
+    const override =
+      sameMachine || isLocalRun(run)
+        ? ""
+        : ` If ${run.lease?.hostname} was this machine before it was renamed, run /exec resume ${run.id} ${SAME_MACHINE_OPTION} to check the worker here.`;
     throw new Error(
-      `Run ${shortRunId(run.id)} still claims ${run.status} and the evidence is incomplete: ${evidenceText(diagnosis)}. Resuming could add a second writer, so nothing was changed. Use /exec status ${run.id} to re-check, or /exec stop ${run.id} to end it and preserve the worktree.`,
+      `Run ${shortRunId(run.id)} still claims ${run.status} and the evidence is incomplete: ${evidenceText(diagnosis)}. Resuming could add a second writer, so nothing was changed.${override} Use /exec status ${run.id} to re-check, or /exec stop ${run.id} to end it and preserve the worktree.`,
     );
   }
   const reconciled = await reconcileRun(
@@ -1576,6 +1624,10 @@ function operationEvidence(diagnosis: ObservedRun): string {
     return "the bridge has no record of its operation";
   if (diagnosis.evidence.asyncDirPresent === true)
     return "its operation directory is still on disk";
+  // Last, so it can never mask evidence: a foreign host is exactly the case
+  // where the probe gathered none, and "could not be observed" would hide why.
+  if (!isLocalRun(diagnosis.run))
+    return `its lease names ${diagnosis.run.lease?.hostname}, not this machine, so nothing here could observe its operation`;
   return "its operation could not be observed";
 }
 
@@ -1742,6 +1794,7 @@ async function runAction(
           selector: rest[0],
           adoptCurrentBranch: false,
           retryTask: false,
+          sameMachine: false,
           model: undefined,
         };
   if (action === EXEC_ACTION.SKIP && (!rest[0] || rest[0] === "--reason"))
@@ -1759,13 +1812,23 @@ async function runAction(
     ctx,
     resumeArguments.adoptCurrentBranch,
   );
+  if (resumeArguments.sameMachine) {
+    const refusal = sameMachineRefusal(resolved);
+    if (refusal) throw new Error(refusal);
+  }
   if (action === EXEC_ACTION.RESUME || action === EXEC_ACTION.SKIP) {
     await checkRuntime();
     // Reconcile before anything else touches the run: from here on resume is
     // working with a state it has evidence for.
     const recovered =
       action === EXEC_ACTION.RESUME
-        ? await reconcileForResume(registry, resolved, sessionId, doctorProbe)
+        ? await reconcileForResume(
+            registry,
+            resolved,
+            sessionId,
+            doctorProbe,
+            resumeArguments.sameMachine,
+          )
         : { run: resolved, note: undefined };
     const run = recovered.run;
     const recoveryModel =
@@ -2207,6 +2270,7 @@ export function parseResumeArguments(args: string[]): {
   selector: string | undefined;
   adoptCurrentBranch: boolean;
   retryTask: boolean;
+  sameMachine: boolean;
   model: string | undefined;
 } {
   const first = args[0];
@@ -2220,21 +2284,25 @@ export function parseResumeArguments(args: string[]): {
 export function parseResumeOptions(args: string[]): {
   adoptCurrentBranch: boolean;
   retryTask: boolean;
+  sameMachine: boolean;
   model: string | undefined;
 } {
   const options: {
     adoptCurrentBranch: boolean;
     retryTask: boolean;
+    sameMachine: boolean;
     model: string | undefined;
   } = {
     adoptCurrentBranch: false,
     retryTask: false,
+    sameMachine: false,
     model: undefined,
   };
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
     if (arg === "--adopt-current-branch") options.adoptCurrentBranch = true;
     else if (arg === TASK_RETRY_OPTION) options.retryTask = true;
+    else if (arg === SAME_MACHINE_OPTION) options.sameMachine = true;
     else if (arg === RECOVERY_MODEL_OPTION) {
       const model = args[index + 1];
       if (!model || model.startsWith("--")) throw resumeUsageError();
@@ -2247,7 +2315,7 @@ export function parseResumeOptions(args: string[]): {
 
 function resumeUsageError(): Error {
   return new Error(
-    `Usage: /exec resume [full-run-id] [--adopt-current-branch] [${TASK_RETRY_OPTION}] [${RECOVERY_MODEL_OPTION} current|provider/model]`,
+    `Usage: /exec resume [full-run-id] [--adopt-current-branch] [${TASK_RETRY_OPTION}] [${SAME_MACHINE_OPTION}] [${RECOVERY_MODEL_OPTION} current|provider/model]`,
   );
 }
 
