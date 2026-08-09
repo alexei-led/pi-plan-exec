@@ -697,7 +697,7 @@ export function formatRunStatus(run: PlanExecRun): string {
   }
   if (operation?.skipFailures) {
     lines.push(
-      `force-skip reconciliation: failed (${operation.skipFailures}/${MAX_STATUS_FAILURES}); retrying${operation.lastSkipError ? ` — ${operation.lastSkipError}` : ""}`,
+      `waived stage: could not stop the worker (${operation.skipFailures}/${MAX_STATUS_FAILURES}); retrying${operation.lastSkipError ? ` — ${operation.lastSkipError}` : ""}`,
     );
   } else if (operation && !operation.statusFailures) {
     lines.push(

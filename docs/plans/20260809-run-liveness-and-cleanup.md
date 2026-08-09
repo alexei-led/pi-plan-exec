@@ -756,6 +756,10 @@ the controller before acting.
   literals out of `src/index.ts` rather than reading a shape table, so a branch added later
   cannot reintroduce the words, and it floors the scrape count so a refactor that empties
   the match set fails instead of passing on nothing
+- ➕ deviation: `formatRunStatus`'s force-skip detail line printed
+  `force-skip reconciliation: failed (n/3)` two lines above the classification it sits
+  next to — the last place in the reader's view carrying the vocabulary this task removes.
+  It now reads `waived stage: could not stop the worker (n/3)`
 - ⚠️ for Task 16: `README.md:71,76,77` and `docs/guide.md:187,190,228` still quote the old
   classification wording. They are in that task's Files list, not this one
 
