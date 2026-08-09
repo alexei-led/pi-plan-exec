@@ -905,6 +905,14 @@ the controller before acting.
   quoted the reason; `parseSkipReason` joins the remaining tokens verbatim, so the
   quotes would have been stored inside a permanent waiver record. Changing only the
   quote characters touches no `/exec <token>`, so Task 9's drift test is unaffected
+- ➕ deviation: the install line in both `README.md` and `docs/guide.md` reads
+  `pi install 'npm:@alexeiled/pi-subagents-bridge@>=0.2.2'`, quoted, where
+  `SETUP_COMMANDS` prints it bare. Both files put that line in a `bash` fence, and
+  unquoted `>` there is a redirect: a paste would install the package with no range
+  at all and write a file named `=0.2.2`. `@^0.2.2` had no such failure mode, so
+  unquoting without quoting would have been a regression this task introduced. Task
+  1's requirement is the range, which the quotes preserve, and its test asserts on
+  `execSetup()` rather than on either document
 - ➕ decision: no test reads `README.md`, `docs/guide.md`, or `docs/architecture.md`,
   so `npm run test:all` cannot verify this task. The gate that can is a scripted
   sweep, run green before commit: every backticked phrase of four words or more in

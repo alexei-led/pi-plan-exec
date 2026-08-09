@@ -27,7 +27,7 @@ does not require cc-thingz agents.
 ```bash
 pi install npm:pi-subagents
 pi install npm:@tintinweb/pi-tasks
-pi install npm:@alexeiled/pi-subagents-bridge@>=0.2.2
+pi install 'npm:@alexeiled/pi-subagents-bridge@>=0.2.2'
 pi install npm:@alexeiled/pi-fusion
 pi install npm:@alexeiled/pi-plan-exec
 ```
@@ -199,7 +199,8 @@ caller cannot answer. Every prompt has a non-interactive equivalent, and the
 former subcommand names still dispatch. They are absent from `/exec help` on
 purpose; `/skill:exec-plan` collects them for agents. `/exec runs` and
 `/exec doctor` both mean `/exec status`, `/exec setup` still prints the install
-commands that `/exec status` now reports inline, `/exec adopt` means
+commands unconditionally where `/exec status` reports them only when a package is
+missing, `/exec adopt` means
 `/exec resume`, and `/exec pause` and
 `/exec cancel` are `/exec stop` without the question. `/exec start` was deleted
 outright: it was the same code path as bare `/exec`.

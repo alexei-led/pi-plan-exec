@@ -46,7 +46,7 @@ Install the prerequisites, then plan-exec:
 ```bash
 pi install npm:pi-subagents
 pi install npm:@tintinweb/pi-tasks
-pi install npm:@alexeiled/pi-subagents-bridge@>=0.2.2
+pi install 'npm:@alexeiled/pi-subagents-bridge@>=0.2.2'
 pi install npm:@alexeiled/pi-fusion
 pi install npm:@alexeiled/pi-plan-exec
 ```
