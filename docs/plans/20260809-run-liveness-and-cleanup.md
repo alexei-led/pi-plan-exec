@@ -107,8 +107,23 @@ Four design rules drive the work:
 4. **Guidance must discriminate.** `"wait"` is only useful if some other input yields
    something else.
 
-Ordering: the cheap independent wins first (version string, lease liveness, cleanup,
-retirement, listing), then the observability work that fixes the reported symptom.
+A fifth rule was added after Tasks 1-9 shipped, because those tasks made the problem they
+solved worse in another dimension:
+
+1. **The user states intent; the tool derives state.** Every place a reader must branch on
+   something the tool has already read is a place to fold. Fold without removing
+   capability: keep the behavior, move the choice to where the tool can make it or
+   explain it.
+
+The work is therefore two arcs.
+
+**Tasks 1-9 — make the state honest.** Cheap independent wins first (version string,
+lease liveness, cleanup, retirement, listing), then the observability that fixes the
+reported symptom, then reconciliation and the skill.
+
+**Tasks 10-14 — make the surface small.** Those nine tasks left 12 subcommands and 8 flags
+behind, three of them newly added here. Collapse to 5 verbs and 2 flags. Findings and the
+full inventory: `docs/plans/2026-08-09-exec-surface-simplification.md`.
 
 ## Technical Details
 
@@ -513,7 +528,114 @@ stale-lease detection. None of these appear in the skill today.
   verification advice as an action. The retention and `--all` facts are stated once under
   Terminal states instead
 
-### Task 10: Verify acceptance criteria
+### Task 10: ➕ Collapse the read surface into `/exec status`
+
+Findings and rationale: `docs/plans/2026-08-09-exec-surface-simplification.md`. Read it
+first. Tasks 10-14 reduce 12 subcommands and 8 flags to 5 verbs and 2 flags.
+
+Three rules bind every task in this group:
+
+1. **Never remove capability to reach a smaller number.** Each fold keeps the behavior
+   and moves the choice to where the tool can make it or explain it.
+2. **Keep every flag as a non-interactive equivalent.** Worker subagents run with no
+   human and the code already throws `"Force-skip requires interactive confirmation."`
+   Flags leave `/exec help` and live on in the skill; they do not leave the code.
+3. **Retire names as hidden aliases, not errors.** A run in flight during an upgrade must
+   not break. An alias keeps working and prints the new spelling once.
+
+**Files:** `src/index.ts`, `src/types.ts`, `test/index.test.ts`
+
+- [ ] delete the `start` subcommand; `src/index.ts:1315` shows it is the identical code
+      path to bare `/exec`, picker included
+- [ ] make `/exec status` with no run ID the full sweep: every run, grouped by what it
+      needs, each row ending in one next command
+- [ ] fold `doctor` into that sweep, and `--all` into it as the zoom control it already is
+- [ ] surface missing packages inside `status` rather than behind a separate verb
+- [ ] keep `runs`, `doctor`, and `setup` as hidden aliases that still work, are absent
+      from `/exec help`, and name their replacement once in the output
+- [ ] keep `--reconcile` reachable on the alias so a scripted caller does not break; the
+      interactive path moves to `resume` in Task 11
+- [ ] do not fold `cleanup` into `status` — reading and deleting stay separate verbs
+- [ ] update Task 9's skill-vs-`EXEC_ACTION` drift test: hidden aliases exist in
+      `EXEC_ACTION` but must not be required in the skill, so the assertion needs an
+      explicit alias set rather than a two-way equality
+- [ ] write tests: `start` is gone, `status` with no ID lists and diagnoses in one pass,
+      each alias still works and names its replacement, `/exec help` no longer lists them
+- [ ] run `npm run test:all` — must pass before task 11
+
+### Task 11: ➕ Collapse the recovery surface into `/exec resume`
+
+Every stuck state must answer one verb. Today the user picks between `resume`, `adopt`,
+and `doctor --reconcile` by inspecting a lease and an operation the tool has already read.
+
+**Files:** `src/index.ts`, `src/types.ts`, `test/index.test.ts`
+
+- [ ] make `resume` claim a run whose lease is foreign and not live, using Task 2's
+      `isLeaseLive`; `adopt` becomes a hidden alias
+- [ ] make `resume` reconcile a provably abandoned run first, then continue, reusing Task
+      8's `classifyAbandonment`; never touch an `ambiguous` run and never launch on
+      partial evidence
+- [ ] ask for task retry and branch adoption at the moment they matter, through the
+      confirms that `--retry-task` and `--adopt-current-branch` already require
+- [ ] keep both flags working for non-interactive callers and remove them from
+      `/exec help`; keep `--model` documented as the one advanced flag
+- [ ] preserve every existing safety gate: no second worker, no consumed task attempt on
+      reconcile, compare-and-swap on every write
+- [ ] write tests: resume claims a dead foreign lease, resume reconciles then continues,
+      resume refuses an ambiguous run, the flags still drive the non-interactive path
+- [ ] run `npm run test:all` — must pass before task 12
+
+### Task 12: ➕ Add `/exec stop` over `pause` and `cancel`
+
+Both mean "stop this". They differ in reversibility, which is exactly the thing to explain
+at the moment of choice rather than encode in two verb names.
+
+**Files:** `src/index.ts`, `src/types.ts`, `test/index.test.ts`
+
+- [ ] add `stop`, which asks: pause (resumable) or cancel (final, worktree preserved)
+- [ ] keep `pause` and `cancel` as hidden aliases and as the non-interactive path
+- [ ] do not fold `skip`; its full run ID, mandatory reason, and confirm are a waiver
+      guard, not friction to remove
+- [ ] instead, when a stage is blocked, make `status` print the exact `skip` command with
+      the run ID already filled in, so it stays hard to run by accident
+- [ ] write tests: `stop` reaches both outcomes, the aliases still work, a blocked stage
+      makes `status` emit a ready-to-run `skip` line
+- [ ] run `npm run test:all` — must pass before task 13
+
+### Task 13: ➕ Rewrite the classification vocabulary around next actions
+
+The largest real win for a reader who struggles, and the most work. The 20 classifications
+in `recoveryGuidance` name controller internals — `preserved unknown operation`,
+`force-skip reconciliation pending`, `execution-branch mismatch`. A reader has to model
+the controller before acting.
+
+**Files:** `src/index.ts`, `test/index.test.ts`
+
+- [ ] rewrite each classification as the user's situation, not the controller's state
+- [ ] collapse classifications that share a next command; the count matters less than the
+      number of distinct actions a reader must choose between
+- [ ] keep the distinctions Task 6 and Task 7 earned: gone, liveness unverified,
+      long-running, and healthy are four different situations and must stay four
+- [ ] make sure every classification still ends at exactly one command
+- [ ] update `skills/exec-plan/references/recovery.md` so its branches match the new
+      wording exactly; Task 9 aligned them to the old wording
+- [ ] write a test asserting no classification string contains the internal vocabulary
+      (`preserved`, `reconciliation`, `operation identity`), so the wording cannot regress
+- [ ] run `npm run test:all` — must pass before task 14
+
+### Task 14: ➕ Rewrite `/exec help` around 5 verbs
+
+**Files:** `src/index.ts`, `skills/exec-plan/SKILL.md`, `test/index.test.ts`
+
+- [ ] reduce `/exec help` to `/exec [plan]`, `status`, `resume`, `stop`, `cleanup`, `help`
+- [ ] leave `--apply` and `--model` as the only flags in help; move the rest to the skill
+- [ ] document every hidden alias and every non-interactive flag once in
+      `skills/exec-plan/SKILL.md`, marked as the scripted path for agents
+- [ ] update `EXEC_COMMANDS` autocomplete to the primary verbs only
+- [ ] write a test that `/exec help` names exactly the primary verbs and no alias
+- [ ] run `npm run test:all` — must pass before task 15
+
+### Task 15: Verify acceptance criteria
 
 - [ ] verify every requirement in Overview is implemented
 - [ ] load each of the eight real run records under `~/.pi/plan-exec/runs/` through
@@ -523,9 +645,11 @@ stale-lease detection. None of these appear in the skill today.
 - [ ] verify no `schemaVersion` bump was introduced anywhere
 - [ ] verify every recovery branch in `skills/exec-plan/references/recovery.md` names a
       command that exists, and that no branch ends without an action
+- [ ] verify the 5-verb surface: every retired name still works as a hidden alias, and
+      no capability was removed to reach the smaller count
 - [ ] run the full gate: `npm run test:all`
 
-### Task 11: [Final] Update documentation
+### Task 16: [Final] Update documentation
 
 **Files:**
 
