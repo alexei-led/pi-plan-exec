@@ -36,8 +36,8 @@ Stale terminal output does not prove that a child stopped.
 ## Running or starting
 
 `/exec status` prints one classification for a run that is still in flight.
-Match it below and run its command. Never run resume, start, or a manual
-subagent merely because a child is slow.
+Match it below and run its command. Never run resume or a manual subagent
+merely because a child is slow.
 
 `/exec status` writes for a human at a keyboard, so it names `/exec stop <id>`,
 which asks whether to pause or to cancel. An agent has nobody to answer that

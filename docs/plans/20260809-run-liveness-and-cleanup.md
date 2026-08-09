@@ -807,17 +807,62 @@ the controller before acting.
 
 ### Task 15: Verify acceptance criteria
 
-- [ ] verify every requirement in Overview is implemented
-- [ ] load each of the eight real run records under `~/.pi/plan-exec/runs/` through
+- [x] verify every requirement in Overview is implemented
+- [x] load each of the eight real run records under `~/.pi/plan-exec/runs/` through
       `RunRegistry.get` and confirm all parse without error after the schema additions
-- [ ] verify `/exec cleanup` preview against the real registry reports the two
-      `completed_with_findings` runs and excludes the five `failed` ones
-- [ ] verify no `schemaVersion` bump was introduced anywhere
-- [ ] verify every recovery branch in `skills/exec-plan/references/recovery.md` names a
+- [x] verify `/exec cleanup` preview against the real registry reports the two
+      `completed_with_findings` runs and excludes the six `failed` ones
+- [x] verify no `schemaVersion` bump was introduced anywhere
+- [x] verify every recovery branch in `skills/exec-plan/references/recovery.md` names a
       command that exists, and that no branch ends without an action
-- [ ] verify the 5-verb surface: every retired name still works as a hidden alias, and
+- [x] verify the 5-verb surface: every retired name still works as a hidden alias, and
       no capability was removed to reach the smaller count
-- [ ] run the full gate: `npm run test:all`
+- [x] run the full gate: `npm run test:all`
+
+**Verification evidence.**
+
+- Overview, claim by claim: a `running` claim is falsifiable through `isLeaseLive`
+  (`src/registry.ts:52`), the `workerSignal` digest, and the `asyncDir` stat; in-flight
+  operations are bounded by `longRunningOperation` keyed on the stage turn budget;
+  terminal runs are retired by `retiredAt` (`src/controller.ts:1381`),
+  `RunRegistry.remove`, `execCleanup`, and the settled-run listing filter. The reported
+  symptom is gone: the word `healthy` no longer appears in any rendered string — only in
+  three source comments — and the four in-flight situations render four different
+  classifications
+- all eight real records loaded through `RunRegistry.get` without error; md5 of every
+  file under `~/.pi/plan-exec/runs/` was identical before and after, so the check was
+  provably read-only. `get` is `readFile` + `parseRun` with no write path
+- ⚠️ acceptance criterion edited: the registry now holds **six** `failed` runs, not five. The run this plan
+  diagnosed (`31f750ca`, `running` at diagnosis) has since gone `failed`. The checkbox
+  text was corrected from five to six; the behavior it asserts is unchanged. Preview
+  reported exactly the two `completed_with_findings` runs and no `failed` one;
+  `--include-failed` added the three `failed` runs past the 7-day window and correctly
+  still withheld the three inside it
+- no `schemaVersion` bump: the branch diff against `main` adds no line changing it, the
+  guard at `src/registry.ts:450` still requires `=== 1`, and `assertRun` validates none
+  of `lease.hostname`, `retiredAt`, `reconciledAt`, or `workerSignal` — proven by the
+  eight on-disk records, which carry none of them
+- `recovery.md` names eleven `/exec` subcommands, every one of them a member of
+  `EXEC_ACTION`. All 15 reader-facing classification strings in `recoveryGuidance` are
+  quoted verbatim; only `between steps` and `not recognised` are absent, and neither is
+  a recovery situation. Criterion for "no branch ends without an action": a branch is a
+  `###` heading quoting a classification, and all six under "Running or starting" name a
+  command. The seventh, "Why no per-turn activity signal exists", is explanatory prose,
+  not a branch, and deliberately carries no command
+- ➕ fix: `recovery.md:40` read "Never run resume, start, or a manual subagent". Task 10
+  deleted `start`, so the line named a verb that no longer exists. It now reads "Never
+  run resume or a manual subagent"
+- 5-verb surface, proven by dispatch rather than by presence in `EXEC_ACTION`:
+  `runs`/`doctor`/`setup` return through `execRead` with their alias note,
+  `adopt`→`resume`, `pause`→`pause`, and `cancel`→`cancel` through `runActionFor` with
+  theirs, `/exec runs --all` and `/exec doctor --reconcile` both still parse, and every
+  retired flag reaches a parser that consumes it — `--all`
+  (`parseStatusArguments`), `--apply` and `--include-failed` (`parseCleanupArguments`),
+  `--reconcile` (`parseDoctorArguments`), `--model`, `--retry-task`, and
+  `--adopt-current-branch` (`parseResumeOptions`), `--reason` (`parseSkipReason`).
+  `/exec help` lists exactly the six primary verbs and no alias. `start` is the one name
+  with no alias: Task 10 deleted it as the identical code path to bare `/exec`
+- full gate green: lint, `tsc --noEmit`, 169 tests, and `pack:dry`
 
 ### Task 16: [Final] Update documentation
 
