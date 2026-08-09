@@ -31,8 +31,9 @@ runs review and fix stages with fresh Pi subagents and Fusion. A worker saying
 - **Executes plans deterministically.** It selects the first incomplete task,
   starts a fresh worker, and verifies completion from the plan checkboxes.
 - **Recovers deliberately.** A reload reattaches a matching run owned by the
-  returning session. `/exec adopt` takes over a stale cross-session run.
-  Compare-and-set records, operation IDs, controller locks, and leases avoid
+  returning session. `/exec resume` takes over a run whose owning session is
+  proven dead, and resets a run whose worker is provably gone before continuing
+  it. Compare-and-set records, operation IDs, controller locks, and leases avoid
   intentionally starting another writer or losing a pause or cancellation.
 - **Reviews before it finishes.** It runs comprehensive, smells, Fusion, and
   critical review/fix phases. Unresolved findings remain visible in the final
@@ -45,7 +46,7 @@ Install the prerequisites, then plan-exec:
 ```bash
 pi install npm:pi-subagents
 pi install npm:@tintinweb/pi-tasks
-pi install npm:@alexeiled/pi-subagents-bridge@^0.2.2
+pi install npm:@alexeiled/pi-subagents-bridge@>=0.2.2
 pi install npm:@alexeiled/pi-fusion
 pi install npm:@alexeiled/pi-plan-exec
 ```
@@ -65,30 +66,38 @@ plan:
 ```
 
 While it runs, Pi shows the execution-worktree path, branch, stage, and worker.
-`/exec status` only observes the run; it does not interrupt or restart it. It
-also reports the recovery classification and one safe next action: wait for a
-healthy operation, reconcile a preserved operation, retry a failed stage, adopt
-a stale owner, or review a plan/branch mismatch. Use it without a run ID for the
-current repository, and use `/exec runs` when several runs need disambiguation.
-`/exec pause` stops after the active child; `/exec resume` reconciles a running
-child, continues paused work, or recovers a recorded failure in the same stage
-and preserved worktree. It retries a no-progress implementation task when the
-user explicitly resumes it. Only an external/manual blocker asks for a retry
-confirmation. A terminal model/provider failure preserves its child error and
-operation without consuming an implementation retry, then uses the current
-authenticated Pi model. `--model current` or `--model provider/model` is an
-advanced one-recovery-launch override; it does not pin later workers. Implementation checkboxes remain sequential and
-cannot be force-skipped. When a provider operation may still exist, plan-exec
-keeps its identity and adopts it
-before any retry. If a review, finalization, or
-statistics stage cannot recover, `/exec skip <full-run-id> --reason <text>`
-stops the tracked child before recording an explicit waiver and advancing. It
-never skips implementation or archival, and the run finishes as
-`completed_with_findings`. If external work moved the execution tree to another
-branch, `/exec resume <full-run-id> --adopt-current-branch` provides an
-interactive, audited rebind after verifying the same repository and no active
-child. The installed `exec-plan` skill is also available as
-`/skill:exec-plan` for the plan format and recovery rules.
+Four verbs cover everything after the start:
+
+- `/exec status` only observes; it never interrupts or restarts a run. With no
+  run ID it lists every run, groups the ones that claim a worker by the evidence
+  for that claim, reports any missing package with its install command, and ends
+  every row in one next command. Add a full run ID for one run in detail, or
+  `--all` to include terminal runs older than a day.
+- `/exec resume` continues or recovers anything stuck. It takes the lease over
+  from a session proven dead, resets a run whose worker is provably gone and then
+  continues it, and asks before retrying a task blocked outside the run or
+  rebinding the execution branch after external work moved the worktree. It never
+  launches on partial evidence: a run whose worker cannot be proven gone is
+  reported, not reset. A model or provider failure is retried with the model this
+  Pi session is signed in to and does not consume an implementation retry;
+  `--model current` or `--model provider/model` is an advanced override for that
+  one replacement child and never pins later workers.
+- `/exec stop` asks whether to pause the run (resumable) or cancel it (final,
+  worktree preserved).
+- `/exec cleanup` retires run records. It previews by default and deletes
+  nothing; `--apply` removes the registry entry — never the worktree, branch, or
+  progress file — for terminal runs more than 7 days past their last update.
+  `failed` runs are excluded, because their record is what `/exec resume` needs.
+
+Implementation checkboxes remain sequential and cannot be force-skipped. When a
+provider operation may still exist, plan-exec keeps its recorded operation ID and
+reconciles it before any retry. If a review, finalization, or statistics stage
+cannot recover, `/exec skip <full-run-id> --reason <text>` stops the tracked
+child before recording an explicit waiver and advancing. It never skips
+implementation or archival, and the run finishes as `completed_with_findings`.
+The installed `exec-plan` skill is also available as `/skill:exec-plan` for the
+plan format, the recovery rules, and the retired names and flags a scripted agent
+uses instead of a prompt.
 
 The **[Guide](docs/guide.md#executable-plan-format)** defines the accepted plan
 format, including the exact heading and checkbox rules. Omit the path to select

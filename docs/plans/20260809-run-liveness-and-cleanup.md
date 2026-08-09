@@ -872,14 +872,46 @@ the controller before acting.
 - Modify: `docs/architecture.md`
 - Modify: `README.md`
 
-- [ ] document `/exec cleanup` and `/exec runs --all` in `docs/guide.md` alongside the
+- [x] document `/exec cleanup` and `/exec runs --all` in `docs/guide.md` alongside the
       other subcommands, including the default retention window and the `failed`
       exclusion
-- [ ] document the lease liveness rule and the retirement/cleanup lifecycle in
+- [x] document the lease liveness rule and the retirement/cleanup lifecycle in
       `docs/architecture.md`
-- [ ] update `README.md` if it lists subcommands or setup install commands
-- [ ] update `CLAUDE.md` if new patterns were discovered
-- [ ] run `npm run test:all`
+- [x] update `README.md` if it lists subcommands or setup install commands
+- [x] update `CLAUDE.md` if new patterns were discovered
+- [x] run `npm run test:all`
+- ➕ deviation: the first checkbox names `/exec runs --all`, which Task 10 retired.
+  `docs/guide.md` documents `/exec status --all` as the primary spelling, with the
+  24-hour listing window, the 7-day retention window, and the `failed` exclusion
+  stated there; `/exec runs --all` appears once under "Retired names and scripted
+  flags". The checkbox predates the fold and its intent — zoom control, retention,
+  exclusion, all documented — is met under the shipped name
+- ➕ decision: no `CLAUDE.md` exists in this repository, so the condition the
+  checkbox guards is false. Creating one is outside the plan's scope
+- ➕ deviation: `docs/guide.md:157` documented `/exec start [plan]`, which Task 10
+  deleted. That line was not merely stale — dispatch now falls through to plan-path
+  resolution, so `/exec start foo.md` reads `start foo.md` as a path. The command
+  block drops it and the retired-names section records that it was deleted outright,
+  since a reader working from old notes will otherwise type it and get a plan-not-
+  found error naming neither cause nor cure
+- ➕ deviation: `docs/guide.md:185` claimed "Implementation workers and reviewers get
+  a 75-turn recovery budget". `DEFAULT_FROZEN_RUN_CONFIG` gives workers 75 and both
+  reviewers and stats 30, and `operationMaxTurns` keys the Task 7 bound on that same
+  split. The sentence moved into the new "What status can prove about a worker"
+  section, corrected, and now doubles as the only place a reader can learn where
+  `running longer than its budget allows` gets its number
+- ➕ deviation: fixed `skills/exec-plan/references/recovery.md`, which is not in this
+  task's Files list, matching the Task 12 and 13 precedent. Its `/exec skip` example
+  quoted the reason; `parseSkipReason` joins the remaining tokens verbatim, so the
+  quotes would have been stored inside a permanent waiver record. Changing only the
+  quote characters touches no `/exec <token>`, so Task 9's drift test is unaffected
+- ➕ decision: no test reads `README.md`, `docs/guide.md`, or `docs/architecture.md`,
+  so `npm run test:all` cannot verify this task. The gate that can is a scripted
+  sweep, run green before commit: every backticked phrase of four words or more in
+  the three files appears verbatim in `src/index.ts` (the plan-format example
+  excepted), every `/exec <token>` is a member of `EXEC_ACTION`, and every `--flag`
+  reaches a parser that consumes it. The retired names survive only inside the
+  section that labels them retired
 
 ## Post-Completion
 

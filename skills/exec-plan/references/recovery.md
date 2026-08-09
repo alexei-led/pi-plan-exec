@@ -239,7 +239,7 @@ While the waiver is pending, status classifies the run
 Use this only after inspecting the findings and active operation:
 
 ```text
-/exec skip <full-run-id> --reason "<why the residual risk is accepted>"
+/exec skip <full-run-id> --reason <why the residual risk is accepted>
 ```
 
 Pi asks for interactive confirmation. The controller records `skip_pending`,
