@@ -191,6 +191,17 @@ export default function planExecExtension(pi: ExtensionAPI): void {
     },
   );
 
+  // A diagnosis must never hang: /exec doctor is the first step after a restart,
+  // which is exactly when the bridge may not be up yet. It gets the same short
+  // budget as the runtime probe, and no answer is simply no evidence.
+  const doctorProbe = abandonmentProbe(async (operationId) => {
+    const lookup = await new BridgeClient(
+      pi.events,
+      PROVIDER_PROBE_TIMEOUT_MS,
+    ).operation(operationId);
+    return lookup.success ? bridgeOperationState(lookup.data) : undefined;
+  });
+
   const activeControllers = new Map<string, ReturnType<typeof setInterval>>();
   const inFlightControllers = new Set<string>();
   const lastStates = new Map<string, RunState>();
@@ -352,6 +363,7 @@ export default function planExecExtension(pi: ExtensionAPI): void {
           startBackgroundController,
           syncProjection,
           checkRuntime,
+          doctorProbe,
         );
         if (message) ctx.ui.notify(message, "info");
       } catch (error: unknown) {
@@ -385,15 +397,8 @@ export default function planExecExtension(pi: ExtensionAPI): void {
     // command that can act, and never writes. A diagnosis failure is advisory,
     // so it must not take the session down with it.
     try {
-      const abandoned = (await sweepAbandonment(registry)).diagnoses.filter(
-        (diagnosis) => diagnosis.classification === ABANDONMENT.ABANDONED,
-      ).length;
-      if (abandoned > 0)
-        notify(
-          ctx,
-          `${abandoned} plan execution run${abandoned === 1 ? "" : "s"} claim to be running with no worker. Use /exec doctor.`,
-          "warning",
-        );
+      const notice = abandonedRunsNotice(await sweepAbandonment(registry));
+      if (notice) notify(ctx, notice, "warning");
     } catch {
       // Startup diagnosis is advisory; the registry stays authoritative.
     }
@@ -928,6 +933,17 @@ export async function sweepAbandonment(
   };
 }
 
+/** The one line startup is allowed to say about a sweep, or nothing at all. */
+export function abandonedRunsNotice(
+  sweep: AbandonmentSweep,
+): string | undefined {
+  const abandoned = sweep.diagnoses.filter(
+    (diagnosis) => diagnosis.classification === ABANDONMENT.ABANDONED,
+  ).length;
+  if (abandoned === 0) return undefined;
+  return `${abandoned} plan execution ${abandoned === 1 ? "run claims" : "runs claim"} to be running with no worker. Use /exec doctor.`;
+}
+
 export async function execDoctor(
   registry: RunRegistry,
   args: string[],
@@ -1109,6 +1125,13 @@ function recoveryCommand(before: PlanExecRun, after: PlanExecRun): string {
     : `/exec resume ${after.id}`;
 }
 
+function bridgeOperationState(
+  data: Record<string, unknown>,
+): string | undefined {
+  const state = data.state;
+  return typeof state === "string" && state.trim() ? state.trim() : undefined;
+}
+
 async function pathExists(path: string): Promise<boolean> {
   try {
     await access(path);
@@ -1125,6 +1148,7 @@ async function handleCommand(
   startBackgroundController: StartBackgroundController,
   syncProjection: SyncProjection,
   checkRuntime: RuntimeCheck,
+  doctorProbe: EvidenceProbe,
 ): Promise<string | undefined> {
   const [subcommand, ...rest] = args.split(/\s+/).filter(Boolean);
   if (subcommand === EXEC_ACTION.HELP) return execHelp();
@@ -1133,11 +1157,7 @@ async function handleCommand(
     return formatRunList(await registry.list(), parseRunsArguments(rest));
   if (subcommand === EXEC_ACTION.CLEANUP) return execCleanup(registry, rest);
   if (subcommand === EXEC_ACTION.DOCTOR)
-    return execDoctor(
-      registry,
-      rest,
-      abandonmentProbe((operationId) => controller.operationState(operationId)),
-    );
+    return execDoctor(registry, rest, doctorProbe);
   if (
     subcommand === EXEC_ACTION.STATUS ||
     subcommand === EXEC_ACTION.PAUSE ||

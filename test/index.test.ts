@@ -1,17 +1,13 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import {
-  mkdir,
-  mkdtemp,
-  readFile,
-  readdir,
-  writeFile,
-} from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { RunRegistry } from "../src/registry.js";
 import {
+  abandonedRunsNotice,
+  abandonmentProbe,
   execCleanup,
   execDoctor,
   execHelp,
@@ -1264,6 +1260,99 @@ test("reconcile records the reset in the run's own progress file", async () => {
   assert.match(progress, /Reset by \/exec doctor/);
   assert.match(progress, /operation directory is gone from disk/);
   assert.match(progress, /task attempt counter was left unchanged/);
+});
+
+test("the bridge is asked only when the directory check was not decisive", async () => {
+  const asyncDir = await mkdtemp(join(tmpdir(), "pi-plan-exec-async-"));
+  const surviving = abandonedRun({
+    activeOperation: {
+      operationId: "operation-surviving",
+      service: "bridge",
+      kind: "implementation",
+      externalRunId: "external-1",
+      asyncDir,
+    },
+  });
+  const wiped = abandonedRun({
+    id: "22222222-2222-4222-8222-222222222222",
+  });
+  const fused = abandonedRun({
+    id: "33333333-3333-4333-8333-333333333333",
+    stage: "fusion_review",
+    activeOperation: {
+      operationId: "operation-fusion",
+      service: "fusion",
+      kind: "fusion",
+      externalRunId: "external-3",
+      asyncDir,
+    },
+  });
+  const { registry } = await seedDirectory([surviving, wiped, fused]);
+  const asked: string[] = [];
+
+  const report = await execDoctor(
+    registry,
+    ["--reconcile"],
+    abandonmentProbe(async (operationId) => {
+      asked.push(operationId);
+      return "absent";
+    }),
+  );
+
+  assert.deepEqual(
+    asked,
+    ["operation-surviving"],
+    "a gone directory is already decisive, and fusion has no bridge record",
+  );
+  assert.match(report, /Reset 2 abandoned runs to failed\./);
+  assert.match(
+    (await registry.get(surviving.id))?.error ?? "",
+    /the bridge has no record of its operation/,
+  );
+  assert.equal((await registry.get(fused.id))?.status, "running");
+});
+
+test("a bridge that cannot answer is not evidence the worker is gone", async () => {
+  const asyncDir = await mkdtemp(join(tmpdir(), "pi-plan-exec-async-"));
+  const surviving = abandonedRun({
+    activeOperation: {
+      operationId: "operation-surviving",
+      service: "bridge",
+      kind: "implementation",
+      externalRunId: "external-1",
+      asyncDir,
+    },
+  });
+  const { registry } = await seedDirectory([surviving]);
+
+  const report = await execDoctor(
+    registry,
+    ["--reconcile"],
+    abandonmentProbe(() => Promise.reject(new Error("bridge is not loaded"))),
+  );
+
+  assert.match(report, /No run is provably abandoned, so nothing was reset\./);
+  assert.equal((await registry.get(surviving.id))?.status, "running");
+});
+
+test("startup says one line about abandoned runs, or nothing", async () => {
+  const { registry } = await seedDirectory([
+    abandonedRun(),
+    abandonedRun({ id: "22222222-2222-4222-8222-222222222222" }),
+  ]);
+  const { registry: quiet } = await seedDirectory([retiredRun()]);
+
+  assert.equal(
+    abandonedRunsNotice(await sweepAbandonment(registry)),
+    "2 plan execution runs claim to be running with no worker. Use /exec doctor.",
+  );
+  assert.equal(abandonedRunsNotice(await sweepAbandonment(quiet)), undefined);
+
+  const { registry: single } = await seedDirectory([abandonedRun()]);
+  assert.match(
+    abandonedRunsNotice(await sweepAbandonment(single)) ?? "",
+    /^1 plan execution run claims to be running/,
+  );
 });
 
 test("the startup sweep classifies without writing anything", async () => {

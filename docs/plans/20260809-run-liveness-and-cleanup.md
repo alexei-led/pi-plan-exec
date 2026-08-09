@@ -432,6 +432,17 @@ Anything short of all three is **ambiguous** and must be reported, never reset.
   is worded to avoid those words too, and a test pins the resulting classification
 - ➕ decision: the dead lease is left in place as evidence; `isStaleOwner` is already
   skipped once the status is `failed`
+- ⚠️ known limit: a run that failed once, was resumed, then got abandoned still carries
+  its old `failedOperation`, whose `terminalError` feeds `recoveryEvidence`. Reconcile
+  leaves it alone, so such a run can still classify into the `--retry-task` confirmation
+  path despite the reason wording. Recovery is not lost, only gated behind a confirmation
+  the operator should not need; clearing it would trade away the audit trail
+- ➕ decision: `/exec doctor`'s bridge lookup uses its own `BridgeClient` at
+  `PROVIDER_PROBE_TIMEOUT_MS`, not the controller's 30s client. Doctor is the documented
+  first step after a restart, which is exactly when the bridge may not be up, and a
+  diagnosis that hangs for 30 seconds is the non-discriminating experience this plan
+  removes. It is also skipped entirely when the async-directory check was already decisive
+  or the operation is not a bridge operation
 - ➕ decision: no CAS retry loop on reconcile, unlike `claim` and `requestStatus`.
   Skipped-not-overwritten is the requirement, so one attempt against the scanned
   `updatedAt` is the whole point
