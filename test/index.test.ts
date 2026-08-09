@@ -1945,7 +1945,7 @@ test("status hands a blocked stage its skip command with the run ID filled in", 
   assert.match(
     report,
     new RegExp(
-      `- ${blocked.id} [^\\n]*Next: /exec resume ${blocked.id}\\n  If critical_review cannot pass, waive it: /exec skip ${blocked.id} --reason "<why the residual risk is accepted>"`,
+      `- ${blocked.id} [^\\n]*Next: /exec resume ${blocked.id}\\n  If critical_review cannot pass, waive it: /exec skip ${blocked.id} --reason <why the residual risk is accepted>`,
     ),
   );
   // Implementation is never skippable, so nothing offers a waiver for it.

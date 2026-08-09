@@ -814,7 +814,9 @@ function runGroupLines(heading: string, runs: PlanExecRun[]): string[] {
 function stageWaiverLines(run: PlanExecRun): string[] {
   if (!isStageWaiverAvailable(run)) return [];
   return [
-    `  If ${run.stage} cannot pass, waive it: /exec skip ${run.id} --reason "<why the residual risk is accepted>"`,
+    // Unquoted, like every other usage string here: `parseSkipReason` joins the
+    // remaining tokens verbatim, so pasted quotes end up inside the waiver.
+    `  If ${run.stage} cannot pass, waive it: /exec skip ${run.id} --reason <why the residual risk is accepted>`,
   ];
 }
 
