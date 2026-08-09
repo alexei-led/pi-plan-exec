@@ -153,7 +153,10 @@ async function snapshotRuns(
   return snapshot;
 }
 
-/** The label a lease's hostname is reduced to before it is compared. */
+/**
+ * This machine's first label, for building names that look like this machine
+ * and are not it. Only the whole name is machine identity.
+ */
 function thisHost(): string {
   return hostname().split(".")[0]!;
 }
@@ -2632,24 +2635,94 @@ test("a renamed machine can still diagnose and resume its own run", async () => 
   );
 });
 
-test("a network rename of this machine needs no assertion at all", async () => {
+test("a machine that shares this one's first label keeps its live worker", async () => {
+  // The precondition is a registry two machines can see: a shared or NFS home.
+  // Corporate DNS hands `build.a.corp.example` and `build.b.corp.example` the
+  // same first label, and the worker on the other one is alive and beating.
+  const collided = abandonedRun({
+    lease: {
+      sessionId: "session-on-the-other-machine",
+      pid: process.pid,
+      heartbeatAt: Date.now(),
+      hostname: `${thisHost()}.b.corp.example`,
+    },
+  });
+  const { registry, directory } = await seedDirectory([collided]);
+  const before = await snapshotRuns(directory);
+  const asked: string[] = [];
+  const probe = abandonmentProbe(async (operationId) => {
+    asked.push(operationId);
+    return "absent";
+  });
+
+  assert.deepEqual(
+    await runEvidence(collided, probe),
+    { leaseLive: true },
+    "a fresh remote heartbeat is not for a local pid lookup to contradict",
+  );
+  assert.deepEqual(
+    await probe(collided),
+    {},
+    "and nothing here measures that machine's disk",
+  );
+  assert.deepEqual(asked, []);
+
+  const kept = await reconcileForResume(registry, collided, probe);
+
+  assert.equal(kept.run.status, "running");
+  assert.equal(kept.note, undefined, "no reset, so nothing to report");
+  assert.deepEqual(
+    await snapshotRuns(directory),
+    before,
+    "a live remote worker keeps the worktree it is writing to",
+  );
+});
+
+test("a stale lease from a colliding name stays ambiguous, never abandoned", async () => {
+  const collided = abandonedRun({
+    lease: { ...DEAD_LEASE, hostname: `${thisHost()}.b.corp.example` },
+  });
+  const { registry, directory } = await seedDirectory([collided]);
+  const before = await snapshotRuns(directory);
+
+  // A silent heartbeat proves the *lease* is stale, never that the worker
+  // behind it is gone: that worker's disk is on the other machine.
+  await assert.rejects(
+    reconcileForResume(registry, collided),
+    /evidence is incomplete[\s\S]*not this machine/,
+  );
+  assert.deepEqual(await snapshotRuns(directory), before);
+});
+
+test("a network rename of this machine is one documented flag from recovery", async () => {
   const churned = abandonedRun({
     lease: { ...DEAD_LEASE, hostname: `${thisHost()}.lan` },
   });
-  const registry = await seedRegistry([churned]);
+  const { registry, directory } = await seedDirectory([churned]);
+  const before = await snapshotRuns(directory);
 
-  const recovered = await reconcileForResume(registry, churned);
-
+  // Indistinguishable from the colliding machine above by name alone, so it is
+  // refused the same way — and the refusal names the operator's way out.
+  await assert.rejects(
+    reconcileForResume(registry, churned),
+    new RegExp(`/exec resume ${churned.id} --same-machine`),
+  );
+  assert.deepEqual(await snapshotRuns(directory), before);
   assert.equal(
-    recovered.run.status,
-    "failed",
-    "a lease from foo.local is the same machine as foo.lan",
+    sameMachineRefusal(churned),
+    undefined,
+    "the override applies here, because there is something to override",
   );
-  assert.match(
-    sameMachineRefusal(churned) ?? "",
-    /only applies to a run whose lease names another host/,
-    "and the override is refused, because there is nothing to override",
+
+  const recovered = await reconcileForResume(
+    registry,
+    churned,
+    abandonmentProbe(),
+    true,
   );
+
+  assert.equal(recovered.run.status, "failed");
+  assert.equal(isActionAllowed("resume", recovered.run), true);
 });
 
 test("--same-machine supplies a machine, never a verdict", async () => {

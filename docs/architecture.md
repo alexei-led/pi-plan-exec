@@ -113,10 +113,14 @@ available and it counts as live.
 
 `claim` stamps the host once and `heartbeat` never re-stamps it, so the name is
 frozen for the run's whole life while `os.hostname()` moves with the network.
-Only the first label of either name identifies the machine, case-folded:
-`foo.local`, `foo.lan`, and `foo.corp.example.com` are one host. The suffix mDNS
-adds to break a collision — `foo-2.local` — survives that reduction, so two
-machines that can see each other still differ.
+The whole name identifies the machine, case-folded: `foo.local` and `foo.lan`
+are as foreign to each other as `foo` and `bar`. Only the first label would be
+cheaper, but corporate DNS gives `build.a.example` and `build.b.example` the
+same one, and a registry on a shared or NFS home shows both machines' runs — so
+that reduction reads a live remote worker as a dead local one and resets the run
+under it. A name that is not exactly this one is treated as another machine, and
+the renamed machine that reduction was meant to help is recovered by the
+operator instead, with `--same-machine` below.
 
 A session may claim a run when no lease exists, the lease belongs to that
 session, or the prior lease is not live by that rule. A dead local pid therefore
@@ -176,9 +180,9 @@ liveness is persisted, because the record is only refreshed while its owning
 session polls — the instant that stops being true is the instant the question
 matters. Evidence measured here is also discarded for a run whose lease names
 another host: its directory and its bridge are on that machine, and an absence
-observed locally would be an absence of the wrong thing. A rename that changes
-the machine label is indistinguishable from a genuinely foreign host, so nothing
-observable can settle such a run and it would stay `ambiguous` forever. The
+observed locally would be an absence of the wrong thing. Any rename at all is
+indistinguishable from a genuinely foreign host, so nothing observable can
+settle such a run and it would stay `ambiguous` forever. The
 operator breaks that tie: `/exec resume <id> --same-machine` asserts that the
 frozen name was this machine, unblocks the local checks, and changes nothing
 else — the abandonment conjunction still decides, so a worker still writing here

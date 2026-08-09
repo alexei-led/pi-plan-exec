@@ -38,6 +38,7 @@ import {
   LEASE_STALE_MS,
   removalRefusal,
   RunRegistry,
+  takeoverRefusal,
 } from "./registry.js";
 import { readPlan } from "./plan.js";
 import { appendProgress } from "./progress.js";
@@ -593,7 +594,10 @@ export function recoveryGuidance(
       if (!activity)
         return {
           classification: "running, but nothing proves the worker is alive",
-          action: `Wait and use /exec status ${run.id} to re-check; nothing reports what this worker is doing${signal?.mode === WORKFLOW_MODE ? " for a workflow-mode run" : ""}, so it is neither confirmed alive nor confirmed dead. Do not resume or start another run.`,
+          // `/exec stop` is named because the wait can be unbounded: when the
+          // lease behind this run is dead, nothing is polling the worker, so
+          // re-checking alone would never settle it.
+          action: `Wait and use /exec status ${run.id} to re-check; nothing reports what this worker is doing${signal?.mode === WORKFLOW_MODE ? " for a workflow-mode run" : ""}, so it is neither confirmed alive nor confirmed dead. Run /exec stop ${run.id} to end it and preserve the worktree rather than wait. Do not resume or start another run.`,
         };
       return {
         classification: "running, and the worker reported activity",
@@ -2127,6 +2131,15 @@ async function handoffToWorktree(
   if (!sourceSessionFile) return false;
 
   const sourceSessionId = ctx.sessionManager.getSessionId();
+  // Before the fork, not merely before the release below. The handoff drops the
+  // lease to re-claim it for the worktree session, and `release` deletes
+  // whatever is there without asking — so a lease held by another live session
+  // has to be refused here, exactly as `claim` would refuse it, or that
+  // session's worktree gets a second writer. Refusing after the fork would
+  // strand a session file for a run that is not going anywhere.
+  const refusal = takeoverRefusal(run, sourceSessionId);
+  if (refusal) throw new Error(refusal);
+
   const targetSession = SessionManager.forkFrom(
     sourceSessionFile,
     run.worktreeCwd,

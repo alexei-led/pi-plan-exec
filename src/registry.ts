@@ -38,20 +38,33 @@ const RUN_ID =
 type RunLease = NonNullable<PlanExecRun["lease"]>;
 
 /**
- * The part of a hostname that names the machine rather than the network it is
- * on. The same Mac republishes itself as `foo.local`, `foo.lan`, or a
- * DHCP-assigned FQDN as it moves between networks, while a lease keeps the name
- * frozen from claim time, so only the first label decides, case-folded.
- * Widening this far stays safe: mDNS renames a colliding host to `foo-2.local`,
- * so two machines that can see each other still reduce to different names.
+ * Whether the name frozen on a lease is this machine. The whole name decides,
+ * case-folded — never its first label, because two machines can share one:
+ * `build.a.corp.example` and `build.b.corp.example` are different hosts, and a
+ * registry on a shared or NFS home shows both. Matching on the label alone made
+ * one read as this host, so a foreign pid was checked in the wrong namespace
+ * and a foreign directory was stat-ed here — declaring a live remote worker
+ * abandoned and resetting the run under it.
+ *
+ * Two properties hold at once, and this comparison is what holds them:
+ *
+ * - Nothing measured here ever speaks for another machine. A name that is not
+ *   exactly ours is foreign, so `isLeaseLive` falls back to the heartbeat,
+ *   erring toward live, and `isLocalRun` is false, so `abandonmentProbe`
+ *   gathers no evidence at all. Such a run can end AMBIGUOUS; it can never end
+ *   ABANDONED on local evidence, so a second writer is never launched.
+ * - A renamed machine is never stuck. `foo.local` becoming `foo.lan` also reads
+ *   as foreign, so it ends AMBIGUOUS too — with guidance that names
+ *   `/exec resume <id> --same-machine`. That flag (`asLocalRun` below) supplies
+ *   the one fact no probe can derive, and everything downstream then observes
+ *   normally. It asserts a machine, never a verdict, so a worker still writing
+ *   here keeps the run ambiguous and resume still refuses.
+ *
+ * The guess is handed to the operator on purpose: guessing "same machine" costs
+ * two workers in one worktree, while guessing "other machine" costs one flag.
  */
-function hostIdentity(name: string): string {
-  const [label] = name.toLowerCase().split(".");
-  return label ?? name.toLowerCase();
-}
-
 function isThisHost(name: string): boolean {
-  return hostIdentity(name) === hostIdentity(hostname());
+  return name.toLowerCase() === hostname().toLowerCase();
 }
 
 /**
@@ -81,10 +94,10 @@ export function isLocalRun(run: PlanExecRun): boolean {
 }
 
 /**
- * The run with the host on its lease read as this machine. A rename no
- * `hostIdentity` can absorb — a DHCP-assigned corporate name — otherwise leaves
- * the run undiagnosable here forever, and no probe can tell that apart from a
- * genuinely foreign host. `/exec resume --same-machine` lets the operator
+ * The run with the host on its lease read as this machine. Any rename at all —
+ * `foo.local` to `foo.lan`, or a DHCP-assigned corporate name — otherwise
+ * leaves the run undiagnosable here forever, and no probe can tell that apart
+ * from a genuinely foreign host. `/exec resume --same-machine` lets the operator
  * supply that one fact; everything downstream then gathers evidence normally.
  * It asserts a machine, never a verdict: a worker still writing here keeps the
  * run ambiguous and resume still refuses.
@@ -93,6 +106,24 @@ export function asLocalRun(run: PlanExecRun): PlanExecRun {
   return run.lease
     ? { ...run, lease: { ...run.lease, hostname: hostname() } }
     : run;
+}
+
+/**
+ * Why this session cannot take this run's lease, or undefined when it can.
+ * `claim` raises it, and the worktree handoff asks it first: the handoff
+ * releases the lease before re-claiming it for the forked session, and
+ * `release` deletes whatever is there. Without this the delete walks straight
+ * past the refusal `claim` would have raised, and a run held by a live session
+ * — on this machine or another — gets a second writer in its worktree.
+ */
+export function takeoverRefusal(
+  run: PlanExecRun,
+  sessionId: string,
+): string | undefined {
+  const lease = run.lease;
+  return lease && lease.sessionId !== sessionId && isLeaseLive(lease, sessionId)
+    ? `Run ${run.id} is controlled by another active Pi session.`
+    : undefined;
 }
 
 /**
@@ -259,16 +290,8 @@ export class RunRegistry {
     let current = run;
     for (let attempt = 0; attempt < CLAIM_CAS_RETRIES; attempt += 1) {
       const now = Date.now();
-      const lease = current.lease;
-      if (
-        lease &&
-        lease.sessionId !== sessionId &&
-        isLeaseLive(lease, sessionId)
-      ) {
-        throw new Error(
-          `Run ${current.id} is controlled by another active Pi session.`,
-        );
-      }
+      const refusal = takeoverRefusal(current, sessionId);
+      if (refusal) throw new Error(refusal);
       const claimed = await this.updateIfCurrent(
         {
           ...current,

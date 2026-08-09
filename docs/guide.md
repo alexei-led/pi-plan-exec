@@ -232,8 +232,9 @@ absence of a signal as health. Every in-flight situation reads differently:
 - `running, but nothing proves the worker is alive` — nothing reports what the
   worker is doing, so it is neither confirmed alive nor confirmed dead. An
   activity value that no session has refreshed for 30 seconds counts as nothing
-  reported: it froze when its owner died. Re-check later; do not start a second
-  run.
+  reported: it froze when its owner died. Re-check later — and when the lease is
+  dead too, nothing is polling, so the wait is unbounded and `/exec stop` is the
+  arm that ends it. Do not start a second run.
 - `running longer than its budget allows` — the run has claimed an active worker
   past a wall-clock bound derived from that stage's own turn budget (75 turns
   for an implementation worker, 30 for a reviewer or the statistics pass) times
@@ -284,16 +285,18 @@ dead on this host is stale at once, so `/exec resume` takes the run over with no
 wait, including when the dead lease names the caller. A lease recorded before
 the hostname field existed is judged by its 30-second heartbeat window alone.
 
-The host on a lease is frozen when the run is claimed, and only the first label
-of it identifies the machine: a Mac that republishes itself as `foo.local`,
-`foo.lan`, or `foo.corp.example.com` is still `foo`, and still this machine. A
-rename that changes that label — a DHCP-assigned corporate name — makes the
-lease name a machine this one is not, and then no local check can speak for the
-run: the operation directory and the bridge here belong to this machine, and an
-absence measured against the wrong one would start a second worker over a live
-one. `/exec status` says so and names the way out. Only you know whether that
-name was this machine, so `/exec resume <run-id> --same-machine` is how you say
-it. The flag supplies the machine, not the verdict: resume then checks the
+The host on a lease is frozen when the run is claimed, and the whole name
+identifies the machine: a Mac that republishes itself as `foo.local`, `foo.lan`,
+or `foo.corp.example.com` names a different host each time. Matching on the
+first label alone would absorb those renames, but it would also read
+`build.a.example` as `build.b.example` — two real machines that share a registry
+on an NFS home — and then an absence measured here would start a second worker
+over a live remote one. So any rename at all makes the lease name a machine this
+one is not, and then no local check can speak for the run: the operation
+directory and the bridge here belong to this machine. `/exec status` says so and
+names the way out. Only you know whether that name was this machine, so
+`/exec resume <run-id> --same-machine` is how you say it. The flag supplies the
+machine, not the verdict: resume then checks the
 worker here as usual and still refuses while one is running. It is refused
 outright on a run this machine can already observe.
 

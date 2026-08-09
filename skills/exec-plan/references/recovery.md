@@ -68,6 +68,14 @@ Absence of a signal is not evidence of death. Wait, then re-check:
 /exec status <full-run-id>
 ```
 
+Re-checking settles this only while something is polling. When the lease behind
+the run is dead as well, nothing is, and the wait never ends on its own. Once
+the user accepts losing the in-flight work, end it and keep the worktree:
+
+```text
+/exec stop <full-run-id>
+```
+
 ### `running longer than its budget allows`
 
 The run has claimed an active worker for longer than the bound derived from its
@@ -143,10 +151,11 @@ polling on its own. Then re-check:
 ### `its lease names a machine that is not this one`
 
 The host is stamped on the lease when the run is claimed and never re-stamped,
-and only its first label identifies the machine — `foo.local`, `foo.lan`, and
-`foo.corp.example.com` are all `foo`. A rename that changes that label leaves
-the lease naming a machine this one is not. The operation directory and the
-bridge here belong to this machine, so nothing local can speak for the run:
+and the whole name identifies the machine — `foo.local`, `foo.lan`, and
+`foo.corp.example.com` are three different hosts, because two real machines can
+share a first label and a shared home shows both their runs. So any rename
+leaves the lease naming a machine this one is not. The operation directory and
+the bridge here belong to this machine, so nothing local can speak for the run:
 status reports it and never resets it, and resume refuses it.
 
 Only the operator knows whether that name was this machine. When it was, say so:

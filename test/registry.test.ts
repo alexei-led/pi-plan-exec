@@ -23,6 +23,7 @@ import {
   LEASE_STALE_MS,
   removalRefusal,
   RunRegistry,
+  takeoverRefusal,
 } from "../src/registry.js";
 import type { PlanExecRun } from "../src/types.js";
 
@@ -139,7 +140,9 @@ test("lease liveness weighs session, heartbeat, hostname, and pid", () => {
       live: false,
     },
     {
-      name: "the same machine under a different network suffix checks its pid",
+      // The pid on that lease belongs to whatever machine answers to that
+      // name, so it is not ours to check: only the heartbeat can speak.
+      name: "a name sharing this one's first label is not this machine",
       lease: {
         sessionId: "s1",
         pid: gone,
@@ -147,7 +150,7 @@ test("lease liveness weighs session, heartbeat, hostname, and pid", () => {
         hostname: `${shortHere}.corp.example.com`,
       },
       sessionId: "s2",
-      live: false,
+      live: true,
     },
     {
       name: "hostname case is not machine identity",
@@ -155,7 +158,7 @@ test("lease liveness weighs session, heartbeat, hostname, and pid", () => {
         sessionId: "s1",
         pid: gone,
         heartbeatAt: fresh,
-        hostname: shortHere.toUpperCase(),
+        hostname: here.toUpperCase(),
       },
       sessionId: "s2",
       live: false,
@@ -1088,6 +1091,18 @@ test("only this host's evidence speaks for a run", () => {
     ),
     false,
   );
+  assert.equal(
+    isLocalRun(
+      local({
+        sessionId: "s",
+        pid: 1,
+        heartbeatAt: 0,
+        hostname: hostname().toUpperCase(),
+      }),
+    ),
+    true,
+    "DNS names are case-insensitive, so case alone is not another machine",
+  );
   const shortHere = hostname().split(".")[0]!;
   assert.equal(
     isLocalRun(
@@ -1095,11 +1110,11 @@ test("only this host's evidence speaks for a run", () => {
         sessionId: "s",
         pid: 1,
         heartbeatAt: 0,
-        hostname: `${shortHere.toUpperCase()}.lan`,
+        hostname: `${shortHere}.b.corp.example`,
       }),
     ),
-    true,
-    "a network rename of this machine is still this machine",
+    false,
+    "a shared first label is not a shared machine: corporate DNS gives two hosts the same one",
   );
   assert.equal(
     isLocalRun(
@@ -1113,6 +1128,60 @@ test("only this host's evidence speaks for a run", () => {
     false,
     "the suffix mDNS adds to avoid a collision names a different machine",
   );
+});
+
+test("a live lease survives the release-then-claim of a worktree handoff", async () => {
+  const registry = new RunRegistry(
+    await mkdtemp(join(tmpdir(), "pi-plan-exec-handoff-")),
+  );
+  const held = await registry.claim(
+    await registry.create({
+      schemaVersion: 1,
+      repositoryRoot: "/repo",
+      planPath: "/repo/docs/plans/example.md",
+      planHash: "hash",
+      worktreeCwd: "/worktree",
+      branch: "feature",
+      defaultBranch: "main",
+      status: "running",
+      stage: "implementation",
+      taskAttempts: {},
+      stageAttempts: {},
+      reviewFindings: [],
+      unresolvedFindings: [],
+      config,
+    }),
+    "session-a",
+  );
+
+  // The handoff releases before it claims, so `claim`'s own refusal comes too
+  // late: it must be asked first, or the delete hands a live session's worktree
+  // to a second writer.
+  assert.match(
+    takeoverRefusal(held, "session-b") ?? "",
+    /controlled by another active Pi session/,
+  );
+  await assert.rejects(
+    () => registry.claim(held, "session-b"),
+    /controlled by another active Pi session/,
+  );
+  assert.equal((await registry.get(held.id))?.lease?.sessionId, "session-a");
+
+  const lease = (over: Partial<RunLease>): PlanExecRun =>
+    ({ ...held, lease: { ...held.lease!, ...over } }) as PlanExecRun;
+  assert.equal(
+    takeoverRefusal(held, "session-a"),
+    undefined,
+    "the holder may still drop its own lease",
+  );
+  assert.equal(
+    takeoverRefusal(lease({ heartbeatAt: Date.now() - LEASE_STALE_MS }), "b"),
+    undefined,
+    "a dead lease holds nothing",
+  );
+  const unheld: PlanExecRun = { ...held };
+  delete unheld.lease;
+  assert.equal(takeoverRefusal(unheld, "session-b"), undefined);
 });
 
 test("--same-machine asserts the host and touches nothing else", () => {
