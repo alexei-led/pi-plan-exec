@@ -1606,7 +1606,10 @@ export async function reconcileForResume(
   sameMachine = false,
 ): Promise<{ run: PlanExecRun; note?: string }> {
   if (!isInFlightStatus(run.status) || isRecoverableRun(run)) return { run };
-  const evidence = await runEvidence(sameMachine ? asLocalRun(run) : run, probe);
+  const evidence = await runEvidence(
+    sameMachine ? asLocalRun(run) : run,
+    probe,
+  );
   const diagnosis: RunDiagnosis = {
     run,
     evidence,
@@ -2001,18 +2004,18 @@ async function runAction(
   // Ask before claiming: an abandoned dialog must not have taken the lease.
   const outcome =
     action === EXEC_ACTION.STOP
-      ? await chooseStopOutcome(resolved, ctx, sessionId)
+      ? await chooseStopOutcome(resolved, ctx)
       : action;
   const claimed = await registry.claim(resolved, sessionId);
   if (outcome === EXEC_ACTION.PAUSE) {
     const paused = await syncProjection(
-      await requestStatus(claimed, EXEC_ACTION.PAUSE, sessionId),
+      await requestStatus(claimed, EXEC_ACTION.PAUSE),
       { cwd: ctx.cwd, sessionId },
     );
     return `Run ${shortRunId(paused.id)} paused after its active operation. Use /exec resume ${paused.id} to continue.`;
   }
   const cancelled = await syncProjection(
-    await requestStatus(claimed, EXEC_ACTION.CANCEL, sessionId),
+    await requestStatus(claimed, EXEC_ACTION.CANCEL),
     { cwd: ctx.cwd, sessionId },
   );
   startBackgroundController(cancelled, sessionId, ctx.cwd, ctx);
@@ -2034,11 +2037,10 @@ export async function chooseStopOutcome(
       select(title: string, options: string[]): Promise<string | undefined>;
     };
   },
-  sessionId: string,
 ): Promise<typeof EXEC_ACTION.PAUSE | typeof EXEC_ACTION.CANCEL> {
   if (!ctx.hasUI) throw new Error(STOP_REQUIRES_UI);
   const outcomes = STOP_OUTCOMES.filter((outcome) =>
-    isActionAllowed(outcome.action, run, sessionId),
+    isActionAllowed(outcome.action, run),
   );
   if (outcomes.length === 0)
     throw new Error(
@@ -2064,20 +2066,14 @@ async function resolveRunForAction(
   if (selector) {
     const run = await registry.get(selector);
     if (!run) throw new Error(`Plan execution run not found: ${selector}`);
-    assertActionAllowed(
-      action,
-      run,
-      ctx.sessionManager.getSessionId(),
-      adoptCurrentBranch,
-    );
+    assertActionAllowed(action, run, adoptCurrentBranch);
     return run;
   }
 
-  const sessionId = ctx.sessionManager.getSessionId();
   const candidates = (await registry.list()).filter(
     (run) =>
       matchesContext(run, ctx.cwd) &&
-      isActionAllowed(action, run, sessionId, adoptCurrentBranch),
+      isActionAllowed(action, run, adoptCurrentBranch),
   );
   if (candidates.length === 0) {
     const verb =
@@ -2189,10 +2185,15 @@ function matchesContext(run: PlanExecRun, cwd: string): boolean {
   );
 }
 
+/**
+ * Whether this run can take this action at all. It takes no session: no
+ * action's permission depends on who is asking any more — the lease decides
+ * liveness and it is read from the outside — and a caller's own identity was
+ * the last thing that could make a dead lease look held.
+ */
 export function isActionAllowed(
   action: RunAction,
   run: PlanExecRun,
-  sessionId: string,
   adoptCurrentBranch = false,
 ): boolean {
   if (action === EXEC_ACTION.STATUS) return true;
@@ -2200,7 +2201,7 @@ export function isActionAllowed(
   // between them belongs to the reader, not to a lookup they run first.
   if (action === EXEC_ACTION.STOP)
     return STOP_OUTCOMES.some((outcome) =>
-      isActionAllowed(outcome.action, run, sessionId),
+      isActionAllowed(outcome.action, run),
     );
   if (action === EXEC_ACTION.PAUSE)
     return (
@@ -2430,11 +2431,10 @@ export async function reviewedPlanHashForResume(
 async function requestStatus(
   run: PlanExecRun,
   action: typeof EXEC_ACTION.PAUSE | typeof EXEC_ACTION.CANCEL,
-  sessionId: string,
 ): Promise<PlanExecRun> {
   let current = run;
   for (let attempt = 0; attempt < COMMAND_CAS_RETRIES; attempt += 1) {
-    assertActionAllowed(action, current, sessionId);
+    assertActionAllowed(action, current);
     const requested = await registry.updateIfCurrent(
       {
         ...current,
@@ -2456,10 +2456,9 @@ async function requestStatus(
 function assertActionAllowed(
   action: RunAction,
   run: PlanExecRun,
-  sessionId: string,
   adoptCurrentBranch = false,
 ): void {
-  if (!isActionAllowed(action, run, sessionId, adoptCurrentBranch)) {
+  if (!isActionAllowed(action, run, adoptCurrentBranch)) {
     throw new Error(
       `Run ${shortRunId(run.id)} cannot be ${actionPastTense(action)} while ${run.status}.`,
     );

@@ -287,9 +287,9 @@ test("cancel cannot bypass a pending force-skip", () => {
     },
   });
 
-  assert.equal(isActionAllowed("cancel", pending, "session-1"), false);
-  assert.equal(isActionAllowed("resume", pending, "session-1"), false);
-  assert.equal(isActionAllowed("skip", pending, "session-1"), true);
+  assert.equal(isActionAllowed("cancel", pending), false);
+  assert.equal(isActionAllowed("resume", pending), false);
+  assert.equal(isActionAllowed("skip", pending), true);
 });
 
 test("resume accepts options without an explicit run ID", () => {
@@ -357,11 +357,11 @@ test("resume branch-adoption and recovery-model options are explicit", () => {
 
   const running = run({ status: "running" });
   delete running.activeOperation;
-  assert.equal(isActionAllowed("resume", running, "session-1"), true);
-  assert.equal(isActionAllowed("resume", running, "session-1", true), true);
+  assert.equal(isActionAllowed("resume", running), true);
+  assert.equal(isActionAllowed("resume", running, true), true);
   const failed = run({ status: "failed" });
   delete failed.activeOperation;
-  assert.equal(isActionAllowed("resume", failed, "session-1", true), true);
+  assert.equal(isActionAllowed("resume", failed, true), true);
   const busy = run({
     status: "running",
     activeOperation: {
@@ -371,7 +371,7 @@ test("resume branch-adoption and recovery-model options are explicit", () => {
       externalRunId: "live-run",
     },
   });
-  assert.equal(isActionAllowed("resume", busy, "session-1", true), false);
+  assert.equal(isActionAllowed("resume", busy, true), false);
 });
 
 test("force-skip reason parsing requires the explicit option and text", () => {
@@ -589,7 +589,7 @@ test("run status classifies recovery and gives one safe next action", () => {
   assert.match(staleOwner, /owner: stale lease/);
   assert.match(staleOwner, /\/exec resume/);
   assert.doesNotMatch(staleOwner, /\/exec adopt/);
-  assert.equal(isActionAllowed("resume", staleOwnerRun, "session-1"), true);
+  assert.equal(isActionAllowed("resume", staleOwnerRun), true);
 
   const branchMismatch = formatRunStatus(
     run({
@@ -1499,7 +1499,7 @@ test("a reconciled run is an ordinary recoverable failure", async () => {
   const reconciled = await registry.get(abandoned.id);
 
   assert.ok(reconciled);
-  assert.equal(isActionAllowed("resume", reconciled, "session-new"), true);
+  assert.equal(isActionAllowed("resume", reconciled), true);
   assert.equal(isRecoverableFailure(reconciled), true);
   const guidance = recoveryGuidance(reconciled);
   assert.equal(guidance.classification, "stopped, and you can continue it");
@@ -1875,19 +1875,19 @@ test("the exec-plan skill documents exactly the subcommands /exec implements", a
 });
 
 test("resume takes over a lease whose session is provably gone", () => {
+  // A dead lease is claimable whoever it names: the session ID never enters
+  // the answer, so a Pi that restarted under the same ID is not locked out of
+  // the run the sweep just told it to resume.
   const stranded = run({ status: "skip_pending", lease: DEAD_LEASE });
-  assert.equal(isActionAllowed("resume", stranded, "session-new"), true);
+  assert.equal(isActionAllowed("resume", stranded), true);
 
+  // A live lease still blocks it, and no lease and terminal answer as before.
   const held = run({ status: "skip_pending", lease: liveLease() });
-  assert.equal(isActionAllowed("resume", held, "session-new"), false);
-
-  // Own lease, no lease, and terminal keep answering as they did.
-  const mine = run({ status: "skip_pending", lease: liveLease() });
-  assert.equal(isActionAllowed("resume", mine, LIVE_SESSION_ID), false);
+  assert.equal(isActionAllowed("resume", held), false);
   const unheld = run({ status: "skip_pending" });
-  assert.equal(isActionAllowed("resume", unheld, "session-new"), false);
+  assert.equal(isActionAllowed("resume", unheld), false);
   const done = run({ status: "completed", stage: "complete" });
-  assert.equal(isActionAllowed("resume", done, "session-new"), false);
+  assert.equal(isActionAllowed("resume", done), false);
 });
 
 test("a live foreign lease still blocks a second worker", async () => {
@@ -1895,7 +1895,7 @@ test("a live foreign lease still blocks a second worker", async () => {
   const registry = await seedRegistry([held]);
 
   // Resume is reachable by status, and the claim is what refuses it.
-  assert.equal(isActionAllowed("resume", held, "session-new"), true);
+  assert.equal(isActionAllowed("resume", held), true);
   await assert.rejects(
     registry.claim(held, "session-new"),
     /controlled by another active Pi session/,
@@ -1939,7 +1939,10 @@ test("help drops both interactive flags but keeps them working", () => {
     sameMachine: true,
     model: undefined,
   });
-  assert.throws(() => parseResumeOptions(["--same-host"]), /Usage: \/exec resume/);
+  assert.throws(
+    () => parseResumeOptions(["--same-host"]),
+    /Usage: \/exec resume/,
+  );
 });
 
 test("resume reconciles a provably abandoned run, then continues", async () => {
@@ -1969,7 +1972,7 @@ test("resume reconciles a provably abandoned run, then continues", async () => {
   // The reset lands on the state the ordinary resume path already recovers.
   assert.equal(isRecoverableFailure(recovered.run), true);
   assert.equal(
-    isActionAllowed("resume", recovered.run, "session-new"),
+    isActionAllowed("resume", recovered.run),
     true,
     "the reconciled run is resumable",
   );
@@ -2115,14 +2118,8 @@ test("stop reaches both outcomes and asks for the one it takes", async () => {
     },
   });
 
-  assert.equal(
-    await chooseStopOutcome(running, pick(0), "session-1"),
-    EXEC_ACTION.PAUSE,
-  );
-  assert.equal(
-    await chooseStopOutcome(running, pick(1), "session-1"),
-    EXEC_ACTION.CANCEL,
-  );
+  assert.equal(await chooseStopOutcome(running, pick(0)), EXEC_ACTION.PAUSE);
+  assert.equal(await chooseStopOutcome(running, pick(1)), EXEC_ACTION.CANCEL);
   assert.equal(asked.length, 2, "each stop asks before it acts");
   assert.match(asked[0]!.title, new RegExp(running.id.slice(0, 8)));
   // Reversibility is what the two differ by, so it is what the labels say.
@@ -2131,14 +2128,10 @@ test("stop reaches both outcomes and asks for the one it takes", async () => {
 
   // A cancelled dialog stops at the dialog.
   await assert.rejects(
-    chooseStopOutcome(
-      running,
-      {
-        hasUI: true,
-        ui: { select: async () => undefined },
-      },
-      "session-1",
-    ),
+    chooseStopOutcome(running, {
+      hasUI: true,
+      ui: { select: async () => undefined },
+    }),
     /Stop cancelled\./,
   );
 });
@@ -2147,19 +2140,15 @@ test("stop offers only the outcomes a run can still take, and still asks", async
   const paused = run({ status: "paused", stage: "comprehensive_review" });
   let offered: string[] = [];
 
-  const outcome = await chooseStopOutcome(
-    paused,
-    {
-      hasUI: true,
-      ui: {
-        select: async (_title: string, options: string[]) => {
-          offered = options;
-          return options[0];
-        },
+  const outcome = await chooseStopOutcome(paused, {
+    hasUI: true,
+    ui: {
+      select: async (_title: string, options: string[]) => {
+        offered = options;
+        return options[0];
       },
     },
-    "session-1",
-  );
+  });
 
   assert.equal(
     outcome,
@@ -2169,24 +2158,19 @@ test("stop offers only the outcomes a run can still take, and still asks", async
   assert.equal(offered.length, 1);
   // One option is still a question: a final cancel is never assumed.
   assert.match(offered[0]!, /^Cancel — final/);
-  assert.equal(isActionAllowed("stop", paused, "session-1"), true);
+  assert.equal(isActionAllowed("stop", paused), true);
   assert.equal(
-    isActionAllowed(
-      "stop",
-      run({ status: "completed", stage: "complete" }),
-      "session-1",
-    ),
+    isActionAllowed("stop", run({ status: "completed", stage: "complete" })),
     false,
   );
 });
 
 test("stop refuses without a human and names both scripted verbs", async () => {
   await assert.rejects(
-    chooseStopOutcome(
-      run({ status: "running" }),
-      { hasUI: false, ui: { select: async () => "Pause" } },
-      "session-1",
-    ),
+    chooseStopOutcome(run({ status: "running" }), {
+      hasUI: false,
+      ui: { select: async () => "Pause" },
+    }),
     (error: Error) => {
       assert.match(error.message, /\/exec pause <run-id>/);
       assert.match(error.message, /\/exec cancel <run-id>/);
@@ -2366,12 +2350,12 @@ test("the two views judge a lease the same way, including this session's own", a
   assert.match(sweep, /abandoned — no worker is running/);
   assert.match(sweep, new RegExp(`Next: /exec resume ${mine.id}`));
   assert.equal(
-    isActionAllowed("resume", mine, LIVE_SESSION_ID),
+    isActionAllowed("resume", mine),
     true,
     "the sweep must not print a next command its own gate refuses",
   );
   // And the gate itself, which takes no session for exactly this reason: it
-  // used to read its own caller's dead lease as live and wave the run through
+  // used to read its caller's own dead lease as live and wave the run through
   // without clearing the worker both views had just called gone.
   assert.equal(
     (await reconcileForResume(registry, mine)).run.status,
@@ -2456,14 +2440,12 @@ test("decisive evidence outranks every claim that would say wait", async () => {
     );
     assert.ok(guidance.action.includes(next), `${label}: names ${next}`);
     assert.match(sweep, new RegExp(`Next: ${next.replace("/", "\\/")}`), label);
-    // Asked as the session named on the dead lease: a Pi that restarted under
-    // the same ID is the caller most likely to be reading this row, and the
-    // gate must not refuse it the command the row just printed.
+    // The gate must not refuse the command the row just printed, for any
+    // caller — including the session named on the dead lease.
     assert.equal(
       isActionAllowed(
         gone.status === "cancel_pending" ? "stop" : "resume",
         gone,
-        gone.lease!.sessionId,
       ),
       true,
       `${label}: the sweep prints a next command its own gate refuses`,
@@ -2507,7 +2489,10 @@ test("nothing claims a poll loop that no live lease was observed for", async () 
 
   // The count is a stored fact and stays; the claim that something is still
   // trying does not survive a dead lease.
-  assert.match(dead, /observation: unavailable \(2\/3\) — bridge status failed/);
+  assert.match(
+    dead,
+    /observation: unavailable \(2\/3\) — bridge status failed/,
+  );
   assert.doesNotMatch(dead, /retrying/);
   assert.doesNotMatch(dead, /polling continues/);
 
@@ -2639,7 +2624,7 @@ test("a renamed machine can still diagnose and resume its own run", async () => 
   assert.equal(recovered.run.status, "failed");
   assert.equal(recovered.run.activeOperation, undefined);
   assert.match(recovered.note ?? "", /was abandoned/);
-  assert.equal(isActionAllowed("resume", recovered.run, "session-new"), true);
+  assert.equal(isActionAllowed("resume", recovered.run), true);
   assert.equal(
     (await registry.get(renamed.id))?.lease?.hostname,
     `${thisHost()}-corp-dhcp`,
@@ -2713,7 +2698,10 @@ test("--same-machine supplies a machine, never a verdict", async () => {
     ),
     /evidence is incomplete/,
   );
-  assert.equal((await seeded.registry.get(bridgeKnowsIt.id))?.status, "running");
+  assert.equal(
+    (await seeded.registry.get(bridgeKnowsIt.id))?.status,
+    "running",
+  );
   // And it is refused outright on a run this machine can already observe, so
   // it cannot be reached for by an operator who just wants resume to proceed.
   assert.match(
