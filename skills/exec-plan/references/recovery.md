@@ -299,9 +299,13 @@ launching a child directly.
 ## Force-skip a blocked stage
 
 While the waiver is pending, status classifies the run
-`waiting for the stage you waived to stop`; wait it out with
-`/exec status <full-run-id>`. If the worker is provably gone the classification
-is `the worker is gone, so the waived stage cannot finish` instead — nothing is
+`waiting for the stage you waived to stop` and names the one command for the
+state it observed. With a session polling the run, that command is another
+`/exec status <full-run-id>`. With none, nothing notices when the worker stops,
+so the command is the same `/exec skip` again; it attaches a session that stops
+that worker and applies the waiver. If the worker is provably gone the
+classification is
+`the worker is gone, so the waived stage cannot finish` instead — nothing is
 left to stop, so waiting can never end. Use `/exec resume <full-run-id>`, which
 clears the dead worker and continues without starting a second one.
 

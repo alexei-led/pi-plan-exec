@@ -922,7 +922,7 @@ test("every recovery classification ends at a primary verb", () => {
     const { classification, action } = recoveryGuidance(shape, evidence);
     assert.match(
       action,
-      /\/exec (status|resume|stop|cleanup)\b/,
+      /\/exec (status|resume|stop|cleanup|skip)\b/,
       `no primary verb: ${classification}`,
     );
     assert.doesNotMatch(
@@ -1721,7 +1721,7 @@ test("settled runs group by what they need and hide stale terminal rows", () => 
   assert.match(
     lines,
     new RegExp(
-      `finished:\\n- ${justArchived.id} [^\\n]*Next: /exec status ${justArchived.id}`,
+      `finished:\\n- ${justArchived.id} [^\\n]*Next: /exec cleanup ${justArchived.id}`,
     ),
   );
   assert.ok(!lines.includes(oldCompleted.id), "an old terminal run is hidden");
@@ -2260,6 +2260,68 @@ test("every surface names the same next command for one run", async () => {
       `guidance names a resume the gate refuses: ${shape.status}`,
     );
   }
+});
+
+test("a finished run's list row names the command its detail view names", async () => {
+  // The statuses the loop above cannot reach: every in-flight and paused shape
+  // is covered there, and only a terminal non-failed run reaches `finished`.
+  const finished = (
+    ["completed", "completed_with_findings", "cancelled"] as const
+  ).map((status) =>
+    retiredRun({ id: randomUUID(), status, updatedAt: Date.now() }),
+  );
+  const registry = await seedRegistry(finished);
+  const report = await execStatus(registry, { probe: abandonmentProbe() });
+
+  for (const record of finished) {
+    const row = report.split("\n").find((line) => line.includes(record.id));
+    assert.equal(
+      row?.split("Next: ")[1],
+      recoveryGuidance(record).command,
+      `list row disagrees with the detail view: ${record.status}`,
+    );
+  }
+});
+
+test("a waived stage nothing can observe names the waiver, not another read", async () => {
+  const waived = run({
+    id: randomUUID(),
+    status: "skip_pending",
+    stage: "comprehensive_review",
+    lease: DEAD_LEASE,
+    activeOperation: {
+      operationId: "operation-1",
+      service: "bridge",
+      kind: "review",
+    },
+    pendingStageSkip: {
+      stage: "comprehensive_review",
+      reason: "accepted",
+      requestedAt: Date.now() - 60_000,
+      requestedBy: "session-old",
+    },
+  });
+  const probe = abandonmentProbe();
+  const evidence = await runEvidence(waived, probe);
+  // Nothing polls it and nothing proves the worker gone, so neither a re-read
+  // nor a reset moves it. The waiver is the one command that does.
+  assert.equal(evidence.leaseLive, false);
+  assert.equal(evidence.asyncDirPresent, undefined);
+  assert.equal(evidence.bridgeState, undefined);
+  await assert.rejects(
+    reconcileForResume(await seedRegistry([waived]), waived, probe),
+    /evidence is incomplete/,
+  );
+
+  const guidance = recoveryGuidance(waived, evidence);
+  assert.equal(isStageWaiverAvailable(waived), true);
+  assert.equal(namedVerbs(guidance.command)[0], "skip");
+  assert.equal(namedVerbs(guidance.action)[0], "skip");
+  const registry = await seedRegistry([waived]);
+  const row = (await execStatus(registry, { probe }))
+    .split("\n")
+    .find((line) => line.includes(waived.id));
+  assert.equal(row?.split("Next: ")[1], guidance.command);
 });
 
 test("--same-machine cannot act on a lease that is still beating", async () => {

@@ -182,8 +182,9 @@ beside it names first, and always one the run will accept. `/exec status` is
 named only where the next read can differ — something is polling, or an
 operation is left to probe. Where nothing polls, the command has to move the
 run: a takeover for a dead owner, `/exec stop` for a worker that cannot be
-proven gone, `/exec stop` again for a stop nothing will land. Naming a re-read
-there would loop the reader on a record nothing updates.
+proven gone, `/exec stop` again for a stop nothing will land, and the waiver
+again for a pending waiver nothing will finish. Naming a re-read there would
+loop the reader on a record nothing updates.
 
 Every evidence-driven decision reads the same three inputs at the moment it is
 made: the lease, the operation directory on disk, and the bridge. Nothing about

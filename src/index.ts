@@ -561,14 +561,14 @@ export function recoveryGuidance(
         action: `No live session holds this run and no worker is tracked, so it cannot move on by itself. Run ${resume}; it applies the waiver without starting a worker.`,
         command: resume,
       };
+    // Resume refuses a worker it cannot prove gone and stop is refused while a
+    // waiver is pending, so the waiver itself is the only command left. Repeating
+    // it on an already-pending waiver requests nothing new: it attaches a polling
+    // session that stops the worker and advances the stage.
     return {
       classification: "waiting for the stage you waived to stop",
-      // The one state with no command that moves it: resume refuses a worker it
-      // cannot prove gone, and stop is refused while a waiver is pending. The
-      // probe behind /exec status is what changes the answer, so it is honest
-      // here in a way it is not where nothing is left to observe.
-      action: `The worker on that stage was told to stop, but no live session is polling it, so nothing here notices when it does. Run ${status} again; the probe reports that worker gone as soon as it is, and only then can this run move. Do not resume or start another run before it does.`,
-      command: status,
+      action: `The worker on that stage was told to stop, but no live session is polling it, so nothing here notices when it does. Run ${stageWaiverCommand(run)} again; it attaches a session that stops that worker and applies the waiver. Do not resume or start another run.`,
+      command: stageWaiverCommand(run),
     };
   }
   // Ahead of every other unknown: no local probe can settle a run whose lease
@@ -967,10 +967,17 @@ function sectionLines(
 function stageWaiverLines(run: PlanExecRun): string[] {
   if (!isStageWaiverAvailable(run)) return [];
   return [
-    // Unquoted: `parseSkipReason` joins the remaining tokens verbatim, so
-    // pasted quotes end up inside the waiver.
-    `  If ${run.stage} cannot pass, waive it: /exec skip ${run.id} --reason <why the residual risk is accepted>`,
+    `  If ${run.stage} cannot pass, waive it: ${stageWaiverCommand(run)}`,
   ];
+}
+
+/**
+ * The waiver, spelled for pasting. The reason is unquoted because
+ * `parseSkipReason` joins the remaining tokens verbatim, so pasted quotes end
+ * up inside the waiver.
+ */
+function stageWaiverCommand(run: PlanExecRun): string {
+  return `/exec skip ${run.id} --reason <why the residual risk is accepted>`;
 }
 
 /** A settled run that a person still has to move; everything else is history. */
@@ -978,14 +985,9 @@ function needsOperator(run: PlanExecRun): boolean {
   return run.status === RUN_STATUS.PAUSED || isRecoverableFailure(run);
 }
 
-/**
- * The same verdict the detail view renders. A finished run has no verdict to
- * render — nothing is pending — so its row points at the record instead.
- */
+/** The same verdict the detail view renders, derived in the one place. */
 function nextRunCommand(run: PlanExecRun): string {
-  return needsOperator(run)
-    ? recoveryGuidance(run).command
-    : `/exec status ${run.id}`;
+  return recoveryGuidance(run).command;
 }
 
 function isRecentlyRelevantRun(run: PlanExecRun): boolean {
