@@ -167,6 +167,16 @@ export class PlanExecController {
     return this.advance(await this.registry.claim(run, options.sessionId));
   }
 
+  /**
+   * Ask the bridge what it still knows about an operation. Read-only, and
+   * undefined when the bridge cannot answer: a diagnosis must not turn a
+   * provider outage into evidence that the worker is gone.
+   */
+  async operationState(operationId: string): Promise<string | undefined> {
+    const lookup = await this.bridge.operation(operationId);
+    return lookup.success ? text(lookup.data.state) : undefined;
+  }
+
   async markFailed(
     runId: string,
     error: unknown,

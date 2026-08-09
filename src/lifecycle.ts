@@ -34,6 +34,14 @@ const TERMINAL_STATUSES = new Set<RunStatus>([
   RUN_STATUS.FAILED,
 ]);
 
+/** Statuses that assert work is in flight right now, and are therefore falsifiable. */
+const IN_FLIGHT_STATUSES = new Set<RunStatus>([
+  RUN_STATUS.STARTING,
+  RUN_STATUS.RUNNING,
+  RUN_STATUS.SKIP_PENDING,
+  RUN_STATUS.CANCEL_PENDING,
+]);
+
 const REVIEW_STAGES = new Set<RunStage>([
   RUN_STAGE.COMPREHENSIVE_REVIEW,
   RUN_STAGE.SMELLS_REVIEW,
@@ -59,6 +67,10 @@ const NEXT_STAGES: Partial<Record<RunStage, RunStage>> = {
 
 export function isTerminalStatus(status: RunStatus): boolean {
   return TERMINAL_STATUSES.has(status);
+}
+
+export function isInFlightStatus(status: RunStatus): boolean {
+  return IN_FLIGHT_STATUSES.has(status);
 }
 
 export function isReviewStage(stage: RunStage): boolean {

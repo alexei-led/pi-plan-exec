@@ -1,5 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { isSkippableStage, isTerminalStatus } from "./lifecycle.js";
+import {
+  isInFlightStatus,
+  isSkippableStage,
+  isTerminalStatus,
+} from "./lifecycle.js";
 import {
   mkdir,
   open,
@@ -13,6 +17,7 @@ import { homedir, hostname } from "node:os";
 import { dirname, join } from "node:path";
 import {
   DEFAULT_FROZEN_RUN_CONFIG,
+  EXTERNAL_OPERATION_STATE,
   OPERATION_KIND,
   RUN_STAGE,
   RUN_STATUS,
@@ -24,6 +29,7 @@ import {
 } from "./types.js";
 
 const RUNS_DIRECTORY = join(homedir(), ".pi", "plan-exec", "runs");
+const INVALID_RUN_ENTRY = "Invalid plan-exec run registry entry";
 export const LEASE_STALE_MS = 30_000;
 const LOCK_RETRY_MS = 50;
 const LOCK_MAX_RETRIES = 100;
@@ -48,6 +54,43 @@ export function isLeaseLive(lease: RunLease, sessionId?: string): boolean {
   if (Date.now() - lease.heartbeatAt >= LEASE_STALE_MS) return false;
   if (lease.hostname !== hostname()) return true;
   return isProcessRunning(lease.pid);
+}
+
+export const ABANDONMENT = {
+  LIVE: "live",
+  ABANDONED: "abandoned",
+  AMBIGUOUS: "ambiguous",
+} as const;
+
+export type Abandonment = (typeof ABANDONMENT)[keyof typeof ABANDONMENT];
+
+/** What a sweep managed to observe about a run's claim. */
+export interface AbandonmentEvidence {
+  leaseLive: boolean;
+  /** Only `false` is evidence; undefined means no directory was recorded. */
+  asyncDirPresent?: boolean;
+  /** The bridge's own answer for the operation ID, when it was asked. */
+  bridgeState?: string;
+}
+
+/**
+ * `abandoned` is the full conjunction: an in-flight claim, a dead lease, and a
+ * tracked operation provably gone. Anything short of that is `ambiguous` — it
+ * is reported and never reset, because resetting a run whose worker is alive
+ * can double-write a worktree, which is worse than the stall. Pure by
+ * construction: the caller gathers the evidence, so the rule stays testable.
+ */
+export function classifyAbandonment(
+  run: PlanExecRun,
+  evidence: AbandonmentEvidence,
+): Abandonment {
+  if (evidence.leaseLive) return ABANDONMENT.LIVE;
+  if (!isInFlightStatus(run.status) || !run.activeOperation)
+    return ABANDONMENT.AMBIGUOUS;
+  const gone =
+    evidence.asyncDirPresent === false ||
+    evidence.bridgeState === EXTERNAL_OPERATION_STATE.ABSENT;
+  return gone ? ABANDONMENT.ABANDONED : ABANDONMENT.AMBIGUOUS;
 }
 
 /**
@@ -252,12 +295,15 @@ export class RunRegistry {
 
   /**
    * Retire a run from the registry. Only the registry entry is deleted: the
-   * worktree, its branch, and the progress file are left in place.
+   * worktree, its branch, and the progress file are left in place. A record
+   * that cannot be parsed is removable as-is: `list` already drops it, so
+   * refusing here would leave it on disk with nothing able to clean it up.
    */
   async remove(runId: string): Promise<void> {
-    const run = await this.get(runId);
-    if (!run) return;
-    const refusal = removalRefusal(run);
+    assertRunId(runId);
+    const run = await this.readForRemoval(runId);
+    if (run === undefined) return;
+    const refusal = run === null ? undefined : removalRefusal(run);
     if (refusal) throw new Error(refusal);
     const path = this.pathFor(runId);
     const lockPath = `${path}.lock`;
@@ -273,6 +319,24 @@ export class RunRegistry {
     const released = { ...run };
     delete released.lease;
     return this.update(released);
+  }
+
+  /** `undefined` when nothing is on disk, `null` when it is there but unreadable. */
+  private async readForRemoval(
+    runId: string,
+  ): Promise<PlanExecRun | null | undefined> {
+    try {
+      return await this.get(runId);
+    } catch (error: unknown) {
+      // Narrow on purpose: an unreadable file is removable, but an I/O or
+      // permission error is not evidence of anything and must not delete data.
+      if (
+        error instanceof SyntaxError ||
+        (error instanceof Error && error.message.startsWith(INVALID_RUN_ENTRY))
+      )
+        return null;
+      throw error;
+    }
   }
 
   private pathFor(runId: string): string {
@@ -384,7 +448,7 @@ function delay(ms: number): Promise<void> {
 function parseRun(raw: string, runId: string): PlanExecRun {
   const value: unknown = JSON.parse(raw);
   if (!isRecord(value) || value.id !== runId || value.schemaVersion !== 1) {
-    throw new Error(`Invalid plan-exec run registry entry: ${runId}`);
+    throw new Error(`${INVALID_RUN_ENTRY}: ${runId}`);
   }
   const migrated = migrateLegacyRun(value);
   assertRun(migrated);
@@ -492,7 +556,7 @@ function assertRun(run: PlanExecRun): void {
     !isValidOperationForStage(run.activeOperation, run.stage) ||
     !isValidOperationForStage(run.failedOperation, run.stage)
   ) {
-    throw new Error(`Invalid plan-exec run registry entry: ${run.id}`);
+    throw new Error(`${INVALID_RUN_ENTRY}: ${run.id}`);
   }
 }
 

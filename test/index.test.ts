@@ -1,16 +1,26 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  writeFile,
+} from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { RunRegistry } from "../src/registry.js";
 import {
   execCleanup,
+  execDoctor,
   execHelp,
   execSetup,
   isRemovableRun,
   parseCleanupArguments,
+  parseDoctorArguments,
+  sweepAbandonment,
+  type EvidenceProbe,
   formatRunList,
   formatRunStatus,
   getExecArgumentCompletions,
@@ -93,8 +103,10 @@ function retiredRun(overrides: Partial<PlanExecRun> = {}): PlanExecRun {
   return retired;
 }
 
-/** Every cleanup test writes into its own temp directory, never ~/.pi. */
-async function seedRegistry(runs: PlanExecRun[]): Promise<RunRegistry> {
+/** Every registry test writes into its own temp directory, never ~/.pi. */
+async function seedDirectory(
+  runs: PlanExecRun[],
+): Promise<{ registry: RunRegistry; directory: string }> {
   const directory = await mkdtemp(join(tmpdir(), "pi-plan-exec-cleanup-"));
   for (const seed of runs) {
     await mkdir(join(directory, seed.id), { recursive: true });
@@ -104,7 +116,60 @@ async function seedRegistry(runs: PlanExecRun[]): Promise<RunRegistry> {
       "utf8",
     );
   }
-  return new RunRegistry(directory);
+  return { registry: new RunRegistry(directory), directory };
+}
+
+async function seedRegistry(runs: PlanExecRun[]): Promise<RunRegistry> {
+  return (await seedDirectory(runs)).registry;
+}
+
+/** Raw bytes per run directory, so "wrote nothing" can be asserted literally. */
+async function snapshotRuns(
+  directory: string,
+): Promise<Record<string, string>> {
+  const snapshot: Record<string, string> = {};
+  for (const entry of await readdir(directory))
+    snapshot[entry] = await readFile(
+      join(directory, entry, "run.json"),
+      "utf8",
+    );
+  return snapshot;
+}
+
+const DEAD_LEASE = {
+  sessionId: "session-gone",
+  pid: process.pid,
+  heartbeatAt: Date.now() - 10 * 60_000,
+  hostname: hostname(),
+};
+
+const LIVE_LEASE = {
+  sessionId: "session-live",
+  pid: process.pid,
+  heartbeatAt: Date.now(),
+  hostname: hostname(),
+};
+
+const MISSING_ASYNC_DIR = join(
+  tmpdir(),
+  "pi-plan-exec-async-that-never-existed",
+);
+
+/** A run whose worker is provably gone: dead lease, operation directory absent. */
+function abandonedRun(overrides: Partial<PlanExecRun> = {}): PlanExecRun {
+  return run({
+    lease: DEAD_LEASE,
+    taskAttempts: { "1": 2 },
+    activeOperation: {
+      operationId: "operation-1",
+      service: "bridge",
+      kind: "implementation",
+      externalRunId: "external-1",
+      taskId: 1,
+      asyncDir: MISSING_ASYNC_DIR,
+    },
+    ...overrides,
+  });
 }
 
 test("bridge runtime compatibility requires recovery and workflow spawn capabilities", () => {
@@ -1024,6 +1089,222 @@ test("cleanup with a run ID removes just that run and refuses live ones", async 
     () => execCleanup(registry, ["88888888-8888-4888-8888-888888888888"]),
     /Plan execution run not found/,
   );
+});
+
+test("doctor argument parsing accepts only --reconcile", () => {
+  assert.deepEqual(parseDoctorArguments([]), { reconcile: false });
+  assert.deepEqual(parseDoctorArguments(["--reconcile"]), { reconcile: true });
+  assert.throws(() => parseDoctorArguments(["--apply"]), /Usage/);
+  assert.throws(() => parseDoctorArguments(["run-id"]), /Usage/);
+});
+
+test("doctor groups every in-flight claim and mutates nothing", async () => {
+  const abandoned = abandonedRun();
+  const ambiguous = abandonedRun({
+    id: "22222222-2222-4222-8222-222222222222",
+    activeOperation: {
+      operationId: "operation-2",
+      service: "bridge",
+      kind: "implementation",
+      externalRunId: "external-2",
+    },
+  });
+  const live = abandonedRun({
+    id: "33333333-3333-4333-8333-333333333333",
+    lease: LIVE_LEASE,
+  });
+  const settled = retiredRun({ id: "44444444-4444-4444-8444-444444444444" });
+  const { registry, directory } = await seedDirectory([
+    abandoned,
+    ambiguous,
+    live,
+    settled,
+  ]);
+  const before = await snapshotRuns(directory);
+
+  const report = await execDoctor(registry, []);
+
+  assert.match(report, /Plan execution runs claiming work in flight: 3/);
+  assert.match(
+    report,
+    new RegExp(
+      `abandoned — no worker is running:\\n- ${abandoned.id} [^\\n]*operation directory is gone from disk\\. Next: /exec doctor --reconcile`,
+    ),
+  );
+  assert.match(
+    report,
+    new RegExp(
+      `ambiguous[^\\n]*\\n- ${ambiguous.id} [^\\n]*could not be observed\\. Next: /exec status ${ambiguous.id}`,
+    ),
+  );
+  assert.match(
+    report,
+    new RegExp(
+      `live[^\\n]*\\n- ${live.id} [^\\n]*session ${LIVE_LEASE.sessionId} holds a live lease`,
+    ),
+  );
+  assert.match(
+    report,
+    /1 other run is terminal or paused; use \/exec runs --all\./,
+  );
+  assert.deepEqual(
+    await snapshotRuns(directory),
+    before,
+    "preview writes nothing",
+  );
+});
+
+test("doctor --reconcile resets only provably abandoned runs", async () => {
+  const abandoned = abandonedRun();
+  const ambiguous = abandonedRun({
+    id: "22222222-2222-4222-8222-222222222222",
+    activeOperation: {
+      operationId: "operation-2",
+      service: "bridge",
+      kind: "implementation",
+    },
+  });
+  const live = abandonedRun({
+    id: "33333333-3333-4333-8333-333333333333",
+    lease: LIVE_LEASE,
+  });
+  const cancelling = abandonedRun({
+    id: "55555555-5555-4555-8555-555555555555",
+    status: "cancel_pending",
+  });
+  const { registry, directory } = await seedDirectory([
+    abandoned,
+    ambiguous,
+    live,
+    cancelling,
+  ]);
+  const before = await snapshotRuns(directory);
+
+  const report = await execDoctor(registry, ["--reconcile"]);
+
+  assert.match(report, /Reset 2 abandoned runs to failed\./);
+  assert.match(report, /no task attempt was consumed/);
+  assert.match(
+    report,
+    new RegExp(`- ${abandoned.id} [^\\n]*Next: /exec resume ${abandoned.id}`),
+  );
+  assert.match(
+    report,
+    new RegExp(`- ${cancelling.id} [^\\n]*Next: /exec cancel ${cancelling.id}`),
+  );
+
+  const reset = await registry.get(abandoned.id);
+  assert.equal(reset?.status, "failed");
+  assert.equal(reset?.activeOperation, undefined);
+  assert.deepEqual(reset?.taskAttempts, abandoned.taskAttempts);
+  assert.ok(reset?.reconciledAt, "the reset is stamped for audit");
+  assert.match(reset?.error ?? "", /lease was dead/);
+  assert.match(reset?.error ?? "", /operation directory is gone from disk/);
+
+  const after = await snapshotRuns(directory);
+  assert.equal(
+    after[ambiguous.id],
+    before[ambiguous.id],
+    "ambiguous untouched",
+  );
+  assert.equal(after[live.id], before[live.id], "live untouched");
+});
+
+test("doctor --reconcile skips a run reclaimed while the sweep ran", async () => {
+  const reclaimed = abandonedRun();
+  const stalled = abandonedRun({
+    id: "22222222-2222-4222-8222-222222222222",
+  });
+  const { registry } = await seedDirectory([reclaimed, stalled]);
+  const probe: EvidenceProbe = async (candidate) => {
+    if (candidate.id === reclaimed.id) {
+      const current = await registry.get(candidate.id);
+      await registry.update({ ...current!, lease: LIVE_LEASE });
+    }
+    return { asyncDirPresent: false };
+  };
+
+  const report = await execDoctor(registry, ["--reconcile"], probe);
+
+  assert.match(report, /Reset 1 abandoned run to failed\./);
+  assert.match(report, /Skipped 1 run reclaimed while the sweep ran/);
+  assert.match(report, new RegExp(`- ${reclaimed.id} `));
+  assert.equal((await registry.get(reclaimed.id))?.status, "running");
+  assert.equal((await registry.get(reclaimed.id))?.reconciledAt, undefined);
+  assert.equal((await registry.get(stalled.id))?.status, "failed");
+});
+
+test("a reconciled run is an ordinary recoverable failure", async () => {
+  const abandoned = abandonedRun();
+  const { registry } = await seedDirectory([abandoned]);
+
+  await execDoctor(registry, ["--reconcile"]);
+  const reconciled = await registry.get(abandoned.id);
+
+  assert.ok(reconciled);
+  assert.equal(isActionAllowed("resume", reconciled, "session-new"), true);
+  assert.equal(isRecoverableFailure(reconciled), true);
+  const guidance = recoveryGuidance(reconciled);
+  assert.equal(guidance.classification, "failed with no active operation");
+  assert.match(guidance.action, new RegExp(`/exec resume ${abandoned.id}`));
+  assert.deepEqual(reconciled.taskAttempts, { "1": 2 });
+});
+
+test("reconcile records the reset in the run's own progress file", async () => {
+  const progressPath = join(
+    await mkdtemp(join(tmpdir(), "pi-plan-exec-progress-")),
+    "progress.txt",
+  );
+  const abandoned = abandonedRun({ progressPath });
+  const { registry } = await seedDirectory([abandoned]);
+
+  await execDoctor(registry, ["--reconcile"]);
+
+  const progress = await readFile(progressPath, "utf8");
+  assert.match(progress, /Reset by \/exec doctor/);
+  assert.match(progress, /operation directory is gone from disk/);
+  assert.match(progress, /task attempt counter was left unchanged/);
+});
+
+test("the startup sweep classifies without writing anything", async () => {
+  const abandoned = abandonedRun();
+  const live = abandonedRun({
+    id: "22222222-2222-4222-8222-222222222222",
+    lease: LIVE_LEASE,
+  });
+  const { registry, directory } = await seedDirectory([abandoned, live]);
+  const before = await snapshotRuns(directory);
+
+  const sweep = await sweepAbandonment(registry);
+
+  assert.deepEqual(
+    sweep.diagnoses.map((diagnosis) => diagnosis.classification).sort(),
+    ["abandoned", "live"],
+  );
+  assert.deepEqual(await snapshotRuns(directory), before);
+});
+
+test("cleanup removes a run record the registry cannot parse", async () => {
+  const corruptId = "99999999-9999-4999-8999-999999999999";
+  const { registry, directory } = await seedDirectory([retiredRun()]);
+  await mkdir(join(directory, corruptId), { recursive: true });
+  await writeFile(join(directory, corruptId, "run.json"), "{not-json\n");
+
+  const doctored = await execDoctor(registry, []);
+  assert.match(
+    doctored,
+    new RegExp(
+      `unreadable run records:\\n- ${corruptId} — [^\\n]*Next: /exec cleanup ${corruptId} --apply`,
+    ),
+  );
+
+  const preview = await execCleanup(registry, [corruptId]);
+  assert.match(preview, /nothing was deleted/);
+  assert.ok(await registry.listWithErrors().then((it) => it.errors.length));
+
+  const applied = await execCleanup(registry, [corruptId, "--apply"]);
+  assert.match(applied, /Removed 1 unreadable plan execution run record/);
+  assert.deepEqual((await registry.listWithErrors()).errors, []);
 });
 
 test("run list tells users how to inspect an unambiguous run", () => {

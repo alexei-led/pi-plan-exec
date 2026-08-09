@@ -12,10 +12,13 @@ import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  classifyAbandonment,
   isLeaseLive,
   LEASE_STALE_MS,
   removalRefusal,
   RunRegistry,
+  type Abandonment,
+  type AbandonmentEvidence,
 } from "../src/registry.js";
 import type { PlanExecRun } from "../src/types.js";
 
@@ -348,6 +351,157 @@ test("remove retires a terminal run and refuses anything still in play", async (
     () => registry.remove("../escape"),
     /Invalid plan-exec run ID/,
   );
+});
+
+test("remove deletes an unreadable record instead of throwing on it", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-plan-exec-registry-"));
+  const registry = new RunRegistry(directory);
+  const corruptId = "22222222-2222-4222-8222-222222222222";
+  const wrongSchemaId = "33333333-3333-4333-8333-333333333333";
+  await mkdir(join(directory, corruptId), { recursive: true });
+  await writeFile(join(directory, corruptId, "run.json"), "{not-json\n");
+  await mkdir(join(directory, wrongSchemaId), { recursive: true });
+  await writeFile(
+    join(directory, wrongSchemaId, "run.json"),
+    `${JSON.stringify({ id: wrongSchemaId, schemaVersion: 2 })}\n`,
+  );
+
+  await registry.remove(corruptId);
+  await registry.remove(wrongSchemaId);
+
+  await assert.rejects(stat(join(directory, corruptId)), /ENOENT/);
+  await assert.rejects(stat(join(directory, wrongSchemaId)), /ENOENT/);
+  assert.deepEqual((await registry.listWithErrors()).errors, []);
+});
+
+test("abandonment needs a dead lease, an in-flight claim, and a gone operation", () => {
+  const subject = (overrides: Partial<PlanExecRun> = {}): PlanExecRun => ({
+    schemaVersion: 1,
+    id: "11111111-1111-4111-8111-111111111111",
+    repositoryRoot: "/repo",
+    planPath: "/repo/plan.md",
+    planHash: "hash",
+    worktreeCwd: "/repo",
+    branch: "feature",
+    defaultBranch: "main",
+    status: "running",
+    stage: "implementation",
+    taskAttempts: {},
+    stageAttempts: {},
+    reviewFindings: [],
+    unresolvedFindings: [],
+    skippedStages: [],
+    branchRebindings: [],
+    activeOperation: {
+      operationId: "operation-1",
+      service: "bridge",
+      kind: "implementation",
+      asyncDir: "/tmp/async",
+    },
+    config,
+    createdAt: 1,
+    updatedAt: 2,
+    ...overrides,
+  });
+  const withoutOperation = subject();
+  delete withoutOperation.activeOperation;
+  const cases: Array<{
+    name: string;
+    run: PlanExecRun;
+    evidence: AbandonmentEvidence;
+    expected: Abandonment;
+  }> = [
+    {
+      name: "dead lease, running, directory gone",
+      run: subject(),
+      evidence: { leaseLive: false, asyncDirPresent: false },
+      expected: "abandoned",
+    },
+    {
+      name: "dead lease, running, bridge has no record",
+      run: subject(),
+      evidence: { leaseLive: false, bridgeState: "absent" },
+      expected: "abandoned",
+    },
+    {
+      name: "dead lease, starting, directory gone",
+      run: subject({ status: "starting" }),
+      evidence: { leaseLive: false, asyncDirPresent: false },
+      expected: "abandoned",
+    },
+    {
+      name: "dead lease, cancel_pending, directory gone",
+      run: subject({ status: "cancel_pending" }),
+      evidence: { leaseLive: false, asyncDirPresent: false },
+      expected: "abandoned",
+    },
+    {
+      name: "dead lease, skip_pending, directory gone",
+      run: subject({
+        status: "skip_pending",
+        stage: "comprehensive_review",
+        activeOperation: {
+          operationId: "operation-1",
+          service: "bridge",
+          kind: "review",
+          asyncDir: "/tmp/async",
+        },
+        pendingStageSkip: {
+          stage: "comprehensive_review",
+          reason: "blocked",
+          requestedAt: 1,
+          requestedBy: "session-1",
+        },
+      }),
+      evidence: { leaseLive: false, asyncDirPresent: false },
+      expected: "abandoned",
+    },
+    {
+      name: "live lease outranks every other signal",
+      run: subject(),
+      evidence: { leaseLive: true, asyncDirPresent: false },
+      expected: "live",
+    },
+    {
+      name: "directory still on disk is not gone",
+      run: subject(),
+      evidence: { leaseLive: false, asyncDirPresent: true },
+      expected: "ambiguous",
+    },
+    {
+      name: "no operation evidence at all",
+      run: subject(),
+      evidence: { leaseLive: false },
+      expected: "ambiguous",
+    },
+    {
+      name: "a running bridge answer is not absence",
+      run: subject(),
+      evidence: { leaseLive: false, bridgeState: "running" },
+      expected: "ambiguous",
+    },
+    {
+      name: "paused does not claim work in flight",
+      run: subject({ status: "paused" }),
+      evidence: { leaseLive: false, asyncDirPresent: false },
+      expected: "ambiguous",
+    },
+    {
+      name: "a terminal run is never abandoned",
+      run: subject({ status: "failed" }),
+      evidence: { leaseLive: false, asyncDirPresent: false },
+      expected: "ambiguous",
+    },
+    {
+      name: "no tracked operation cannot be proven gone",
+      run: withoutOperation,
+      evidence: { leaseLive: false, asyncDirPresent: false },
+      expected: "ambiguous",
+    },
+  ];
+
+  for (const { name, run, evidence, expected } of cases)
+    assert.equal(classifyAbandonment(run, evidence), expected, name);
 });
 
 test("concurrent claims allow only one session to acquire the lease", async () => {

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
@@ -8,6 +8,7 @@ import {
   PLAN_STRUCTURE_CHANGED_ERROR,
   PlanExecController,
 } from "../src/controller.js";
+import { execDoctor } from "../src/index.js";
 import { parsePlan } from "../src/plan.js";
 import { RunRegistry } from "../src/registry.js";
 import type { BridgeResult, PlanExecRun } from "../src/types.js";
@@ -2419,6 +2420,59 @@ test("observation reports a missing async directory as decisive", async () => {
 
   assert.equal(stored?.activeOperation?.workerSignal?.asyncDirMissing, true);
   assert.equal(stored?.status, "running");
+});
+
+test("a reconciled run resumes through the normal recovery path", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
+  const planPath = join(root, "plan.md");
+  const plan = "### Task 1: Implement\n- [ ] Do the work\n";
+  await writeFile(planPath, plan);
+  const registry = new RunRegistry(join(root, "runs"));
+  const bridge = new FakeBridge(join(root, "none.json"));
+  const controller = new PlanExecController(
+    registry,
+    bridge,
+    new FakeFusion(),
+    fakeGit(root),
+  );
+  const created = await registry.create({
+    ...baseRun(root, planPath),
+    planHash: parsePlan(planPath, plan).hash,
+    stage: "implementation",
+    taskAttempts: { "1": 1 },
+    activeOperation: {
+      operationId: "operation-1",
+      service: "bridge",
+      kind: "implementation",
+      externalRunId: "external-1",
+      taskId: 1,
+      asyncDir: join(root, "async-directory-that-is-gone"),
+    },
+    lease: {
+      sessionId: "session-old",
+      pid: process.pid,
+      heartbeatAt: Date.now() - 10 * 60_000,
+      hostname: hostname(),
+    },
+  });
+
+  const report = await execDoctor(registry, ["--reconcile"]);
+
+  assert.match(report, /Reset 1 abandoned run to failed\./);
+  const reconciled = await registry.get(created.id);
+  assert.equal(reconciled?.status, "failed");
+  assert.equal(reconciled?.activeOperation, undefined);
+  assert.deepEqual(
+    reconciled?.taskAttempts,
+    { "1": 1 },
+    "reconcile must not consume a task attempt",
+  );
+
+  const resumed = await controller.resume(created.id, "session-new", true);
+
+  assert.equal(resumed.status, "running");
+  assert.equal(resumed.activeOperation?.kind, "implementation");
+  assert.equal(bridge.spawnCount, 1, "resume launches one replacement worker");
 });
 
 function baseRun(

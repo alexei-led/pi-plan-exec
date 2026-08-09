@@ -6,6 +6,7 @@ export const EXEC_ACTION = {
   SETUP: "setup",
   RUNS: "runs",
   CLEANUP: "cleanup",
+  DOCTOR: "doctor",
   STATUS: "status",
   PAUSE: "pause",
   RESUME: "resume",
@@ -16,7 +17,7 @@ export const EXEC_ACTION = {
 
 export type RunAction = (typeof EXEC_ACTION)[Exclude<
   keyof typeof EXEC_ACTION,
-  "HELP" | "START" | "SETUP" | "RUNS" | "CLEANUP"
+  "HELP" | "START" | "SETUP" | "RUNS" | "CLEANUP" | "DOCTOR"
 >];
 
 export const RUN_STAGE = {
@@ -261,6 +262,8 @@ export interface PlanExecRun {
   updatedAt: number;
   /** Set when the archive stage completes; absent on runs archived before this field existed. */
   retiredAt?: number;
+  /** Set when /exec doctor --reconcile reset an abandoned run, so the reset is auditable. */
+  reconciledAt?: number;
   lease?: {
     sessionId: string;
     pid: number;

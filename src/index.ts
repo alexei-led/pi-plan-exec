@@ -1,4 +1,4 @@
-import { readdir } from "node:fs/promises";
+import { access, readdir } from "node:fs/promises";
 import { basename, relative, resolve, sep } from "node:path";
 import {
   SessionManager,
@@ -21,16 +21,28 @@ import {
 } from "./controller.js";
 import { FusionClient } from "./fusion.js";
 import {
+  isInFlightStatus,
   isRecoverableRun,
   isSkippableStage,
   isTerminalStatus,
 } from "./lifecycle.js";
-import { isLeaseLive, removalRefusal, RunRegistry } from "./registry.js";
+import {
+  ABANDONMENT,
+  classifyAbandonment,
+  isLeaseLive,
+  removalRefusal,
+  RunRegistry,
+  type Abandonment,
+  type AbandonmentEvidence,
+} from "./registry.js";
 import { readPlan } from "./plan.js";
+import { appendProgress } from "./progress.js";
 import { TaskProjector } from "./task-projection.js";
 import {
   COMPLETED_PLANS_DIRECTORY,
   EXEC_ACTION,
+  EXTERNAL_OPERATION_STATE,
+  OPERATION_SERVICE,
   RUN_STATUS,
   WORKFLOW_MODE,
   type ActiveOperation,
@@ -60,6 +72,7 @@ const CLEANUP_STATUSES = new Set<PlanExecRun["status"]>([
 ]);
 const RUNS_ALL_OPTION = "--all";
 const RUN_LIST_TERMINAL_WINDOW_MS = MILLISECONDS_PER_DAY;
+const DOCTOR_RECONCILE_OPTION = "--reconcile";
 const REQUIRED_RUNTIME_TOOLS: Record<string, string> = {
   subagent: "pi-subagents",
   TaskCreate: "@tintinweb/pi-tasks",
@@ -90,6 +103,11 @@ const EXEC_COMMANDS: AutocompleteItem[] = [
     value: EXEC_ACTION.CLEANUP,
     label: EXEC_ACTION.CLEANUP,
     description: "Preview or remove retired run records",
+  },
+  {
+    value: EXEC_ACTION.DOCTOR,
+    label: EXEC_ACTION.DOCTOR,
+    description: "Diagnose runs that claim work with no live worker",
   },
   {
     value: EXEC_ACTION.STATUS,
@@ -362,6 +380,22 @@ export default function planExecExtension(pi: ExtensionAPI): void {
       ) {
         startBackgroundController(run, sessionId, ctx.cwd, ctx);
       }
+    }
+    // Read-only on purpose: startup reports what it found and points at the
+    // command that can act, and never writes. A diagnosis failure is advisory,
+    // so it must not take the session down with it.
+    try {
+      const abandoned = (await sweepAbandonment(registry)).diagnoses.filter(
+        (diagnosis) => diagnosis.classification === ABANDONMENT.ABANDONED,
+      ).length;
+      if (abandoned > 0)
+        notify(
+          ctx,
+          `${abandoned} plan execution run${abandoned === 1 ? "" : "s"} claim to be running with no worker. Use /exec doctor.`,
+          "warning",
+        );
+    } catch {
+      // Startup diagnosis is advisory; the registry stays authoritative.
     }
   });
 
@@ -741,6 +775,12 @@ export async function execCleanup(
   args: string[],
 ): Promise<string> {
   const { runId, apply, includeFailed } = parseCleanupArguments(args);
+  if (runId) {
+    const unreadable = (await registry.listWithErrors()).errors.find(
+      (error) => error.runId === runId,
+    );
+    if (unreadable) return cleanupUnreadable(registry, unreadable, apply);
+  }
   const failedHint = includeFailed
     ? []
     : [
@@ -775,6 +815,25 @@ export async function execCleanup(
   ].join("\n");
 }
 
+/**
+ * A record the registry cannot parse has nothing left to protect: `list` drops
+ * it, so removal is the only action that applies to it.
+ */
+async function cleanupUnreadable(
+  registry: RunRegistry,
+  unreadable: { runId: string; message: string },
+  apply: boolean,
+): Promise<string> {
+  if (!apply)
+    return [
+      `Unreadable plan execution run record (preview; nothing was deleted): ${unreadable.runId} — ${unreadable.message}`,
+      "Removal deletes the registry entry only; the worktree, branch, and progress file are left in place.",
+      `Use /exec cleanup ${unreadable.runId} ${CLEANUP_APPLY_OPTION} to remove it.`,
+    ].join("\n");
+  await registry.remove(unreadable.runId);
+  return `Removed 1 unreadable plan execution run record: ${unreadable.runId}; its worktree, branch, and progress file were left in place.`;
+}
+
 async function removableRun(
   registry: RunRegistry,
   runId: string,
@@ -784,6 +843,279 @@ async function removableRun(
   const refusal = removalRefusal(run);
   if (refusal) throw new Error(refusal);
   return run;
+}
+
+export function parseDoctorArguments(args: string[]): { reconcile: boolean } {
+  for (const arg of args)
+    if (arg !== DOCTOR_RECONCILE_OPTION)
+      throw new Error(`Usage: /exec doctor [${DOCTOR_RECONCILE_OPTION}]`);
+  return { reconcile: args.includes(DOCTOR_RECONCILE_OPTION) };
+}
+
+/** Evidence about the tracked operation; the sweep supplies lease liveness itself. */
+export type EvidenceProbe = (
+  run: PlanExecRun,
+) => Promise<Omit<AbandonmentEvidence, "leaseLive">>;
+
+export interface RunDiagnosis {
+  run: PlanExecRun;
+  evidence: AbandonmentEvidence;
+  classification: Abandonment;
+}
+
+export interface AbandonmentSweep {
+  diagnoses: RunDiagnosis[];
+  /** Runs that claim nothing right now: terminal or paused. */
+  settled: number;
+  unreadable: Array<{ runId: string; message: string }>;
+}
+
+/**
+ * Filesystem evidence always; the bridge is asked only when a lookup is wired
+ * in and the cheap check was not already decisive. Both are read-only, and a
+ * lookup that cannot answer yields no evidence rather than a false verdict.
+ */
+export function abandonmentProbe(
+  lookupOperationState?: (operationId: string) => Promise<string | undefined>,
+): EvidenceProbe {
+  return async (run) => {
+    const operation = run.activeOperation;
+    if (!operation) return {};
+    const asyncDirPresent = operation.asyncDir
+      ? await pathExists(operation.asyncDir)
+      : undefined;
+    if (asyncDirPresent === false) return { asyncDirPresent };
+    const bridgeState =
+      lookupOperationState && operation.service === OPERATION_SERVICE.BRIDGE
+        ? await lookupOperationState(operation.operationId).catch(
+            () => undefined,
+          )
+        : undefined;
+    return {
+      ...(asyncDirPresent === undefined ? {} : { asyncDirPresent }),
+      ...(bridgeState ? { bridgeState } : {}),
+    };
+  };
+}
+
+/**
+ * Diagnose every run that claims work in flight. Read-only by construction: it
+ * observes and classifies and writes nothing, so extension startup can call it.
+ */
+export async function sweepAbandonment(
+  registry: RunRegistry,
+  probe: EvidenceProbe = abandonmentProbe(),
+): Promise<AbandonmentSweep> {
+  const { runs, errors } = await registry.listWithErrors();
+  const claiming = runs.filter((run) => isInFlightStatus(run.status));
+  const diagnoses = await Promise.all(
+    claiming.map(async (run) => {
+      const leaseLive = Boolean(run.lease && isLeaseLive(run.lease));
+      const evidence: AbandonmentEvidence = leaseLive
+        ? { leaseLive }
+        : { leaseLive, ...(await probe(run)) };
+      return {
+        run,
+        evidence,
+        classification: classifyAbandonment(run, evidence),
+      };
+    }),
+  );
+  return {
+    diagnoses,
+    settled: runs.length - claiming.length,
+    unreadable: errors,
+  };
+}
+
+export async function execDoctor(
+  registry: RunRegistry,
+  args: string[],
+  probe?: EvidenceProbe,
+): Promise<string> {
+  const { reconcile } = parseDoctorArguments(args);
+  const sweep = await sweepAbandonment(registry, probe);
+  const group = (classification: Abandonment): RunDiagnosis[] =>
+    sweep.diagnoses.filter(
+      (diagnosis) => diagnosis.classification === classification,
+    );
+  const abandoned = group(ABANDONMENT.ABANDONED);
+  const lines =
+    sweep.diagnoses.length === 0
+      ? ["No plan execution run claims work in flight."]
+      : [
+          `Plan execution runs claiming work in flight: ${sweep.diagnoses.length}`,
+        ];
+  if (reconcile) lines.push(...(await reconcileLines(registry, abandoned)));
+  else
+    lines.push(
+      ...groupLines(
+        "abandoned — no worker is running",
+        abandoned,
+        `Reset them with /exec doctor ${DOCTOR_RECONCILE_OPTION}; it never launches a worker.`,
+      ),
+    );
+  lines.push(
+    ...groupLines(
+      "ambiguous — evidence is incomplete, so nothing was reset",
+      group(ABANDONMENT.AMBIGUOUS),
+    ),
+    ...groupLines(
+      "live — a session still holds this run",
+      group(ABANDONMENT.LIVE),
+    ),
+  );
+  if (sweep.unreadable.length > 0) {
+    lines.push("unreadable run records:");
+    for (const record of sweep.unreadable)
+      lines.push(
+        `- ${record.runId} — ${record.message}. Next: /exec cleanup ${record.runId} ${CLEANUP_APPLY_OPTION}`,
+      );
+  }
+  if (sweep.settled > 0)
+    lines.push(
+      `${sweep.settled} other run${sweep.settled === 1 ? " is" : "s are"} terminal or paused; use /exec runs ${RUNS_ALL_OPTION}.`,
+    );
+  return lines.join("\n");
+}
+
+function groupLines(
+  heading: string,
+  diagnoses: RunDiagnosis[],
+  footer?: string,
+): string[] {
+  if (diagnoses.length === 0) return [];
+  return [
+    `${heading}:`,
+    ...diagnoses.map(
+      (diagnosis) =>
+        `- ${runClaim(diagnosis.run)} — ${evidenceText(diagnosis)}. Next: ${nextCommand(diagnosis)}`,
+    ),
+    ...(footer ? [footer] : []),
+  ];
+}
+
+async function reconcileLines(
+  registry: RunRegistry,
+  abandoned: RunDiagnosis[],
+): Promise<string[]> {
+  const reset: Array<{ diagnosis: RunDiagnosis; run: PlanExecRun }> = [];
+  const skipped: RunDiagnosis[] = [];
+  for (const diagnosis of abandoned) {
+    const run = await reconcileRun(registry, diagnosis);
+    if (run) reset.push({ diagnosis, run });
+    else skipped.push(diagnosis);
+  }
+  const lines: string[] = [];
+  if (reset.length > 0)
+    lines.push(
+      `Reset ${reset.length} abandoned run${reset.length === 1 ? "" : "s"} to failed. No worker was launched and no task attempt was consumed.`,
+      ...reset.map(
+        ({ diagnosis, run }) =>
+          `- ${runClaim(diagnosis.run)} → failed. Next: ${recoveryCommand(diagnosis.run, run)}`,
+      ),
+    );
+  if (skipped.length > 0)
+    lines.push(
+      `Skipped ${skipped.length} run${skipped.length === 1 ? "" : "s"} reclaimed while the sweep ran; nothing was overwritten:`,
+      ...skipped.map((diagnosis) => `- ${runClaim(diagnosis.run)}`),
+    );
+  if (reset.length === 0 && skipped.length === 0)
+    lines.push("No run is provably abandoned, so nothing was reset.");
+  return lines;
+}
+
+/**
+ * Convert decisive evidence into the recoverable failure that /exec resume
+ * already knows how to handle, and stop there. Compare-and-swap on the scanned
+ * `updatedAt`, with no retry: a run reclaimed between the scan and this write
+ * is skipped, never overwritten. `taskAttempts` is untouched because the worker
+ * never ran, so the operator must not lose an attempt.
+ */
+async function reconcileRun(
+  registry: RunRegistry,
+  diagnosis: RunDiagnosis,
+): Promise<PlanExecRun | undefined> {
+  const reason = reconcileReason(diagnosis);
+  const reset = { ...diagnosis.run };
+  delete reset.activeOperation;
+  const reconciled = await registry.updateIfCurrent(
+    {
+      ...reset,
+      status: RUN_STATUS.FAILED,
+      error: reason,
+      reconciledAt: Date.now(),
+    },
+    diagnosis.run.updatedAt,
+  );
+  if (!reconciled.applied) return undefined;
+  try {
+    await appendProgress(
+      reconciled.run,
+      `${reason} The task attempt counter was left unchanged.`,
+    );
+  } catch {
+    // An abandoned run often outlived its worktree; the registry entry is the record.
+  }
+  return reconciled.run;
+}
+
+/**
+ * Name the evidence in the stored error, so the reset is legible later. Worded
+ * to describe this reconciliation only: recovery classification reads run.error
+ * back, and a stray "provider" or "external" here would reclassify the run.
+ */
+function reconcileReason(diagnosis: RunDiagnosis): string {
+  const operation = diagnosis.run.activeOperation;
+  return `Reset by /exec doctor: its lease was dead and ${operationEvidence(diagnosis)}, so no worker was running${operation ? ` for ${operation.service}/${operation.kind}` : ""}.`;
+}
+
+function runClaim(run: PlanExecRun): string {
+  return `${run.id} ${basename(run.planPath)} ${run.status}/${run.stage}`;
+}
+
+function evidenceText(diagnosis: RunDiagnosis): string {
+  const lease = diagnosis.run.lease;
+  const leaseText = !lease
+    ? "no session holds it"
+    : diagnosis.evidence.leaseLive
+      ? `session ${lease.sessionId} holds a live lease`
+      : `its lease for session ${lease.sessionId} is dead, last beat ${relativeTime(lease.heartbeatAt)}`;
+  return `${leaseText}; ${operationEvidence(diagnosis)}`;
+}
+
+function operationEvidence(diagnosis: RunDiagnosis): string {
+  const operation = diagnosis.run.activeOperation;
+  if (!operation) return "no operation is tracked";
+  if (diagnosis.evidence.asyncDirPresent === false)
+    return "its operation directory is gone from disk";
+  if (diagnosis.evidence.bridgeState === EXTERNAL_OPERATION_STATE.ABSENT)
+    return "the bridge has no record of its operation";
+  if (diagnosis.evidence.asyncDirPresent === true)
+    return "its operation directory is still on disk";
+  return "its operation could not be observed";
+}
+
+function nextCommand(diagnosis: RunDiagnosis): string {
+  if (diagnosis.classification === ABANDONMENT.ABANDONED)
+    return `/exec doctor ${DOCTOR_RECONCILE_OPTION}`;
+  return `/exec status ${diagnosis.run.id}`;
+}
+
+/** A reconciled cancel-pending run still wants cancelling, not resuming. */
+function recoveryCommand(before: PlanExecRun, after: PlanExecRun): string {
+  return before.status === RUN_STATUS.CANCEL_PENDING
+    ? `/exec cancel ${after.id}`
+    : `/exec resume ${after.id}`;
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function handleCommand(
@@ -800,6 +1132,12 @@ async function handleCommand(
   if (subcommand === EXEC_ACTION.RUNS)
     return formatRunList(await registry.list(), parseRunsArguments(rest));
   if (subcommand === EXEC_ACTION.CLEANUP) return execCleanup(registry, rest);
+  if (subcommand === EXEC_ACTION.DOCTOR)
+    return execDoctor(
+      registry,
+      rest,
+      abandonmentProbe((operationId) => controller.operationState(operationId)),
+    );
   if (
     subcommand === EXEC_ACTION.STATUS ||
     subcommand === EXEC_ACTION.PAUSE ||
@@ -1456,6 +1794,8 @@ export function execHelp(): string {
     `/exec runs [${RUNS_ALL_OPTION}]      List active runs plus terminal runs from the last day; ${RUNS_ALL_OPTION} shows every run.`,
     `/exec cleanup [full-run-id] [${CLEANUP_APPLY_OPTION}] [${CLEANUP_INCLUDE_FAILED_OPTION}]`,
     `                        Preview retired runs older than ${CLEANUP_RETENTION_DAYS} days; ${CLEANUP_APPLY_OPTION} deletes their registry entries only. Failed runs need ${CLEANUP_INCLUDE_FAILED_OPTION}.`,
+    `/exec doctor [${DOCTOR_RECONCILE_OPTION}]`,
+    `                        Diagnose every run claiming work in flight; ${DOCTOR_RECONCILE_OPTION} resets provably abandoned ones to failed so /exec resume can recover them. It never launches a worker.`,
     "/exec pause [run-id]    Pause after the active child finishes.",
     `/exec resume [run-id] [${RECOVERY_MODEL_OPTION} current|provider/model]`,
     "                        Reconcile, resume, or retry safely. Model/provider failures use the current Pi model.",

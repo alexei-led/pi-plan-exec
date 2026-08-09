@@ -385,39 +385,69 @@ Anything short of all three is **ambiguous** and must be reported, never reset.
 - Modify: `src/types.ts`
 - Modify: `test/registry.test.ts`, `test/index.test.ts`, `test/controller.test.ts`
 
-- [ ] add an exported `classifyAbandonment(run, evidence)` returning
+- [x] add an exported `classifyAbandonment(run, evidence)` returning
       `live | abandoned | ambiguous`, with the three-part rule above; no I/O inside the
       predicate so it stays table-testable
-- [ ] add `/exec doctor` to `EXEC_ACTION`, `EXEC_COMMANDS`, and the help text: one
+- [x] add `/exec doctor` to `EXEC_ACTION`, `EXEC_COMMANDS`, and the help text: one
       read-only sweep over every run that prints, per run, what it claims, what the
       evidence shows, and the single next command
-- [ ] group the `doctor` output by classification so several stalled runs in different
+- [x] group the `doctor` output by classification so several stalled runs in different
       stages read as one list, not as one paragraph per run
-- [ ] add `/exec doctor --reconcile` which, for `abandoned` runs only, clears
+- [x] add `/exec doctor --reconcile` which, for `abandoned` runs only, clears
       `activeOperation`, sets `status` to `failed` with an explicit reason naming the
       evidence, and stamps the run so the reset is auditable
-- [ ] make `--reconcile` reuse `updateIfCurrent` compare-and-swap, so a run that a live
+- [x] make `--reconcile` reuse `updateIfCurrent` compare-and-swap, so a run that a live
       session reclaims between the scan and the write is skipped rather than overwritten
-- [ ] leave the recovery itself to the existing `/exec resume <id>`: after reconcile a run
+- [x] leave the recovery itself to the existing `/exec resume <id>`: after reconcile a run
       is an ordinary recoverable failure, so no second retry path is introduced
-- [ ] append a line to each reconciled run's progress file recording the reset and its
+- [x] append a line to each reconciled run's progress file recording the reset and its
       evidence, so the plan's own history shows why the attempt counter did not advance
-- [ ] do not consume a task attempt on reconcile — the worker never ran, so
+- [x] do not consume a task attempt on reconcile — the worker never ran, so
       `taskAttempts` must not change
-- [ ] on extension load, run the read-only sweep and, when any run is `abandoned`, print
+- [x] on extension load, run the read-only sweep and, when any run is `abandoned`, print
       one line naming the count and pointing at `/exec doctor`; never write during startup
-- [ ] make `RunRegistry.remove` handle a corrupt `run.json` that `get` cannot parse, and
+- [x] make `RunRegistry.remove` handle a corrupt `run.json` that `get` cannot parse, and
       make `doctor` list corrupt directories as removable; today `list` drops them and
       `remove` throws, so nothing can clean them up
-- [ ] write a table-driven test over
+- [x] write a table-driven test over
       `(status, lease live, asyncDir present, bridge answer)` asserting `abandoned` needs
       the full conjunction and that every partial case is `ambiguous`
-- [ ] write a test that `--reconcile` skips a run whose `updatedAt` changed during the
+- [x] write a test that `--reconcile` skips a run whose `updatedAt` changed during the
       sweep, and one that it never touches an `ambiguous` or `live` run
-- [ ] write a test that a reconciled run is then recoverable through the normal resume
+- [x] write a test that a reconciled run is then recoverable through the normal resume
       path, and that `taskAttempts` is unchanged
-- [ ] write a test that startup reconciliation performs no writes
-- [ ] run `npm run test:all` — must pass before task 9
+- [x] write a test that startup reconciliation performs no writes
+- [x] run `npm run test:all` — must pass before task 9
+- ➕ decision: `classifyAbandonment` takes lease liveness, async-directory presence, and
+  the bridge answer as caller-gathered evidence, so the rule is pure and the plan's four
+  table axes map one-to-one onto its inputs. `asyncDirPresent === false` is the test, never
+  `!asyncDirPresent`: undefined means "not observed", which is not evidence
+- ➕ decision: a run with no `activeOperation` is `ambiguous`, never `abandoned`. Nothing
+  can be proven gone when nothing was tracked, and `/exec adopt` plus resume already
+  recovers that shape
+- ➕ decision: reconcile clears `activeOperation` and does **not** move it to
+  `failedOperation`. `recoveryEvidence` feeds `isExternalManualBlocker`, whose word list
+  includes `provider`, `network`, and `external`, so a preserved operation error could
+  reclassify an implementation-stage run into the retry-confirmation path. The reason text
+  is worded to avoid those words too, and a test pins the resulting classification
+- ➕ decision: the dead lease is left in place as evidence; `isStaleOwner` is already
+  skipped once the status is `failed`
+- ➕ decision: no CAS retry loop on reconcile, unlike `claim` and `requestStatus`.
+  Skipped-not-overwritten is the requirement, so one attempt against the scanned
+  `updatedAt` is the whole point
+- ➕ deviation: `isInFlightStatus` went into `src/lifecycle.ts` next to `isTerminalStatus`
+  rather than into a file the task lists — it is a status classification, and lifecycle is
+  where those live
+- ➕ deviation: the bridge answer reaches `doctor` through a new read-only
+  `PlanExecController.operationState`, and the startup sweep uses the filesystem-only probe
+  — no RPC during `session_start`, and a provider outage can never read as evidence that a
+  worker is gone
+- ➕ decision: `/exec cleanup <id> --apply` also removes an unreadable record, so the
+  escape `doctor` prints actually lands. It is an early-exit branch keyed on
+  `listWithErrors`, leaving Task 3's sweep, preview, and rows untouched
+- ➕ decision: `remove` classifies only a `SyntaxError` or an
+  `Invalid plan-exec run registry entry` failure as corrupt; an I/O or permission error is
+  rethrown, because a blanket catch would turn EACCES into a recursive delete
 
 ### Task 9: ➕ Bring the exec-plan skill up to the new behavior
 
