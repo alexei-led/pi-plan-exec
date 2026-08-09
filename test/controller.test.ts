@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  parseWorkerSignal,
   PLAN_STRUCTURE_CHANGED_ERROR,
   PlanExecController,
 } from "../src/controller.js";
@@ -2263,6 +2264,163 @@ test("controller records unresolved capped review findings and completes honestl
   assert.equal(resolved.unresolvedFindings[0]?.severity, "MAJOR");
 });
 
+const WORKFLOW_STATUS_TEXT = `Run: worker-run-1
+State: running
+Activity: active 9m ago
+Mode: workflow
+Progress: implementation step 1
+Started: 2026-08-09T10:00:00.000Z
+Updated: 2026-08-09T10:00:00.023Z
+Dir: /tmp/async
+Workflow child main: worker running, active 9m ago
+Session: /tmp/session.jsonl`;
+
+const CHAIN_STATUS_TEXT = `Run: worker-run-1
+State: running
+Activity: active 12s ago
+Mode: chain
+Progress: step 2 of 3
+Updated: 2026-08-09T10:09:00.000Z
+Turn budget: 14/75+5 (within)
+Step 1: worker running, active 12s ago`;
+
+test("worker signal digest never carries a workflow-mode activity value", () => {
+  const cases: {
+    name: string;
+    text: unknown;
+    activity?: string;
+    mode?: string;
+    steps?: string[];
+  }[] = [
+    {
+      name: "workflow mode suppresses activity and its step lines",
+      text: WORKFLOW_STATUS_TEXT,
+      mode: "workflow",
+    },
+    {
+      name: "workflow mode with no activity line is still suppressed",
+      text: WORKFLOW_STATUS_TEXT.replace("Activity: active 9m ago\n", ""),
+      mode: "workflow",
+    },
+    {
+      name: "non-workflow mode keeps activity and steps",
+      text: CHAIN_STATUS_TEXT,
+      mode: "chain",
+      activity: "active 12s ago",
+      steps: ["worker running, active 12s ago"],
+    },
+    {
+      name: "no activity line and no mode line yields neither",
+      text: "Run: worker-run-1\nState: running\nProgress: warming up",
+    },
+    { name: "empty text yields no digest", text: "" },
+    { name: "non-string text yields no digest", text: { state: "running" } },
+  ];
+
+  for (const testCase of cases) {
+    const signal = parseWorkerSignal(testCase.text);
+    assert.equal(signal?.activity, testCase.activity, testCase.name);
+    assert.equal(signal?.mode, testCase.mode, testCase.name);
+    assert.deepEqual(signal?.steps, testCase.steps, testCase.name);
+    if (testCase.mode !== "workflow") continue;
+    assert.equal(
+      JSON.stringify(signal).includes("9m ago"),
+      false,
+      `${testCase.name}: the launch-anchored age must not survive anywhere`,
+    );
+  }
+});
+
+test("worker signal digest keeps the fields that are not activity", () => {
+  const signal = parseWorkerSignal(WORKFLOW_STATUS_TEXT);
+
+  assert.equal(signal?.progress, "implementation step 1");
+  assert.equal(signal?.updated, "2026-08-09T10:00:00.023Z");
+  assert.equal(
+    parseWorkerSignal(CHAIN_STATUS_TEXT)?.turnBudget,
+    "14/75+5 (within)",
+  );
+});
+
+test("observation persists the worker digest without the workflow activity", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
+  const planPath = join(root, "plan.md");
+  const plan = "### Task 1: Implement\n- [ ] Do the work\n";
+  await writeFile(planPath, plan);
+  const asyncDir = join(root, "async");
+  await mkdir(asyncDir);
+  const registry = new RunRegistry(join(root, "runs"));
+  const controller = new PlanExecController(
+    registry,
+    new StatusTextBridge(join(root, "none.json"), WORKFLOW_STATUS_TEXT),
+    new FakeFusion(),
+    fakeGit(root),
+  );
+  const run = await registry.create({
+    ...baseRun(root, planPath),
+    planHash: parsePlan(planPath, plan).hash,
+    stage: "implementation",
+    activeOperation: {
+      operationId: "operation-1",
+      service: "bridge",
+      kind: "implementation",
+      externalRunId: "worker-run-1",
+      asyncDir,
+      taskId: 1,
+      launchStartedAt: Date.now(),
+    },
+  });
+
+  await controller.advance(await registry.claim(run, "session-1"));
+  const stored = await registry.get(run.id);
+
+  assert.equal(stored?.activeOperation?.workerSignal?.mode, "workflow");
+  assert.equal(stored?.activeOperation?.workerSignal?.activity, undefined);
+  assert.equal(
+    stored?.activeOperation?.workerSignal?.asyncDirMissing,
+    undefined,
+  );
+  assert.equal(
+    stored?.activeOperation?.workerSignal?.progress,
+    "implementation step 1",
+  );
+});
+
+test("observation reports a missing async directory as decisive", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
+  const planPath = join(root, "plan.md");
+  const plan = "### Task 1: Implement\n- [ ] Do the work\n";
+  await writeFile(planPath, plan);
+  const registry = new RunRegistry(join(root, "runs"));
+  const controller = new PlanExecController(
+    registry,
+    new StatusTextBridge(join(root, "none.json"), WORKFLOW_STATUS_TEXT),
+    new FakeFusion(),
+    fakeGit(root),
+  );
+  const run = await registry.create({
+    ...baseRun(root, planPath),
+    planHash: parsePlan(planPath, plan).hash,
+    stage: "implementation",
+    activeOperation: {
+      operationId: "operation-1",
+      service: "bridge",
+      kind: "implementation",
+      externalRunId: "worker-run-1",
+      // Never created: the temp root is wiped while the bridge still answers.
+      asyncDir: join(root, "gone"),
+      taskId: 1,
+      launchStartedAt: Date.now(),
+    },
+  });
+
+  await controller.advance(await registry.claim(run, "session-1"));
+  const stored = await registry.get(run.id);
+
+  assert.equal(stored?.activeOperation?.workerSignal?.asyncDirMissing, true);
+  assert.equal(stored?.status, "running");
+});
+
 function baseRun(
   root: string,
   planPath: string,
@@ -2460,6 +2618,22 @@ class RunningBridge extends FakeBridge {
     | { success: false; error: { message: string } }
   > {
     return success({ state: "running" });
+  }
+}
+
+class StatusTextBridge extends FakeBridge {
+  constructor(
+    resultPath: string,
+    private readonly statusText: string,
+  ) {
+    super(resultPath);
+  }
+
+  override async status(): Promise<
+    | { success: true; data: Record<string, unknown> }
+    | { success: false; error: { message: string } }
+  > {
+    return success({ state: "running", text: this.statusText });
   }
 }
 

@@ -292,28 +292,33 @@ say so in a code comment. Classify only; never auto-fail, never auto-kill.
 - Modify: `test/controller.test.ts`
 - Modify: `test/index.test.ts`
 
-- [ ] add an optional `workerSignal` field to `ActiveOperation` in `src/types.ts:190`
+- [x] add an optional `workerSignal` field to `ActiveOperation` in `src/types.ts:190`
       holding a compact digest of the parsed observation
-- [ ] parse the `text` returned by `bridge.status()` in the observe path
+- [x] parse the `text` returned by `bridge.status()` in the observe path
       (`src/controller.ts:970`), extracting `Mode`, `Activity`, `Progress`, `Turn budget`,
       `Updated`, and `Step N:` lines; every field is optional, so no parse failure may
       throw or fail the run
-- [ ] **suppress `Activity` when the `Mode:` line says `workflow`** — upstream anchors it
+- [x] **suppress `Activity` when the `Mode:` line says `workflow`** — upstream anchors it
       to launch time, so it grows without bound on a healthy worker and would reintroduce
       the false signal this plan removes (see Context). Trust it only for non-workflow modes
-- [ ] persist the digest on `activeOperation` alongside `lastObservedAt`
-- [ ] `stat` `operation.asyncDir` during observation; a missing directory is decisive
+- [x] persist the digest on `activeOperation` alongside `lastObservedAt`
+- [x] `stat` `operation.asyncDir` during observation; a missing directory is decisive
       evidence the operation is gone and must be reported as such rather than as running
-- [ ] render the signal in `formatRunStatus`; when no trustworthy activity line is
+- [x] render the signal in `formatRunStatus`; when no trustworthy activity line is
       available, print the absence explicitly, e.g.
       `worker: bridge reports running, 9m since launch / no per-turn activity signal (workflow-mode run)`
-- [ ] write a table-driven test over status-text fixtures covering: no `Activity:` line;
+- [x] write a table-driven test over status-text fixtures covering: no `Activity:` line;
       an `Activity:` line with `Mode: workflow` (must be suppressed, never rendered); an
       `Activity:` line with a non-workflow mode (must be rendered). Assert the render never
       implies health when no trustworthy signal exists
-- [ ] write a test that a missing `asyncDir` is reported as gone, not running
-- [ ] run `npm run test:all` — must pass before task 7
+- [x] write a test that a missing `asyncDir` is reported as gone, not running
+- [x] run `npm run test:all` — must pass before task 7
 
+- ➕ decision: the pre-existing assertion on `recovery: healthy active operation`
+  in `test/index.test.ts` encoded the bug — that string rendered for an operation with
+  no signal at all. It now asserts the honest classification plus `doesNotMatch(/healthy/)`,
+  and a second case with a trustworthy non-workflow activity value keeps the `healthy`
+  branch covered, so the text is proven to discriminate rather than merely to be cautious
 ### Task 7: Long-running operation classification
 
 **Files:**

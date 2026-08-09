@@ -39,11 +39,13 @@ import {
   OPERATION_SERVICE,
   RUN_STAGE,
   RUN_STATUS,
+  WORKFLOW_MODE,
   type ActiveOperation,
   type FrozenRunConfig,
   type PlanExecRun,
   type ReviewFinding,
   type RunStage,
+  type WorkerSignal,
 } from "./types.js";
 
 export const MAX_STATUS_FAILURES = 3;
@@ -824,7 +826,11 @@ export class PlanExecController {
         operation,
         status.error.message,
       );
-    const observed = await this.recordObservation(run, operation);
+    const observed = await this.recordObservation(
+      run,
+      operation,
+      status.data.text,
+    );
     if (!sameOperationState(run, observed, operation)) return observed;
     const state =
       operation.service === OPERATION_SERVICE.BRIDGE
@@ -871,7 +877,11 @@ export class PlanExecController {
         operation,
         status.error.message,
       );
-    const observed = await this.recordObservation(run, operation);
+    const observed = await this.recordObservation(
+      run,
+      operation,
+      status.data.text,
+    );
     if (!sameOperationState(run, observed, operation)) return observed;
     const state = text(status.data.state);
     if (
@@ -961,10 +971,17 @@ export class PlanExecController {
   private async recordObservation(
     run: PlanExecRun,
     operation: ActiveOperation,
+    statusText?: unknown,
   ): Promise<PlanExecRun> {
-    const observedOperation = { ...operation, lastObservedAt: Date.now() };
+    const observedOperation: ActiveOperation = {
+      ...operation,
+      lastObservedAt: Date.now(),
+    };
     delete observedOperation.statusFailures;
     delete observedOperation.lastStatusError;
+    const signal = await workerSignal(operation, statusText);
+    if (signal) observedOperation.workerSignal = signal;
+    else delete observedOperation.workerSignal;
     return this.registry.heartbeat({
       ...run,
       activeOperation: observedOperation,
@@ -1720,7 +1737,11 @@ export class PlanExecController {
         operation,
         terminal.error.message,
       );
-    const observed = await this.recordObservation(run, operation);
+    const observed = await this.recordObservation(
+      run,
+      operation,
+      terminal.data.text,
+    );
     const bridgeState =
       operation.service === OPERATION_SERVICE.BRIDGE
         ? text(terminal.data.state)
@@ -2215,4 +2236,67 @@ async function pathExists(path: string): Promise<boolean> {
 
 function text(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+/** `Step 1:`, `Step 1/3 Agent 2/2:`, `Agent 1/2:`, `Workflow child build:`. */
+const WORKER_SIGNAL_STEP_LINE =
+  /^(?:Step\b|Agent \d|Workflow child\b)[^:]*:\s*(?<detail>.+)$/;
+const MAX_WORKER_SIGNAL_STEPS = 5;
+
+/**
+ * Digest the provider status blob. Every line is optional and the format is
+ * upstream's, so nothing here may throw: a status text that cannot be read
+ * yields no signal rather than a failed run.
+ */
+/**
+ * Digest plus the one corroborating check available at observation time. A
+ * missing async directory is decisive: an operation cannot still be running
+ * out of a directory that no longer exists.
+ */
+async function workerSignal(
+  operation: ActiveOperation,
+  statusText: unknown,
+): Promise<WorkerSignal | undefined> {
+  const parsed = parseWorkerSignal(statusText);
+  if (!operation.asyncDir || (await pathExists(operation.asyncDir)))
+    return parsed;
+  return { ...parsed, asyncDirMissing: true };
+}
+
+export function parseWorkerSignal(value: unknown): WorkerSignal | undefined {
+  const blob = text(value);
+  if (!blob) return undefined;
+  const lines = blob.split("\n").map((line) => line.trim());
+  const field = (label: string): string | undefined => {
+    const prefix = `${label}: `;
+    return text(
+      lines.find((line) => line.startsWith(prefix))?.slice(prefix.length),
+    );
+  };
+  // Read every field before deciding: upstream renders `Mode:` after
+  // `Activity:`, so a single forward pass would judge activity too early.
+  const mode = field("Mode");
+  const workflow = mode === WORKFLOW_MODE;
+  // Workflow-mode step lines carry the same launch-anchored activity fragment
+  // as the top-level `Activity:` line, so they are dropped whole rather than
+  // edited — surfacing either would restore the false signal.
+  const steps = workflow
+    ? []
+    : lines
+        .map((line) => WORKER_SIGNAL_STEP_LINE.exec(line)?.groups?.detail)
+        .filter((detail): detail is string => Boolean(detail))
+        .slice(0, MAX_WORKER_SIGNAL_STEPS);
+  const activity = workflow ? undefined : field("Activity");
+  const progress = field("Progress");
+  const turnBudget = field("Turn budget");
+  const updated = field("Updated");
+  const signal: WorkerSignal = {
+    ...(mode ? { mode } : {}),
+    ...(activity ? { activity } : {}),
+    ...(progress ? { progress } : {}),
+    ...(turnBudget ? { turnBudget } : {}),
+    ...(updated ? { updated } : {}),
+    ...(steps.length > 0 ? { steps } : {}),
+  };
+  return Object.keys(signal).length > 0 ? signal : undefined;
 }

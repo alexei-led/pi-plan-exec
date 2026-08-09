@@ -339,9 +339,33 @@ test("run status classifies recovery and gives one safe next action", () => {
       },
     }),
   );
-  assert.match(active, /recovery: healthy active operation/);
+  // No reported signal is not health. This assertion is the regression guard
+  // for the original bug: the old text said "healthy active operation" here,
+  // which read identically for a live worker and a dead one.
+  assert.match(
+    active,
+    /recovery: active operation, worker liveness unverified/,
+  );
   assert.match(active, /next safe action: wait/);
   assert.match(active, /do not resume/);
+  assert.doesNotMatch(active, /healthy/);
+
+  // A trustworthy activity value still earns "healthy". Without this pair the
+  // status text would be honest but undiscriminating, which is its own failure.
+  const signalled = formatRunStatus(
+    run({
+      status: "running",
+      activeOperation: {
+        operationId: "active-operation",
+        service: "bridge",
+        kind: "implementation",
+        taskId: 1,
+        externalRunId: "worker-run-1",
+        workerSignal: { mode: "chain", activity: "active 12s ago" },
+      },
+    }),
+  );
+  assert.match(signalled, /recovery: healthy active operation/);
 
   const failedRun = run({
     status: "failed",

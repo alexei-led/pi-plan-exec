@@ -31,6 +31,8 @@ import {
   COMPLETED_PLANS_DIRECTORY,
   EXEC_ACTION,
   RUN_STATUS,
+  WORKFLOW_MODE,
+  type ActiveOperation,
   type PlanExecRun,
   type RunAction,
 } from "./types.js";
@@ -42,6 +44,7 @@ const CONTROLLER_POLL_INTERVAL_MS = 1_000;
 const COMMAND_CAS_RETRIES = 5;
 const MILLISECONDS_PER_SECOND = 1_000;
 const SECONDS_PER_MINUTE = 60;
+const MINUTES_PER_HOUR = 60;
 const DISPLAY_RUN_ID_LENGTH = 8;
 const RECOVERY_MODEL_OPTION = "--model";
 const CLEANUP_APPLY_OPTION = "--apply";
@@ -454,12 +457,27 @@ export function recoveryGuidance(run: PlanExecRun): RecoveryGuidance {
         action:
           "Repair the provider and wait for observation to recover; do not resume while the operation identity is preserved.",
       };
-    if (run.activeOperation)
+    // A stored `running` claim is not evidence. Only a trustworthy activity
+    // signal earns the word "healthy"; anything else says so in words, because
+    // absence of signal read as health is the bug this branch exists to fix.
+    if (run.activeOperation) {
+      const signal = run.activeOperation.workerSignal;
+      if (signal?.asyncDirMissing)
+        return {
+          classification: "active operation directory is gone",
+          action: `The operation's async directory no longer exists, so the worker is not running. Use /exec status ${run.id} to re-check; if it stays absent, /exec cancel ${run.id} stops the run and preserves the worktree. Do not start a second run.`,
+        };
+      if (!signal?.activity)
+        return {
+          classification: "active operation, worker liveness unverified",
+          action: `wait and use /exec status ${run.id} to re-check; no per-turn activity signal is available${signal?.mode === WORKFLOW_MODE ? " for a workflow-mode run" : ""}, so this worker is neither confirmed alive nor confirmed dead. do not resume or start another run.`,
+        };
       return {
         classification: "healthy active operation",
         action:
           "wait; the controller is polling this operation. do not resume or start another run.",
       };
+    }
     return {
       classification: "controller advancing",
       action: "Wait for the next controller tick, then use /exec status.",
@@ -556,6 +574,7 @@ export function formatRunStatus(run: PlanExecRun): string {
     lines.push(
       `last observation: ${new Date(operation.lastObservedAt).toISOString()}`,
     );
+  lines.push(...workerSignalLines(operation));
   if (operation?.statusFailures) {
     lines.push(
       `observation: unavailable (${operation.statusFailures}/${MAX_STATUS_FAILURES}); retrying${operation.lastStatusError ? ` — ${operation.lastStatusError}` : ""}`,
@@ -597,6 +616,34 @@ export function formatRunStatus(run: PlanExecRun): string {
     );
   lines.push(`next safe action: ${guidance.action}`);
   return lines.join("\n");
+}
+
+/**
+ * Report what the provider actually said about the worker. Nothing here may
+ * read as health on its own: with no trustworthy activity value the line
+ * states the absence instead of staying silent.
+ */
+function workerSignalLines(operation: ActiveOperation | undefined): string[] {
+  if (!operation) return [];
+  const signal = operation.workerSignal;
+  const since = operation.launchStartedAt
+    ? `, ${elapsedLabel(Date.now() - operation.launchStartedAt)} since launch`
+    : "";
+  const lines = [
+    signal?.asyncDirMissing
+      ? `worker: operation directory is gone; the operation is not running${since}`
+      : signal?.activity
+        ? `worker: ${signal.activity}${since}`
+        : `worker: no per-turn activity signal${
+            signal?.mode === WORKFLOW_MODE ? " (workflow-mode run)" : ""
+          }; liveness unverified${since}`,
+  ];
+  if (signal?.progress) lines.push(`worker progress: ${signal.progress}`);
+  if (signal?.turnBudget)
+    lines.push(`worker turn budget: ${signal.turnBudget}`);
+  if (signal?.updated) lines.push(`worker status updated: ${signal.updated}`);
+  for (const step of signal?.steps ?? []) lines.push(`worker step: ${step}`);
+  return lines;
 }
 
 /**
@@ -1427,15 +1474,19 @@ function shortRunId(id: string): string {
   return id.slice(0, DISPLAY_RUN_ID_LENGTH);
 }
 
-function relativeTime(timestamp: number): string {
+function elapsedLabel(milliseconds: number): string {
   const seconds = Math.max(
     0,
-    Math.floor((Date.now() - timestamp) / MILLISECONDS_PER_SECOND),
+    Math.floor(milliseconds / MILLISECONDS_PER_SECOND),
   );
-  if (seconds < SECONDS_PER_MINUTE) return `${seconds}s ago`;
+  if (seconds < SECONDS_PER_MINUTE) return `${seconds}s`;
   const minutes = Math.floor(seconds / SECONDS_PER_MINUTE);
-  if (minutes < SECONDS_PER_MINUTE) return `${minutes}m ago`;
-  return `${Math.floor(minutes / SECONDS_PER_MINUTE)}h ago`;
+  if (minutes < MINUTES_PER_HOUR) return `${minutes}m`;
+  return `${Math.floor(minutes / MINUTES_PER_HOUR)}h`;
+}
+
+function relativeTime(timestamp: number): string {
+  return `${elapsedLabel(Date.now() - timestamp)} ago`;
 }
 
 function isPathWithin(root: string, path: string): boolean {

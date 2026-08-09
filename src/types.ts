@@ -181,6 +181,30 @@ export interface BranchRebinding {
   requestedBy: string;
 }
 
+/** `status.mode` value the bridge spawns; its activity fields are untrustworthy. */
+export const WORKFLOW_MODE = "workflow";
+
+/**
+ * Compact digest of the provider status text. Every field is optional: the
+ * provider renders each line conditionally, so a missing field means "not
+ * reported", never "healthy".
+ */
+export interface WorkerSignal {
+  mode?: string;
+  /**
+   * Only ever set for non-workflow modes. Upstream anchors the workflow-mode
+   * value to launch time (nicobailon/pi-subagents#920), so it grows without
+   * bound while the worker is healthy and must never be surfaced.
+   */
+  activity?: string;
+  progress?: string;
+  turnBudget?: string;
+  updated?: string;
+  steps?: string[];
+  /** Only the `true` case is decisive: the operation directory is gone. */
+  asyncDirMissing?: boolean;
+}
+
 export interface ActiveOperation {
   operationId: string;
   service: OperationService;
@@ -201,6 +225,8 @@ export interface ActiveOperation {
   terminalError?: string;
   skipFailures?: number;
   lastSkipError?: string;
+  /** Last digest parsed from the provider status text; absent when unreported. */
+  workerSignal?: WorkerSignal;
 }
 
 export interface PlanExecRun {
