@@ -767,13 +767,43 @@ the controller before acting.
 
 **Files:** `src/index.ts`, `skills/exec-plan/SKILL.md`, `test/index.test.ts`
 
-- [ ] reduce `/exec help` to `/exec [plan]`, `status`, `resume`, `stop`, `cleanup`, `help`
-- [ ] leave `--apply` and `--model` as the only flags in help; move the rest to the skill
-- [ ] document every hidden alias and every non-interactive flag once in
+- [x] reduce `/exec help` to `/exec [plan]`, `status`, `resume`, `stop`, `cleanup`, `help`
+- [x] leave `--apply` and `--model` as the only flags in help; move the rest to the skill
+- [x] document every hidden alias and every non-interactive flag once in
       `skills/exec-plan/SKILL.md`, marked as the scripted path for agents
-- [ ] update `EXEC_COMMANDS` autocomplete to the primary verbs only
-- [ ] write a test that `/exec help` names exactly the primary verbs and no alias
-- [ ] run `npm run test:all` — must pass before task 15
+- [x] update `EXEC_COMMANDS` autocomplete to the primary verbs only
+- [x] write a test that `/exec help` names exactly the primary verbs and no alias
+- [x] run `npm run test:all` — must pass before task 15
+- ➕ decision: `skip` stays in help. The checkbox lists five verbs, but `skip` is not an
+  alias, so Task 9's drift test requires the skill to document it and a reader who is
+  offered `/exec skip <id>` by a blocked status row must find it in help. The primary set
+  is derived — `EXEC_ACTION` minus `EXEC_ALIAS_ACTIONS` — so it is six lines plus
+  `/exec [plan-path]`, and its help line calls it a waiver of last resort
+- ➕ decision: `--reason` stays in help as part of the `skip` line. It is a required
+  argument of that verb, not an optional flag; dropping it would print a command that
+  cannot run. The test therefore asserts positively on `--apply`, `--model`, and
+  `--reason`, and negatively on exactly the five retired flags
+- ➕ decision: the verb test scrapes `^/exec <token>` line-anchored over the command list
+  and asserts set equality with the derived primary set, so a verb added later must appear
+  in help and an alias never can. The whole-text `doesNotMatch` loop stays for the alias
+  direction; a whole-text scrape would read `(bare /exec opens the plan picker)` as a
+  subcommand
+- ➕ decision: a second test asserts that every retired flag and every `EXEC_ALIAS_ACTIONS`
+  member absent from help is present in `SKILL.md`. Help was the only place naming them, so
+  without it "moved to the skill" and "deleted" look identical to the suite
+- ➕ deviation: `EXEC_COMMANDS` is autocomplete-only — dispatch keys on `EXEC_ACTION`,
+  `RUN_ACTIONS`, and `execRead` — so pruning it cannot break a retired name. Verified
+  before pruning, since a completion list that gated dispatch would have turned
+  `/exec runs` into a plan path named `runs`
+- ➕ deviation: rewrote `SKILL.md`'s "Choose the job" around the primary verbs and added a
+  "Scripted path for agents" section, beyond the checkbox's "document every alias once".
+  The list still named `/exec doctor` as the first step after a Pi restart, which Task 10
+  folded into `/exec status` — leaving it would have sent an agent at the retired name as
+  the documented path. Prose elsewhere that named a retired verb or a flag now names the
+  primary verb or points at the new section, so each appears exactly once
+- ➕ decision: `references/recovery.md` is untouched. Task 13 aligned its branches, the
+  drift test permits an alias there, and its `/exec doctor --reconcile` branches are
+  scripted answers the new section documents rather than contradicts
 
 ### Task 15: Verify acceptance criteria
 

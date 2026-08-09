@@ -212,7 +212,6 @@ test("exec command completions explain the command family", () => {
   );
   assert.match(items?.[0]?.description ?? "", /every run and what it needs/);
   const allItems = getExecArgumentCompletions("") ?? [];
-  assert.match(allItems.map((item) => item.value).join(" "), /setup/);
   assert.match(
     allItems.find((item) => item.value === "resume")?.description ?? "",
     /Continue the current run safely/,
@@ -237,7 +236,6 @@ test("help and setup explain the installed command surface", () => {
   assert.match(execHelp(), /\/exec cleanup \[full-run-id\]/);
   assert.match(execHelp(), /registry entries only/);
   assert.match(execHelp(), /\/skill:exec-plan/);
-  assert.match(execHelp(), /\/exec status \[run-id\] \[--all\]/);
   for (const alias of EXEC_ALIAS_ACTIONS)
     assert.doesNotMatch(execHelp(), new RegExp(`/exec ${alias}`), alias);
   assert.match(
@@ -2097,4 +2095,53 @@ test("status hands a blocked stage its skip command with the run ID filled in", 
   assert.doesNotMatch(report, new RegExp(`/exec skip ${implementing.id}`));
   assert.equal(isStageWaiverAvailable(blocked), true);
   assert.equal(isStageWaiverAvailable(implementing), false);
+});
+
+test("help lists every primary verb and no retired alias", () => {
+  const help = execHelp();
+  const aliases = new Set<string>(EXEC_ALIAS_ACTIONS);
+  const primary = Object.values(EXEC_ACTION).filter(
+    (action) => !aliases.has(action),
+  );
+  // Only the command list is line-anchored; the hints under it are prose.
+  const listed = [...help.matchAll(/^\/exec[ \t]+(?<verb>[a-z][a-z-]*)/gm)].map(
+    (match) => match.groups?.verb,
+  );
+
+  assert.deepEqual(listed.sort(), [...primary].sort());
+  assert.match(help, /^\/exec \[plan-path\]/m);
+  for (const alias of aliases)
+    assert.doesNotMatch(help, new RegExp(`/exec ${alias}`), alias);
+  // Autocomplete teaches the same surface the help lists.
+  assert.deepEqual(
+    (getExecArgumentCompletions("") ?? []).map((item) => item.value).sort(),
+    [...primary].sort(),
+  );
+});
+
+test("what help drops, the skill keeps for scripted callers", async () => {
+  const help = execHelp();
+  const skill = await readFile(
+    fileURLToPath(new URL("../skills/exec-plan/SKILL.md", import.meta.url)),
+    "utf8",
+  );
+  // Retired names and prompt-answering flags leave help, never the docs.
+  const scripted = [
+    "--all",
+    "--include-failed",
+    "--reconcile",
+    "--retry-task",
+    "--adopt-current-branch",
+  ];
+
+  assert.match(help, /--apply/);
+  assert.match(help, /--model current\|provider\/model/);
+  // --reason is a required argument of skip, not an optional flag.
+  assert.match(help, /--reason <text>/);
+  for (const flag of scripted) {
+    assert.doesNotMatch(help, new RegExp(flag), `help names ${flag}`);
+    assert.match(skill, new RegExp(flag), `skill drops ${flag}`);
+  }
+  for (const alias of EXEC_ALIAS_ACTIONS)
+    assert.match(skill, new RegExp(`/exec ${alias}`), `skill drops ${alias}`);
 });

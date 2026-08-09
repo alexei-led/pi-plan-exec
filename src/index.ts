@@ -140,6 +140,10 @@ const SETUP_COMMANDS = [
   "pi install npm:@alexeiled/pi-plan-exec",
 ];
 
+/**
+ * Autocomplete offers the primary verbs only. A retired name still dispatches,
+ * so a scripted caller keeps working; completing it would teach it back.
+ */
 const EXEC_COMMANDS: AutocompleteItem[] = [
   {
     value: EXEC_ACTION.HELP,
@@ -147,24 +151,9 @@ const EXEC_COMMANDS: AutocompleteItem[] = [
     description: "Show /exec commands and recovery hints",
   },
   {
-    value: EXEC_ACTION.SETUP,
-    label: EXEC_ACTION.SETUP,
-    description: "Show required Pi packages and install commands",
-  },
-  {
-    value: EXEC_ACTION.RUNS,
-    label: EXEC_ACTION.RUNS,
-    description: "List recent plan execution runs",
-  },
-  {
     value: EXEC_ACTION.CLEANUP,
     label: EXEC_ACTION.CLEANUP,
     description: "Preview or remove retired run records",
-  },
-  {
-    value: EXEC_ACTION.DOCTOR,
-    label: EXEC_ACTION.DOCTOR,
-    description: "Diagnose runs that claim work with no live worker",
   },
   {
     value: EXEC_ACTION.STATUS,
@@ -177,30 +166,15 @@ const EXEC_COMMANDS: AutocompleteItem[] = [
     description: "Stop a run: pause it (resumable) or cancel it (final)",
   },
   {
-    value: EXEC_ACTION.PAUSE,
-    label: EXEC_ACTION.PAUSE,
-    description: "Pause advancing after the active child",
-  },
-  {
     value: EXEC_ACTION.RESUME,
     label: EXEC_ACTION.RESUME,
     description:
       "Continue the current run safely and reconcile its tracked worker",
   },
   {
-    value: EXEC_ACTION.ADOPT,
-    label: EXEC_ACTION.ADOPT,
-    description: "Adopt a stale run from another session",
-  },
-  {
     value: EXEC_ACTION.SKIP,
     label: EXEC_ACTION.SKIP,
     description: "Force-skip a blocked non-implementation stage with a reason",
-  },
-  {
-    value: EXEC_ACTION.CANCEL,
-    label: EXEC_ACTION.CANCEL,
-    description: "Cancel safely and preserve the worktree",
   },
 ];
 
@@ -2239,15 +2213,15 @@ export function execHelp(): string {
   return [
     "Plan execution commands:",
     "/exec [plan-path]       Start a plan (bare /exec opens the plan picker).",
-    `/exec status [run-id] [${RUNS_ALL_OPTION}]`,
-    `                        No run ID: every run grouped by what it needs, with any missing package and one next command per run. ${RUNS_ALL_OPTION} also shows terminal runs older than a day.`,
-    `/exec cleanup [full-run-id] [${CLEANUP_APPLY_OPTION}] [${CLEANUP_INCLUDE_FAILED_OPTION}]`,
-    `                        Preview retired runs older than ${CLEANUP_RETENTION_DAYS} days; ${CLEANUP_APPLY_OPTION} deletes their registry entries only. Failed runs need ${CLEANUP_INCLUDE_FAILED_OPTION}.`,
-    "/exec stop [run-id]     Stop a run: it asks whether to pause it (resumable) or cancel it (final, worktree preserved).",
+    "/exec status [run-id]   No run ID: every run grouped by what it needs, with any missing package and one next command per run. With a run ID: that run in detail.",
     `/exec resume [run-id] [${RECOVERY_MODEL_OPTION} current|provider/model]`,
     "                        Continue a stuck run: it takes the lease over from a dead session, resets a run whose worker is provably gone, and asks before retrying a blocked task or rebinding the current branch. Model/provider failures use the current Pi model.",
+    "/exec stop [run-id]     Stop a run: it asks whether to pause it (resumable) or cancel it (final, worktree preserved).",
+    `/exec cleanup [full-run-id] [${CLEANUP_APPLY_OPTION}]`,
+    `                        Preview retired runs older than ${CLEANUP_RETENTION_DAYS} days; ${CLEANUP_APPLY_OPTION} deletes their registry entries only.`,
     "/exec skip <full-run-id> --reason <text>",
-    "                        Stop any tracked child, force-skip a blocked review/finalize/stats stage, and record the waiver.",
+    "                        Waiver of last resort: stop any tracked child, force-skip a review/finalize/stats stage that cannot pass, and record why.",
+    "/exec help              Show this list.",
     "",
     "Hints:",
     "- Prefer Worktree (isolated) when asked.",
@@ -2259,7 +2233,7 @@ export function execHelp(): string {
     "- /exec status spells out the /exec skip command, run ID filled in, for a stage that is blocked; skip keeps its reason and its confirm.",
     "- /exec skip never skips implementation or archive; skipped runs finish as completed_with_findings.",
     "- Worktree runs fork this Pi session into the worktree so the footer and tools use the execution directory.",
-    "- Use /skill:exec-plan for the executable-plan format and recovery rules.",
+    "- Use /skill:exec-plan for the executable-plan format, the recovery rules, and the retired names and flags a scripted agent uses instead of a prompt.",
   ].join("\n");
 }
 
