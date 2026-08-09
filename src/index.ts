@@ -57,7 +57,7 @@ import {
   type RunAction,
 } from "./types.js";
 
-const registry = new RunRegistry();
+const defaultRegistry = new RunRegistry();
 const STATUS_KEY = "plan-exec";
 const PROVIDER_PROBE_TIMEOUT_MS = 1_500;
 const CONTROLLER_POLL_INTERVAL_MS = 1_000;
@@ -73,11 +73,6 @@ const CLEANUP_INCLUDE_FAILED_OPTION = "--include-failed";
 const CLEANUP_RETENTION_DAYS = 7;
 const MILLISECONDS_PER_DAY = 86_400_000;
 const CLEANUP_RETENTION_MS = CLEANUP_RETENTION_DAYS * MILLISECONDS_PER_DAY;
-const CLEANUP_STATUSES = new Set<PlanExecRun["status"]>([
-  RUN_STATUS.COMPLETED,
-  RUN_STATUS.COMPLETED_WITH_FINDINGS,
-  RUN_STATUS.CANCELLED,
-]);
 const RUNS_ALL_OPTION = "--all";
 /** Keyed by `ExecAliasAction`, so retiring another name forces a note with it. */
 const ALIAS_NOTES: Record<ExecAliasAction, string> = {
@@ -121,8 +116,17 @@ const STOP_OUTCOMES = [
 const STOP_REQUIRES_UI =
   "/exec stop asks whether to pause or cancel and needs an interactive session. Use /exec pause <run-id> to stop after the active operation and keep the run resumable, or /exec cancel <run-id> to stop it for good with its worktree preserved.";
 const RUN_LIST_TERMINAL_WINDOW_MS = MILLISECONDS_PER_DAY;
+/** Why a reconcile left a run alone. Each reason gets its own report line. */
+const RECONCILE_SKIP = {
+  RECLAIMED: "reclaimed",
+  STOP_REQUESTED: "stop-requested",
+} as const;
+type ReconcileSkip = (typeof RECONCILE_SKIP)[keyof typeof RECONCILE_SKIP];
+type ReconcileOutcome =
+  | { run: PlanExecRun; skipped?: undefined }
+  | { run?: undefined; skipped: ReconcileSkip };
 /** Deleted, not retired: bare /exec is the same code path, picker included. */
-const RETIRED_START_ACTION = "start";
+const REMOVED_START_ACTION = "start";
 const DOCTOR_RECONCILE_OPTION = "--reconcile";
 const REQUIRED_RUNTIME_TOOLS: Record<string, string> = {
   subagent: "pi-subagents",
@@ -192,7 +196,7 @@ type SyncProjection = (
 ) => Promise<PlanExecRun>;
 
 export default function planExecExtension(pi: ExtensionAPI): void {
-  const projector = new TaskProjector(registry);
+  const projector = new TaskProjector(defaultRegistry);
   const projectionQueues = new Map<string, Promise<PlanExecRun>>();
   const syncProjection: SyncProjection = (run, options) => {
     const previous = projectionQueues.get(run.id) ?? Promise.resolve(run);
@@ -209,7 +213,7 @@ export default function planExecExtension(pi: ExtensionAPI): void {
   const bridge = new BridgeClient(pi.events);
   const fusion = new FusionClient(pi.events);
   const controller = new PlanExecController(
-    registry,
+    defaultRegistry,
     bridge,
     fusion,
     async (command, args, cwd) => {
@@ -406,7 +410,7 @@ export default function planExecExtension(pi: ExtensionAPI): void {
 
   pi.on("session_start", async (_event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId();
-    const { runs, errors } = await registry.listWithErrors();
+    const { runs, errors } = await defaultRegistry.listWithErrors();
     if (errors.length > 0)
       notify(
         ctx,
@@ -425,7 +429,9 @@ export default function planExecExtension(pi: ExtensionAPI): void {
     // Advisory only: startup never writes, and a failed diagnosis must not take
     // the session down with it.
     try {
-      const notice = abandonedRunsNotice(await sweepAbandonment(registry));
+      const notice = abandonedRunsNotice(
+        await sweepAbandonment(defaultRegistry),
+      );
       if (notice) notify(ctx, notice, "warning");
     } catch {
       // The registry stays authoritative.
@@ -486,6 +492,23 @@ type RecoveryGuidance = {
   command: string;
 };
 
+/** Every command a verdict can name for one run, so no branch spells one out. */
+type RunCommands = {
+  status: string;
+  resume: string;
+  stop: string;
+  cleanup: string;
+};
+
+function runCommands(run: PlanExecRun): RunCommands {
+  return {
+    status: `/exec status ${run.id}`,
+    resume: `/exec resume ${run.id}`,
+    stop: `/exec stop ${run.id}`,
+    cleanup: `/exec cleanup ${run.id}`,
+  };
+}
+
 /**
  * The one next action for a run. Branch order matters throughout: each branch
  * assumes the ones above it did not fire. Without evidence nothing is proven
@@ -499,15 +522,14 @@ export function recoveryGuidance(
   run: PlanExecRun,
   evidence?: AbandonmentEvidence,
 ): RecoveryGuidance {
-  const status = `/exec status ${run.id}`;
-  const resume = `/exec resume ${run.id}`;
-  const stop = `/exec stop ${run.id}`;
+  const commands = runCommands(run);
+  const { status, resume, stop } = commands;
   const polled = evidence?.leaseLive === true;
   if (isTerminal(run.status) && run.status !== RUN_STATUS.FAILED)
     return {
       classification: "finished",
       action: `This run is over and there is nothing to recover. Run /exec cleanup once you no longer need its record.`,
-      command: `/exec cleanup ${run.id}`,
+      command: commands.cleanup,
     };
   // Only when nothing is tracked. With an unresolved operation this would
   // recommend a takeover the recovery gate then refuses; the operation branches
@@ -535,7 +557,7 @@ export function recoveryGuidance(
   // Ahead of every branch that tells the reader to wait: each such wait needs
   // something still running, so a proven-gone worker falsifies them all.
   if (evidence && classifyAbandonment(run, evidence) === ABANDONMENT.ABANDONED)
-    return abandonedGuidance(run, evidence);
+    return abandonedGuidance(run, commands, evidence);
   if (run.status === RUN_STATUS.CANCEL_PENDING)
     return polled
       ? {
@@ -593,7 +615,7 @@ export function recoveryGuidance(
     !run.activeOperation.externalRunId
   )
     return waitOrStop(
-      run,
+      commands,
       polled,
       "cannot check on the worker right now",
       `A worker was launched and the tool never learned its name, so nothing here can tell whether it is still writing to the worktree.`,
@@ -601,7 +623,7 @@ export function recoveryGuidance(
   if (run.status === RUN_STATUS.RUNNING || run.status === RUN_STATUS.STARTING) {
     if (run.activeOperation?.statusFailures)
       return waitOrStop(
-        run,
+        commands,
         polled,
         "cannot check on the worker right now",
         `The provider could not be reached, so nothing here can see what the worker is doing.`,
@@ -618,14 +640,14 @@ export function recoveryGuidance(
       const overdue = activity ? undefined : longRunningOperation(run);
       if (overdue)
         return waitOrStop(
-          run,
+          commands,
           polled,
           "running longer than its budget allows",
           `This run has claimed an active worker for ${elapsedLabel(overdue.elapsedMs)} since launch, past the ${minutesLabel(overdue.boundMs)} allowed for its ${overdue.maxTurns}-turn budget, and nothing reports what it is doing${workflow}. That is not proof the worker is stuck.`,
         );
       if (!activity)
         return waitOrStop(
-          run,
+          commands,
           polled,
           "running, but nothing proves the worker is alive",
           `Nothing reports what this worker is doing${workflow}, so it is neither confirmed alive nor confirmed dead.`,
@@ -695,7 +717,7 @@ export function recoveryGuidance(
  * round a record nothing updates, so the command that ends it leads instead.
  */
 function waitOrStop(
-  run: PlanExecRun,
+  commands: RunCommands,
   polled: boolean,
   classification: string,
   reason: string,
@@ -703,38 +725,39 @@ function waitOrStop(
   return polled
     ? {
         classification,
-        action: `${reason} The controller is still polling it, so run /exec status ${run.id} to look again later. Do not resume or start another run.`,
-        command: `/exec status ${run.id}`,
+        action: `${reason} The controller is still polling it, so run ${commands.status} to look again later. Do not resume or start another run.`,
+        command: commands.status,
       }
     : {
         classification,
-        action: `${reason} No live session is polling it, so waiting alone never settles it. Run /exec stop ${run.id} to end it and preserve the worktree. Do not resume or start another run.`,
-        command: `/exec stop ${run.id}`,
+        action: `${reason} No live session is polling it, so waiting alone never settles it. Run ${commands.stop} to end it and preserve the worktree. Do not resume or start another run.`,
+        command: commands.stop,
       };
 }
 
 /** The one shape the evidence settled: nothing is running. */
 function abandonedGuidance(
   run: PlanExecRun,
+  commands: RunCommands,
   evidence: AbandonmentEvidence,
 ): RecoveryGuidance {
   const checked = `Checked just now: ${operationEvidence({ run, evidence })}`;
   if (run.status === RUN_STATUS.CANCEL_PENDING)
     return {
       classification: "the worker is gone, so the stop cannot land by itself",
-      action: `${checked}, so this run will never reach cancelled on its own. Run /exec stop ${run.id} to finish the cancellation; its worktree is kept either way.`,
-      command: `/exec stop ${run.id}`,
+      action: `${checked}, so this run will never reach cancelled on its own. Run ${commands.stop} to finish the cancellation; its worktree is kept either way.`,
+      command: commands.stop,
     };
   if (run.status === RUN_STATUS.SKIP_PENDING)
     return {
       classification: "the worker is gone, so the waived stage cannot finish",
-      action: `${checked}, so there is nothing left to stop and the run cannot move on by itself. Run /exec resume ${run.id}; it clears the dead worker and continues, without starting a second one.`,
-      command: `/exec resume ${run.id}`,
+      action: `${checked}, so there is nothing left to stop and the run cannot move on by itself. Run ${commands.resume}; it clears the dead worker and continues, without starting a second one.`,
+      command: commands.resume,
     };
   return {
     classification: "the worker is gone, so nothing is running",
-    action: `${checked}. Run /exec resume ${run.id}; it clears the dead worker and continues, without starting a second one. Run /exec stop ${run.id} instead to end the run and keep the worktree.`,
-    command: `/exec resume ${run.id}`,
+    action: `${checked}. Run ${commands.resume}; it clears the dead worker and continues, without starting a second one. Run ${commands.stop} instead to end the run and keep the worktree.`,
+    command: commands.resume,
   };
 }
 
@@ -1057,12 +1080,10 @@ export function isRemovableRun(
   run: PlanExecRun,
   includeFailed = false,
 ): boolean {
+  // The refusal above already rejected every non-terminal status, so `failed`
+  // is the only terminal status left to exclude.
   if (removalRefusal(run)) return false;
-  if (
-    !CLEANUP_STATUSES.has(run.status) &&
-    !(includeFailed && run.status === RUN_STATUS.FAILED)
-  )
-    return false;
+  if (run.status === RUN_STATUS.FAILED && !includeFailed) return false;
   return Date.now() - (run.retiredAt ?? run.updatedAt) >= CLEANUP_RETENTION_MS;
 }
 
@@ -1558,15 +1579,6 @@ async function reconcileLines(
   return lines;
 }
 
-const RECONCILE_SKIP = {
-  RECLAIMED: "reclaimed",
-  STOP_REQUESTED: "stop-requested",
-} as const;
-type ReconcileSkip = (typeof RECONCILE_SKIP)[keyof typeof RECONCILE_SKIP];
-type ReconcileOutcome =
-  | { run: PlanExecRun; skipped?: undefined }
-  | { run?: undefined; skipped: ReconcileSkip };
-
 /**
  * The single writer behind every reconcile, so its exclusions cannot drift.
  * Compare-and-swap on the scanned `updatedAt` with no retry: a run reclaimed
@@ -1754,8 +1766,9 @@ async function handleCommand(
   } = dependencies;
   const [subcommand, ...rest] = args.split(/\s+/).filter(Boolean);
   if (subcommand === EXEC_ACTION.HELP) return execHelp();
-  if (subcommand === EXEC_ACTION.CLEANUP) return execCleanup(registry, rest);
-  const read = await execRead(registry, subcommand, rest, {
+  if (subcommand === EXEC_ACTION.CLEANUP)
+    return execCleanup(defaultRegistry, rest);
+  const read = await execRead(defaultRegistry, subcommand, rest, {
     probe: doctorProbe,
     problems: runtimeProblems,
   });
@@ -1764,7 +1777,7 @@ async function handleCommand(
   // can only be here with `--reconcile`: the write half of it.
   if (subcommand === EXEC_ACTION.DOCTOR)
     return withAliasNote(
-      await execReconcile(registry, doctorProbe),
+      await execReconcile(defaultRegistry, doctorProbe),
       RECONCILE_ALIAS_NOTE,
     );
   if (subcommand === EXEC_ACTION.STATUS) {
@@ -1779,9 +1792,9 @@ async function handleCommand(
   }
   // Without this the token reads as the first word of a plan path, so the
   // reader gets an isolation prompt and then an unexplained not-found error.
-  if (subcommand === RETIRED_START_ACTION)
+  if (subcommand === REMOVED_START_ACTION)
     throw new Error(
-      `/exec ${RETIRED_START_ACTION} was removed. Run /exec ${rest.join(" ") || "<path/to/plan.md>"} instead; bare /exec opens the plan picker.`,
+      `/exec ${REMOVED_START_ACTION} was removed. Run /exec ${rest.join(" ") || "<path/to/plan.md>"} instead; bare /exec opens the plan picker.`,
     );
   const dispatched = runActionFor(subcommand);
   if (dispatched) {
@@ -1861,9 +1874,7 @@ async function runAction(
           model: undefined,
         };
   if (action === EXEC_ACTION.SKIP && (!rest[0] || rest[0] === "--reason"))
-    throw new Error(
-      "Usage: /exec skip <full-run-id> --reason <non-empty reason>",
-    );
+    throw skipUsageError();
   // Before resolving a run, so a repository with several candidates does not
   // ask a picker question first and then refuse anyway.
   if (action === EXEC_ACTION.STOP && !ctx.hasUI)
@@ -1886,7 +1897,7 @@ async function runAction(
     const recovered =
       action === EXEC_ACTION.RESUME
         ? await reconcileForResume(
-            registry,
+            defaultRegistry,
             resolved,
             doctorProbe,
             resumeArguments.sameMachine,
@@ -2009,7 +2020,7 @@ async function runAction(
     action === EXEC_ACTION.STOP
       ? await chooseStopOutcome(resolved, ctx)
       : action;
-  const claimed = await registry.claim(resolved, sessionId);
+  const claimed = await defaultRegistry.claim(resolved, sessionId);
   if (outcome === EXEC_ACTION.PAUSE) {
     const paused = await syncProjection(
       await requestStatus(claimed, EXEC_ACTION.PAUSE),
@@ -2065,13 +2076,13 @@ async function resolveRunForAction(
   adoptCurrentBranch = false,
 ): Promise<PlanExecRun> {
   if (selector) {
-    const run = await registry.get(selector);
+    const run = await defaultRegistry.get(selector);
     if (!run) throw new Error(`Plan execution run not found: ${selector}`);
     assertActionAllowed(action, run, adoptCurrentBranch);
     return run;
   }
 
-  const candidates = (await registry.list()).filter(
+  const candidates = (await defaultRegistry.list()).filter(
     (run) =>
       matchesContext(run, ctx.cwd) &&
       isActionAllowed(action, run, adoptCurrentBranch),
@@ -2143,8 +2154,8 @@ async function handoffToWorktree(
     throw new Error("Could not create a worktree Pi session.");
   }
 
-  let claimed = await registry.claim(
-    await registry.release(run),
+  let claimed = await defaultRegistry.claim(
+    await defaultRegistry.release(run),
     targetSession.getSessionId(),
   );
   claimed = await syncProjection(claimed, {
@@ -2179,9 +2190,12 @@ async function restoreSourceLease(
   runId: string,
   sourceSessionId: string,
 ): Promise<void> {
-  const current = await registry.get(runId);
+  const current = await defaultRegistry.get(runId);
   if (!current) return;
-  await registry.claim(await registry.release(current), sourceSessionId);
+  await defaultRegistry.claim(
+    await defaultRegistry.release(current),
+    sourceSessionId,
+  );
 }
 
 function matchesContext(run: PlanExecRun, cwd: string): boolean {
@@ -2226,6 +2240,10 @@ export function isActionAllowed(
       run.pendingStageSkip === undefined &&
       (!isTerminal(run.status) || run.status === RUN_STATUS.FAILED)
     );
+  // A verb added to `RunAction` fails to compile here until it is decided.
+  // Only a caller outside the type system reaches the refusal below.
+  const unhandled: never = action;
+  void unhandled;
   return false;
 }
 
@@ -2377,6 +2395,12 @@ function resumeUsageError(): Error {
   );
 }
 
+function skipUsageError(): Error {
+  return new Error(
+    "Usage: /exec skip <full-run-id> --reason <non-empty reason>",
+  );
+}
+
 export function resumeResultMessage(run: PlanExecRun): string {
   if (needsPlanStructureReview(run))
     return [
@@ -2394,15 +2418,9 @@ export function resumeResultMessage(run: PlanExecRun): string {
 }
 
 export function parseSkipReason(args: string[]): string {
-  if (args[0] !== "--reason")
-    throw new Error(
-      "Usage: /exec skip <full-run-id> --reason <non-empty reason>",
-    );
+  if (args[0] !== "--reason") throw skipUsageError();
   const reason = args.slice(1).join(" ").trim();
-  if (!reason)
-    throw new Error(
-      "Usage: /exec skip <full-run-id> --reason <non-empty reason>",
-    );
+  if (!reason) throw skipUsageError();
   return reason;
 }
 
@@ -2439,7 +2457,7 @@ async function requestStatus(
   let current = run;
   for (let attempt = 0; attempt < COMMAND_CAS_RETRIES; attempt += 1) {
     assertActionAllowed(action, current);
-    const requested = await registry.updateIfCurrent(
+    const requested = await defaultRegistry.updateIfCurrent(
       {
         ...current,
         status:
@@ -2519,7 +2537,9 @@ function progressTransition(
 
 function observationLabel(run: PlanExecRun): string {
   const failures = run.activeOperation?.statusFailures;
-  return failures ? `cannot observe worker (${failures}/3)` : "polling worker";
+  return failures
+    ? `cannot observe worker (${failures}/${MAX_STATUS_FAILURES})`
+    : "polling worker";
 }
 
 function compactRunStatus(run: PlanExecRun): string {

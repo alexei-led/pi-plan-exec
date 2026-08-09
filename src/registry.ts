@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { isSkippableStage, isTerminalStatus } from "./lifecycle.js";
 import {
   mkdir,
   open,
@@ -11,6 +10,7 @@ import {
 } from "node:fs/promises";
 import { homedir, hostname } from "node:os";
 import { dirname, join } from "node:path";
+import { isSkippableStage, isTerminalStatus } from "./lifecycle.js";
 import {
   DEFAULT_FROZEN_RUN_CONFIG,
   OPERATION_KIND,
