@@ -1509,7 +1509,10 @@ test("status arguments take one run ID or the --all zoom, never both", () => {
     () => parseStatusArguments(["run-id", "--all"]),
     /cannot be combined/,
   );
-  assert.throws(() => parseStatusArguments(["--reconcile"]), /Usage/);
+  assert.throws(
+    () => parseStatusArguments(["--reconcile"]),
+    /\/exec status never writes\. Use \/exec doctor --reconcile/,
+  );
   assert.throws(() => parseStatusArguments(["one", "two"]), /Usage/);
 });
 

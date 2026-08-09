@@ -582,7 +582,9 @@ rest, sources)` whose registry is a required argument, mirroring Task 3's rule t
   gains no extra RPC, and the two old throw messages merged into one that names
   `/exec status` rather than the retired `/exec setup`
 - ➕ decision: `--all` and a run ID are rejected together — `--all` is a listing zoom, and
-  silently ignoring it would hide the contradiction
+  silently ignoring it would hide the contradiction. `/exec status --reconcile` gets its
+  own refusal naming `/exec doctor --reconcile`: the retired name points at `status`, so
+  the retired flag has to point back until Task 11 moves it to `resume`
 - ➕ deviation: the no-ID sweep covers every run with no `matchesContext` filter, as
   `doctor` already did, so bare `/exec status` no longer prints one run's detail. Every
   message that already holds a run ID now prints `/exec status <id>` instead of bare

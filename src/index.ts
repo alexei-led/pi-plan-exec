@@ -776,6 +776,11 @@ export function parseStatusArguments(args: string[]): {
   let all = false;
   for (const arg of args) {
     if (arg === RUNS_ALL_OPTION) all = true;
+    // The retired name points here, so the retired flag must point back.
+    else if (arg === DOCTOR_RECONCILE_OPTION)
+      throw new Error(
+        `/exec status never writes. Use /exec doctor ${DOCTOR_RECONCILE_OPTION} to reset provably abandoned runs.`,
+      );
     else if (arg.startsWith("--") || selector !== undefined)
       throw new Error(`Usage: /exec status [full-run-id] [${RUNS_ALL_OPTION}]`);
     else selector = arg;
