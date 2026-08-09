@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { isSkippableStage } from "./lifecycle.js";
+import { isSkippableStage, isTerminalStatus } from "./lifecycle.js";
 import {
   mkdir,
   open,
@@ -48,6 +48,19 @@ export function isLeaseLive(lease: RunLease, sessionId?: string): boolean {
   if (Date.now() - lease.heartbeatAt >= LEASE_STALE_MS) return false;
   if (lease.hostname !== hostname()) return true;
   return isProcessRunning(lease.pid);
+}
+
+/**
+ * Why this run cannot be removed, or undefined when it can. `remove` and
+ * `/exec cleanup` share it so a preview never promises a removal the registry
+ * would refuse.
+ */
+export function removalRefusal(run: PlanExecRun): string | undefined {
+  if (!isTerminalStatus(run.status))
+    return `Run ${run.id} is ${run.status}; only a terminal run can be removed.`;
+  if (run.lease && isLeaseLive(run.lease))
+    return `Run ${run.id} is held by a live lease from session ${run.lease.sessionId}.`;
+  return undefined;
 }
 
 /**
@@ -235,6 +248,25 @@ export class RunRegistry {
       run.updatedAt,
     );
     return heartbeat.run;
+  }
+
+  /**
+   * Retire a run from the registry. Only the registry entry is deleted: the
+   * worktree, its branch, and the progress file are left in place.
+   */
+  async remove(runId: string): Promise<void> {
+    const run = await this.get(runId);
+    if (!run) return;
+    const refusal = removalRefusal(run);
+    if (refusal) throw new Error(refusal);
+    const path = this.pathFor(runId);
+    const lockPath = `${path}.lock`;
+    const lock = await acquireLock(lockPath);
+    try {
+      await rm(dirname(path), { recursive: true, force: true });
+    } finally {
+      await releaseLock(lockPath, lock);
+    }
   }
 
   async release(run: PlanExecRun): Promise<PlanExecRun> {

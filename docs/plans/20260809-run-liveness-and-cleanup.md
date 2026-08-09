@@ -199,23 +199,30 @@ say so in a code comment. Classify only; never auto-fail, never auto-kill.
 - Modify: `test/registry.test.ts`
 - Modify: `test/index.test.ts`
 
-- [ ] add `RunRegistry.remove(runId)` deleting the run directory; it must refuse when the
-      run is non-terminal or its lease is live per `isLeaseLive`
-- [ ] add `CLEANUP: "cleanup"` to `EXEC_ACTION` in `src/types.ts:3` and an entry in
+- [x] add `RunRegistry.remove(runId)` deleting the run directory; it must refuse when the
+      run is non-terminal or its lease is live per `isLeaseLive` — the refusal itself is
+      an exported `removalRefusal(run)` so the `/exec cleanup` preview cannot promise a
+      removal the registry would reject
+- [x] add `CLEANUP: "cleanup"` to `EXEC_ACTION` in `src/types.ts:3` and an entry in
       `EXEC_COMMANDS` for autocomplete
-- [ ] implement `/exec cleanup` in the `src/index.ts:603` dispatch supporting
+- [x] implement `/exec cleanup` in the `src/index.ts:603` dispatch supporting
       `/exec cleanup` (preview), `--apply`, `<run-id>`, and `--include-failed`
-- [ ] default removable set: `completed`, `completed_with_findings`, `cancelled`, older
+- [x] default removable set: `completed`, `completed_with_findings`, `cancelled`, older
       than a 7-day retention window by `updatedAt`; exclude `failed` unless
       `--include-failed` is passed
-- [ ] make preview the default — without `--apply` nothing is deleted — and state in the
+- [x] make preview the default — without `--apply` nothing is deleted — and state in the
       preview output that removal touches only the registry entry, never the worktree,
       branch, or progress file
-- [ ] add a `/exec cleanup` line to the help text alongside the other subcommands
-- [ ] write tests: preview mutates nothing; `--apply` removes only entries past
+- [x] add a `/exec cleanup` line to the help text alongside the other subcommands
+- [x] write tests: preview mutates nothing; `--apply` removes only entries past
       retention; non-terminal and live-lease runs are refused; `failed` excluded by
       default and included with the flag; a single explicit run-id removes just that run
-- [ ] run `npm run test:all` — must pass before task 4
+- [x] run `npm run test:all` — must pass before task 4
+- ➕ decision: an explicit `<run-id>` bypasses the retention window and the `failed`
+      exclusion — the user named that run — but still needs `--apply`, and `remove`
+      still enforces terminal status and a dead lease
+- ➕ decision: `execCleanup(registry, args)` takes its registry as a required argument,
+      so no test can reach the real `~/.pi/plan-exec/runs/`
 
 ### Task 4: Retire runs on archive
 

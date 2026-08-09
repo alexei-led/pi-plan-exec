@@ -1,10 +1,22 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { isLeaseLive, LEASE_STALE_MS, RunRegistry } from "../src/registry.js";
+import {
+  isLeaseLive,
+  LEASE_STALE_MS,
+  removalRefusal,
+  RunRegistry,
+} from "../src/registry.js";
 import type { PlanExecRun } from "../src/types.js";
 
 type RunLease = NonNullable<PlanExecRun["lease"]>;
@@ -273,6 +285,67 @@ test("a lease written before hostname existed is judged by heartbeat alone", asy
   await assert.rejects(
     () => registry.claim(loaded, "session-2"),
     /another active Pi session/,
+  );
+});
+
+test("remove retires a terminal run and refuses anything still in play", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-plan-exec-registry-"));
+  const registry = new RunRegistry(directory);
+  const seed = {
+    schemaVersion: 1 as const,
+    repositoryRoot: "/repo",
+    planPath: "/repo/plan.md",
+    planHash: "hash",
+    worktreeCwd: "/repo",
+    branch: "feature",
+    defaultBranch: "main",
+    taskAttempts: {},
+    stageAttempts: {},
+    reviewFindings: [],
+    unresolvedFindings: [],
+    config,
+  };
+  const retired = await registry.create({
+    ...seed,
+    status: "completed",
+    stage: "complete",
+  });
+  const running = await registry.create({
+    ...seed,
+    status: "running",
+    stage: "implementation",
+  });
+  const held = await registry.create({
+    ...seed,
+    status: "cancelled",
+    stage: "implementation",
+    lease: {
+      sessionId: "session-1",
+      pid: process.pid,
+      heartbeatAt: Date.now(),
+      hostname: hostname(),
+    },
+  });
+
+  await registry.remove(retired.id);
+
+  assert.equal(await registry.get(retired.id), undefined);
+  await assert.rejects(stat(join(directory, retired.id)), /ENOENT/);
+  await assert.rejects(
+    () => registry.remove(running.id),
+    /only a terminal run can be removed/,
+  );
+  await assert.rejects(
+    () => registry.remove(held.id),
+    /held by a live lease from session session-1/,
+  );
+  assert.equal(removalRefusal(retired), undefined);
+  assert.match(removalRefusal(running) ?? "", /only a terminal run/);
+  // A second removal of a gone run is a no-op, not a failure.
+  await registry.remove(retired.id);
+  await assert.rejects(
+    () => registry.remove("../escape"),
+    /Invalid plan-exec run ID/,
   );
 });
 

@@ -5,6 +5,7 @@ export const EXEC_ACTION = {
   START: "start",
   SETUP: "setup",
   RUNS: "runs",
+  CLEANUP: "cleanup",
   STATUS: "status",
   PAUSE: "pause",
   RESUME: "resume",
@@ -15,7 +16,7 @@ export const EXEC_ACTION = {
 
 export type RunAction = (typeof EXEC_ACTION)[Exclude<
   keyof typeof EXEC_ACTION,
-  "HELP" | "START" | "SETUP" | "RUNS"
+  "HELP" | "START" | "SETUP" | "RUNS" | "CLEANUP"
 >];
 
 export const RUN_STAGE = {

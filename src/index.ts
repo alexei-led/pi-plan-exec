@@ -24,7 +24,7 @@ import {
   isSkippableStage,
   isTerminalStatus,
 } from "./lifecycle.js";
-import { isLeaseLive, RunRegistry } from "./registry.js";
+import { isLeaseLive, removalRefusal, RunRegistry } from "./registry.js";
 import { readPlan } from "./plan.js";
 import { TaskProjector } from "./task-projection.js";
 import {
@@ -44,6 +44,16 @@ const MILLISECONDS_PER_SECOND = 1_000;
 const SECONDS_PER_MINUTE = 60;
 const DISPLAY_RUN_ID_LENGTH = 8;
 const RECOVERY_MODEL_OPTION = "--model";
+const CLEANUP_APPLY_OPTION = "--apply";
+const CLEANUP_INCLUDE_FAILED_OPTION = "--include-failed";
+const CLEANUP_RETENTION_DAYS = 7;
+const MILLISECONDS_PER_DAY = 86_400_000;
+const CLEANUP_RETENTION_MS = CLEANUP_RETENTION_DAYS * MILLISECONDS_PER_DAY;
+const CLEANUP_STATUSES = new Set<PlanExecRun["status"]>([
+  RUN_STATUS.COMPLETED,
+  RUN_STATUS.COMPLETED_WITH_FINDINGS,
+  RUN_STATUS.CANCELLED,
+]);
 const REQUIRED_RUNTIME_TOOLS: Record<string, string> = {
   subagent: "pi-subagents",
   TaskCreate: "@tintinweb/pi-tasks",
@@ -69,6 +79,11 @@ const EXEC_COMMANDS: AutocompleteItem[] = [
     value: EXEC_ACTION.RUNS,
     label: EXEC_ACTION.RUNS,
     description: "List recent plan execution runs",
+  },
+  {
+    value: EXEC_ACTION.CLEANUP,
+    label: EXEC_ACTION.CLEANUP,
+    description: "Preview or remove retired run records",
   },
   {
     value: EXEC_ACTION.STATUS,
@@ -594,6 +609,94 @@ export function formatRunList(runs: PlanExecRun[]): string {
   ].join("\n");
 }
 
+export function parseCleanupArguments(args: string[]): {
+  runId: string | undefined;
+  apply: boolean;
+  includeFailed: boolean;
+} {
+  let runId: string | undefined;
+  let apply = false;
+  let includeFailed = false;
+  for (const arg of args) {
+    if (arg === CLEANUP_APPLY_OPTION) apply = true;
+    else if (arg === CLEANUP_INCLUDE_FAILED_OPTION) includeFailed = true;
+    else if (arg.startsWith("--") || runId !== undefined)
+      throw new Error(
+        `Usage: /exec cleanup [full-run-id] [${CLEANUP_APPLY_OPTION}] [${CLEANUP_INCLUDE_FAILED_OPTION}]`,
+      );
+    else runId = arg;
+  }
+  return { runId, apply, includeFailed };
+}
+
+/**
+ * Removable = retired past the retention window with nothing alive holding it.
+ * `failed` is excluded by default: /exec resume is the documented recovery path
+ * for a failed run, and its registry entry is what makes that path possible.
+ */
+export function isRemovableRun(
+  run: PlanExecRun,
+  includeFailed = false,
+): boolean {
+  if (removalRefusal(run)) return false;
+  if (
+    !CLEANUP_STATUSES.has(run.status) &&
+    !(includeFailed && run.status === RUN_STATUS.FAILED)
+  )
+    return false;
+  return Date.now() - run.updatedAt >= CLEANUP_RETENTION_MS;
+}
+
+export async function execCleanup(
+  registry: RunRegistry,
+  args: string[],
+): Promise<string> {
+  const { runId, apply, includeFailed } = parseCleanupArguments(args);
+  const failedHint = includeFailed
+    ? []
+    : [
+        `Failed runs are excluded so /exec resume stays available; add ${CLEANUP_INCLUDE_FAILED_OPTION} to consider them.`,
+      ];
+  const targets = runId
+    ? [await removableRun(registry, runId)]
+    : (await registry.list()).filter((run) =>
+        isRemovableRun(run, includeFailed),
+      );
+  if (targets.length === 0)
+    return [
+      `No plan execution runs are removable. A terminal run becomes removable ${CLEANUP_RETENTION_DAYS} days after its last update.`,
+      ...failedHint,
+    ].join("\n");
+  const rows = targets.map(
+    (run) =>
+      `${run.id} ${basename(run.planPath)} ${run.status}/${run.stage} updated ${relativeTime(run.updatedAt)}`,
+  );
+  if (!apply)
+    return [
+      "Removable plan execution runs (preview; nothing was deleted):",
+      ...rows,
+      "Removal deletes the registry entry only; the worktree, branch, and progress file are left in place.",
+      ...failedHint,
+      `Use /exec cleanup ${runId ? `${runId} ` : ""}${CLEANUP_APPLY_OPTION}${includeFailed ? ` ${CLEANUP_INCLUDE_FAILED_OPTION}` : ""} to remove them.`,
+    ].join("\n");
+  for (const run of targets) await registry.remove(run.id);
+  return [
+    `Removed ${targets.length} plan execution run${targets.length === 1 ? "" : "s"}; worktrees, branches, and progress files were left in place.`,
+    ...rows,
+  ].join("\n");
+}
+
+async function removableRun(
+  registry: RunRegistry,
+  runId: string,
+): Promise<PlanExecRun> {
+  const run = await registry.get(runId);
+  if (!run) throw new Error(`Plan execution run not found: ${runId}`);
+  const refusal = removalRefusal(run);
+  if (refusal) throw new Error(refusal);
+  return run;
+}
+
 async function handleCommand(
   args: string,
   ctx: ExtensionCommandContext,
@@ -607,6 +710,7 @@ async function handleCommand(
   if (subcommand === EXEC_ACTION.SETUP) return execSetup();
   if (subcommand === EXEC_ACTION.RUNS)
     return formatRunList(await registry.list());
+  if (subcommand === EXEC_ACTION.CLEANUP) return execCleanup(registry, rest);
   if (
     subcommand === EXEC_ACTION.STATUS ||
     subcommand === EXEC_ACTION.PAUSE ||
@@ -1261,6 +1365,8 @@ export function execHelp(): string {
     "/exec setup             Show required packages and install commands.",
     "/exec status [run-id]   Show progress; run-id is optional when unambiguous.",
     "/exec runs              List runs and their full IDs.",
+    `/exec cleanup [full-run-id] [${CLEANUP_APPLY_OPTION}] [${CLEANUP_INCLUDE_FAILED_OPTION}]`,
+    `                        Preview retired runs older than ${CLEANUP_RETENTION_DAYS} days; ${CLEANUP_APPLY_OPTION} deletes their registry entries only. Failed runs need ${CLEANUP_INCLUDE_FAILED_OPTION}.`,
     "/exec pause [run-id]    Pause after the active child finishes.",
     `/exec resume [run-id] [${RECOVERY_MODEL_OPTION} current|provider/model]`,
     "                        Reconcile, resume, or retry safely. Model/provider failures use the current Pi model.",
