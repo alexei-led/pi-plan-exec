@@ -13,11 +13,10 @@ export const EXEC_ACTION = {
   CANCEL: "cancel",
 } as const;
 
-export type RunAction =
-  (typeof EXEC_ACTION)[Exclude<
-    keyof typeof EXEC_ACTION,
-    "HELP" | "START" | "SETUP" | "RUNS"
-  >];
+export type RunAction = (typeof EXEC_ACTION)[Exclude<
+  keyof typeof EXEC_ACTION,
+  "HELP" | "START" | "SETUP" | "RUNS"
+>];
 
 export const RUN_STAGE = {
   RESOLVE: "resolve",

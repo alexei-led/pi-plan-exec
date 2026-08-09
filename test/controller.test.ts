@@ -509,7 +509,10 @@ test("resume keeps a preserved fixer recoverable when adoption is not ready", as
   assert.equal(resumed.status, "running");
   assert.equal(resumed.activeOperation?.operationId, "preserved-fix");
   assert.equal(resumed.activeOperation?.statusFailures, 2);
-  assert.match(resumed.activeOperation?.lastStatusError ?? "", /Status file not found/);
+  assert.match(
+    resumed.activeOperation?.lastStatusError ?? "",
+    /Status file not found/,
+  );
   assert.equal(bridge.spawnCount, 0);
 });
 
@@ -1672,10 +1675,7 @@ test("explicit recovery can adopt the verified current execution branch", async 
     error: "Execution directory is on feature/current, expected master.",
   });
 
-  const rebound = await controller.rebindBranchAndResume(
-    stale.id,
-    "session-1",
-  );
+  const rebound = await controller.rebindBranchAndResume(stale.id, "session-1");
 
   assert.equal(rebound.branch, "feature/current");
   assert.equal(rebound.activeOperation?.kind, "review");
@@ -1792,7 +1792,10 @@ test("force skip stops a live fixer before advancing", async () => {
   assert.equal(stopping.status, "skip_pending");
   assert.equal(stopping.stage, "comprehensive_review");
   assert.equal(stopping.activeOperation?.stopRequested, true);
-  assert.equal(stopping.pendingStageSkip?.reason, "operator accepted the remaining review risk");
+  assert.equal(
+    stopping.pendingStageSkip?.reason,
+    "operator accepted the remaining review risk",
+  );
   assert.equal(bridge.stopCount, 1);
   assert.equal(bridge.spawnCount, 0);
 
@@ -1942,10 +1945,7 @@ test("resume returns a failed pending skip to skip_pending", async () => {
   );
   const failed = await registry.create({
     ...baseRun(root, planPath),
-    planHash: parsePlan(
-      planPath,
-      "### Task 1: Implement\n- [x] Done\n",
-    ).hash,
+    planHash: parsePlan(planPath, "### Task 1: Implement\n- [x] Done\n").hash,
     status: "failed",
     stage: "comprehensive_review",
     pendingStageSkip: {
@@ -2308,8 +2308,7 @@ class ModelFailureBridge extends FakeBridge {
   override async status() {
     return success({
       state: this.state,
-      text:
-        'Error: Run failed: OAuth refresh failed for anthropic-work: body={"error":"invalid_grant","error_description":"Refresh token expired"}.',
+      text: 'Error: Run failed: OAuth refresh failed for anthropic-work: body={"error":"invalid_grant","error_description":"Refresh token expired"}.',
     });
   }
 }

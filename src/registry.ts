@@ -44,11 +44,7 @@ export class RunRegistry {
   async create(
     run: Omit<
       PlanExecRun,
-      | "id"
-      | "createdAt"
-      | "updatedAt"
-      | "skippedStages"
-      | "branchRebindings"
+      "id" | "createdAt" | "updatedAt" | "skippedStages" | "branchRebindings"
     > & {
       skippedStages?: PlanExecRun["skippedStages"];
       branchRebindings?: PlanExecRun["branchRebindings"];
@@ -340,8 +336,7 @@ function parseRun(raw: string, runId: string): PlanExecRun {
 }
 
 function migrateLegacyRun(value: Record<string, unknown>): PlanExecRun {
-  const stage =
-    value.stage === "tasks" ? RUN_STAGE.PROJECT_TASKS : value.stage;
+  const stage = value.stage === "tasks" ? RUN_STAGE.PROJECT_TASKS : value.stage;
   const config = isRecord(value.config) ? value.config : {};
   return {
     ...(value as unknown as PlanExecRun),

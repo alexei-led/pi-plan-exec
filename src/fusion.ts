@@ -13,8 +13,7 @@ export const FUSION_PHASE = {
   CANCELLED: "cancelled",
 } as const;
 
-export type FusionPhase =
-  (typeof FUSION_PHASE)[keyof typeof FUSION_PHASE];
+export type FusionPhase = (typeof FUSION_PHASE)[keyof typeof FUSION_PHASE];
 const FUSION_PHASES = new Set<FusionPhase>(Object.values(FUSION_PHASE));
 
 export interface FusionRunState {

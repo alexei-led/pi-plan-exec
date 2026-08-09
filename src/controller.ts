@@ -530,8 +530,7 @@ export class PlanExecController {
   }
 
   private async launchFusion(run: PlanExecRun): Promise<PlanExecRun> {
-    const iteration =
-      (run.stageAttempts[RUN_STAGE.FUSION_REVIEW] ?? 0) + 1;
+    const iteration = (run.stageAttempts[RUN_STAGE.FUSION_REVIEW] ?? 0) + 1;
     if (iteration > run.config.fusionIterations) {
       return this.advanceUnlocked(
         await this.recordUnresolvedAndAdvance(run, run.reviewFindings),
@@ -584,11 +583,7 @@ export class PlanExecController {
 
   private launchFinalizer(run: PlanExecRun): Promise<PlanExecRun> {
     if (!run.config.finalizeEnabled)
-      return this.transition(
-        run,
-        RUN_STAGE.STATS,
-        "Finalization disabled.",
-      );
+      return this.transition(run, RUN_STAGE.STATS, "Finalization disabled.");
     return this.launchBridge(run, {
       kind: OPERATION_KIND.FINALIZE,
       agent: run.config.workerAgent,
@@ -629,9 +624,7 @@ export class PlanExecController {
       context: "fresh",
       turnBudget: { maxTurns: input.maxTurns },
       acceptance: false,
-      ...(input.kind === OPERATION_KIND.FIX
-        ? { completionGuard: false }
-        : {}),
+      ...(input.kind === OPERATION_KIND.FIX ? { completionGuard: false } : {}),
     };
     const persisted = await this.registry.updateIfCurrent(
       {
@@ -740,7 +733,11 @@ export class PlanExecController {
     patch: Partial<ActiveOperation>,
   ): Promise<PlanExecRun> {
     let current = (await this.registry.get(run.id)) ?? run;
-    for (let attempt = 0; attempt < OPERATION_UPDATE_CAS_RETRIES; attempt += 1) {
+    for (
+      let attempt = 0;
+      attempt < OPERATION_UPDATE_CAS_RETRIES;
+      attempt += 1
+    ) {
       if (current.activeOperation?.operationId !== operationId) return current;
       const updated = await this.registry.updateIfCurrent(
         {
@@ -894,13 +891,7 @@ export class PlanExecController {
       );
     if (operation.kind === OPERATION_KIND.REVIEW) {
       if (!isSuccessfulOperationState(state))
-        return this.finishReview(
-          observed,
-          operation,
-          state,
-          "",
-          terminalError,
-        );
+        return this.finishReview(observed, operation, state, "", terminalError);
       let output: string;
       try {
         output = await this.bridgeOutput(operation);
@@ -1461,7 +1452,10 @@ export class PlanExecController {
   private async advanceStageSkip(run: PlanExecRun): Promise<PlanExecRun> {
     const request = run.pendingStageSkip;
     if (!request || request.stage !== run.stage)
-      return this.fail(run, "Force-skip state does not match the current stage.");
+      return this.fail(
+        run,
+        "Force-skip state does not match the current stage.",
+      );
     const operation = run.activeOperation;
     if (!operation) return this.finishStageSkip(run, "no active operation");
 
@@ -2139,7 +2133,8 @@ export function isRecoverableImplementationFailure(run: PlanExecRun): boolean {
     run.activeOperation === undefined &&
     (/^Worker .+ ended as .+ and left task \d+ checkboxes unchecked\.$/.test(
       run.error ?? "",
-    ) || /Task \d+ exhausted its retry limit\./.test(run.error ?? ""))
+    ) ||
+      /Task \d+ exhausted its retry limit\./.test(run.error ?? ""))
   );
 }
 
@@ -2156,7 +2151,8 @@ export function isTaskRetryConfirmationRequired(run: PlanExecRun): boolean {
     run.status === RUN_STATUS.FAILED &&
     run.stage === RUN_STAGE.IMPLEMENTATION &&
     run.activeOperation === undefined &&
-    !isModelProviderFailure(run) && isExternalManualBlocker(run)
+    !isModelProviderFailure(run) &&
+    isExternalManualBlocker(run)
   );
 }
 

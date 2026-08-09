@@ -81,7 +81,6 @@ export function stageIndex(stage: RunStage): number {
 
 export function isRecoverableRun(run: PlanExecRun): boolean {
   return (
-    run.status === RUN_STATUS.FAILED ||
-    run.status === RUN_STATUS.CANCEL_PENDING
+    run.status === RUN_STATUS.FAILED || run.status === RUN_STATUS.CANCEL_PENDING
   );
 }
