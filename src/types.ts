@@ -23,13 +23,14 @@ export const EXEC_ALIAS_ACTIONS = [
   EXEC_ACTION.RUNS,
   EXEC_ACTION.DOCTOR,
   EXEC_ACTION.SETUP,
+  EXEC_ACTION.ADOPT,
 ] as const;
 
 export type ExecAliasAction = (typeof EXEC_ALIAS_ACTIONS)[number];
 
 export type RunAction = (typeof EXEC_ACTION)[Exclude<
   keyof typeof EXEC_ACTION,
-  "HELP" | "SETUP" | "RUNS" | "CLEANUP" | "DOCTOR"
+  "HELP" | "SETUP" | "RUNS" | "CLEANUP" | "DOCTOR" | "ADOPT"
 >];
 
 export const RUN_STAGE = {

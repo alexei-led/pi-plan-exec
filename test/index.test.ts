@@ -32,6 +32,8 @@ import {
   parseResumeOptions,
   parseSkipReason,
   parseStatusArguments,
+  reconcileForResume,
+  runActionFor,
   settledRunLines,
   resumeResultMessage,
   prioritizeRunCandidates,
@@ -226,7 +228,7 @@ test("runtime prerequisite check identifies missing provider extensions", () => 
 
 test("help and setup explain the installed command surface", () => {
   assert.match(execHelp(), /\/exec status \[run-id\]/);
-  assert.match(execHelp(), /Reconcile, resume, or retry safely/);
+  assert.match(execHelp(), /Continue a stuck run/);
   assert.match(execHelp(), /\/exec skip <full-run-id> --reason <text>/);
   assert.match(execHelp(), /--model current\|provider\/model/);
   assert.match(execHelp(), /completed_with_findings/);
@@ -521,7 +523,6 @@ test("run status classifies recovery and gives one safe next action", () => {
   assert.match(staleOwner, /\/exec resume/);
   assert.doesNotMatch(staleOwner, /\/exec adopt/);
   assert.equal(isActionAllowed("resume", staleOwnerRun, "session-1"), true);
-  assert.equal(isActionAllowed("adopt", staleOwnerRun, "session-1"), false);
 
   const branchMismatch = formatRunStatus(
     run({
@@ -530,7 +531,9 @@ test("run status classifies recovery and gives one safe next action", () => {
     }),
   );
   assert.match(branchMismatch, /recovery: execution-branch mismatch/);
-  assert.match(branchMismatch, /--adopt-current-branch/);
+  // The flag left the guidance with the help text; interactive resume asks.
+  assert.match(branchMismatch, /interactive \/exec resume .*asks before/);
+  assert.doesNotMatch(branchMismatch, /--adopt-current-branch/);
 
   const planMismatch = formatRunStatus(
     run({
@@ -1116,7 +1119,7 @@ test("doctor groups every in-flight claim and mutates nothing", async () => {
   assert.match(
     report,
     new RegExp(
-      `abandoned — no worker is running:\\n- ${abandoned.id} [^\\n]*operation directory is gone from disk\\. Next: /exec doctor --reconcile`,
+      `abandoned — no worker is running:\\n- ${abandoned.id} [^\\n]*operation directory is gone from disk\\. Next: /exec resume ${abandoned.id}`,
     ),
   );
   assert.match(
@@ -1461,9 +1464,10 @@ test("status answers what is going on in one pass", async () => {
   assert.match(
     report,
     new RegExp(
-      `abandoned — no worker is running:\\n- ${abandoned.id} [^\\n]*Next: /exec doctor --reconcile`,
+      `abandoned — no worker is running:\\n- ${abandoned.id} [^\\n]*Next: /exec resume ${abandoned.id}`,
     ),
   );
+  assert.doesNotMatch(report, /--reconcile/, "the retired flag is not offered");
   assert.match(
     report,
     new RegExp(`- ${paused.id} [^\\n]*Next: /exec resume ${paused.id}`),
@@ -1511,7 +1515,7 @@ test("status arguments take one run ID or the --all zoom, never both", () => {
   );
   assert.throws(
     () => parseStatusArguments(["--reconcile"]),
-    /\/exec status never writes\. Use \/exec doctor --reconcile/,
+    /\/exec status never writes\. \/exec resume <run-id> resets/,
   );
   assert.throws(() => parseStatusArguments(["one", "two"]), /Usage/);
 });
@@ -1599,6 +1603,193 @@ test("the exec-plan skill documents exactly the subcommands /exec implements", a
         documented.has(action),
         `skill never documents: /exec ${action}`,
       );
+});
+
+test("resume takes over a lease whose session is provably gone", () => {
+  const stranded = run({ status: "skip_pending", lease: DEAD_LEASE });
+  assert.equal(isActionAllowed("resume", stranded, "session-new"), true);
+
+  const held = run({ status: "skip_pending", lease: LIVE_LEASE });
+  assert.equal(isActionAllowed("resume", held, "session-new"), false);
+
+  // Own lease, no lease, and terminal keep answering as they did.
+  const mine = run({ status: "skip_pending", lease: LIVE_LEASE });
+  assert.equal(isActionAllowed("resume", mine, LIVE_LEASE.sessionId), false);
+  const unheld = run({ status: "skip_pending" });
+  assert.equal(isActionAllowed("resume", unheld, "session-new"), false);
+  const done = run({ status: "completed", stage: "complete" });
+  assert.equal(isActionAllowed("resume", done, "session-new"), false);
+});
+
+test("a live foreign lease still blocks a second worker", async () => {
+  const held = run({ status: "running", lease: LIVE_LEASE });
+  const registry = await seedRegistry([held]);
+
+  // Resume is reachable by status, and the claim is what refuses it.
+  assert.equal(isActionAllowed("resume", held, "session-new"), true);
+  await assert.rejects(
+    registry.claim(held, "session-new"),
+    /controlled by another active Pi session/,
+  );
+});
+
+test("the retired adopt verb runs resume and names it once", () => {
+  assert.deepEqual(runActionFor("adopt"), {
+    action: "resume",
+    note: "/exec adopt is now /exec resume; the old name still works.",
+  });
+  assert.deepEqual(runActionFor("resume"), { action: "resume" });
+  assert.deepEqual(runActionFor("cancel"), { action: "cancel" });
+  assert.equal(runActionFor("status"), undefined);
+  assert.equal(runActionFor("cleanup"), undefined);
+  assert.equal(runActionFor(undefined), undefined);
+  assert.ok(
+    (EXEC_ALIAS_ACTIONS as readonly string[]).includes(EXEC_ACTION.ADOPT),
+    "adopt is a hidden alias",
+  );
+});
+
+test("help drops both interactive flags but keeps them working", () => {
+  const help = execHelp();
+  assert.doesNotMatch(help, /--adopt-current-branch/);
+  assert.doesNotMatch(help, /--retry-task/);
+  assert.match(help, /--model current\|provider\/model/);
+  // Both flags stay parseable for a caller with no human to ask.
+  assert.deepEqual(
+    parseResumeOptions(["--adopt-current-branch", "--retry-task"]),
+    { adoptCurrentBranch: true, retryTask: true, model: undefined },
+  );
+});
+
+test("resume reconciles a provably abandoned run, then continues", async () => {
+  const progressPath = join(
+    await mkdtemp(join(tmpdir(), "pi-plan-exec-resume-")),
+    "progress.txt",
+  );
+  const abandoned = abandonedRun({ progressPath });
+  const registry = await seedRegistry([abandoned]);
+
+  const recovered = await reconcileForResume(
+    registry,
+    abandoned,
+    "session-new",
+  );
+
+  assert.equal(recovered.run.status, "failed");
+  assert.equal(recovered.run.activeOperation, undefined);
+  assert.deepEqual(recovered.run.taskAttempts, abandoned.taskAttempts);
+  assert.ok(recovered.run.reconciledAt, "the reset is stamped for audit");
+  assert.match(recovered.note ?? "", /was abandoned/);
+  assert.match(recovered.note ?? "", /No task attempt was consumed/);
+  assert.match(
+    (await registry.get(abandoned.id))?.error ?? "",
+    /Reset by \/exec resume/,
+  );
+  assert.match(
+    await readFile(progressPath, "utf8"),
+    /Reset by \/exec resume[\s\S]*attempt counter was left unchanged/,
+  );
+  // The reset lands on the state the ordinary resume path already recovers.
+  assert.equal(isRecoverableFailure(recovered.run), true);
+  assert.equal(
+    isActionAllowed("resume", recovered.run, "session-new"),
+    true,
+    "the reconciled run is resumable",
+  );
+});
+
+test("resume refuses a run whose worker cannot be proven gone", async () => {
+  const asyncDir = await mkdtemp(join(tmpdir(), "pi-plan-exec-async-live-"));
+  const ambiguous = abandonedRun({
+    activeOperation: {
+      operationId: "operation-1",
+      service: "bridge",
+      kind: "implementation",
+      externalRunId: "external-1",
+      asyncDir,
+    },
+  });
+  const { registry, directory } = await seedDirectory([ambiguous]);
+  const before = await snapshotRuns(directory);
+
+  await assert.rejects(
+    reconcileForResume(registry, ambiguous, "session-new"),
+    /evidence is incomplete[\s\S]*could add a second writer[\s\S]*\/exec status/,
+  );
+  assert.deepEqual(
+    await snapshotRuns(directory),
+    before,
+    "an ambiguous run is reported, never reset",
+  );
+});
+
+test("resume passes through what it has no evidence against", async () => {
+  const registry = await seedRegistry([]);
+  const untracked = run({ status: "running", lease: DEAD_LEASE });
+  delete untracked.activeOperation;
+  const own = abandonedRun({ lease: LIVE_LEASE });
+  const cancelling = abandonedRun({ status: "cancel_pending" });
+  const failed = abandonedRun({ status: "failed" });
+
+  for (const [label, candidate] of [
+    ["nothing tracked, so nothing can double-write", untracked],
+    ["a live lease holds it", own],
+    ["cancellation must survive, not be reset", cancelling],
+    ["resume already recovers a failure", failed],
+  ] as const) {
+    const recovered = await reconcileForResume(
+      registry,
+      candidate,
+      LIVE_LEASE.sessionId,
+    );
+    assert.equal(recovered.run, candidate, label);
+    assert.equal(recovered.note, undefined, label);
+  }
+});
+
+test("resume skips a run reclaimed while it was being diagnosed", async () => {
+  const abandoned = abandonedRun();
+  const registry = await seedRegistry([abandoned]);
+  const probe: EvidenceProbe = async () => {
+    const current = await registry.get(abandoned.id);
+    await registry.update({ ...current!, lease: LIVE_LEASE });
+    return { asyncDirPresent: false };
+  };
+
+  await assert.rejects(
+    reconcileForResume(registry, abandoned, "session-new", probe),
+    /reclaimed while it was being diagnosed/,
+  );
+  assert.equal((await registry.get(abandoned.id))?.status, "running");
+  assert.equal((await registry.get(abandoned.id))?.reconciledAt, undefined);
+});
+
+test("every run whose guidance names resume survives the resume gate", async () => {
+  const registry = await seedRegistry([]);
+  const shapes: PlanExecRun[] = [
+    run({ status: "paused", stage: "comprehensive_review" }),
+    run({ status: "failed", error: "worker crashed" }),
+    run({ status: "cancel_pending" }),
+    run({ status: "running", lease: DEAD_LEASE }),
+    abandonedRun(),
+  ];
+
+  for (const shape of shapes) {
+    const guidance = recoveryGuidance(shape);
+    if (!guidance.action.includes(`/exec resume ${shape.id}`)) continue;
+    await assert.doesNotReject(
+      reconcileForResume(registry, shape, "session-new"),
+      `guidance recommends resume but the gate refuses it: ${guidance.classification}`,
+    );
+  }
+  // The pairing only proves something if both branches are exercised.
+  const stranded = run({ status: "running", lease: DEAD_LEASE });
+  delete stranded.activeOperation;
+  assert.equal(recoveryGuidance(stranded).classification, "stale owner");
+  assert.match(
+    recoveryGuidance(abandonedRun({ id: stranded.id })).action,
+    /wait and use \/exec status/,
+  );
 });
 
 test("status counts a hidden-only registry instead of reporting an empty one", async () => {

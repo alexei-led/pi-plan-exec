@@ -605,20 +605,54 @@ and `doctor --reconcile` by inspecting a lease and an operation the tool has alr
 
 **Files:** `src/index.ts`, `src/types.ts`, `test/index.test.ts`
 
-- [ ] make `resume` claim a run whose lease is foreign and not live, using Task 2's
+- [x] make `resume` claim a run whose lease is foreign and not live, using Task 2's
       `isLeaseLive`; `adopt` becomes a hidden alias
-- [ ] make `resume` reconcile a provably abandoned run first, then continue, reusing Task
+- [x] make `resume` reconcile a provably abandoned run first, then continue, reusing Task
       8's `classifyAbandonment`; never touch an `ambiguous` run and never launch on
       partial evidence
-- [ ] ask for task retry and branch adoption at the moment they matter, through the
+- [x] ask for task retry and branch adoption at the moment they matter, through the
       confirms that `--retry-task` and `--adopt-current-branch` already require
-- [ ] keep both flags working for non-interactive callers and remove them from
+- [x] keep both flags working for non-interactive callers and remove them from
       `/exec help`; keep `--model` documented as the one advanced flag
-- [ ] preserve every existing safety gate: no second worker, no consumed task attempt on
+- [x] preserve every existing safety gate: no second worker, no consumed task attempt on
       reconcile, compare-and-swap on every write
-- [ ] write tests: resume claims a dead foreign lease, resume reconciles then continues,
+- [x] write tests: resume claims a dead foreign lease, resume reconciles then continues,
       resume refuses an ambiguous run, the flags still drive the non-interactive path
-- [ ] run `npm run test:all` — must pass before task 12
+- [x] run `npm run test:all` — must pass before task 12
+- ➕ decision: the gate is an exported `reconcileForResume(registry, run, sessionId,
+probe)`, registry injected like Task 3's rule, and it runs only for a status that is
+  in flight and not already recoverable — `starting`, `running`, `skip_pending`.
+  `failed` and `cancel_pending` pass through untouched: resetting a cancel-pending run
+  would drop the cancellation it is carrying, and resume already recovers both
+- ➕ decision: `ambiguous` refuses only when an operation is tracked. Task 8 recorded
+  that a run with no `activeOperation` is `ambiguous` and that adopt-plus-resume is how
+  that shape recovers; nothing can double-write when nothing was tracked, so refusing it
+  would have removed the very capability this fold absorbs. What is refused is the one
+  shape that could add a second writer
+- ➕ decision: `recoveryGuidance`'s `stale owner` branch is now gated on
+  `!run.activeOperation`. It fired before the operation branches, so a dead owner holding
+  an unresolved operation was told to take the run over — a resume the gate then refuses.
+  A test walks every guidance shape and asserts the gate accepts each run whose action
+  names `/exec resume <id>`, so the two can never disagree again
+- ➕ decision: `/exec status` stops naming `/exec doctor --reconcile`. An abandoned row's
+  next command is `recoveryCommand`, the same function the reconcile report uses, so an
+  abandoned `cancel_pending` run still reads `/exec cancel <id>`. The retired flag keeps
+  working on the retired verb
+- ➕ decision: branch adoption is derived, not asked twice — an interactive resume of a
+  run whose error is an execution-branch mismatch, with no tracked operation, enters the
+  existing confirm on its own. `--adopt-current-branch` still forces it for a caller with
+  no human, and the guidance text now names the prompt instead of the flag
+- ➕ decision: `reconcileReason` takes the actor with `/exec doctor` as its default, so
+  Task 8's progress-file wording and its tests are untouched while a resume-driven reset
+  records `Reset by /exec resume`
+- ➕ deviation: the run-action dispatch moved out of `handleCommand` into `runAction`,
+  with an exported `runActionFor(subcommand)` naming the action and the alias note. The
+  alias note then wraps one return instead of six, and the mapping is testable without a
+  Pi command context
+- ➕ deviation: `EXEC_COMMANDS` keeps its `adopt` entry, as Task 10 kept `runs`, `doctor`,
+  and `setup`. Task 14 owns the autocomplete list. `skills/exec-plan` still names
+  `/exec adopt`, which the alias keeps working and the drift test permits; Tasks 13 and 14
+  own the skill's wording
 
 ### Task 12: ➕ Add `/exec stop` over `pause` and `cancel`
 

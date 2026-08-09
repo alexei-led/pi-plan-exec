@@ -83,7 +83,19 @@ const ALIAS_NOTES: Record<ExecAliasAction, string> = {
     "/exec doctor is now /exec status; the old name still works.",
   [EXEC_ACTION.SETUP]:
     "/exec setup is now part of /exec status; the old name still works.",
+  [EXEC_ACTION.ADOPT]:
+    "/exec adopt is now /exec resume; the old name still works.",
 };
+/** A retired verb that runs its replacement's code path. */
+const RUN_ACTION_ALIASES = {
+  [EXEC_ACTION.ADOPT]: EXEC_ACTION.RESUME,
+} as const satisfies Partial<Record<ExecAliasAction, RunAction>>;
+const RUN_ACTIONS = new Set<string>([
+  EXEC_ACTION.PAUSE,
+  EXEC_ACTION.RESUME,
+  EXEC_ACTION.SKIP,
+  EXEC_ACTION.CANCEL,
+]);
 const RUN_LIST_TERMINAL_WINDOW_MS = MILLISECONDS_PER_DAY;
 const DOCTOR_RECONCILE_OPTION = "--reconcile";
 const REQUIRED_RUNTIME_TOOLS: Record<string, string> = {
@@ -474,15 +486,23 @@ export function recoveryGuidance(run: PlanExecRun): RecoveryGuidance {
       classification: "terminal",
       action: "Run is terminal; no recovery action is available.",
     };
-  if (isStaleOwner(run) && run.status !== RUN_STATUS.FAILED)
+  // Only when nothing is tracked: a dead owner holding an unresolved operation
+  // is answered by the operation branches below, which know whether that
+  // operation is gone. Naming a takeover here would recommend a resume the
+  // recovery gate then refuses.
+  if (
+    isStaleOwner(run) &&
+    run.status !== RUN_STATUS.FAILED &&
+    !run.activeOperation
+  )
     return {
       classification: "stale owner",
-      action: `Confirm the prior session stopped, then use /exec adopt ${run.id}; do not resume from this session.`,
+      action: `Confirm the prior session stopped, then use /exec resume ${run.id}; it takes the lease over from the dead session.`,
     };
   if (hasExecutionBranchMismatch(run))
     return {
       classification: "execution-branch mismatch",
-      action: `Review the current branch, then use interactive /exec resume ${run.id} --adopt-current-branch; normal resume will not rebind it.`,
+      action: `Review the current branch, then use interactive /exec resume ${run.id}; it asks before rebinding the run to the branch you are on.`,
     };
   if (needsPlanStructureReview(run))
     return {
@@ -521,7 +541,7 @@ export function recoveryGuidance(run: PlanExecRun): RecoveryGuidance {
       if (signal?.asyncDirMissing)
         return {
           classification: "active operation directory is gone",
-          action: `The operation's async directory no longer exists, so the worker is not running. Use /exec status ${run.id} to re-check; if it stays absent, /exec cancel ${run.id} stops the run and preserves the worktree. Do not start a second run.`,
+          action: `The operation's async directory no longer exists, so the worker is not running. Use /exec resume ${run.id}; it resets the abandoned operation before continuing, without launching a second worker. Use /exec cancel ${run.id} instead to stop the run and preserve the worktree.`,
         };
       // Elapsed time is weaker evidence than a fresh activity value, so the
       // bound only speaks when nothing else does. It prompts a look; it never
@@ -776,10 +796,9 @@ export function parseStatusArguments(args: string[]): {
   let all = false;
   for (const arg of args) {
     if (arg === RUNS_ALL_OPTION) all = true;
-    // The retired name points here, so the retired flag must point back.
     else if (arg === DOCTOR_RECONCILE_OPTION)
       throw new Error(
-        `/exec status never writes. Use /exec doctor ${DOCTOR_RECONCILE_OPTION} to reset provably abandoned runs.`,
+        `/exec status never writes. /exec resume <run-id> resets a provably abandoned run and continues it.`,
       );
     else if (arg.startsWith("--") || selector !== undefined)
       throw new Error(`Usage: /exec status [full-run-id] [${RUNS_ALL_OPTION}]`);
@@ -1099,7 +1118,7 @@ export async function execStatus(
     ...groupLines(
       "abandoned — no worker is running",
       diagnosisGroup(sweep, ABANDONMENT.ABANDONED),
-      `Reset them with /exec doctor ${DOCTOR_RECONCILE_OPTION}; it never launches a worker.`,
+      "Each resets to a recoverable failure before it continues; no second worker is launched.",
     ),
     ...groupLines(
       "ambiguous — evidence is incomplete, so nothing was reset",
@@ -1223,8 +1242,8 @@ async function reconcileLines(
     lines.push(
       `Reset ${reset.length} abandoned run${reset.length === 1 ? "" : "s"} to failed. No worker was launched and no task attempt was consumed.`,
       ...reset.map(
-        ({ diagnosis, run }) =>
-          `- ${runClaim(diagnosis.run)} → failed. Next: ${recoveryCommand(diagnosis.run, run)}`,
+        ({ diagnosis }) =>
+          `- ${runClaim(diagnosis.run)} → failed. Next: ${recoveryCommand(diagnosis.run)}`,
       ),
     );
   if (skipped.length > 0)
@@ -1247,8 +1266,9 @@ async function reconcileLines(
 async function reconcileRun(
   registry: RunRegistry,
   diagnosis: RunDiagnosis,
+  actor = `/exec ${EXEC_ACTION.DOCTOR}`,
 ): Promise<PlanExecRun | undefined> {
-  const reason = reconcileReason(diagnosis);
+  const reason = reconcileReason(diagnosis, actor);
   const reset = { ...diagnosis.run };
   delete reset.activeOperation;
   const reconciled = await registry.updateIfCurrent(
@@ -1277,9 +1297,59 @@ async function reconcileRun(
  * to describe this reconciliation only: recovery classification reads run.error
  * back, and a stray "provider" or "external" here would reclassify the run.
  */
-function reconcileReason(diagnosis: RunDiagnosis): string {
+function reconcileReason(diagnosis: RunDiagnosis, actor: string): string {
   const operation = diagnosis.run.activeOperation;
-  return `Reset by /exec doctor: its lease was dead and ${operationEvidence(diagnosis)}, so no worker was running${operation ? ` for ${operation.service}/${operation.kind}` : ""}.`;
+  return `Reset by ${actor}: its lease was dead and ${operationEvidence(diagnosis)}, so no worker was running${operation ? ` for ${operation.service}/${operation.kind}` : ""}.`;
+}
+
+/**
+ * The recovery gate in front of every resume. It reconciles only on Task 8's
+ * full conjunction — an in-flight claim, a dead lease, and a tracked operation
+ * provably gone — and otherwise leaves the record exactly as it found it.
+ *
+ * Statuses resume already recovers (`failed`, `cancel_pending`) pass straight
+ * through: resetting a cancel-pending run would drop the cancellation it is
+ * carrying. A run with nothing tracked also passes through — nothing can
+ * double-write when no operation exists, and claiming it is what the retired
+ * `/exec adopt` did. What is refused is the one shape that could add a second
+ * writer: an unresolved operation that could not be proven gone.
+ */
+export async function reconcileForResume(
+  registry: RunRegistry,
+  run: PlanExecRun,
+  sessionId: string,
+  probe: EvidenceProbe = abandonmentProbe(),
+): Promise<{ run: PlanExecRun; note?: string }> {
+  if (!isInFlightStatus(run.status) || isRecoverableRun(run)) return { run };
+  const leaseLive = Boolean(run.lease && isLeaseLive(run.lease, sessionId));
+  const evidence: AbandonmentEvidence = leaseLive
+    ? { leaseLive }
+    : { leaseLive, ...(await probe(run)) };
+  const diagnosis: RunDiagnosis = {
+    run,
+    evidence,
+    classification: classifyAbandonment(run, evidence),
+  };
+  if (diagnosis.classification === ABANDONMENT.LIVE) return { run };
+  if (diagnosis.classification === ABANDONMENT.AMBIGUOUS) {
+    if (!run.activeOperation) return { run };
+    throw new Error(
+      `Run ${shortRunId(run.id)} still claims ${run.status} and the evidence is incomplete: ${evidenceText(diagnosis)}. Resuming could add a second writer, so nothing was changed. Use /exec status ${run.id} to re-check, or /exec cancel ${run.id} to stop it and preserve the worktree.`,
+    );
+  }
+  const reconciled = await reconcileRun(
+    registry,
+    diagnosis,
+    `/exec ${EXEC_ACTION.RESUME}`,
+  );
+  if (!reconciled)
+    throw new Error(
+      `Run ${shortRunId(run.id)} was reclaimed while it was being diagnosed, so nothing was changed. Use /exec status ${run.id}.`,
+    );
+  return {
+    run: reconciled,
+    note: `Run ${shortRunId(run.id)} was abandoned — ${evidenceText(diagnosis)} — so it was reset to failed before resuming. No task attempt was consumed.`,
+  };
 }
 
 function runClaim(run: PlanExecRun): string {
@@ -1310,15 +1380,15 @@ function operationEvidence(diagnosis: RunDiagnosis): string {
 
 function nextCommand(diagnosis: RunDiagnosis): string {
   if (diagnosis.classification === ABANDONMENT.ABANDONED)
-    return `/exec doctor ${DOCTOR_RECONCILE_OPTION}`;
+    return recoveryCommand(diagnosis.run);
   return `/exec status ${diagnosis.run.id}`;
 }
 
-/** A reconciled cancel-pending run still wants cancelling, not resuming. */
-function recoveryCommand(before: PlanExecRun, after: PlanExecRun): string {
-  return before.status === RUN_STATUS.CANCEL_PENDING
-    ? `/exec cancel ${after.id}`
-    : `/exec resume ${after.id}`;
+/** A cancel-pending run still wants cancelling, before or after a reset. */
+function recoveryCommand(run: PlanExecRun): string {
+  return run.status === RUN_STATUS.CANCEL_PENDING
+    ? `/exec cancel ${run.id}`
+    : `/exec resume ${run.id}`;
 }
 
 function bridgeOperationState(
@@ -1375,156 +1445,13 @@ async function handleCommand(
         ctx,
       ),
     );
-  if (
-    subcommand === EXEC_ACTION.PAUSE ||
-    subcommand === EXEC_ACTION.RESUME ||
-    subcommand === EXEC_ACTION.ADOPT ||
-    subcommand === EXEC_ACTION.SKIP ||
-    subcommand === EXEC_ACTION.CANCEL
-  ) {
-    const action = subcommand as RunAction;
-    const resumeArguments =
-      action === EXEC_ACTION.RESUME
-        ? parseResumeArguments(rest)
-        : {
-            selector: rest[0],
-            adoptCurrentBranch: false,
-            retryTask: false,
-            model: undefined,
-          };
-    const adoptCurrentBranch = resumeArguments.adoptCurrentBranch;
-    if (action === EXEC_ACTION.SKIP && (!rest[0] || rest[0] === "--reason"))
-      throw new Error(
-        "Usage: /exec skip <full-run-id> --reason <non-empty reason>",
-      );
-    const run = await resolveRunForAction(
-      action,
-      resumeArguments.selector,
-      ctx,
-      adoptCurrentBranch,
-    );
-    if (
-      action === EXEC_ACTION.RESUME ||
-      action === EXEC_ACTION.ADOPT ||
-      action === EXEC_ACTION.SKIP
-    ) {
-      await checkRuntime();
-      const recoveryModel =
-        action === EXEC_ACTION.RESUME
-          ? await recoveryModelForResume(run, resumeArguments.model, ctx)
-          : undefined;
-      let retryTask = resumeArguments.retryTask;
-      if (
-        action === EXEC_ACTION.RESUME &&
-        isTaskRetryConfirmationRequired(run) &&
-        !retryTask
-      ) {
-        if (!ctx.hasUI) throw new Error(taskRetryRequiredMessage(run));
-        const accepted = await ctx.ui.confirm(
-          "Retry externally blocked task?",
-          `${taskRetryRequiredMessage(run)}\n\nRetry it now?`,
-        );
-        if (!accepted) throw new Error("Task retry cancelled.");
-        retryTask = true;
-      }
-      const skipReason =
-        action === EXEC_ACTION.SKIP
-          ? parseSkipReason(rest.slice(1))
-          : undefined;
-      const handedOff = await handoffToWorktree(
-        ctx,
-        run,
-        syncProjection,
-        action === EXEC_ACTION.RESUME
-          ? `resume ${run.id}${adoptCurrentBranch ? " --adopt-current-branch" : ""}${retryTask ? ` ${TASK_RETRY_OPTION}` : ""}${recoveryModel ? ` ${RECOVERY_MODEL_OPTION} ${recoveryModel}` : ""}`
-          : action === EXEC_ACTION.SKIP
-            ? `skip ${run.id} --reason ${skipReason}`
-            : undefined,
-      );
-      if (handedOff) return undefined;
-      const sessionId = ctx.sessionManager.getSessionId();
-      if (action === EXEC_ACTION.SKIP) {
-        if (!ctx.hasUI)
-          throw new Error("Force-skip requires interactive confirmation.");
-        const operation = run.activeOperation;
-        const accepted = await ctx.ui.confirm(
-          `Force-skip ${run.stage}?`,
-          [
-            `Run: ${run.id}`,
-            `Reason: ${skipReason}`,
-            operation
-              ? `Active operation: ${operation.service}/${operation.kind} ${operation.externalRunId ?? operation.operationId}`
-              : "Active operation: none",
-            `Known findings: ${run.reviewFindings.length}`,
-            "The controller will stop any tracked child before advancing.",
-            "Final status will be completed_with_findings.",
-          ].join("\n"),
-        );
-        if (!accepted) throw new Error("Force-skip cancelled.");
-        const skipped = await syncProjection(
-          await controller.skip(run.id, sessionId, skipReason!),
-          { cwd: ctx.cwd, sessionId },
-        );
-        startBackgroundController(skipped, sessionId, ctx.cwd, ctx);
-        return `Run ${shortRunId(skipped.id)} force-skip requested: ${skipped.status} (${skipped.stage}).\nUse /exec status ${skipped.id} for live progress.`;
-      }
-      if (adoptCurrentBranch) {
-        if (!ctx.hasUI)
-          throw new Error("Branch adoption requires interactive confirmation.");
-        if (run.activeOperation)
-          throw new Error(
-            "Cannot adopt the current branch while an external operation is tracked.",
-          );
-        const accepted = await ctx.ui.confirm(
-          "Adopt current execution branch?",
-          [
-            `Run: ${run.id}`,
-            `Recorded branch: ${run.branch}`,
-            `Worktree: ${run.worktreeCwd}`,
-            "The controller will verify the repository, record the actual named branch, and resume the same run.",
-          ].join("\n"),
-        );
-        if (!accepted) throw new Error("Branch adoption cancelled.");
-        const rebound = await syncProjection(
-          await controller.rebindBranchAndResume(run.id, sessionId),
-          { cwd: ctx.cwd, sessionId },
-        );
-        startBackgroundController(rebound, sessionId, ctx.cwd, ctx);
-        return `Run ${shortRunId(rebound.id)} adopted branch ${rebound.branch}: ${rebound.status} (${rebound.stage}).\nUse /exec status ${rebound.id} for live progress.`;
-      }
-      const reviewedPlanHash =
-        action === EXEC_ACTION.RESUME
-          ? await reviewedPlanHashForResume(run, ctx)
-          : undefined;
-      const resumed = await syncProjection(
-        await controller.resume(
-          run.id,
-          sessionId,
-          true,
-          reviewedPlanHash,
-          retryTask,
-          recoveryModel,
-        ),
-        { cwd: ctx.cwd, sessionId },
-      );
-      startBackgroundController(resumed, sessionId, ctx.cwd, ctx);
-      return resumeResultMessage(resumed);
-    }
-    const sessionId = ctx.sessionManager.getSessionId();
-    const claimed = await registry.claim(run, sessionId);
-    if (action === EXEC_ACTION.PAUSE) {
-      const paused = await syncProjection(
-        await requestStatus(claimed, EXEC_ACTION.PAUSE, sessionId),
-        { cwd: ctx.cwd, sessionId },
-      );
-      return `Run ${shortRunId(paused.id)} paused after its active operation. Use /exec resume ${paused.id} to continue.`;
-    }
-    const cancelled = await syncProjection(
-      await requestStatus(claimed, EXEC_ACTION.CANCEL, sessionId),
-      { cwd: ctx.cwd, sessionId },
-    );
-    startBackgroundController(cancelled, sessionId, ctx.cwd, ctx);
-    return `Run ${shortRunId(cancelled.id)} marked cancel-pending. Its worktree is preserved.`;
+  const dispatched = runActionFor(subcommand);
+  if (dispatched) {
+    const message = await runAction(dispatched.action, rest, ctx, dependencies);
+    if (!dispatched.note) return message;
+    return message === undefined
+      ? dispatched.note
+      : withAliasNote(message, dispatched.note);
   }
 
   const planPath = args || (await selectPlan(ctx));
@@ -1548,6 +1475,189 @@ async function handleCommand(
     ctx,
   );
   return `Run ${shortRunId(run.id)} started: ${run.status} (${run.stage})\nbranch: ${run.branch}\nworktree: ${run.worktreeCwd}\nUse /exec status ${run.id} for live progress.`;
+}
+
+/** The subcommand's action and, when the name is retired, the note to append. */
+export function runActionFor(
+  subcommand: string | undefined,
+): { action: RunAction; note?: string } | undefined {
+  if (subcommand === undefined) return undefined;
+  if (Object.hasOwn(RUN_ACTION_ALIASES, subcommand)) {
+    const alias = subcommand as keyof typeof RUN_ACTION_ALIASES;
+    return { action: RUN_ACTION_ALIASES[alias], note: ALIAS_NOTES[alias] };
+  }
+  return RUN_ACTIONS.has(subcommand)
+    ? { action: subcommand as RunAction }
+    : undefined;
+}
+
+async function runAction(
+  action: RunAction,
+  rest: string[],
+  ctx: ExtensionCommandContext,
+  dependencies: CommandDependencies,
+): Promise<string | undefined> {
+  const {
+    controller,
+    startBackgroundController,
+    syncProjection,
+    checkRuntime,
+    doctorProbe,
+  } = dependencies;
+  const resumeArguments =
+    action === EXEC_ACTION.RESUME
+      ? parseResumeArguments(rest)
+      : {
+          selector: rest[0],
+          adoptCurrentBranch: false,
+          retryTask: false,
+          model: undefined,
+        };
+  if (action === EXEC_ACTION.SKIP && (!rest[0] || rest[0] === "--reason"))
+    throw new Error(
+      "Usage: /exec skip <full-run-id> --reason <non-empty reason>",
+    );
+  const sessionId = ctx.sessionManager.getSessionId();
+  const resolved = await resolveRunForAction(
+    action,
+    resumeArguments.selector,
+    ctx,
+    resumeArguments.adoptCurrentBranch,
+  );
+  if (action === EXEC_ACTION.RESUME || action === EXEC_ACTION.SKIP) {
+    await checkRuntime();
+    // Reconcile before anything else touches the run: from here on resume is
+    // working with a state it has evidence for.
+    const recovered =
+      action === EXEC_ACTION.RESUME
+        ? await reconcileForResume(registry, resolved, sessionId, doctorProbe)
+        : { run: resolved, note: undefined };
+    const run = recovered.run;
+    const recoveryModel =
+      action === EXEC_ACTION.RESUME
+        ? await recoveryModelForResume(run, resumeArguments.model, ctx)
+        : undefined;
+    let retryTask = resumeArguments.retryTask;
+    if (
+      action === EXEC_ACTION.RESUME &&
+      isTaskRetryConfirmationRequired(run) &&
+      !retryTask
+    ) {
+      if (!ctx.hasUI) throw new Error(taskRetryRequiredMessage(run));
+      const accepted = await ctx.ui.confirm(
+        "Retry externally blocked task?",
+        `${taskRetryRequiredMessage(run)}\n\nRetry it now?`,
+      );
+      if (!accepted) throw new Error("Task retry cancelled.");
+      retryTask = true;
+    }
+    // A branch mismatch cannot advance without rebinding, so an interactive
+    // resume asks instead of requiring the caller to know the flag. The flag
+    // stays for callers with no human to ask.
+    const adoptCurrentBranch =
+      resumeArguments.adoptCurrentBranch ||
+      (action === EXEC_ACTION.RESUME &&
+        ctx.hasUI &&
+        hasExecutionBranchMismatch(run) &&
+        run.activeOperation === undefined);
+    const skipReason =
+      action === EXEC_ACTION.SKIP ? parseSkipReason(rest.slice(1)) : undefined;
+    const handedOff = await handoffToWorktree(
+      ctx,
+      run,
+      syncProjection,
+      action === EXEC_ACTION.RESUME
+        ? `resume ${run.id}${adoptCurrentBranch ? " --adopt-current-branch" : ""}${retryTask ? ` ${TASK_RETRY_OPTION}` : ""}${recoveryModel ? ` ${RECOVERY_MODEL_OPTION} ${recoveryModel}` : ""}`
+        : action === EXEC_ACTION.SKIP
+          ? `skip ${run.id} --reason ${skipReason}`
+          : undefined,
+    );
+    if (handedOff) return undefined;
+    if (action === EXEC_ACTION.SKIP) {
+      if (!ctx.hasUI)
+        throw new Error("Force-skip requires interactive confirmation.");
+      const operation = run.activeOperation;
+      const accepted = await ctx.ui.confirm(
+        `Force-skip ${run.stage}?`,
+        [
+          `Run: ${run.id}`,
+          `Reason: ${skipReason}`,
+          operation
+            ? `Active operation: ${operation.service}/${operation.kind} ${operation.externalRunId ?? operation.operationId}`
+            : "Active operation: none",
+          `Known findings: ${run.reviewFindings.length}`,
+          "The controller will stop any tracked child before advancing.",
+          "Final status will be completed_with_findings.",
+        ].join("\n"),
+      );
+      if (!accepted) throw new Error("Force-skip cancelled.");
+      const skipped = await syncProjection(
+        await controller.skip(run.id, sessionId, skipReason!),
+        { cwd: ctx.cwd, sessionId },
+      );
+      startBackgroundController(skipped, sessionId, ctx.cwd, ctx);
+      return `Run ${shortRunId(skipped.id)} force-skip requested: ${skipped.status} (${skipped.stage}).\nUse /exec status ${skipped.id} for live progress.`;
+    }
+    if (adoptCurrentBranch) {
+      if (!ctx.hasUI)
+        throw new Error("Branch adoption requires interactive confirmation.");
+      if (run.activeOperation)
+        throw new Error(
+          "Cannot adopt the current branch while an external operation is tracked.",
+        );
+      const accepted = await ctx.ui.confirm(
+        "Adopt current execution branch?",
+        [
+          `Run: ${run.id}`,
+          `Recorded branch: ${run.branch}`,
+          `Worktree: ${run.worktreeCwd}`,
+          "The controller will verify the repository, record the actual named branch, and resume the same run.",
+        ].join("\n"),
+      );
+      if (!accepted) throw new Error("Branch adoption cancelled.");
+      const rebound = await syncProjection(
+        await controller.rebindBranchAndResume(run.id, sessionId),
+        { cwd: ctx.cwd, sessionId },
+      );
+      startBackgroundController(rebound, sessionId, ctx.cwd, ctx);
+      return `Run ${shortRunId(rebound.id)} adopted branch ${rebound.branch}: ${rebound.status} (${rebound.stage}).\nUse /exec status ${rebound.id} for live progress.`;
+    }
+    const reviewedPlanHash =
+      action === EXEC_ACTION.RESUME
+        ? await reviewedPlanHashForResume(run, ctx)
+        : undefined;
+    const resumed = await syncProjection(
+      await controller.resume(
+        run.id,
+        sessionId,
+        true,
+        reviewedPlanHash,
+        retryTask,
+        recoveryModel,
+      ),
+      { cwd: ctx.cwd, sessionId },
+    );
+    startBackgroundController(resumed, sessionId, ctx.cwd, ctx);
+    // The reset is reported where the operator asked for it, not only in the
+    // progress file it was appended to.
+    return recovered.note
+      ? `${recovered.note}\n${resumeResultMessage(resumed)}`
+      : resumeResultMessage(resumed);
+  }
+  const claimed = await registry.claim(resolved, sessionId);
+  if (action === EXEC_ACTION.PAUSE) {
+    const paused = await syncProjection(
+      await requestStatus(claimed, EXEC_ACTION.PAUSE, sessionId),
+      { cwd: ctx.cwd, sessionId },
+    );
+    return `Run ${shortRunId(paused.id)} paused after its active operation. Use /exec resume ${paused.id} to continue.`;
+  }
+  const cancelled = await syncProjection(
+    await requestStatus(claimed, EXEC_ACTION.CANCEL, sessionId),
+    { cwd: ctx.cwd, sessionId },
+  );
+  startBackgroundController(cancelled, sessionId, ctx.cwd, ctx);
+  return `Run ${shortRunId(cancelled.id)} marked cancel-pending. Its worktree is preserved.`;
 }
 
 async function resolveRunForAction(
@@ -1700,10 +1810,8 @@ export function isActionAllowed(
       : run.status === RUN_STATUS.STARTING ||
           run.status === RUN_STATUS.RUNNING ||
           run.status === RUN_STATUS.PAUSED ||
-          isRecoverableFailure(run);
-  if (action === EXEC_ACTION.ADOPT) {
-    return !isTerminal(run.status) && run.lease?.sessionId !== sessionId;
-  }
+          isRecoverableFailure(run) ||
+          isClaimableForeignRun(run, sessionId);
   if (action === EXEC_ACTION.SKIP)
     return (
       isSkippableStage(run.stage) &&
@@ -1717,6 +1825,21 @@ export function isActionAllowed(
       (!isTerminal(run.status) || run.status === RUN_STATUS.FAILED)
     );
   return false;
+}
+
+/**
+ * The lease that used to force a reader to choose `/exec adopt`: another
+ * session still holds this run and that session is provably gone. Resume reads
+ * the lease itself and takes it over.
+ */
+function isClaimableForeignRun(run: PlanExecRun, sessionId: string): boolean {
+  const lease = run.lease;
+  return (
+    !isTerminal(run.status) &&
+    lease !== undefined &&
+    lease.sessionId !== sessionId &&
+    !isLeaseLive(lease, sessionId)
+  );
 }
 
 export function isRecoverableFailure(run: PlanExecRun): boolean {
@@ -1932,7 +2055,6 @@ function actionPastTense(action: RunAction): string {
     [EXEC_ACTION.STATUS]: "inspected",
     [EXEC_ACTION.PAUSE]: "paused",
     [EXEC_ACTION.RESUME]: "resumed",
-    [EXEC_ACTION.ADOPT]: "adopted",
     [EXEC_ACTION.SKIP]: "force-skipped",
     [EXEC_ACTION.CANCEL]: "cancelled",
   }[action];
@@ -2013,8 +2135,7 @@ export function execHelp(): string {
     `                        Preview retired runs older than ${CLEANUP_RETENTION_DAYS} days; ${CLEANUP_APPLY_OPTION} deletes their registry entries only. Failed runs need ${CLEANUP_INCLUDE_FAILED_OPTION}.`,
     "/exec pause [run-id]    Pause after the active child finishes.",
     `/exec resume [run-id] [${RECOVERY_MODEL_OPTION} current|provider/model]`,
-    "                        Reconcile, resume, or retry safely. Model/provider failures use the current Pi model.",
-    "/exec adopt [run-id]    Adopt a stale run from another session.",
+    "                        Continue a stuck run: it takes the lease over from a dead session, resets a run whose worker is provably gone, and asks before retrying a blocked task or rebinding the current branch. Model/provider failures use the current Pi model.",
     "/exec skip <full-run-id> --reason <text>",
     "                        Stop any tracked child, force-skip a blocked review/finalize/stats stage, and record the waiver.",
     "/exec cancel [run-id]   Cancel safely and preserve the worktree.",
@@ -2024,7 +2145,7 @@ export function execHelp(): string {
     "- /exec status reports a missing package with the exact install commands, and diagnoses every run that claims a worker.",
     "- The footer shows live stage and worker progress.",
     "- /exec resume preserves the stage and worktree, and reconciles a known Bridge operation before retrying it.",
-    "- --adopt-current-branch requires confirmation, no active child, and the same Git repository.",
+    "- /exec resume never starts a second worker: a run whose worker cannot be proven gone is reported, not reset.",
     `- ${RECOVERY_MODEL_OPTION} is an advanced one-recovery-launch override; normal resume uses this Pi session model after a model/provider failure.`,
     "- /exec skip never skips implementation or archive; skipped runs finish as completed_with_findings.",
     "- Worktree runs fork this Pi session into the worktree so the footer and tools use the execution directory.",
