@@ -46,6 +46,7 @@ import {
   RUN_STATUS,
   WORKFLOW_MODE,
   type ActiveOperation,
+  type ExecAliasAction,
   type PlanExecRun,
   type RunAction,
 } from "./types.js";
@@ -71,23 +72,37 @@ const CLEANUP_STATUSES = new Set<PlanExecRun["status"]>([
   RUN_STATUS.CANCELLED,
 ]);
 const RUNS_ALL_OPTION = "--all";
+/**
+ * A retired verb keeps working and says so once. The record is keyed by
+ * `ExecAliasAction`, so retiring another name forces a note with it.
+ */
+const ALIAS_NOTES: Record<ExecAliasAction, string> = {
+  [EXEC_ACTION.RUNS]:
+    "/exec runs is now /exec status; the old name still works.",
+  [EXEC_ACTION.DOCTOR]:
+    "/exec doctor is now /exec status; the old name still works.",
+  [EXEC_ACTION.SETUP]:
+    "/exec setup is now part of /exec status; the old name still works.",
+};
 const RUN_LIST_TERMINAL_WINDOW_MS = MILLISECONDS_PER_DAY;
 const DOCTOR_RECONCILE_OPTION = "--reconcile";
 const REQUIRED_RUNTIME_TOOLS: Record<string, string> = {
   subagent: "pi-subagents",
   TaskCreate: "@tintinweb/pi-tasks",
 };
+const SETUP_COMMANDS = [
+  "pi install npm:pi-subagents",
+  "pi install npm:@tintinweb/pi-tasks",
+  "pi install npm:@alexeiled/pi-subagents-bridge@>=0.2.2",
+  "pi install npm:@alexeiled/pi-fusion",
+  "pi install npm:@alexeiled/pi-plan-exec",
+];
 
 const EXEC_COMMANDS: AutocompleteItem[] = [
   {
     value: EXEC_ACTION.HELP,
     label: EXEC_ACTION.HELP,
     description: "Show /exec commands and recovery hints",
-  },
-  {
-    value: EXEC_ACTION.START,
-    label: EXEC_ACTION.START,
-    description: "Start a plan; bare /exec is an alias",
   },
   {
     value: EXEC_ACTION.SETUP,
@@ -112,7 +127,7 @@ const EXEC_COMMANDS: AutocompleteItem[] = [
   {
     value: EXEC_ACTION.STATUS,
     label: EXEC_ACTION.STATUS,
-    description: "Show the current run status",
+    description: "Show every run and what it needs, or one run in detail",
   },
   {
     value: EXEC_ACTION.PAUSE,
@@ -155,6 +170,8 @@ type StartBackgroundController = (
   ctx: ExtensionContext,
 ) => void;
 type RuntimeCheck = () => Promise<void>;
+/** Prerequisite problems in report form; empty when every package is present. */
+type RuntimeProbe = () => Promise<string[]>;
 type SyncProjection = (
   run: PlanExecRun,
   options: { cwd: string; sessionId: string },
@@ -255,7 +272,7 @@ export default function planExecExtension(pi: ExtensionAPI): void {
       }
       notify(
         ctx,
-        `Plan execution ${shortRunId(failed.id)} failed at ${failed.stage}: ${failed.error ?? message}. Worktree preserved. Use /exec status to inspect it.`,
+        `Plan execution ${shortRunId(failed.id)} failed at ${failed.stage}: ${failed.error ?? message}. Worktree preserved. Use /exec status ${failed.id} to inspect it.`,
         "error",
       );
     } catch (markError: unknown) {
@@ -268,15 +285,13 @@ export default function planExecExtension(pi: ExtensionAPI): void {
       );
     }
   };
-  const checkRuntime: RuntimeCheck = async () => {
+  // Reported, not thrown: /exec status prints the same problems next to the
+  // install commands, so a missing package is visible without a separate verb.
+  const runtimeProblems: RuntimeProbe = async () => {
     const missingTools = missingRuntimeTools(
       pi.getAllTools().map((tool) => tool.name),
     );
-    if (missingTools.length > 0) {
-      throw new Error(
-        `Missing plan-exec prerequisite${missingTools.length === 1 ? "" : "s"}: ${missingTools.join(", ")}. Run /exec setup, install the packages, then /reload.`,
-      );
-    }
+    if (missingTools.length > 0) return [`missing: ${missingTools.join(", ")}`];
     const [bridgeReply, fusionReply] = await Promise.all([
       new BridgeClient(pi.events, PROVIDER_PROBE_TIMEOUT_MS).ping(),
       new FusionClient(pi.events, PROVIDER_PROBE_TIMEOUT_MS).ping(),
@@ -290,17 +305,19 @@ export default function planExecExtension(pi: ExtensionAPI): void {
     )
       incompatible.push("@alexeiled/pi-subagents-bridge >=0.2.2");
     if (!fusionReply.success) missing.push("@alexeiled/pi-fusion");
-    if (missing.length > 0 || incompatible.length > 0) {
-      const problems = [
-        ...(missing.length > 0 ? [`missing: ${missing.join(", ")}`] : []),
-        ...(incompatible.length > 0
-          ? [`incompatible: ${incompatible.join(", ")}`]
-          : []),
-      ];
+    return [
+      ...(missing.length > 0 ? [`missing: ${missing.join(", ")}`] : []),
+      ...(incompatible.length > 0
+        ? [`incompatible: ${incompatible.join(", ")}`]
+        : []),
+    ];
+  };
+  const checkRuntime: RuntimeCheck = async () => {
+    const problems = await runtimeProblems();
+    if (problems.length > 0)
       throw new Error(
-        `Plan-exec provider ${problems.join("; ")}. Run /exec setup, install compatible packages, then /reload.`,
+        `${prerequisiteProblem(problems)} Use /exec status for the install commands, then /reload.`,
       );
-    }
   };
   const startBackgroundController: StartBackgroundController = (
     initialRun,
@@ -331,7 +348,7 @@ export default function planExecExtension(pi: ExtensionAPI): void {
             stopBackgroundController(runId);
             notify(
               ctx,
-              `Plan execution ${shortRunId(run.id)} is paused. Use /exec resume to continue.`,
+              `Plan execution ${shortRunId(run.id)} is paused. Use /exec resume ${run.id} to continue.`,
               "warning",
             );
           } else {
@@ -356,15 +373,14 @@ export default function planExecExtension(pi: ExtensionAPI): void {
     getArgumentCompletions: getExecArgumentCompletions,
     handler: async (args, ctx) => {
       try {
-        const message = await handleCommand(
-          args.trim(),
-          ctx,
+        const message = await handleCommand(args.trim(), ctx, {
           controller,
           startBackgroundController,
           syncProjection,
           checkRuntime,
+          runtimeProblems,
           doctorProbe,
-        );
+        });
         if (message) ctx.ui.notify(message, "info");
       } catch (error: unknown) {
         ctx.ui.notify(
@@ -696,31 +712,53 @@ function workerSignalLines(operation: ActiveOperation | undefined): string[] {
 }
 
 /**
- * A terminal run stops being news once it is a day old, so the default view is
- * everything still in flight plus whatever finished recently. Hidden rows are
+ * Rows for the runs that claim nothing in flight, grouped by what they need.
+ * A terminal run stops being news once it is a day old, so hidden rows are
  * counted in a footer rather than dropped silently.
  */
-export function formatRunList(runs: PlanExecRun[], showAll = false): string {
-  if (runs.length === 0) return "No plan execution runs. Start one with /exec.";
+export function settledRunLines(
+  runs: PlanExecRun[],
+  showAll = false,
+): string[] {
   const visible = showAll ? runs : runs.filter(isRecentlyRelevantRun);
   const hidden = runs.length - visible.length;
-  const footer =
-    hidden === 0
+  return [
+    ...runGroupLines(
+      "waiting for you — no worker is running",
+      visible.filter(needsOperator),
+    ),
+    ...runGroupLines(
+      "finished",
+      visible.filter((run) => !needsOperator(run)),
+    ),
+    ...(hidden === 0
       ? []
       : [
-          `${hidden} older terminal run${hidden === 1 ? "" : "s"} hidden. /exec runs ${RUNS_ALL_OPTION} to show, /exec cleanup to remove.`,
-        ];
-  if (visible.length === 0)
-    return ["No recent plan execution runs.", ...footer].join("\n");
+          `${hidden} older terminal run${hidden === 1 ? "" : "s"} hidden. /exec status ${RUNS_ALL_OPTION} to show, /exec cleanup to remove.`,
+        ]),
+  ];
+}
+
+function runGroupLines(heading: string, runs: PlanExecRun[]): string[] {
+  if (runs.length === 0) return [];
   return [
-    "Plan execution runs:",
-    ...visible.map(
+    `${heading}:`,
+    ...runs.map(
       (run) =>
-        `${run.id} ${basename(run.planPath)} ${run.status}/${run.stage} ${activeOperationLabel(run)} updated ${relativeTime(run.updatedAt)}`,
+        `- ${runClaim(run)} updated ${relativeTime(run.updatedAt)}. Next: ${nextRunCommand(run)}`,
     ),
-    "Use /exec status, pause, resume, adopt, skip, or cancel. Force-skip requires a full run ID and reason.",
-    ...footer,
-  ].join("\n");
+  ];
+}
+
+/** A settled run that a person still has to move; everything else is history. */
+function needsOperator(run: PlanExecRun): boolean {
+  return run.status === RUN_STATUS.PAUSED || isRecoverableFailure(run);
+}
+
+function nextRunCommand(run: PlanExecRun): string {
+  return needsOperator(run)
+    ? `/exec resume ${run.id}`
+    : `/exec status ${run.id}`;
 }
 
 function isRecentlyRelevantRun(run: PlanExecRun): boolean {
@@ -728,6 +766,25 @@ function isRecentlyRelevantRun(run: PlanExecRun): boolean {
     !isTerminal(run.status) ||
     Date.now() - run.updatedAt < RUN_LIST_TERMINAL_WINDOW_MS
   );
+}
+
+export function parseStatusArguments(args: string[]): {
+  selector: string | undefined;
+  all: boolean;
+} {
+  let selector: string | undefined;
+  let all = false;
+  for (const arg of args) {
+    if (arg === RUNS_ALL_OPTION) all = true;
+    else if (arg.startsWith("--") || selector !== undefined)
+      throw new Error(`Usage: /exec status [full-run-id] [${RUNS_ALL_OPTION}]`);
+    else selector = arg;
+  }
+  if (selector && all)
+    throw new Error(
+      `${RUNS_ALL_OPTION} lists every run, so it cannot be combined with a run ID.`,
+    );
+  return { selector, all };
 }
 
 function parseRunsArguments(args: string[]): boolean {
@@ -871,7 +928,7 @@ export interface RunDiagnosis {
 export interface AbandonmentSweep {
   diagnoses: RunDiagnosis[];
   /** Runs that claim nothing right now: terminal or paused. */
-  settled: number;
+  settled: PlanExecRun[];
   unreadable: Array<{ runId: string; message: string }>;
 }
 
@@ -928,7 +985,7 @@ export async function sweepAbandonment(
   );
   return {
     diagnoses,
-    settled: runs.length - claiming.length,
+    settled: runs.filter((run) => !isInFlightStatus(run.status)),
     unreadable: errors,
   };
 }
@@ -941,56 +998,190 @@ export function abandonedRunsNotice(
     (diagnosis) => diagnosis.classification === ABANDONMENT.ABANDONED,
   ).length;
   if (abandoned === 0) return undefined;
-  return `${abandoned} plan execution ${abandoned === 1 ? "run claims" : "runs claim"} to be running with no worker. Use /exec doctor.`;
+  return `${abandoned} plan execution ${abandoned === 1 ? "run claims" : "runs claim"} to be running with no worker. Use /exec status.`;
 }
 
+/** Probes are optional and lazy: a read command must pay for them, nothing else. */
+export interface StatusSources {
+  probe?: EvidenceProbe;
+  problems?: RuntimeProbe;
+}
+
+export interface StatusOptions {
+  all?: boolean;
+  probe?: EvidenceProbe;
+  problems?: string[];
+}
+
+/**
+ * The whole read surface, with its registry injected so no caller can reach
+ * the real one by accident. Returns undefined when the subcommand is not a
+ * read command, and when `status` named a run the caller must resolve against
+ * its own session.
+ */
+export async function execRead(
+  registry: RunRegistry,
+  subcommand: string | undefined,
+  rest: string[],
+  sources: StatusSources = {},
+): Promise<string | undefined> {
+  if (subcommand === EXEC_ACTION.SETUP)
+    return withAliasNote(execSetup(), ALIAS_NOTES[EXEC_ACTION.SETUP]);
+  if (subcommand === EXEC_ACTION.RUNS)
+    return withAliasNote(
+      await execStatus(
+        registry,
+        await statusOptions(parseRunsArguments(rest), sources),
+      ),
+      ALIAS_NOTES[EXEC_ACTION.RUNS],
+    );
+  if (subcommand === EXEC_ACTION.DOCTOR)
+    return withAliasNote(
+      await execDoctor(registry, rest, sources.probe),
+      parseDoctorArguments(rest).reconcile
+        ? `/exec doctor ${DOCTOR_RECONCILE_OPTION} still works for scripted callers; /exec status reports the same diagnosis without writing.`
+        : ALIAS_NOTES[EXEC_ACTION.DOCTOR],
+    );
+  if (subcommand === EXEC_ACTION.STATUS) {
+    const { selector, all } = parseStatusArguments(rest);
+    if (!selector)
+      return execStatus(registry, await statusOptions(all, sources));
+  }
+  return undefined;
+}
+
+/** One line, appended once, naming what the retired verb became. */
+function withAliasNote(body: string, note: string): string {
+  return `${body}\n${note}`;
+}
+
+async function statusOptions(
+  all: boolean,
+  sources: StatusSources,
+): Promise<StatusOptions> {
+  const problems = sources.problems ? await sources.problems() : [];
+  return {
+    all,
+    ...(sources.probe ? { probe: sources.probe } : {}),
+    ...(problems.length > 0 ? { problems } : {}),
+  };
+}
+
+/**
+ * One read for "what is going on": every run, grouped by what it needs, each
+ * row ending in a single next command. Listing, diagnosis, and the missing
+ * package report are the same question at different zoom levels, so they are
+ * one answer; `--all` is the zoom control.
+ */
+export async function execStatus(
+  registry: RunRegistry,
+  options: StatusOptions = {},
+): Promise<string> {
+  const sweep = await sweepAbandonment(registry, options.probe);
+  const lines =
+    options.problems && options.problems.length > 0
+      ? prerequisiteLines(options.problems)
+      : [];
+  const total =
+    sweep.diagnoses.length + sweep.settled.length + sweep.unreadable.length;
+  if (total === 0)
+    return [...lines, "No plan execution runs. Start one with /exec."].join(
+      "\n",
+    );
+  const inFlight = sweep.diagnoses.length;
+  lines.push(
+    `Plan execution runs: ${total}${inFlight > 0 ? ` (${inFlight} claiming work in flight)` : ""}`,
+    ...groupLines(
+      "abandoned — no worker is running",
+      diagnosisGroup(sweep, ABANDONMENT.ABANDONED),
+      `Reset them with /exec doctor ${DOCTOR_RECONCILE_OPTION}; it never launches a worker.`,
+    ),
+    ...groupLines(
+      "ambiguous — evidence is incomplete, so nothing was reset",
+      diagnosisGroup(sweep, ABANDONMENT.AMBIGUOUS),
+    ),
+    ...groupLines(
+      "live — a session still holds this run",
+      diagnosisGroup(sweep, ABANDONMENT.LIVE),
+    ),
+    ...settledRunLines(sweep.settled, options.all ?? false),
+    ...unreadableLines(sweep.unreadable),
+  );
+  return lines.join("\n");
+}
+
+/** Name the problem where the reader already is, next to the exact cure. */
+function prerequisiteLines(problems: string[]): string[] {
+  return [
+    `${prerequisiteProblem(problems)} Install them, then /reload:`,
+    ...SETUP_COMMANDS,
+    "",
+  ];
+}
+
+function prerequisiteProblem(problems: string[]): string {
+  return `Plan-exec prerequisites — ${problems.join("; ")}.`;
+}
+
+function unreadableLines(
+  unreadable: Array<{ runId: string; message: string }>,
+): string[] {
+  if (unreadable.length === 0) return [];
+  return [
+    "unreadable run records:",
+    ...unreadable.map(
+      (record) =>
+        `- ${record.runId} — ${record.message}. Next: /exec cleanup ${record.runId} ${CLEANUP_APPLY_OPTION}`,
+    ),
+  ];
+}
+
+function diagnosisGroup(
+  sweep: AbandonmentSweep,
+  classification: Abandonment,
+): RunDiagnosis[] {
+  return sweep.diagnoses.filter(
+    (diagnosis) => diagnosis.classification === classification,
+  );
+}
+
+/**
+ * Retired: the read-only sweep is /exec status. Only the write half still lives
+ * here, so a scripted `--reconcile` caller keeps working until it moves to
+ * /exec resume.
+ */
 export async function execDoctor(
   registry: RunRegistry,
   args: string[],
   probe?: EvidenceProbe,
 ): Promise<string> {
   const { reconcile } = parseDoctorArguments(args);
+  if (!reconcile) return execStatus(registry, probe ? { probe } : {});
   const sweep = await sweepAbandonment(registry, probe);
-  const group = (classification: Abandonment): RunDiagnosis[] =>
-    sweep.diagnoses.filter(
-      (diagnosis) => diagnosis.classification === classification,
-    );
-  const abandoned = group(ABANDONMENT.ABANDONED);
   const lines =
     sweep.diagnoses.length === 0
       ? ["No plan execution run claims work in flight."]
       : [
           `Plan execution runs claiming work in flight: ${sweep.diagnoses.length}`,
         ];
-  if (reconcile) lines.push(...(await reconcileLines(registry, abandoned)));
-  else
-    lines.push(
-      ...groupLines(
-        "abandoned — no worker is running",
-        abandoned,
-        `Reset them with /exec doctor ${DOCTOR_RECONCILE_OPTION}; it never launches a worker.`,
-      ),
-    );
   lines.push(
+    ...(await reconcileLines(
+      registry,
+      diagnosisGroup(sweep, ABANDONMENT.ABANDONED),
+    )),
     ...groupLines(
       "ambiguous — evidence is incomplete, so nothing was reset",
-      group(ABANDONMENT.AMBIGUOUS),
+      diagnosisGroup(sweep, ABANDONMENT.AMBIGUOUS),
     ),
     ...groupLines(
       "live — a session still holds this run",
-      group(ABANDONMENT.LIVE),
+      diagnosisGroup(sweep, ABANDONMENT.LIVE),
     ),
+    ...unreadableLines(sweep.unreadable),
   );
-  if (sweep.unreadable.length > 0) {
-    lines.push("unreadable run records:");
-    for (const record of sweep.unreadable)
-      lines.push(
-        `- ${record.runId} — ${record.message}. Next: /exec cleanup ${record.runId} ${CLEANUP_APPLY_OPTION}`,
-      );
-  }
-  if (sweep.settled > 0)
+  if (sweep.settled.length > 0)
     lines.push(
-      `${sweep.settled} other run${sweep.settled === 1 ? " is" : "s are"} terminal or paused; use /exec runs ${RUNS_ALL_OPTION}.`,
+      `${sweep.settled.length} other run${sweep.settled.length === 1 ? " is" : "s are"} terminal or paused; use /exec status ${RUNS_ALL_OPTION}.`,
     );
   return lines.join("\n");
 }
@@ -1141,25 +1332,45 @@ async function pathExists(path: string): Promise<boolean> {
   }
 }
 
+interface CommandDependencies {
+  controller: PlanExecController;
+  startBackgroundController: StartBackgroundController;
+  syncProjection: SyncProjection;
+  checkRuntime: RuntimeCheck;
+  runtimeProblems: RuntimeProbe;
+  doctorProbe: EvidenceProbe;
+}
+
 async function handleCommand(
   args: string,
   ctx: ExtensionCommandContext,
-  controller: PlanExecController,
-  startBackgroundController: StartBackgroundController,
-  syncProjection: SyncProjection,
-  checkRuntime: RuntimeCheck,
-  doctorProbe: EvidenceProbe,
+  dependencies: CommandDependencies,
 ): Promise<string | undefined> {
+  const {
+    controller,
+    startBackgroundController,
+    syncProjection,
+    checkRuntime,
+    runtimeProblems,
+    doctorProbe,
+  } = dependencies;
   const [subcommand, ...rest] = args.split(/\s+/).filter(Boolean);
   if (subcommand === EXEC_ACTION.HELP) return execHelp();
-  if (subcommand === EXEC_ACTION.SETUP) return execSetup();
-  if (subcommand === EXEC_ACTION.RUNS)
-    return formatRunList(await registry.list(), parseRunsArguments(rest));
   if (subcommand === EXEC_ACTION.CLEANUP) return execCleanup(registry, rest);
-  if (subcommand === EXEC_ACTION.DOCTOR)
-    return execDoctor(registry, rest, doctorProbe);
+  const read = await execRead(registry, subcommand, rest, {
+    probe: doctorProbe,
+    problems: runtimeProblems,
+  });
+  if (read !== undefined) return read;
+  if (subcommand === EXEC_ACTION.STATUS)
+    return formatRunStatus(
+      await resolveRunForAction(
+        EXEC_ACTION.STATUS,
+        parseStatusArguments(rest).selector,
+        ctx,
+      ),
+    );
   if (
-    subcommand === EXEC_ACTION.STATUS ||
     subcommand === EXEC_ACTION.PAUSE ||
     subcommand === EXEC_ACTION.RESUME ||
     subcommand === EXEC_ACTION.ADOPT ||
@@ -1187,7 +1398,6 @@ async function handleCommand(
       ctx,
       adoptCurrentBranch,
     );
-    if (action === EXEC_ACTION.STATUS) return formatRunStatus(run);
     if (
       action === EXEC_ACTION.RESUME ||
       action === EXEC_ACTION.ADOPT ||
@@ -1251,7 +1461,7 @@ async function handleCommand(
           { cwd: ctx.cwd, sessionId },
         );
         startBackgroundController(skipped, sessionId, ctx.cwd, ctx);
-        return `Run ${shortRunId(skipped.id)} force-skip requested: ${skipped.status} (${skipped.stage}).\nUse /exec status for live progress.`;
+        return `Run ${shortRunId(skipped.id)} force-skip requested: ${skipped.status} (${skipped.stage}).\nUse /exec status ${skipped.id} for live progress.`;
       }
       if (adoptCurrentBranch) {
         if (!ctx.hasUI)
@@ -1275,7 +1485,7 @@ async function handleCommand(
           { cwd: ctx.cwd, sessionId },
         );
         startBackgroundController(rebound, sessionId, ctx.cwd, ctx);
-        return `Run ${shortRunId(rebound.id)} adopted branch ${rebound.branch}: ${rebound.status} (${rebound.stage}).\nUse /exec status for live progress.`;
+        return `Run ${shortRunId(rebound.id)} adopted branch ${rebound.branch}: ${rebound.status} (${rebound.stage}).\nUse /exec status ${rebound.id} for live progress.`;
       }
       const reviewedPlanHash =
         action === EXEC_ACTION.RESUME
@@ -1302,7 +1512,7 @@ async function handleCommand(
         await requestStatus(claimed, EXEC_ACTION.PAUSE, sessionId),
         { cwd: ctx.cwd, sessionId },
       );
-      return `Run ${shortRunId(paused.id)} paused after its active operation. Use /exec resume to continue.`;
+      return `Run ${shortRunId(paused.id)} paused after its active operation. Use /exec resume ${paused.id} to continue.`;
     }
     const cancelled = await syncProjection(
       await requestStatus(claimed, EXEC_ACTION.CANCEL, sessionId),
@@ -1312,10 +1522,7 @@ async function handleCommand(
     return `Run ${shortRunId(cancelled.id)} marked cancel-pending. Its worktree is preserved.`;
   }
 
-  const planPath =
-    subcommand === EXEC_ACTION.START
-      ? rest.join(" ") || (await selectPlan(ctx))
-      : args || (await selectPlan(ctx));
+  const planPath = args || (await selectPlan(ctx));
   await checkRuntime();
   const useWorktree = await chooseIsolation(ctx);
   const started = await controller.start({
@@ -1335,7 +1542,7 @@ async function handleCommand(
     ctx.cwd,
     ctx,
   );
-  return `Run ${shortRunId(run.id)} started: ${run.status} (${run.stage})\nbranch: ${run.branch}\nworktree: ${run.worktreeCwd}\nUse /exec status for live progress.`;
+  return `Run ${shortRunId(run.id)} started: ${run.status} (${run.stage})\nbranch: ${run.branch}\nworktree: ${run.worktreeCwd}\nUse /exec status ${run.id} for live progress.`;
 }
 
 async function resolveRunForAction(
@@ -1370,18 +1577,14 @@ async function resolveRunForAction(
           ? "resumable"
           : `${action}able`;
     throw new Error(
-      `No ${verb} plan execution run found here. Use /exec runs or /exec <plan> to start one.`,
+      `No ${verb} plan execution run found here. Use /exec status or /exec <plan> to start one.`,
     );
   }
-  const preferred = prioritizeRunCandidates(
-    candidates,
-    ctx.cwd,
-    action === EXEC_ACTION.STATUS,
-  );
+  const preferred = prioritizeRunCandidates(candidates, ctx.cwd);
   if (preferred.length === 1) return preferred[0]!;
   if (!ctx.hasUI) {
     throw new Error(
-      `Multiple runs match this repository. Use /exec ${action} <run-id> or /exec runs.`,
+      `Multiple runs match this repository. Use /exec ${action} <run-id> or /exec status.`,
     );
   }
   const labels = preferred.map(
@@ -1398,16 +1601,11 @@ async function resolveRunForAction(
 export function prioritizeRunCandidates(
   candidates: PlanExecRun[],
   cwd: string,
-  preferLive = false,
 ): PlanExecRun[] {
-  const live = preferLive
-    ? candidates.filter((run) => !isTerminal(run.status))
-    : [];
-  const pool = live.length > 0 ? live : candidates;
-  const exactWorktree = pool.filter(
+  const exactWorktree = candidates.filter(
     (run) => resolve(run.worktreeCwd) === resolve(cwd),
   );
-  return exactWorktree.length > 0 ? exactWorktree : pool;
+  return exactWorktree.length > 0 ? exactWorktree : candidates;
 }
 
 async function handoffToWorktree(
@@ -1642,7 +1840,7 @@ export function resumeResultMessage(run: PlanExecRun): string {
       : "resumed";
   return [
     `Run ${shortRunId(run.id)} ${verb}: ${run.status} (${run.stage}).`,
-    "Use /exec status for live progress.",
+    `Use /exec status ${run.id} for live progress.`,
   ].join("\n");
 }
 
@@ -1783,9 +1981,9 @@ function compactRunStatus(run: PlanExecRun): string {
 
 function terminalMessage(run: PlanExecRun): string {
   if (run.status === RUN_STATUS.FAILED)
-    return `Plan execution ${shortRunId(run.id)} failed at ${run.stage}: ${run.error ?? "unknown error"}. Worktree preserved; use /exec status.`;
+    return `Plan execution ${shortRunId(run.id)} failed at ${run.stage}: ${run.error ?? "unknown error"}. Worktree preserved; use /exec status ${run.id}.`;
   if (run.status === RUN_STATUS.COMPLETED_WITH_FINDINGS)
-    return `Plan execution ${shortRunId(run.id)} completed with findings. Use /exec status for details.`;
+    return `Plan execution ${shortRunId(run.id)} completed with findings. Use /exec status ${run.id} for details.`;
   if (run.status === RUN_STATUS.CANCELLED)
     return `Plan execution ${shortRunId(run.id)} cancelled. Its worktree was preserved.`;
   return `Plan execution ${shortRunId(run.id)} completed.`;
@@ -1794,11 +1992,7 @@ function terminalMessage(run: PlanExecRun): string {
 export function execSetup(): string {
   return [
     "Install the plan-exec prerequisites at compatible versions:",
-    "pi install npm:pi-subagents",
-    "pi install npm:@tintinweb/pi-tasks",
-    "pi install npm:@alexeiled/pi-subagents-bridge@>=0.2.2",
-    "pi install npm:@alexeiled/pi-fusion",
-    "pi install npm:@alexeiled/pi-plan-exec",
+    ...SETUP_COMMANDS,
     "",
     "Then run /reload. Use /exec help for commands.",
   ].join("\n");
@@ -1808,14 +2002,10 @@ export function execHelp(): string {
   return [
     "Plan execution commands:",
     "/exec [plan-path]       Start a plan (bare /exec opens the plan picker).",
-    "/exec start [plan-path] Start a plan explicitly.",
-    "/exec setup             Show required packages and install commands.",
-    "/exec status [run-id]   Show progress; run-id is optional when unambiguous.",
-    `/exec runs [${RUNS_ALL_OPTION}]      List active runs plus terminal runs from the last day; ${RUNS_ALL_OPTION} shows every run.`,
+    `/exec status [run-id] [${RUNS_ALL_OPTION}]`,
+    `                        No run ID: every run grouped by what it needs, with any missing package and one next command per run. ${RUNS_ALL_OPTION} also shows terminal runs older than a day.`,
     `/exec cleanup [full-run-id] [${CLEANUP_APPLY_OPTION}] [${CLEANUP_INCLUDE_FAILED_OPTION}]`,
     `                        Preview retired runs older than ${CLEANUP_RETENTION_DAYS} days; ${CLEANUP_APPLY_OPTION} deletes their registry entries only. Failed runs need ${CLEANUP_INCLUDE_FAILED_OPTION}.`,
-    `/exec doctor [${DOCTOR_RECONCILE_OPTION}]`,
-    `                        Diagnose every run claiming work in flight; ${DOCTOR_RECONCILE_OPTION} resets provably abandoned ones to failed so /exec resume can recover them. It never launches a worker.`,
     "/exec pause [run-id]    Pause after the active child finishes.",
     `/exec resume [run-id] [${RECOVERY_MODEL_OPTION} current|provider/model]`,
     "                        Reconcile, resume, or retry safely. Model/provider failures use the current Pi model.",
@@ -1826,6 +2016,7 @@ export function execHelp(): string {
     "",
     "Hints:",
     "- Prefer Worktree (isolated) when asked.",
+    "- /exec status reports a missing package with the exact install commands, and diagnoses every run that claims a worker.",
     "- The footer shows live stage and worker progress.",
     "- /exec resume preserves the stage and worktree, and reconciles a known Bridge operation before retrying it.",
     "- --adopt-current-branch requires confirmation, no active child, and the same Git repository.",

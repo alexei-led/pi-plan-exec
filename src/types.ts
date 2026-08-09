@@ -2,7 +2,6 @@ export const COMPLETED_PLANS_DIRECTORY = "completed";
 
 export const EXEC_ACTION = {
   HELP: "help",
-  START: "start",
   SETUP: "setup",
   RUNS: "runs",
   CLEANUP: "cleanup",
@@ -15,9 +14,22 @@ export const EXEC_ACTION = {
   CANCEL: "cancel",
 } as const;
 
+/**
+ * Retired names that still dispatch. They are absent from /exec help and name
+ * their replacement once in their own output, so a run in flight during an
+ * upgrade — or a scripted caller — never breaks on a renamed verb.
+ */
+export const EXEC_ALIAS_ACTIONS = [
+  EXEC_ACTION.RUNS,
+  EXEC_ACTION.DOCTOR,
+  EXEC_ACTION.SETUP,
+] as const;
+
+export type ExecAliasAction = (typeof EXEC_ALIAS_ACTIONS)[number];
+
 export type RunAction = (typeof EXEC_ACTION)[Exclude<
   keyof typeof EXEC_ACTION,
-  "HELP" | "START" | "SETUP" | "RUNS" | "CLEANUP" | "DOCTOR"
+  "HELP" | "SETUP" | "RUNS" | "CLEANUP" | "DOCTOR"
 >];
 
 export const RUN_STAGE = {

@@ -545,23 +545,56 @@ Three rules bind every task in this group:
 
 **Files:** `src/index.ts`, `src/types.ts`, `test/index.test.ts`
 
-- [ ] delete the `start` subcommand; `src/index.ts:1315` shows it is the identical code
+- [x] delete the `start` subcommand; `src/index.ts:1315` shows it is the identical code
       path to bare `/exec`, picker included
-- [ ] make `/exec status` with no run ID the full sweep: every run, grouped by what it
+- [x] make `/exec status` with no run ID the full sweep: every run, grouped by what it
       needs, each row ending in one next command
-- [ ] fold `doctor` into that sweep, and `--all` into it as the zoom control it already is
-- [ ] surface missing packages inside `status` rather than behind a separate verb
-- [ ] keep `runs`, `doctor`, and `setup` as hidden aliases that still work, are absent
+- [x] fold `doctor` into that sweep, and `--all` into it as the zoom control it already is
+- [x] surface missing packages inside `status` rather than behind a separate verb
+- [x] keep `runs`, `doctor`, and `setup` as hidden aliases that still work, are absent
       from `/exec help`, and name their replacement once in the output
-- [ ] keep `--reconcile` reachable on the alias so a scripted caller does not break; the
+- [x] keep `--reconcile` reachable on the alias so a scripted caller does not break; the
       interactive path moves to `resume` in Task 11
-- [ ] do not fold `cleanup` into `status` — reading and deleting stay separate verbs
-- [ ] update Task 9's skill-vs-`EXEC_ACTION` drift test: hidden aliases exist in
+- [x] do not fold `cleanup` into `status` — reading and deleting stay separate verbs;
+      `cleanup` keeps its own dispatch branch and both flags
+- [x] update Task 9's skill-vs-`EXEC_ACTION` drift test: hidden aliases exist in
       `EXEC_ACTION` but must not be required in the skill, so the assertion needs an
       explicit alias set rather than a two-way equality
-- [ ] write tests: `start` is gone, `status` with no ID lists and diagnoses in one pass,
+- [x] write tests: `start` is gone, `status` with no ID lists and diagnoses in one pass,
       each alias still works and names its replacement, `/exec help` no longer lists them
-- [ ] run `npm run test:all` — must pass before task 11
+- [x] run `npm run test:all` — must pass before task 11
+- ➕ decision: the read surface moved into an exported `execRead(registry, subcommand,
+rest, sources)` whose registry is a required argument, mirroring Task 3's rule that no
+  test can reach the real `~/.pi/plan-exec/runs/`. `handleCommand` keeps only
+  `status <run-id>`, which needs the session context to resolve a run
+- ➕ decision: `formatRunList` is gone, replaced by `settledRunLines`. Folding `runs` into
+  `status` left it with no production caller, and a second unused renderer would drift;
+  its hidden-footer behavior and both of its tests moved across intact
+- ➕ decision: the no-ID sweep groups settled runs as `waiting for you` (paused or
+  recoverable failure → `/exec resume <id>`) and `finished` (→ `/exec status <id>`), so
+  every row still ends at exactly one command. The `--all` footer now names
+  `/exec status --all`
+- ➕ decision: `EXEC_ALIAS_ACTIONS` lives in `src/types.ts` beside `EXEC_ACTION` and keys
+  the `ALIAS_NOTES` record, so retiring another name forces a note with it and the drift
+  test asserts against production truth instead of a hand-kept literal
+- ➕ decision: `checkRuntime` split into a reporting `runtimeProblems()` plus the throwing
+  wrapper. The probe is lazy and only the read commands pay for it, so `/exec resume`
+  gains no extra RPC, and the two old throw messages merged into one that names
+  `/exec status` rather than the retired `/exec setup`
+- ➕ decision: `--all` and a run ID are rejected together — `--all` is a listing zoom, and
+  silently ignoring it would hide the contradiction
+- ➕ deviation: the no-ID sweep covers every run with no `matchesContext` filter, as
+  `doctor` already did, so bare `/exec status` no longer prints one run's detail. Every
+  message that already holds a run ID now prints `/exec status <id>` instead of bare
+  `/exec status`, so the detail view stays one keystroke away
+- ➕ deviation: deleted `prioritizeRunCandidates`'s `preferLive` parameter and the test
+  that pinned it. Only status-without-an-ID passed `true`, and that path no longer
+  resolves a run from context, so the branch was dead
+- ➕ deviation: edited `skills/exec-plan/SKILL.md`, which is not in this task's Files list.
+  With `start` gone from `EXEC_ACTION`, its two `/exec start` mentions failed the drift
+  test's documented-subcommand direction. The start line now reads
+  `/exec <path/to/plan.md>`, angle-bracketed so the scraper cannot read `path` as a
+  subcommand
 
 ### Task 11: ➕ Collapse the recovery surface into `/exec resume`
 

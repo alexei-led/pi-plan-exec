@@ -18,7 +18,8 @@ import {
   parseDoctorArguments,
   sweepAbandonment,
   type EvidenceProbe,
-  formatRunList,
+  execRead,
+  execStatus,
   formatRunStatus,
   getExecArgumentCompletions,
   hasBridgeOperationMethod,
@@ -30,12 +31,18 @@ import {
   parseResumeArguments,
   parseResumeOptions,
   parseSkipReason,
+  parseStatusArguments,
+  settledRunLines,
   resumeResultMessage,
   prioritizeRunCandidates,
   recoveryGuidance,
   reviewedPlanHashForResume,
 } from "../src/index.js";
-import { EXEC_ACTION, type PlanExecRun } from "../src/types.js";
+import {
+  EXEC_ACTION,
+  EXEC_ALIAS_ACTIONS,
+  type PlanExecRun,
+} from "../src/types.js";
 
 const config = {
   taskRetries: 1,
@@ -197,9 +204,9 @@ test("exec command completions explain the command family", () => {
   const items = getExecArgumentCompletions("st");
   assert.deepEqual(
     items?.map((item) => item.value),
-    ["start", "status"],
+    ["status"],
   );
-  assert.match(items?.[0]?.description ?? "", /Start a plan/);
+  assert.match(items?.[0]?.description ?? "", /every run and what it needs/);
   const allItems = getExecArgumentCompletions("") ?? [];
   assert.match(allItems.map((item) => item.value).join(" "), /setup/);
   assert.match(
@@ -226,6 +233,9 @@ test("help and setup explain the installed command surface", () => {
   assert.match(execHelp(), /\/exec cleanup \[full-run-id\]/);
   assert.match(execHelp(), /registry entries only/);
   assert.match(execHelp(), /\/skill:exec-plan/);
+  assert.match(execHelp(), /\/exec status \[run-id\] \[--all\]/);
+  for (const alias of EXEC_ALIAS_ACTIONS)
+    assert.doesNotMatch(execHelp(), new RegExp(`/exec ${alias}`), alias);
   assert.match(
     execSetup(),
     /pi install npm:@alexeiled\/pi-subagents-bridge@>=0\.2\.2/,
@@ -796,25 +806,6 @@ test("run status distinguishes unavailable observation from normal polling", () 
   assert.match(status, /bridge unavailable/);
 });
 
-test("status prefers a live isolated run over a failed current-checkout run", () => {
-  const failedInPlace = run({
-    id: "11111111-1111-4111-8111-111111111111",
-    status: "failed",
-    worktreeCwd: "/repo",
-  });
-  const activeIsolated = run({
-    id: "22222222-2222-4222-8222-222222222222",
-    worktreeCwd: "/tmp/execution-worktree",
-  });
-
-  assert.deepEqual(
-    prioritizeRunCandidates([failedInPlace, activeIsolated], "/repo", true).map(
-      (candidate) => candidate.id,
-    ),
-    [activeIsolated.id],
-  );
-});
-
 test("resume keeps exact-worktree priority over a live isolated run", () => {
   const recoverableInPlace = run({
     id: "11111111-1111-4111-8111-111111111111",
@@ -1121,7 +1112,7 @@ test("doctor groups every in-flight claim and mutates nothing", async () => {
 
   const report = await execDoctor(registry, []);
 
-  assert.match(report, /Plan execution runs claiming work in flight: 3/);
+  assert.match(report, /Plan execution runs: 4 \(3 claiming work in flight\)/);
   assert.match(
     report,
     new RegExp(
@@ -1142,7 +1133,7 @@ test("doctor groups every in-flight claim and mutates nothing", async () => {
   );
   assert.match(
     report,
-    /1 other run is terminal or paused; use \/exec runs --all\./,
+    /1 older terminal run hidden\. \/exec status --all to show, \/exec cleanup to remove\./,
   );
   assert.deepEqual(
     await snapshotRuns(directory),
@@ -1345,7 +1336,7 @@ test("startup says one line about abandoned runs, or nothing", async () => {
 
   assert.equal(
     abandonedRunsNotice(await sweepAbandonment(registry)),
-    "2 plan execution runs claim to be running with no worker. Use /exec doctor.",
+    "2 plan execution runs claim to be running with no worker. Use /exec status.",
   );
   assert.equal(abandonedRunsNotice(await sweepAbandonment(quiet)), undefined);
 
@@ -1397,45 +1388,183 @@ test("cleanup removes a run record the registry cannot parse", async () => {
   assert.deepEqual((await registry.listWithErrors()).errors, []);
 });
 
-test("run list tells users how to inspect an unambiguous run", () => {
-  const list = formatRunList([run()]);
-  assert.match(list, /example\.md running\/implementation/);
-  assert.match(list, /\/exec status/);
-  assert.doesNotMatch(list, /hidden/, "nothing hidden means no footer");
-});
-
-test("run list hides older terminal runs behind --all", () => {
-  const active = run();
+test("settled runs group by what they need and hide stale terminal rows", () => {
+  const paused = run({
+    id: "11111111-1111-4111-8111-111111111111",
+    status: "paused",
+    updatedAt: Date.now() - HOUR_MS,
+  });
+  const failed = run({
+    id: "22222222-2222-4222-8222-222222222222",
+    status: "failed",
+    updatedAt: Date.now() - HOUR_MS,
+  });
   // Retired an hour ago: the archive stamp does not hide a run, age does.
   const justArchived = retiredRun({
-    id: "22222222-2222-4222-8222-222222222222",
+    id: "33333333-3333-4333-8333-333333333333",
     updatedAt: Date.now() - HOUR_MS,
     retiredAt: Date.now() - HOUR_MS,
   });
   const oldCompleted = retiredRun({
-    id: "33333333-3333-4333-8333-333333333333",
+    id: "44444444-4444-4444-8444-444444444444",
   });
   const oldCancelled = retiredRun({
-    id: "44444444-4444-4444-8444-444444444444",
+    id: "55555555-5555-4555-8555-555555555555",
     status: "cancelled",
   });
-  const runs = [active, justArchived, oldCompleted, oldCancelled];
+  const runs = [paused, failed, justArchived, oldCompleted, oldCancelled];
 
-  const listed = formatRunList(runs);
+  const lines = settledRunLines(runs).join("\n");
 
-  assert.ok(listed.includes(active.id), "an active run always lists");
-  assert.ok(listed.includes(justArchived.id), "a fresh terminal run lists");
-  assert.ok(!listed.includes(oldCompleted.id), "an old terminal run is hidden");
-  assert.ok(!listed.includes(oldCancelled.id), "an old terminal run is hidden");
   assert.match(
-    listed,
-    /2 older terminal runs hidden\. \/exec runs --all to show, \/exec cleanup to remove\./,
+    lines,
+    new RegExp(
+      `waiting for you — no worker is running:\\n- ${paused.id} [^\\n]*Next: /exec resume ${paused.id}`,
+    ),
+  );
+  assert.match(
+    lines,
+    new RegExp(`- ${failed.id} [^\\n]*/exec resume ${failed.id}`),
+  );
+  assert.match(
+    lines,
+    new RegExp(
+      `finished:\\n- ${justArchived.id} [^\\n]*Next: /exec status ${justArchived.id}`,
+    ),
+  );
+  assert.ok(!lines.includes(oldCompleted.id), "an old terminal run is hidden");
+  assert.ok(!lines.includes(oldCancelled.id), "an old terminal run is hidden");
+  assert.match(
+    lines,
+    /2 older terminal runs hidden\. \/exec status --all to show, \/exec cleanup to remove\./,
   );
 
-  const all = formatRunList(runs, true);
+  const all = settledRunLines(runs, true).join("\n");
 
   for (const shown of runs) assert.ok(all.includes(shown.id), shown.id);
   assert.doesNotMatch(all, /hidden/, "--all hides nothing, so no footer");
+});
+
+test("status answers what is going on in one pass", async () => {
+  const abandoned = abandonedRun();
+  const paused = run({
+    id: "22222222-2222-4222-8222-222222222222",
+    status: "paused",
+    updatedAt: Date.now() - HOUR_MS,
+  });
+  const stale = retiredRun({ id: "33333333-3333-4333-8333-333333333333" });
+  const registry = await seedRegistry([abandoned, paused, stale]);
+
+  const report = await execStatus(registry);
+
+  assert.match(report, /Plan execution runs: 3 \(1 claiming work in flight\)/);
+  assert.match(
+    report,
+    new RegExp(
+      `abandoned — no worker is running:\\n- ${abandoned.id} [^\\n]*Next: /exec doctor --reconcile`,
+    ),
+  );
+  assert.match(
+    report,
+    new RegExp(`- ${paused.id} [^\\n]*Next: /exec resume ${paused.id}`),
+  );
+  assert.ok(!report.includes(stale.id), "an old terminal run needs --all");
+  assert.match(report, /1 older terminal run hidden\./);
+
+  const zoomed = await execStatus(registry, { all: true });
+  assert.ok(zoomed.includes(stale.id), "--all is the zoom control");
+  assert.doesNotMatch(zoomed, /hidden/);
+});
+
+test("status reports a missing package with its install commands", async () => {
+  const registry = await seedRegistry([]);
+
+  const report = await execStatus(registry, {
+    problems: ["missing: pi-subagents"],
+  });
+
+  assert.match(report, /Plan-exec prerequisites — missing: pi-subagents\./);
+  assert.match(report, /^pi install npm:pi-subagents$/m);
+  assert.match(report, /No plan execution runs\. Start one with \/exec\./);
+  assert.equal(
+    await execStatus(registry),
+    "No plan execution runs. Start one with /exec.",
+  );
+});
+
+test("status arguments take one run ID or the --all zoom, never both", () => {
+  assert.deepEqual(parseStatusArguments([]), {
+    selector: undefined,
+    all: false,
+  });
+  assert.deepEqual(parseStatusArguments(["run-id"]), {
+    selector: "run-id",
+    all: false,
+  });
+  assert.deepEqual(parseStatusArguments(["--all"]), {
+    selector: undefined,
+    all: true,
+  });
+  assert.throws(
+    () => parseStatusArguments(["run-id", "--all"]),
+    /cannot be combined/,
+  );
+  assert.throws(() => parseStatusArguments(["--reconcile"]), /Usage/);
+  assert.throws(() => parseStatusArguments(["one", "two"]), /Usage/);
+});
+
+test("the retired read verbs still work and name their replacement", async () => {
+  const abandoned = abandonedRun();
+  const stale = retiredRun({ id: "33333333-3333-4333-8333-333333333333" });
+  const registry = await seedRegistry([abandoned, stale]);
+
+  const runs = await execRead(registry, "runs", []);
+  assert.match(runs ?? "", /Plan execution runs: 2/);
+  assert.match(runs ?? "", new RegExp(`- ${abandoned.id} `));
+  assert.equal(
+    (runs?.match(/\/exec runs is now \/exec status/g) ?? []).length,
+    1,
+    "the replacement is named once",
+  );
+
+  const zoomed = await execRead(registry, "runs", ["--all"]);
+  assert.ok(zoomed?.includes(stale.id), "--all still zooms through the alias");
+
+  const doctor = await execRead(registry, "doctor", []);
+  assert.match(doctor ?? "", new RegExp(`- ${abandoned.id} `));
+  assert.match(doctor ?? "", /\/exec doctor is now \/exec status/);
+
+  const setup = await execRead(registry, "setup", []);
+  assert.match(setup ?? "", /^pi install npm:pi-subagents$/m);
+  assert.match(setup ?? "", /\/exec setup is now part of \/exec status/);
+
+  assert.equal(await execRead(registry, "resume", []), undefined);
+  assert.equal(await execRead(registry, "status", ["run-id"]), undefined);
+});
+
+test("the doctor alias keeps --reconcile for scripted callers", async () => {
+  const abandoned = abandonedRun();
+  const registry = await seedRegistry([abandoned]);
+
+  const report = await execRead(registry, "doctor", ["--reconcile"]);
+
+  assert.match(report ?? "", /Reset 1 abandoned run to failed\./);
+  assert.match(report ?? "", /still works for scripted callers/);
+  assert.equal((await registry.get(abandoned.id))?.status, "failed");
+});
+
+test("the start subcommand is gone", () => {
+  assert.ok(
+    !(Object.values(EXEC_ACTION) as string[]).includes("start"),
+    "start is not a subcommand",
+  );
+  assert.doesNotMatch(execHelp(), /\/exec start/);
+  assert.equal(
+    (getExecArgumentCompletions("") ?? []).find(
+      (item) => item.value === "start",
+    ),
+    undefined,
+  );
 });
 
 test("the exec-plan skill documents exactly the subcommands /exec implements", async () => {
@@ -1454,21 +1583,27 @@ test("the exec-plan skill documents exactly the subcommands /exec implements", a
       .filter((token): token is string => Boolean(token)),
   );
   const actions = new Set<string>(Object.values(EXEC_ACTION));
+  const aliases = new Set<string>(EXEC_ALIAS_ACTIONS);
 
   assert.ok(documented.size > 0, "no /exec subcommand was found in the skill");
   for (const token of documented)
     assert.ok(actions.has(token), `skill documents unknown: /exec ${token}`);
+  // A hidden alias may appear in the skill but is never required there: it is
+  // absent from /exec help and exists only so an in-flight run keeps working.
   for (const action of actions)
-    assert.ok(documented.has(action), `skill never documents: /exec ${action}`);
+    if (!aliases.has(action))
+      assert.ok(
+        documented.has(action),
+        `skill never documents: /exec ${action}`,
+      );
 });
 
-test("run list reports a hidden-only registry instead of an empty one", () => {
-  const listed = formatRunList([retiredRun()]);
+test("status counts a hidden-only registry instead of reporting an empty one", async () => {
+  const registry = await seedRegistry([retiredRun()]);
 
-  assert.match(listed, /^No recent plan execution runs\./);
-  assert.match(listed, /1 older terminal run hidden\./);
-  assert.equal(
-    formatRunList([]),
-    "No plan execution runs. Start one with /exec.",
-  );
+  const report = await execStatus(registry);
+
+  assert.match(report, /^Plan execution runs: 1$/m);
+  assert.doesNotMatch(report, /claiming work in flight/);
+  assert.match(report, /1 older terminal run hidden\./);
 });

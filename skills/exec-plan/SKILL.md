@@ -15,7 +15,7 @@ recovery with a manually launched subagent.
 
 - Create a plan: write a strict Markdown plan under `docs/plans/`. Do not start
   it unless asked.
-- Start a named plan: `/exec start path/to/plan.md`.
+- Start a named plan: `/exec <path/to/plan.md>`.
 - Pick a plan interactively: `/exec`.
 - Diagnose after a Pi restart or a session handoff: `/exec doctor`, before
   `/exec runs`. It is read-only. It groups every run that claims work in flight
@@ -164,7 +164,7 @@ second writer.
   branch, or progress file, and it refuses a non-terminal run or one held by a
   live lease.
 - Do not use `subagent resume` for a child owned by plan-exec.
-- Do not run `/exec start` as a substitute for `/exec resume`.
+- Do not start a new run as a substitute for `/exec resume`.
 - Do not hand-edit `~/.pi/plan-exec/runs/<id>/run.json`.
 - Do not edit the worktree until status evidence rules out a live writer.
 - `/exec adopt` is an active takeover that may advance work. Inspect first.
