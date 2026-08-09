@@ -9,6 +9,7 @@ import { RunRegistry } from "../src/registry.js";
 import {
   abandonedRunsNotice,
   abandonmentProbe,
+  chooseStopOutcome,
   execCleanup,
   execDoctor,
   execHelp,
@@ -26,6 +27,7 @@ import {
   hasBridgeWorkflowScriptSpawnCapability,
   isActionAllowed,
   isRecoverableFailure,
+  isStageWaiverAvailable,
   missingRuntimeTools,
   needsPlanStructureReview,
   parseResumeArguments,
@@ -206,7 +208,7 @@ test("exec command completions explain the command family", () => {
   const items = getExecArgumentCompletions("st");
   assert.deepEqual(
     items?.map((item) => item.value),
-    ["status"],
+    ["status", "stop"],
   );
   assert.match(items?.[0]?.description ?? "", /every run and what it needs/);
   const allItems = getExecArgumentCompletions("") ?? [];
@@ -1639,7 +1641,7 @@ test("the retired adopt verb runs resume and names it once", () => {
     note: "/exec adopt is now /exec resume; the old name still works.",
   });
   assert.deepEqual(runActionFor("resume"), { action: "resume" });
-  assert.deepEqual(runActionFor("cancel"), { action: "cancel" });
+  assert.deepEqual(runActionFor("skip"), { action: "skip" });
   assert.equal(runActionFor("status"), undefined);
   assert.equal(runActionFor("cleanup"), undefined);
   assert.equal(runActionFor(undefined), undefined);
@@ -1800,4 +1802,154 @@ test("status counts a hidden-only registry instead of reporting an empty one", a
   assert.match(report, /^Plan execution runs: 1$/m);
   assert.doesNotMatch(report, /claiming work in flight/);
   assert.match(report, /1 older terminal run hidden\./);
+});
+
+test("stop reaches both outcomes and asks for the one it takes", async () => {
+  const running = run({ status: "running" });
+  const asked: Array<{ title: string; options: string[] }> = [];
+  const pick = (index: number) => ({
+    hasUI: true,
+    ui: {
+      select: async (title: string, options: string[]) => {
+        asked.push({ title, options });
+        return options[index];
+      },
+    },
+  });
+
+  assert.equal(
+    await chooseStopOutcome(running, pick(0), "session-1"),
+    EXEC_ACTION.PAUSE,
+  );
+  assert.equal(
+    await chooseStopOutcome(running, pick(1), "session-1"),
+    EXEC_ACTION.CANCEL,
+  );
+  assert.equal(asked.length, 2, "each stop asks before it acts");
+  assert.match(asked[0]!.title, new RegExp(running.id.slice(0, 8)));
+  // Reversibility is what the two differ by, so it is what the labels say.
+  assert.match(asked[0]!.options[0]!, /^Pause — .*\/exec resume continues/);
+  assert.match(asked[0]!.options[1]!, /^Cancel — final.*worktree is preserved/);
+
+  // A cancelled dialog stops at the dialog.
+  await assert.rejects(
+    chooseStopOutcome(
+      running,
+      {
+        hasUI: true,
+        ui: { select: async () => undefined },
+      },
+      "session-1",
+    ),
+    /Stop cancelled\./,
+  );
+});
+
+test("stop offers only the outcomes a run can still take, and still asks", async () => {
+  const paused = run({ status: "paused", stage: "comprehensive_review" });
+  let offered: string[] = [];
+
+  const outcome = await chooseStopOutcome(
+    paused,
+    {
+      hasUI: true,
+      ui: {
+        select: async (_title: string, options: string[]) => {
+          offered = options;
+          return options[0];
+        },
+      },
+    },
+    "session-1",
+  );
+
+  assert.equal(
+    outcome,
+    EXEC_ACTION.CANCEL,
+    "a paused run has nothing to pause",
+  );
+  assert.equal(offered.length, 1);
+  // One option is still a question: a final cancel is never assumed.
+  assert.match(offered[0]!, /^Cancel — final/);
+  assert.equal(isActionAllowed("stop", paused, "session-1"), true);
+  assert.equal(
+    isActionAllowed(
+      "stop",
+      run({ status: "completed", stage: "complete" }),
+      "session-1",
+    ),
+    false,
+  );
+});
+
+test("stop refuses without a human and names both scripted verbs", async () => {
+  await assert.rejects(
+    chooseStopOutcome(
+      run({ status: "running" }),
+      { hasUI: false, ui: { select: async () => "Pause" } },
+      "session-1",
+    ),
+    (error: Error) => {
+      assert.match(error.message, /\/exec pause <run-id>/);
+      assert.match(error.message, /\/exec cancel <run-id>/);
+      assert.match(error.message, /resumable/);
+      assert.match(error.message, /for good/);
+      return true;
+    },
+  );
+});
+
+test("the retired pause and cancel verbs still work and name their replacement", () => {
+  assert.deepEqual(runActionFor("stop"), { action: "stop" });
+  assert.deepEqual(runActionFor("pause"), {
+    action: "pause",
+    note: "/exec pause is now /exec stop; the old name still works and is the way to pause without a human to ask.",
+  });
+  assert.deepEqual(runActionFor("cancel"), {
+    action: "cancel",
+    note: "/exec cancel is now /exec stop; the old name still works and is the way to cancel without a human to ask.",
+  });
+  for (const alias of ["pause", "cancel"])
+    assert.ok(
+      (EXEC_ALIAS_ACTIONS as readonly string[]).includes(alias),
+      `${alias} is a hidden alias`,
+    );
+  assert.match(execHelp(), /\/exec stop \[run-id\]/);
+  assert.ok(
+    (getExecArgumentCompletions("") ?? []).some(
+      (item) => item.value === "stop",
+    ),
+    "stop completes",
+  );
+});
+
+test("status hands a blocked stage its skip command with the run ID filled in", async () => {
+  const blocked = run({
+    status: "failed",
+    stage: "critical_review",
+    error: "reviewer could not pass the stage",
+    updatedAt: Date.now() - HOUR_MS,
+  });
+  delete blocked.activeOperation;
+  const implementing = run({
+    id: "22222222-2222-4222-8222-222222222222",
+    status: "paused",
+    stage: "implementation",
+    updatedAt: Date.now() - HOUR_MS,
+  });
+  const registry = await seedRegistry([blocked, implementing]);
+
+  const report = (await execRead(registry, "status", [])) ?? "";
+
+  // The row keeps its single next command; the waiver is the line under it.
+  assert.match(
+    report,
+    new RegExp(
+      `- ${blocked.id} [^\\n]*Next: /exec resume ${blocked.id}\\n  If critical_review cannot pass, waive it: /exec skip ${blocked.id} --reason "<why the residual risk is accepted>"`,
+    ),
+  );
+  // Implementation is never skippable, so nothing offers a waiver for it.
+  assert.doesNotMatch(report, new RegExp(`/exec skip ${implementing.id}`));
+  assert.equal(isStageWaiverAvailable(blocked), true);
+  assert.equal(isStageWaiverAvailable(implementing), false);
 });

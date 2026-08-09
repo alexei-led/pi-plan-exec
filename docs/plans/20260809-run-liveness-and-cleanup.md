@@ -661,15 +661,47 @@ at the moment of choice rather than encode in two verb names.
 
 **Files:** `src/index.ts`, `src/types.ts`, `test/index.test.ts`
 
-- [ ] add `stop`, which asks: pause (resumable) or cancel (final, worktree preserved)
-- [ ] keep `pause` and `cancel` as hidden aliases and as the non-interactive path
-- [ ] do not fold `skip`; its full run ID, mandatory reason, and confirm are a waiver
+- [x] add `stop`, which asks: pause (resumable) or cancel (final, worktree preserved)
+- [x] keep `pause` and `cancel` as hidden aliases and as the non-interactive path
+- [x] do not fold `skip`; its full run ID, mandatory reason, and confirm are a waiver
       guard, not friction to remove
-- [ ] instead, when a stage is blocked, make `status` print the exact `skip` command with
+- [x] instead, when a stage is blocked, make `status` print the exact `skip` command with
       the run ID already filled in, so it stays hard to run by accident
-- [ ] write tests: `stop` reaches both outcomes, the aliases still work, a blocked stage
+- [x] write tests: `stop` reaches both outcomes, the aliases still work, a blocked stage
       makes `status` emit a ready-to-run `skip` line
-- [ ] run `npm run test:all` — must pass before task 13
+- [x] run `npm run test:all` — must pass before task 13
+- ➕ decision: the choice is an exported `chooseStopOutcome(run, ctx, sessionId)` taking a
+  structural `ctx`, the seam `reviewedPlanHashForResume` already uses. `runAction` is not
+  exported, so without it "stop reaches both outcomes" could only have been asserted on
+  the name it dispatches, not on the two states it produces
+- ➕ decision: `stop` refuses without a TTY twice — once in `runAction` before a run is
+  resolved, once inside `chooseStopOutcome` — from one `STOP_REQUIRES_UI` constant naming
+  both `/exec pause` and `/exec cancel`. The early guard exists because bare `/exec stop`
+  with several candidates would otherwise fail in `resolveRunForAction` with a message
+  naming neither
+- ➕ decision: only the outcomes a run can still take are offered, and a single remaining
+  outcome is still asked rather than assumed. A paused run can only be cancelled, and
+  cancelling it silently because the reader typed the softer word is the damage the
+  question exists to prevent
+- ➕ decision: `pause` and `cancel` enter `RUN_ACTION_ALIASES` as identity mappings. Task
+  11 built the record to point a retired verb at its replacement's code path; here only
+  the name was retired, so the alias note is the whole change
+- ➕ decision: `recoveryGuidance` keeps naming `/exec cancel <id>`, and `recoveryCommand`
+  keeps returning it for a `cancel_pending` run. Both are non-interactive answers Task 11
+  deliberately set, and Task 13 owns the classification wording
+- ➕ deviation: `isActionAllowed`'s skip branch moved into an exported
+  `isStageWaiverAvailable(run)`, so the status row offers the waiver on exactly the terms
+  `skip` accepts it rather than on a copy of them
+- ➕ deviation: the waiver is a second, indented line under the blocked run's row, not its
+  `Next:`. Task 10's rule that every row ends at one command still holds; the waiver is
+  the alternative that only applies if that command cannot succeed
+- ➕ deviation: `/exec pause` and `/exec cancel` left `/exec help` and `/exec stop` took
+  their place, as Task 10 did for `runs`, `doctor`, and `setup`. Task 14 owns the final
+  help shape
+- ➕ deviation: edited `skills/exec-plan/SKILL.md`, which is not in this task's Files list.
+  `stop` is not an alias, so the Task 9 drift test requires the skill to document it. The
+  new bullet also tells an agent to keep using `/exec pause` and `/exec cancel`, since it
+  has no human to answer the question
 
 ### Task 13: ➕ Rewrite the classification vocabulary around next actions
 

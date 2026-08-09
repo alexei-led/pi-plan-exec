@@ -35,6 +35,9 @@ recovery with a manually launched subagent.
   passed, because their registry entry is what `/exec resume` needs. Removal
   deletes the registry entry only; the worktree, branch, and progress file stay
   in place.
+- Stop a run and choose the outcome: `/exec stop <full-run-id>`. It asks whether
+  to pause (resumable) or cancel (final, worktree preserved). It needs a human,
+  so an agent uses `/exec pause` or `/exec cancel` instead.
 - Request a pause for a starting or running run: `/exec pause <full-run-id>`.
 - Continue or recover: `/exec resume [full-run-id]`. It reconciles a running child, continues a paused run, or safely retries a recoverable failed run.
 - Recover a terminal model/provider failure: `/exec resume [full-run-id]` uses the active authenticated Pi model. `--model current|provider/model` is an advanced one-replacement-child override.

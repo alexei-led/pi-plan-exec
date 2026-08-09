@@ -7,6 +7,7 @@ export const EXEC_ACTION = {
   CLEANUP: "cleanup",
   DOCTOR: "doctor",
   STATUS: "status",
+  STOP: "stop",
   PAUSE: "pause",
   RESUME: "resume",
   ADOPT: "adopt",
@@ -24,6 +25,8 @@ export const EXEC_ALIAS_ACTIONS = [
   EXEC_ACTION.DOCTOR,
   EXEC_ACTION.SETUP,
   EXEC_ACTION.ADOPT,
+  EXEC_ACTION.PAUSE,
+  EXEC_ACTION.CANCEL,
 ] as const;
 
 export type ExecAliasAction = (typeof EXEC_ALIAS_ACTIONS)[number];

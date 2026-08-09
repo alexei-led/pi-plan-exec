@@ -85,17 +85,47 @@ const ALIAS_NOTES: Record<ExecAliasAction, string> = {
     "/exec setup is now part of /exec status; the old name still works.",
   [EXEC_ACTION.ADOPT]:
     "/exec adopt is now /exec resume; the old name still works.",
+  [EXEC_ACTION.PAUSE]:
+    "/exec pause is now /exec stop; the old name still works and is the way to pause without a human to ask.",
+  [EXEC_ACTION.CANCEL]:
+    "/exec cancel is now /exec stop; the old name still works and is the way to cancel without a human to ask.",
 };
-/** A retired verb that runs its replacement's code path. */
+/**
+ * A retired verb and the action it runs. The mapping is the identity when only
+ * the name was retired and the behavior stayed exactly where it was.
+ */
 const RUN_ACTION_ALIASES = {
   [EXEC_ACTION.ADOPT]: EXEC_ACTION.RESUME,
+  [EXEC_ACTION.PAUSE]: EXEC_ACTION.PAUSE,
+  [EXEC_ACTION.CANCEL]: EXEC_ACTION.CANCEL,
 } as const satisfies Partial<Record<ExecAliasAction, RunAction>>;
 const RUN_ACTIONS = new Set<string>([
+  EXEC_ACTION.STOP,
   EXEC_ACTION.PAUSE,
   EXEC_ACTION.RESUME,
   EXEC_ACTION.SKIP,
   EXEC_ACTION.CANCEL,
 ]);
+/**
+ * The two outcomes of stopping, worded so the difference that matters —
+ * reversibility — is read at the moment the choice is made instead of being
+ * encoded in two verb names the reader has to know in advance.
+ */
+const STOP_OUTCOMES = [
+  {
+    action: EXEC_ACTION.PAUSE,
+    label:
+      "Pause — stop after the active operation finishes; /exec resume continues this run.",
+  },
+  {
+    action: EXEC_ACTION.CANCEL,
+    label:
+      "Cancel — final; the run stops for good and its worktree is preserved.",
+  },
+] as const;
+/** Stop asks a question, so with no human it names both scripted answers. */
+const STOP_REQUIRES_UI =
+  "/exec stop asks whether to pause or cancel and needs an interactive session. Use /exec pause <run-id> to stop after the active operation and keep the run resumable, or /exec cancel <run-id> to stop it for good with its worktree preserved.";
 const RUN_LIST_TERMINAL_WINDOW_MS = MILLISECONDS_PER_DAY;
 const DOCTOR_RECONCILE_OPTION = "--reconcile";
 const REQUIRED_RUNTIME_TOOLS: Record<string, string> = {
@@ -140,6 +170,11 @@ const EXEC_COMMANDS: AutocompleteItem[] = [
     value: EXEC_ACTION.STATUS,
     label: EXEC_ACTION.STATUS,
     description: "Show every run and what it needs, or one run in detail",
+  },
+  {
+    value: EXEC_ACTION.STOP,
+    label: EXEC_ACTION.STOP,
+    description: "Stop a run: pause it (resumable) or cancel it (final)",
   },
   {
     value: EXEC_ACTION.PAUSE,
@@ -763,10 +798,23 @@ function runGroupLines(heading: string, runs: PlanExecRun[]): string[] {
   if (runs.length === 0) return [];
   return [
     `${heading}:`,
-    ...runs.map(
-      (run) =>
-        `- ${runClaim(run)} updated ${relativeTime(run.updatedAt)}. Next: ${nextRunCommand(run)}`,
-    ),
+    ...runs.flatMap((run) => [
+      `- ${runClaim(run)} updated ${relativeTime(run.updatedAt)}. Next: ${nextRunCommand(run)}`,
+      ...stageWaiverLines(run),
+    ]),
+  ];
+}
+
+/**
+ * A blocked review, finalize, or stats stage moves only by waiver, so the row
+ * that reports it spells the waiver out with the run ID already filled in.
+ * `skip` keeps its full ID, its mandatory reason, and its confirm: still hard
+ * to run by accident, now easy to run on purpose.
+ */
+function stageWaiverLines(run: PlanExecRun): string[] {
+  if (!isStageWaiverAvailable(run)) return [];
+  return [
+    `  If ${run.stage} cannot pass, waive it: /exec skip ${run.id} --reason "<why the residual risk is accepted>"`,
   ];
 }
 
@@ -1517,6 +1565,10 @@ async function runAction(
     throw new Error(
       "Usage: /exec skip <full-run-id> --reason <non-empty reason>",
     );
+  // Refuse before resolving a run, so the answer is the same one question
+  // whether or not this repository has several candidates.
+  if (action === EXEC_ACTION.STOP && !ctx.hasUI)
+    throw new Error(STOP_REQUIRES_UI);
   const sessionId = ctx.sessionManager.getSessionId();
   const resolved = await resolveRunForAction(
     action,
@@ -1647,8 +1699,13 @@ async function runAction(
       ? `${recovered.note}\n${resumeResultMessage(resumed)}`
       : resumeResultMessage(resumed);
   }
+  // Ask before claiming: an abandoned dialog must not have taken the lease.
+  const outcome =
+    action === EXEC_ACTION.STOP
+      ? await chooseStopOutcome(resolved, ctx, sessionId)
+      : action;
   const claimed = await registry.claim(resolved, sessionId);
-  if (action === EXEC_ACTION.PAUSE) {
+  if (outcome === EXEC_ACTION.PAUSE) {
     const paused = await syncProjection(
       await requestStatus(claimed, EXEC_ACTION.PAUSE, sessionId),
       { cwd: ctx.cwd, sessionId },
@@ -1661,6 +1718,42 @@ async function runAction(
   );
   startBackgroundController(cancelled, sessionId, ctx.cwd, ctx);
   return `Run ${shortRunId(cancelled.id)} marked cancel-pending. Its worktree is preserved.`;
+}
+
+/**
+ * One verb, two outcomes: the reader chooses between them here, where the
+ * difference can be stated, instead of choosing a verb name before it is
+ * explained. Only the outcomes this run can still take are offered, and the
+ * single-outcome case is still asked rather than assumed — a final cancel the
+ * reader did not pick is exactly the damage this question prevents.
+ */
+export async function chooseStopOutcome(
+  run: PlanExecRun,
+  ctx: {
+    hasUI: boolean;
+    ui: {
+      select(title: string, options: string[]): Promise<string | undefined>;
+    };
+  },
+  sessionId: string,
+): Promise<typeof EXEC_ACTION.PAUSE | typeof EXEC_ACTION.CANCEL> {
+  if (!ctx.hasUI) throw new Error(STOP_REQUIRES_UI);
+  const outcomes = STOP_OUTCOMES.filter((outcome) =>
+    isActionAllowed(outcome.action, run, sessionId),
+  );
+  if (outcomes.length === 0)
+    throw new Error(
+      `Run ${shortRunId(run.id)} cannot be stopped while ${run.status}.`,
+    );
+  const labels: string[] = outcomes.map((outcome) => outcome.label);
+  const choice = await ctx.ui.select(
+    `Stop run ${shortRunId(run.id)} (${run.status}/${run.stage})?`,
+    labels,
+  );
+  if (!choice) throw new Error("Stop cancelled.");
+  const selected = outcomes[labels.indexOf(choice)];
+  if (!selected) throw new Error("Stop selection returned an unknown outcome.");
+  return selected.action;
 }
 
 async function resolveRunForAction(
@@ -1693,7 +1786,9 @@ async function resolveRunForAction(
         ? "matching"
         : action === EXEC_ACTION.RESUME
           ? "resumable"
-          : `${action}able`;
+          : action === EXEC_ACTION.STOP
+            ? "stoppable"
+            : `${action}able`;
     throw new Error(
       `No ${verb} plan execution run found here. Use /exec status or /exec <plan> to start one.`,
     );
@@ -1802,6 +1897,12 @@ export function isActionAllowed(
   adoptCurrentBranch = false,
 ): boolean {
   if (action === EXEC_ACTION.STATUS) return true;
+  // Stop is whichever of its two outcomes this run can still take; the choice
+  // between them belongs to the reader, not to a lookup they run first.
+  if (action === EXEC_ACTION.STOP)
+    return STOP_OUTCOMES.some((outcome) =>
+      isActionAllowed(outcome.action, run, sessionId),
+    );
   if (action === EXEC_ACTION.PAUSE)
     return (
       run.status === RUN_STATUS.STARTING || run.status === RUN_STATUS.RUNNING
@@ -1815,19 +1916,27 @@ export function isActionAllowed(
           run.status === RUN_STATUS.PAUSED ||
           isRecoverableFailure(run) ||
           isClaimableForeignRun(run, sessionId);
-  if (action === EXEC_ACTION.SKIP)
-    return (
-      isSkippableStage(run.stage) &&
-      (run.status === RUN_STATUS.FAILED ||
-        run.status === RUN_STATUS.PAUSED ||
-        run.status === RUN_STATUS.SKIP_PENDING)
-    );
+  if (action === EXEC_ACTION.SKIP) return isStageWaiverAvailable(run);
   if (action === EXEC_ACTION.CANCEL)
     return (
       run.pendingStageSkip === undefined &&
       (!isTerminal(run.status) || run.status === RUN_STATUS.FAILED)
     );
   return false;
+}
+
+/**
+ * Whether a waiver is what this run needs: a blocked non-implementation stage
+ * that a person must release. The lease never enters it, so `/exec status` can
+ * offer the waiver from the outside on the same terms `skip` will accept it.
+ */
+export function isStageWaiverAvailable(run: PlanExecRun): boolean {
+  return (
+    isSkippableStage(run.stage) &&
+    (run.status === RUN_STATUS.FAILED ||
+      run.status === RUN_STATUS.PAUSED ||
+      run.status === RUN_STATUS.SKIP_PENDING)
+  );
 }
 
 /**
@@ -2056,6 +2165,7 @@ function assertActionAllowed(
 function actionPastTense(action: RunAction): string {
   return {
     [EXEC_ACTION.STATUS]: "inspected",
+    [EXEC_ACTION.STOP]: "stopped",
     [EXEC_ACTION.PAUSE]: "paused",
     [EXEC_ACTION.RESUME]: "resumed",
     [EXEC_ACTION.SKIP]: "force-skipped",
@@ -2136,12 +2246,11 @@ export function execHelp(): string {
     `                        No run ID: every run grouped by what it needs, with any missing package and one next command per run. ${RUNS_ALL_OPTION} also shows terminal runs older than a day.`,
     `/exec cleanup [full-run-id] [${CLEANUP_APPLY_OPTION}] [${CLEANUP_INCLUDE_FAILED_OPTION}]`,
     `                        Preview retired runs older than ${CLEANUP_RETENTION_DAYS} days; ${CLEANUP_APPLY_OPTION} deletes their registry entries only. Failed runs need ${CLEANUP_INCLUDE_FAILED_OPTION}.`,
-    "/exec pause [run-id]    Pause after the active child finishes.",
+    "/exec stop [run-id]     Stop a run: it asks whether to pause it (resumable) or cancel it (final, worktree preserved).",
     `/exec resume [run-id] [${RECOVERY_MODEL_OPTION} current|provider/model]`,
     "                        Continue a stuck run: it takes the lease over from a dead session, resets a run whose worker is provably gone, and asks before retrying a blocked task or rebinding the current branch. Model/provider failures use the current Pi model.",
     "/exec skip <full-run-id> --reason <text>",
     "                        Stop any tracked child, force-skip a blocked review/finalize/stats stage, and record the waiver.",
-    "/exec cancel [run-id]   Cancel safely and preserve the worktree.",
     "",
     "Hints:",
     "- Prefer Worktree (isolated) when asked.",
@@ -2150,6 +2259,7 @@ export function execHelp(): string {
     "- /exec resume preserves the stage and worktree, and reconciles a known Bridge operation before retrying it.",
     "- /exec resume never starts a second worker: a run whose worker cannot be proven gone is reported, not reset.",
     `- ${RECOVERY_MODEL_OPTION} is an advanced one-recovery-launch override; normal resume uses this Pi session model after a model/provider failure.`,
+    "- /exec status spells out the /exec skip command, run ID filled in, for a stage that is blocked; skip keeps its reason and its confirm.",
     "- /exec skip never skips implementation or archive; skipped runs finish as completed_with_findings.",
     "- Worktree runs fork this Pi session into the worktree so the footer and tools use the execution directory.",
     "- Use /skill:exec-plan for the executable-plan format and recovery rules.",
