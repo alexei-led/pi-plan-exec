@@ -1,6 +1,6 @@
 ---
 name: exec-plan
-description: Plan, run, inspect, pause, resume, adopt, or recover a checked Markdown implementation plan through pi-plan-exec. Use when a plan-exec run is active, stuck, failed, detached after reload, cancel-pending, or `/exec resume` does not work. Do not bypass the controller by launching or resuming implementation/review subagents manually.
+description: Plan, run, inspect, pause, resume, adopt, diagnose, reconcile, retire, or recover a checked Markdown implementation plan through pi-plan-exec. Use when a plan-exec run is active, stuck, failed, detached after reload, cancel-pending, abandoned after a Pi restart, or `/exec resume` does not work. Do not bypass the controller by launching or resuming implementation/review subagents manually.
 ---
 
 <!-- markdownlint-disable MD013 -->
@@ -17,14 +17,33 @@ recovery with a manually launched subagent.
   it unless asked.
 - Start a named plan: `/exec start path/to/plan.md`.
 - Pick a plan interactively: `/exec`.
-- List durable runs: `/exec runs`.
+- Diagnose after a Pi restart or a session handoff: `/exec doctor`, before
+  `/exec runs`. It is read-only. It groups every run that claims work in flight
+  as abandoned, ambiguous, or live, names the evidence, and prints one next
+  command per run. Pi also prints a pointer to it at session start when its
+  startup sweep finds an abandoned run.
+- Reset provably abandoned runs: `/exec doctor --reconcile`. It touches only
+  runs proven to have no worker, and turns each into a recoverable `failed`
+  run. It never launches a worker, so it resumes nothing on its own. Recover
+  each reset run with `/exec resume <full-run-id>`.
+- List durable runs: `/exec runs`. It lists every unfinished run plus terminal
+  runs from the last day. `/exec runs --all` lists every run.
 - Inspect one run: `/exec status <full-run-id>`.
+- Retire terminal run records: `/exec cleanup` previews and deletes nothing;
+  `/exec cleanup --apply` deletes. A terminal run becomes removable 7 days
+  after its last update. `failed` runs are excluded until `--include-failed` is
+  passed, because their registry entry is what `/exec resume` needs. Removal
+  deletes the registry entry only; the worktree, branch, and progress file stay
+  in place.
 - Request a pause for a starting or running run: `/exec pause <full-run-id>`.
 - Continue or recover: `/exec resume [full-run-id]`. It reconciles a running child, continues a paused run, or safely retries a recoverable failed run.
 - Recover a terminal model/provider failure: `/exec resume [full-run-id]` uses the active authenticated Pi model. `--model current|provider/model` is an advanced one-replacement-child override.
 - A normal resume retries a no-progress implementation task. An external/manual blocker prompts for confirmation; implementation cannot be skipped.
 - Adopt a verified current execution branch: `/exec resume <full-run-id> --adopt-current-branch`.
-- Claim an unfinished stale run: `/exec adopt <full-run-id>`.
+- Claim an unfinished stale run: `/exec adopt <full-run-id>`. A lease whose pid
+  is dead on this host is stale at once, so no 30-second wait is needed. A
+  lease recorded without a hostname is judged by its heartbeat alone; wait out
+  the 30-second heartbeat window before treating it as stale.
 - Force-skip a blocked review/finalize/stats stage: `/exec skip <full-run-id> --reason <text>`.
 - Request safe cancellation: `/exec cancel <full-run-id>`.
 - Inspect live command support: `/exec help`.
@@ -79,17 +98,26 @@ A slow or silent run is not a reason to start the plan again.
 
 For every control or recovery request:
 
-1. Run `/exec runs` and select the durable run ID.
-2. Run `/exec status <full-run-id>`.
-3. Record the status, stage, worktree, branch, active or failed operation,
-   progress path, last observation, terminal child error, and run error.
-4. Choose exactly one action from that evidence.
-5. Run `/exec status <full-run-id>` again and verify the same run moved to the
+1. When Pi restarted, the session changed, or the run's owner is unknown, run
+   `/exec doctor` first.
+2. Run `/exec runs` and select the durable run ID.
+3. Run `/exec status <full-run-id>`.
+4. Record the status, stage, worktree, branch, active or failed operation,
+   progress path, last observation, worker signal, terminal child error, and
+   run error.
+5. Choose exactly one action from that evidence.
+6. Run `/exec status <full-run-id>` again and verify the same run moved to the
    expected state.
 
-`/exec status` is observational. It reports a recovery classification and one
-safe next action. A healthy active operation should normally be left alone while
-the controller polls it.
+`/exec status` is observational. It reports one recovery classification and one
+safe next action. Take that action and nothing else. A `healthy active
+operation` is left alone while the controller polls it.
+
+A run without a per-turn activity signal is neither alive nor dead as far as
+plan-exec can tell, and `/exec status` says so in those words. Absence of a
+signal is not evidence that the worker died. Do not treat
+`active operation, worker liveness unverified` or `long-running active
+operation` as permission to start a second run.
 
 ## Recover a stuck run
 
@@ -98,6 +126,7 @@ true:
 
 - `/exec resume` fails, refuses the state, or returns without progress;
 - Pi reloaded, changed session, or handed off to another worktree;
+- `/exec doctor` reports an abandoned or ambiguous run;
 - the run is failed, paused, cancel-pending, or owned by another session;
 - Bridge, Fusion, pi-subagents, or pi-tasks is missing or unavailable;
 - the plan structure changed or archive failed;
@@ -127,6 +156,13 @@ second writer.
   interactive confirmation and reason, stops any tracked child before advancing,
   and ends as `completed_with_findings`. Never use it for implementation or
   archive stages.
+- `/exec doctor --reconcile` never launches a worker. It only converts a
+  provably abandoned run into a recoverable `failed` run, leaves `taskAttempts`
+  unchanged, and skips any run a live session reclaimed during the sweep.
+  Recovery is still `/exec resume <full-run-id>`.
+- `/exec cleanup` deletes registry entries only. It never touches the worktree,
+  branch, or progress file, and it refuses a non-terminal run or one held by a
+  live lease.
 - Do not use `subagent resume` for a child owned by plan-exec.
 - Do not run `/exec start` as a substitute for `/exec resume`.
 - Do not hand-edit `~/.pi/plan-exec/runs/<id>/run.json`.
@@ -155,7 +191,7 @@ After recovery, report:
 ```text
 PLAN RECOVERY
 Run: <full ID>
-Action: <wait|resume|adopt|cancel|repair extension|blocked>
+Action: <wait|reconcile|resume|adopt|cancel|cleanup|repair extension|blocked>
 Before: <status/stage/operation/error>
 After: <status/stage/operation>
 Worktree: <path and git state>
@@ -169,7 +205,7 @@ record, worktree, active-operation evidence, and approval or runtime fix needed.
 ## Prerequisites
 
 `pi-plan-exec` requires compatible installations of `pi-subagents`,
-`@tintinweb/pi-tasks`, `@alexeiled/pi-subagents-bridge` `0.2.2` or later, and
+`@tintinweb/pi-tasks`, `@alexeiled/pi-subagents-bridge` `>=0.2.2`, and
 `@alexeiled/pi-fusion`. Use `/exec setup`, install what it reports, run
 `/reload`, then return to the same run ID. Installing dependencies does not
 replace or complete the preserved run.

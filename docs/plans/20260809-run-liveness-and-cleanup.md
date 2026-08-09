@@ -473,26 +473,45 @@ stale-lease detection. None of these appear in the skill today.
 - Modify: `skills/exec-plan/SKILL.md`
 - Modify: `skills/exec-plan/references/recovery.md`
 
-- [ ] add `/exec cleanup`, `/exec runs --all`, and `/exec doctor` to the "Choose the job"
+- [x] add `/exec cleanup`, `/exec runs --all`, and `/exec doctor` to the "Choose the job"
       list in `SKILL.md`, with the retention window and the `failed` exclusion stated
-- [ ] make `/exec doctor` the documented first step after a Pi restart or a session
+- [x] make `/exec doctor` the documented first step after a Pi restart or a session
       handoff, ahead of `/exec runs`, and state that `--reconcile` resets only provably
       abandoned runs and never launches a worker
-- [ ] state that a lease whose pid is dead on this host is stale at once, so `/exec adopt`
+- [x] state that a lease whose pid is dead on this host is stale at once, so `/exec adopt`
       no longer needs a 30-second wait; absent `hostname` still waits out the heartbeat
-- [ ] add the `long-running active operation` classification to `references/recovery.md`
+- [x] add the `long-running active operation` classification to `references/recovery.md`
       with its decision branch: re-check, or cancel, and never start a second run
-- [ ] record that a workflow-mode run reports no trustworthy per-turn activity, so
+- [x] record that a workflow-mode run reports no trustworthy per-turn activity, so
       elapsed time is the only bound; cite `nicobailon/pi-subagents#920` so a reader knows
       the limit is upstream and temporary
-- [ ] remove guidance that the new surface makes obsolete, and make sure every recovery
+- [x] remove guidance that the new surface makes obsolete, and make sure every recovery
       branch names one command; prefer deleting a branch over adding a caveat
-- [ ] fix the stale `@^0.2.2` pin at `skills/exec-plan/SKILL.md:172` to `>=0.2.2`
-- [ ] verify every `/exec` subcommand named in the skill exists in `EXEC_ACTION`, and that
-      every member of `EXEC_ACTION` is either documented or deliberately internal
-- [ ] add a test that asserts the skill's documented subcommand list matches `EXEC_ACTION`,
+- [x] fix the stale `@^0.2.2` pin at `skills/exec-plan/SKILL.md:172` to `>=0.2.2`
+- [x] verify every `/exec` subcommand named in the skill exists in `EXEC_ACTION`, and that
+      every member of `EXEC_ACTION` is either documented or deliberately internal — all
+      twelve members are documented; none is internal
+- [x] add a test that asserts the skill's documented subcommand list matches `EXEC_ACTION`,
       so the two cannot drift again
-- [ ] run `npm run test:all` — must pass before task 10
+- [x] run `npm run test:all` — must pass before task 10
+- ➕ deviation: no literal `@^0.2.2` existed in `SKILL.md`; line 172 read
+  "`@alexeiled/pi-subagents-bridge` `0.2.2` or later". It now reads `>=0.2.2`, byte-identical
+  to the range `execSetup` prints and to `peerDependencies`, so the checkbox's intent holds
+- ➕ decision: the drift test lives in `test/index.test.ts`, not `test/pack.test.ts` — the
+  claim is about `EXEC_ACTION`, which `index.test.ts` already exercises, while `pack.test.ts`
+  exists to read `package.json`
+- ➕ decision: the drift assertion scrapes `/exec <token>` where the token starts with a
+  letter, so `--all`, `--apply`, `--reconcile`, and `--include-failed` can never match, and
+  it asserts in both directions with a named failure per token. Verified against the
+  pre-edit skill: it fails on `cleanup` and `doctor`
+- ➕ decision: `active operation directory is gone` is documented as two branches keyed on
+  the `/exec doctor` verdict — `abandoned` takes `--reconcile`, `live` takes `/exec cancel`.
+  `classifyAbandonment` needs the full conjunction, so `--reconcile` will not touch a run
+  whose lease is still live, and one branch naming both commands would have implied it would
+- ➕ decision: the model/provider-failure and terminal-state sections keep their existing
+  shape. Tasks 1-8 changed neither, and forcing a command onto `completed` would dress
+  verification advice as an action. The retention and `--all` facts are stated once under
+  Terminal states instead
 
 ### Task 10: Verify acceptance criteria
 

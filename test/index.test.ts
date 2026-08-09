@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import { RunRegistry } from "../src/registry.js";
 import {
   abandonedRunsNotice,
@@ -34,7 +35,7 @@ import {
   recoveryGuidance,
   reviewedPlanHashForResume,
 } from "../src/index.js";
-import type { PlanExecRun } from "../src/types.js";
+import { EXEC_ACTION, type PlanExecRun } from "../src/types.js";
 
 const config = {
   taskRetries: 1,
@@ -1435,6 +1436,30 @@ test("run list hides older terminal runs behind --all", () => {
 
   for (const shown of runs) assert.ok(all.includes(shown.id), shown.id);
   assert.doesNotMatch(all, /hidden/, "--all hides nothing, so no footer");
+});
+
+test("the exec-plan skill documents exactly the subcommands /exec implements", async () => {
+  const skill = fileURLToPath(new URL("../skills/exec-plan/", import.meta.url));
+  const prose = (
+    await Promise.all([
+      readFile(join(skill, "SKILL.md"), "utf8"),
+      readFile(join(skill, "references", "recovery.md"), "utf8"),
+    ])
+  ).join("\n");
+  // A subcommand token must start with a letter, so `--all`, `--apply`,
+  // `--reconcile`, and `--include-failed` are flags and never match.
+  const documented = new Set(
+    [...prose.matchAll(/(?<![-\w])\/exec[ \t]+(?<subcommand>[a-z][a-z-]*)/g)]
+      .map((match) => match.groups?.subcommand)
+      .filter((token): token is string => Boolean(token)),
+  );
+  const actions = new Set<string>(Object.values(EXEC_ACTION));
+
+  assert.ok(documented.size > 0, "no /exec subcommand was found in the skill");
+  for (const token of documented)
+    assert.ok(actions.has(token), `skill documents unknown: /exec ${token}`);
+  for (const action of actions)
+    assert.ok(documented.has(action), `skill never documents: /exec ${action}`);
 });
 
 test("run list reports a hidden-only registry instead of an empty one", () => {
