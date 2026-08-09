@@ -518,8 +518,8 @@ type RecoveryGuidance = {
 export function recoveryGuidance(run: PlanExecRun): RecoveryGuidance {
   if (isTerminal(run.status) && run.status !== RUN_STATUS.FAILED)
     return {
-      classification: "terminal",
-      action: "Run is terminal; no recovery action is available.",
+      classification: "finished",
+      action: `This run is over and there is nothing to recover. Run /exec cleanup once you no longer need its record.`,
     };
   // Only when nothing is tracked: a dead owner holding an unresolved operation
   // is answered by the operation branches below, which know whether that
@@ -531,52 +531,51 @@ export function recoveryGuidance(run: PlanExecRun): RecoveryGuidance {
     !run.activeOperation
   )
     return {
-      classification: "stale owner",
-      action: `Confirm the prior session stopped, then use /exec resume ${run.id}; it takes the lease over from the dead session.`,
+      classification:
+        "someone else's session was holding this run, and it is gone",
+      action: `Check that the other session really stopped, then run /exec resume ${run.id}; it takes the run over from the dead one.`,
     };
   if (hasExecutionBranchMismatch(run))
     return {
-      classification: "execution-branch mismatch",
-      action: `Review the current branch, then use interactive /exec resume ${run.id}; it asks before rebinding the run to the branch you are on.`,
+      classification: "this run belongs to a branch you are not on",
+      action: `Check the branch you are on, then run interactive /exec resume ${run.id}; it asks before moving the run to that branch.`,
     };
   if (needsPlanStructureReview(run))
     return {
-      classification: "plan-structure review required",
-      action: `Restore the original structure, or use interactive /exec resume ${run.id} to adopt the current plan. If the first resume only records this pause, a second resume is required after review.`,
+      classification: "the plan file changed shape since this run started",
+      action: `Put the original headings and checkboxes back, or run interactive /exec resume ${run.id} to accept the plan as it now reads. If the first resume only records this pause, run it once more after you have read the plan.`,
     };
   if (run.status === RUN_STATUS.SKIP_PENDING)
     return {
-      classification: "force-skip reconciliation pending",
-      action:
-        "Wait for the tracked child to become terminal; use /exec status. Do not resume or start another child.",
+      classification: "waiting for the stage you waived to stop",
+      action: `The worker on that stage was told to stop, and the run moves on by itself once it has. Run /exec status ${run.id} to re-check. Do not resume or start another run.`,
     };
   if (run.status === RUN_STATUS.CANCEL_PENDING)
     return {
-      classification: "cancel-pending",
-      action: `Wait and use /exec status ${run.id}; /exec resume ${run.id} retries cancellation only and cannot launch plan work.`,
+      classification: "waiting for the stop you asked for",
+      action: `Run /exec status ${run.id} until it reads cancelled or failed. If the stop itself failed, /exec resume ${run.id} retries only the stop and cannot start plan work.`,
     };
   if (run.activeOperation && !run.activeOperation.externalRunId)
     return {
-      classification: "preserved unknown operation",
-      action:
-        "Repair the provider and reconcile the preserved operation; never launch a replacement worker while its outcome is unknown. Do not resume blindly.",
+      classification: "cannot check on the worker right now",
+      action: `A worker was launched and the tool never learned its name, so nothing here can tell whether it is still writing to the worktree. Run /exec status ${run.id} to re-check once the provider answers again. Do not start another worker while that is unknown.`,
     };
   if (run.status === RUN_STATUS.RUNNING || run.status === RUN_STATUS.STARTING) {
     if (run.activeOperation?.statusFailures)
       return {
-        classification: "active operation observation unavailable",
-        action:
-          "Repair the provider and wait for observation to recover; do not resume while the operation identity is preserved.",
+        classification: "cannot check on the worker right now",
+        action: `The provider could not be reached, so nothing here can see what the worker is doing. Repair the provider and polling picks up on its own, then run /exec status ${run.id} to re-check. Do not start another worker while this one's outcome is unknown.`,
       };
     // A stored `running` claim is not evidence. Only a trustworthy activity
-    // signal earns the word "healthy"; anything else says so in words, because
-    // absence of signal read as health is the bug this branch exists to fix.
+    // signal earns a word that says the worker is alive; anything else says so
+    // in words, because absence of signal read as health is the bug this branch
+    // exists to fix.
     if (run.activeOperation) {
       const signal = run.activeOperation.workerSignal;
       if (signal?.asyncDirMissing)
         return {
-          classification: "active operation directory is gone",
-          action: `The operation's async directory no longer exists, so the worker is not running. Use /exec resume ${run.id}; it resets the abandoned operation before continuing, without launching a second worker. Use /exec cancel ${run.id} instead to stop the run and preserve the worktree.`,
+          classification: "the worker's files are gone, so nothing is running",
+          action: `The directory that worker was writing to no longer exists. Run /exec resume ${run.id}; it clears the dead worker and continues, without starting a second one. Run /exec stop ${run.id} instead to end the run and keep the worktree.`,
         };
       // Elapsed time is weaker evidence than a fresh activity value, so the
       // bound only speaks when nothing else does. It prompts a look; it never
@@ -584,60 +583,56 @@ export function recoveryGuidance(run: PlanExecRun): RecoveryGuidance {
       const overdue = signal?.activity ? undefined : longRunningOperation(run);
       if (overdue)
         return {
-          classification: "long-running active operation",
-          action: `The bridge still reports this operation running ${elapsedLabel(overdue.elapsedMs)} after launch, past the ${minutesLabel(overdue.boundMs)} allowed for its ${overdue.maxTurns}-turn budget, and no per-turn activity signal is available${signal?.mode === WORKFLOW_MODE ? " for a workflow-mode run" : ""}. That is not proof the worker is stuck. Use /exec status ${run.id} to re-check, or /exec cancel ${run.id} to stop it and preserve the worktree. Do not resume or start a second run.`,
+          classification: "running longer than its budget allows",
+          action: `The bridge still reports this worker running ${elapsedLabel(overdue.elapsedMs)} after launch, past the ${minutesLabel(overdue.boundMs)} allowed for its ${overdue.maxTurns}-turn budget, and nothing reports what it is doing${signal?.mode === WORKFLOW_MODE ? " for a workflow-mode run" : ""}. That is not proof the worker is stuck. Run /exec status ${run.id} to re-check, or /exec stop ${run.id} to end it and preserve the worktree. Do not resume or start a second run.`,
         };
       if (!signal?.activity)
         return {
-          classification: "active operation, worker liveness unverified",
-          action: `wait and use /exec status ${run.id} to re-check; no per-turn activity signal is available${signal?.mode === WORKFLOW_MODE ? " for a workflow-mode run" : ""}, so this worker is neither confirmed alive nor confirmed dead. do not resume or start another run.`,
+          classification: "running, but nothing proves the worker is alive",
+          action: `Wait and use /exec status ${run.id} to re-check; nothing reports what this worker is doing${signal?.mode === WORKFLOW_MODE ? " for a workflow-mode run" : ""}, so it is neither confirmed alive nor confirmed dead. Do not resume or start another run.`,
         };
       return {
-        classification: "healthy active operation",
-        action:
-          "wait; the controller is polling this operation. do not resume or start another run.",
+        classification: "running, and the worker reported activity",
+        action: `Wait; the controller is polling this worker. Run /exec status ${run.id} to look again later. Do not resume or start another run.`,
       };
     }
     return {
-      classification: "controller advancing",
-      action: "Wait for the next controller tick, then use /exec status.",
+      classification: "between steps",
+      action: `Wait for the next controller tick, then run /exec status ${run.id}.`,
     };
   }
   if (run.status === RUN_STATUS.PAUSED)
     return {
-      classification: "paused review",
-      action: `Use /exec resume ${run.id}; it applies the paused stage or its terminal child without starting a second writer.`,
+      classification: "paused, waiting for you to continue it",
+      action: `Run /exec resume ${run.id}; it applies the paused stage or its finished worker without starting a second one.`,
     };
   if (run.status === RUN_STATUS.FAILED) {
     if (isModelProviderFailure(run))
       return {
-        classification: "model/provider failure",
-        action: `Use /exec resume ${run.id}. It retries the failed child with the current authenticated Pi model without consuming another task attempt.`,
+        classification:
+          "stopped because the model or provider could not be used",
+        action: `Run /exec resume ${run.id}. It retries the failed worker with the model this Pi session is signed in to, and does not spend another task attempt.`,
       };
+    // Reachable only here: `isTaskRetryConfirmationRequired` conjoins this same
+    // predicate, so a separate branch below it could never fire.
     if (isExternalManualBlocker(run))
       return {
-        classification: "external/manual blocker",
-        action: `${taskRetryRequiredMessage(run)} Do not use force-skip: implementation is sequential.`,
-      };
-    if (isTaskRetryConfirmationRequired(run))
-      return {
-        classification: "retry-exhausted or no-progress task",
-        action: taskRetryRequiredMessage(run),
+        classification: "a task is blocked by something outside this run",
+        action: `Fix the outside cause first — billing, credentials, quota, network, or a manual step — then run interactive /exec resume ${run.id}; it asks before retrying that task. Implementation work cannot be waived, so there is no way past it.`,
       };
     if (run.activeOperation?.externalRunId)
       return {
-        classification: "preserved operation needs reconciliation",
-        action: `Use /exec resume ${run.id}; it reconciles ${run.activeOperation.service}/${run.activeOperation.kind} before any retry in the preserved worktree.`,
+        classification: "stopped, and you can continue it",
+        action: `Run /exec resume ${run.id}; it first checks what the tracked ${run.activeOperation.service}/${run.activeOperation.kind} worker did, then retries the same stage in the worktree that was kept.`,
       };
     return {
-      classification: "failed with no active operation",
-      action: `Use /exec resume ${run.id}; it retries the same stage (${run.stage}) in the preserved worktree.`,
+      classification: "stopped, and you can continue it",
+      action: `Run /exec resume ${run.id}; it retries the same stage (${run.stage}) in the worktree that was kept.`,
     };
   }
   return {
-    classification: "unclassified",
-    action:
-      "Use /exec status again or /exec help; no recovery action is inferred.",
+    classification: "not recognised",
+    action: `Run /exec status ${run.id} again; no next step could be worked out from this state.`,
   };
 }
 
@@ -1384,7 +1379,7 @@ export async function reconcileForResume(
   if (diagnosis.classification === ABANDONMENT.AMBIGUOUS) {
     if (!run.activeOperation) return { run };
     throw new Error(
-      `Run ${shortRunId(run.id)} still claims ${run.status} and the evidence is incomplete: ${evidenceText(diagnosis)}. Resuming could add a second writer, so nothing was changed. Use /exec status ${run.id} to re-check, or /exec cancel ${run.id} to stop it and preserve the worktree.`,
+      `Run ${shortRunId(run.id)} still claims ${run.status} and the evidence is incomplete: ${evidenceText(diagnosis)}. Resuming could add a second writer, so nothing was changed. Use /exec status ${run.id} to re-check, or /exec stop ${run.id} to end it and preserve the worktree.`,
     );
   }
   const reconciled = await reconcileRun(
@@ -1434,10 +1429,10 @@ function nextCommand(diagnosis: RunDiagnosis): string {
   return `/exec status ${diagnosis.run.id}`;
 }
 
-/** A cancel-pending run still wants cancelling, before or after a reset. */
+/** A run already told to stop still wants stopping, before or after a reset. */
 function recoveryCommand(run: PlanExecRun): string {
   return run.status === RUN_STATUS.CANCEL_PENDING
-    ? `/exec cancel ${run.id}`
+    ? `/exec stop ${run.id}`
     : `/exec resume ${run.id}`;
 }
 

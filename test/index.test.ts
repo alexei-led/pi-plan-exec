@@ -417,18 +417,19 @@ test("run status classifies recovery and gives one safe next action", () => {
     }),
   );
   // No reported signal is not health. This assertion is the regression guard
-  // for the original bug: the old text said "healthy active operation" here,
+  // for the original bug: the old text said the operation was healthy here,
   // which read identically for a live worker and a dead one.
   assert.match(
     active,
-    /recovery: active operation, worker liveness unverified/,
+    /recovery: running, but nothing proves the worker is alive/,
   );
-  assert.match(active, /next safe action: wait/);
-  assert.match(active, /do not resume/);
-  assert.doesNotMatch(active, /healthy/);
+  assert.match(active, /next safe action: Wait and use \/exec status/);
+  assert.match(active, /Do not resume/);
+  assert.doesNotMatch(active, /reported activity/);
 
-  // A trustworthy activity value still earns "healthy". Without this pair the
-  // status text would be honest but undiscriminating, which is its own failure.
+  // A trustworthy activity value still earns the alive reading. Without this
+  // pair the status text would be honest but undiscriminating, which is its own
+  // failure.
   const signalled = formatRunStatus(
     run({
       status: "running",
@@ -442,7 +443,10 @@ test("run status classifies recovery and gives one safe next action", () => {
       },
     }),
   );
-  assert.match(signalled, /recovery: healthy active operation/);
+  assert.match(
+    signalled,
+    /recovery: running, and the worker reported activity/,
+  );
 
   const failedRun = run({
     status: "failed",
@@ -450,7 +454,7 @@ test("run status classifies recovery and gives one safe next action", () => {
   });
   delete failedRun.activeOperation;
   const failed = formatRunStatus(failedRun);
-  assert.match(failed, /recovery: failed with no active operation/);
+  assert.match(failed, /recovery: stopped, and you can continue it/);
   assert.match(failed, /resume .* retries the same stage/);
 
   const blockedRun = run({
@@ -460,9 +464,14 @@ test("run status classifies recovery and gives one safe next action", () => {
   });
   delete blockedRun.activeOperation;
   const blocked = formatRunStatus(blockedRun);
-  assert.match(blocked, /recovery: external\/manual blocker/);
-  assert.match(blocked, /--retry-task/);
-  assert.match(blocked, /cannot bypass an incomplete implementation task/);
+  assert.match(
+    blocked,
+    /recovery: a task is blocked by something outside this run/,
+  );
+  // The flag left the guidance with the help text; interactive resume asks.
+  assert.match(blocked, /interactive \/exec resume .*asks before retrying/);
+  assert.doesNotMatch(blocked, /--retry-task/);
+  assert.match(blocked, /Implementation work cannot be waived/);
 
   const modelFailureRun = run({
     status: "failed",
@@ -480,10 +489,13 @@ test("run status classifies recovery and gives one safe next action", () => {
   });
   delete modelFailureRun.activeOperation;
   const modelFailure = formatRunStatus(modelFailureRun);
-  assert.match(modelFailure, /recovery: model\/provider failure/);
   assert.match(
     modelFailure,
-    /Use \/exec resume .*current authenticated Pi model/,
+    /recovery: stopped because the model or provider could not be used/,
+  );
+  assert.match(
+    modelFailure,
+    /Run \/exec resume .*model this Pi session is signed in to/,
   );
   assert.match(modelFailure, /failed-model-run/);
   assert.match(modelFailure, /string_above_max_length/);
@@ -500,20 +512,21 @@ test("run status classifies recovery and gives one safe next action", () => {
       },
     }),
   );
-  assert.match(unknown, /recovery: preserved unknown operation/);
-  assert.match(unknown, /never launch a replacement worker/);
+  assert.match(unknown, /recovery: cannot check on the worker right now/);
+  assert.match(unknown, /the tool never learned its name/);
+  assert.match(unknown, /Do not start another worker/);
 
   const pausedRun = run({ status: "paused", stage: "comprehensive_review" });
   delete pausedRun.activeOperation;
   const paused = formatRunStatus(pausedRun);
-  assert.match(paused, /recovery: paused review/);
+  assert.match(paused, /recovery: paused, waiting for you to continue it/);
   assert.match(paused, /resume .* applies the paused stage/);
 
   const cancellingRun = run({ status: "cancel_pending" });
   delete cancellingRun.activeOperation;
   const cancelling = formatRunStatus(cancellingRun);
-  assert.match(cancelling, /recovery: cancel-pending/);
-  assert.match(cancelling, /resume .* retries cancellation only/);
+  assert.match(cancelling, /recovery: waiting for the stop you asked for/);
+  assert.match(cancelling, /resume .* retries only the stop/);
 
   const staleOwnerRun = run({
     status: "failed",
@@ -532,7 +545,10 @@ test("run status classifies recovery and gives one safe next action", () => {
       error: "Execution directory is on feature/current, expected master.",
     }),
   );
-  assert.match(branchMismatch, /recovery: execution-branch mismatch/);
+  assert.match(
+    branchMismatch,
+    /recovery: this run belongs to a branch you are not on/,
+  );
   // The flag left the guidance with the help text; interactive resume asks.
   assert.match(branchMismatch, /interactive \/exec resume .*asks before/);
   assert.doesNotMatch(branchMismatch, /--adopt-current-branch/);
@@ -543,14 +559,18 @@ test("run status classifies recovery and gives one safe next action", () => {
       error: "Plan task structure changed outside checkbox completion.",
     }),
   );
-  assert.match(planMismatch, /recovery: plan-structure review required/);
+  assert.match(
+    planMismatch,
+    /recovery: the plan file changed shape since this run started/,
+  );
   assert.match(planMismatch, /first resume only records this pause/);
 
   const terminal = formatRunStatus(
     run({ status: "completed", stage: "complete" }),
   );
-  assert.match(terminal, /recovery: terminal/);
-  assert.match(terminal, /no recovery action/);
+  assert.match(terminal, /recovery: finished/);
+  assert.match(terminal, /nothing to recover/);
+  assert.match(terminal, /\/exec cleanup/);
 });
 
 test("an overdue operation is classified without being called dead", () => {
@@ -582,33 +602,33 @@ test("an overdue operation is classified without being called dead", () => {
     [
       "nine minutes, no signal",
       active(9),
-      "active operation, worker liveness unverified",
+      "running, but nothing proves the worker is alive",
     ],
     [
       "nine minutes, workflow-mode signal with no activity",
       active(9, { workerSignal: { mode: "workflow" } }),
-      "active operation, worker liveness unverified",
+      "running, but nothing proves the worker is alive",
     ],
     [
       "inside the worker bound, no signal",
       active(99),
-      "active operation, worker liveness unverified",
+      "running, but nothing proves the worker is alive",
     ],
     [
       "past the worker bound, no signal",
       active(101),
-      "long-running active operation",
+      "running longer than its budget allows",
     ],
     // Same elapsed time, different stage budget: the bound is derived, not flat.
     [
       "past the reviewer bound but inside the worker bound",
       active(65),
-      "active operation, worker liveness unverified",
+      "running, but nothing proves the worker is alive",
     ],
     [
       "past the reviewer bound on a review operation",
       active(65, { kind: "review" }),
-      "long-running active operation",
+      "running longer than its budget allows",
     ],
     // Fresh activity outranks the timer; the operation is provably alive.
     [
@@ -616,35 +636,35 @@ test("an overdue operation is classified without being called dead", () => {
       active(180, {
         workerSignal: { mode: "chain", activity: "active 12s ago" },
       }),
-      "healthy active operation",
+      "running, and the worker reported activity",
     ],
     // Decisive death still wins over a mere bound breach.
     [
       "past the bound with the async directory gone",
       active(180, { workerSignal: { asyncDirMissing: true } }),
-      "active operation directory is gone",
+      "the worker's files are gone, so nothing is running",
     ],
     [
       "past the bound while observation is unavailable",
       active(180, { statusFailures: 1 }),
-      "active operation observation unavailable",
+      "cannot check on the worker right now",
     ],
     [
       "past the bound while still starting",
       active(180, {}, { status: "starting" }),
-      "long-running active operation",
+      "running longer than its budget allows",
     ],
     // A pre-upgrade record carries no launch time and cannot be bounded.
     [
       "no launch time recorded",
       active(undefined),
-      "active operation, worker liveness unverified",
+      "running, but nothing proves the worker is alive",
     ],
     // The bound only speaks while the bridge still reports the run in flight.
     [
       "past the bound on a failed run",
       active(180, {}, { status: "failed", error: "worker crashed" }),
-      "preserved operation needs reconciliation",
+      "stopped, and you can continue it",
     ],
   ];
   for (const [name, candidate, classification] of cases)
@@ -655,14 +675,136 @@ test("an overdue operation is classified without being called dead", () => {
     );
 
   const overdue = formatRunStatus(active(180));
-  assert.match(overdue, /recovery: long-running active operation/);
+  assert.match(overdue, /recovery: running longer than its budget allows/);
   assert.match(overdue, /past the 100m allowed for its 50-turn budget/);
   // Names the uncertainty, offers both escapes, and forbids a second writer.
   assert.match(overdue, /not proof the worker is stuck/);
   assert.match(overdue, /\/exec status .* to re-check/);
-  assert.match(overdue, /\/exec cancel .* preserve the worktree/);
+  assert.match(overdue, /\/exec stop .* preserve the worktree/);
   assert.match(overdue, /Do not resume or start a second run/);
   assert.doesNotMatch(overdue, /healthy|dead|stalled/);
+});
+
+test("no recovery classification names a controller internal", async () => {
+  // Scraped from source, not from a shape table: a table only guards the
+  // branches it lists, and the point is that a branch added later cannot
+  // reintroduce the vocabulary either.
+  const source = await readFile(
+    new URL("../src/index.ts", import.meta.url),
+    "utf8",
+  );
+  const classifications = [
+    ...source.matchAll(/classification:\s*"([^"]+)"/g),
+  ].map((match) => match[1] ?? "");
+  assert.ok(
+    classifications.length >= 15,
+    `expected the classification literals to be found, got ${classifications.length}`,
+  );
+  for (const classification of classifications)
+    assert.doesNotMatch(
+      classification,
+      /preserved|reconciliation|operation identity/i,
+      `classification names a controller internal: ${classification}`,
+    );
+});
+
+test("every recovery classification ends at a primary verb", () => {
+  const withoutOperation = (overrides: Partial<PlanExecRun>): PlanExecRun => {
+    const shape = run(overrides);
+    delete shape.activeOperation;
+    return shape;
+  };
+  const launched = (
+    overrides: Partial<NonNullable<PlanExecRun["activeOperation"]>> = {},
+  ): NonNullable<PlanExecRun["activeOperation"]> => ({
+    operationId: "operation-1",
+    service: "bridge",
+    kind: "implementation",
+    taskId: 1,
+    externalRunId: "worker-run-1",
+    launchStartedAt: Date.now() - 180 * 60_000,
+    ...overrides,
+  });
+  const unnamedOperation = run({
+    status: "failed",
+    error: "Bridge operation lookup is unresolved",
+    activeOperation: { operationId: "op", service: "bridge", kind: "review" },
+  });
+  const unobservable = run({
+    activeOperation: launched({ statusFailures: 1 }),
+  });
+  const trackedFailure = run({
+    status: "failed",
+    error: "worker crashed",
+    activeOperation: launched(),
+  });
+  const untrackedFailure = withoutOperation({
+    status: "failed",
+    error: "worker crashed",
+  });
+  const shapes: PlanExecRun[] = [
+    retiredRun(),
+    withoutOperation({ lease: DEAD_LEASE }),
+    withoutOperation({
+      status: "failed",
+      error: "Execution directory is on feature/current, expected master.",
+    }),
+    withoutOperation({
+      status: "paused",
+      error: "Plan task structure changed outside checkbox completion.",
+    }),
+    run({ status: "skip_pending" }),
+    run({ status: "cancel_pending" }),
+    unnamedOperation,
+    unobservable,
+    run({
+      activeOperation: launched({ workerSignal: { asyncDirMissing: true } }),
+    }),
+    run({ activeOperation: launched() }),
+    run({ activeOperation: launched({ launchStartedAt: Date.now() }) }),
+    run({
+      activeOperation: launched({
+        workerSignal: { mode: "chain", activity: "active 12s ago" },
+      }),
+    }),
+    withoutOperation({ status: "running" }),
+    withoutOperation({ status: "paused", stage: "comprehensive_review" }),
+    withoutOperation({
+      status: "failed",
+      error: "Worker failed: invalid api key.",
+    }),
+    withoutOperation({
+      status: "failed",
+      taskAttempts: { "1": 2 },
+      error: "Task 1 exhausted its retry limit. Provider billing unavailable.",
+    }),
+    trackedFailure,
+    untrackedFailure,
+  ];
+
+  for (const shape of shapes) {
+    const { classification, action } = recoveryGuidance(shape);
+    assert.match(
+      action,
+      /\/exec (status|resume|stop|cleanup)\b/,
+      `no primary verb: ${classification}`,
+    );
+    assert.doesNotMatch(
+      action,
+      /\/exec (start|runs|doctor|setup|adopt|pause|cancel)\b/,
+      `names a retired alias: ${classification}`,
+    );
+  }
+
+  // The two collapses: one situation each, not two words for the same answer.
+  assert.equal(
+    recoveryGuidance(unnamedOperation).classification,
+    recoveryGuidance(unobservable).classification,
+  );
+  assert.equal(
+    recoveryGuidance(trackedFailure).classification,
+    recoveryGuidance(untrackedFailure).classification,
+  );
 });
 
 test("status guidance judges lease staleness the way claiming does", () => {
@@ -748,7 +890,7 @@ test("run status includes live operation, progress, and recovery hints", () => {
   assert.match(status, /external run ID: worker-run-1/);
   assert.match(status, /progress: \/repo\/\.ralphex\/progress\.txt/);
   assert.match(status, /error: Plan structure changed/);
-  assert.match(status, /preserved worktree/);
+  assert.match(status, /worktree that was kept/);
 
   const recoverable = formatRunStatus(
     run({
@@ -1183,7 +1325,7 @@ test("doctor --reconcile resets only provably abandoned runs", async () => {
   );
   assert.match(
     report,
-    new RegExp(`- ${cancelling.id} [^\\n]*Next: /exec cancel ${cancelling.id}`),
+    new RegExp(`- ${cancelling.id} [^\\n]*Next: /exec stop ${cancelling.id}`),
   );
 
   const reset = await registry.get(abandoned.id);
@@ -1238,7 +1380,7 @@ test("a reconciled run is an ordinary recoverable failure", async () => {
   assert.equal(isActionAllowed("resume", reconciled, "session-new"), true);
   assert.equal(isRecoverableFailure(reconciled), true);
   const guidance = recoveryGuidance(reconciled);
-  assert.equal(guidance.classification, "failed with no active operation");
+  assert.equal(guidance.classification, "stopped, and you can continue it");
   assert.match(guidance.action, new RegExp(`/exec resume ${abandoned.id}`));
   assert.deepEqual(reconciled.taskAttempts, { "1": 2 });
 });
@@ -1787,10 +1929,13 @@ test("every run whose guidance names resume survives the resume gate", async () 
   // The pairing only proves something if both branches are exercised.
   const stranded = run({ status: "running", lease: DEAD_LEASE });
   delete stranded.activeOperation;
-  assert.equal(recoveryGuidance(stranded).classification, "stale owner");
+  assert.equal(
+    recoveryGuidance(stranded).classification,
+    "someone else's session was holding this run, and it is gone",
+  );
   assert.match(
     recoveryGuidance(abandonedRun({ id: stranded.id })).action,
-    /wait and use \/exec status/,
+    /Wait and use \/exec status/,
   );
 });
 

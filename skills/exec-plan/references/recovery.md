@@ -39,7 +39,12 @@ Stale terminal output does not prove that a child stopped.
 Match it below and run its command. Never run resume, start, or a manual
 subagent merely because a child is slow.
 
-### `healthy active operation`
+`/exec status` writes for a human at a keyboard, so it names `/exec stop <id>`,
+which asks whether to pause or to cancel. An agent has nobody to answer that
+question: use `/exec pause <full-run-id>` or `/exec cancel <full-run-id>`
+instead. Both still work and neither asks.
+
+### `running, and the worker reported activity`
 
 A trustworthy per-turn activity signal was read. Wait, then re-check:
 
@@ -47,7 +52,7 @@ A trustworthy per-turn activity signal was read. Wait, then re-check:
 /exec status <full-run-id>
 ```
 
-### `active operation, worker liveness unverified`
+### `running, but nothing proves the worker is alive`
 
 No per-turn activity signal is available, so the worker is neither confirmed
 alive nor confirmed dead. This is the normal reading for a workflow-mode run.
@@ -57,7 +62,7 @@ Absence of a signal is not evidence of death. Wait, then re-check:
 /exec status <full-run-id>
 ```
 
-### `long-running active operation`
+### `running longer than its budget allows`
 
 The bridge still reports the operation running past the bound derived from its
 own stage budget: two minutes per turn, so 150 minutes for the default 75-turn
@@ -80,7 +85,7 @@ worktree:
 
 Never start a second run for the same plan.
 
-### `active operation directory is gone`
+### `the worker's files are gone, so nothing is running`
 
 The operation's async directory no longer exists, so the worker is not running.
 
@@ -101,11 +106,12 @@ and `--reconcile` will not touch it. Stop the run and keep the worktree:
 /exec cancel <full-run-id>
 ```
 
-### `active operation observation unavailable`
+### `cannot check on the worker right now`
 
-The provider could not be polled, and the operation identity is preserved, so a
-resume would risk a second writer. Repair the provider; the controller resumes
-polling on its own. Then re-check:
+Either the provider could not be polled, or a worker was launched and plan-exec
+never learned its name. Both mean the same thing: nothing can say whether that
+worker is still writing, so a resume would risk a second writer. Repair the
+provider; the controller resumes polling on its own. Then re-check:
 
 ```text
 /exec status <full-run-id>
@@ -160,7 +166,7 @@ more:
 
 ## Paused
 
-Use:
+Status classifies this `paused, waiting for you to continue it`. Use:
 
 ```text
 /exec resume <full-run-id>
@@ -171,12 +177,16 @@ not resume the child directly.
 
 ## Failed
 
+Status classifies a recoverable failure `stopped, and you can continue it`.
 Inspect the stage, error, and active-operation fields first.
 
 - No active operation: `/exec resume <id>` retries the same stage in the same
   worktree. It automatically resets a no-progress implementation retry because
-  the user explicitly requested resume. An external/manual blocker asks for
-  interactive confirmation. Implementation is sequential; it cannot be skipped.
+  the user explicitly requested resume. A run classified
+  `a task is blocked by something outside this run` — billing, credentials,
+  quota, network, or a manual step — asks for interactive confirmation, or
+  takes `--retry-task` from a caller with no human. Implementation is
+  sequential; it cannot be skipped.
 - Preserved active operation: `/exec resume <id>` adopts or looks up that exact
   operation before retrying.
 - Operation lookup is `pending`: wait, reload if needed, then run
@@ -197,7 +207,8 @@ reconciles it instead of creating another writer.
 
 ## Model or provider failure
 
-When status classifies `model/provider failure`, the Bridge child is terminal.
+When status classifies `stopped because the model or provider could not be used`,
+the Bridge child is terminal.
 Plan-exec preserves its external run ID and terminal error and does not consume
 an implementation task attempt. Recover the same run with one of:
 
@@ -221,6 +232,10 @@ launching a child directly.
 
 ## Force-skip a blocked stage
 
+While the waiver is pending, status classifies the run
+`waiting for the stage you waived to stop`; wait it out with
+`/exec status <full-run-id>`.
+
 Use this only after inspecting the findings and active operation:
 
 ```text
@@ -236,6 +251,7 @@ known findings remain unresolved, and the final run becomes
 
 ## Cancel pending or failed cancellation
 
+Status classifies this `waiting for the stop you asked for`.
 `/exec cancel <id>` only requests cancellation. It does not prove that the child
 stopped.
 
@@ -252,7 +268,9 @@ replacement worker while cancellation is unresolved.
 
 ## Stale owner or different session
 
-Inspect the selected run before takeover:
+Status classifies this
+`someone else's session was holding this run, and it is gone`. Inspect the
+selected run before takeover:
 
 ```text
 /exec status <full-run-id>
@@ -271,8 +289,9 @@ seconds have passed since its last beat before treating it as stale.
 
 ## Plan structure changed
 
-Do not silently accept changed task structure. Status says `plan-structure review
-required` and explains whether the first resume only records `paused`; if so,
+Do not silently accept changed task structure. Status says
+`the plan file changed shape since this run started` and explains whether the
+first resume only records `paused`; if so,
 review the plan and run the interactive resume a second time. This is deliberate
 for legacy records and is safer than silently adopting a new task contract.
 
@@ -287,8 +306,9 @@ Headless recovery cannot approve a changed plan structure.
 
 ## Execution branch changed
 
-If status or resume reports `Execution directory is on <current>, expected
-<recorded>`, inspect the current branch and worktree first. When the current
+Status classifies this `this run belongs to a branch you are not on`. If status
+or resume reports `Execution directory is on <current>, expected <recorded>`,
+inspect the current branch and worktree first. When the current
 named branch is authoritative, has no tracked child, and belongs to the same
 repository, use:
 
@@ -375,6 +395,9 @@ Do not manually invoke implementation, review, fix, finalizer, or statistics
 subagents while repairing the extension.
 
 ## Terminal states
+
+Status classifies every non-failed terminal run `finished` and names
+`/exec cleanup` as its one command; nothing here is recoverable.
 
 - `completed`: verify checkboxes, archived plan, tests, and clean/reviewed Git
   state. No resume is needed.

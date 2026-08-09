@@ -712,17 +712,52 @@ the controller before acting.
 
 **Files:** `src/index.ts`, `test/index.test.ts`
 
-- [ ] rewrite each classification as the user's situation, not the controller's state
-- [ ] collapse classifications that share a next command; the count matters less than the
+- [x] rewrite each classification as the user's situation, not the controller's state
+- [x] collapse classifications that share a next command; the count matters less than the
       number of distinct actions a reader must choose between
-- [ ] keep the distinctions Task 6 and Task 7 earned: gone, liveness unverified,
+- [x] keep the distinctions Task 6 and Task 7 earned: gone, liveness unverified,
       long-running, and healthy are four different situations and must stay four
-- [ ] make sure every classification still ends at exactly one command
-- [ ] update `skills/exec-plan/references/recovery.md` so its branches match the new
+- [x] make sure every classification still ends at exactly one command
+- [x] update `skills/exec-plan/references/recovery.md` so its branches match the new
       wording exactly; Task 9 aligned them to the old wording
-- [ ] write a test asserting no classification string contains the internal vocabulary
+- [x] write a test asserting no classification string contains the internal vocabulary
       (`preserved`, `reconciliation`, `operation identity`), so the wording cannot regress
-- [ ] run `npm run test:all` — must pass before task 14
+- [x] run `npm run test:all` — must pass before task 14
+- ➕ decision: 20 classifications became 16, but the number that matters is the distinct
+  next actions a reader chooses between, which is three: `/exec resume <id>` to continue,
+  `/exec status <id>` to wait and look again, `/exec cleanup` to retire a finished record.
+  `/exec stop <id>` appears only as the escape on the two branches that offer one
+- ➕ decision: only two pairs collapsed, both by sharing one string across two `if`s rather
+  than by merging the branches — the unnamed operation and the unreachable provider both
+  read `cannot check on the worker right now`, and a failed run with or without a tracked
+  worker both reads `stopped, and you can continue it`. `skip_pending` and `cancel_pending`
+  were left apart despite sharing `/exec status`: they give opposite advice about resume,
+  since resume retries a stuck cancellation and must not touch a pending waiver
+- ➕ deviation: deleted the `retry-exhausted or no-progress task` branch as dead code.
+  `isTaskRetryConfirmationRequired` conjoins `isExternalManualBlocker`, which is the branch
+  immediately above it, so it could never fire. The predicate itself stays — `src/index.ts`
+  and `src/controller.ts` still gate the resume confirmation on it
+- ➕ decision: `terminal` had no command and the external-blocker branch named
+  `--retry-task`. Both are now one primary verb: a finished run points at `/exec cleanup`,
+  and the blocker points at interactive `/exec resume <id>`, which asks — the same move
+  Task 11 made for `--adopt-current-branch`. The flag still reaches the same path for a
+  caller with no human, and `taskRetryRequiredMessage` still names it when there is no UI
+- ➕ decision: guidance now names `/exec stop <id>` where it named `/exec cancel <id>`, and
+  so do `recoveryCommand` and the ambiguous-resume refusal, which Task 12 deferred here. A
+  row that ends in a verb `/exec help` will not list is a dead end for the reader the
+  rewrite is for
+- ➕ deviation: edited `skills/exec-plan/SKILL.md`, which is not in this task's Files list.
+  It quoted `healthy active operation`, `active operation, worker liveness unverified`, and
+  `long-running active operation` verbatim, so leaving it would send an agent looking for
+  text that no longer exists. Both skill files also state that `/exec status` writes
+  `/exec stop` for a human and that an agent uses `/exec pause` or `/exec cancel` instead
+- ➕ decision: a second test walks every guidance shape and asserts each action names a
+  primary verb and no retired alias. The vocabulary test scrapes the `classification:`
+  literals out of `src/index.ts` rather than reading a shape table, so a branch added later
+  cannot reintroduce the words, and it floors the scrape count so a refactor that empties
+  the match set fails instead of passing on nothing
+- ⚠️ for Task 16: `README.md:71,76,77` and `docs/guide.md:187,190,228` still quote the old
+  classification wording. They are in that task's Files list, not this one
 
 ### Task 14: ➕ Rewrite `/exec help` around 5 verbs
 

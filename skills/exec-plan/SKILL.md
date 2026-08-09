@@ -40,8 +40,8 @@ recovery with a manually launched subagent.
   so an agent uses `/exec pause` or `/exec cancel` instead.
 - Request a pause for a starting or running run: `/exec pause <full-run-id>`.
 - Continue or recover: `/exec resume [full-run-id]`. It reconciles a running child, continues a paused run, or safely retries a recoverable failed run.
-- Recover a terminal model/provider failure: `/exec resume [full-run-id]` uses the active authenticated Pi model. `--model current|provider/model` is an advanced one-replacement-child override.
-- A normal resume retries a no-progress implementation task. An external/manual blocker prompts for confirmation; implementation cannot be skipped.
+- Recover a run `stopped because the model or provider could not be used`: `/exec resume [full-run-id]` uses the active authenticated Pi model. `--model current|provider/model` is an advanced one-replacement-child override.
+- A normal resume retries a no-progress implementation task. A run `a task is blocked by something outside this run` prompts for confirmation; implementation cannot be skipped.
 - Adopt a verified current execution branch: `/exec resume <full-run-id> --adopt-current-branch`.
 - Claim an unfinished stale run: `/exec adopt <full-run-id>`. A lease whose pid
   is dead on this host is stale at once, so no 30-second wait is needed. A
@@ -113,14 +113,19 @@ For every control or recovery request:
    expected state.
 
 `/exec status` is observational. It reports one recovery classification and one
-safe next action. Take that action and nothing else. A `healthy active
-operation` is left alone while the controller polls it.
+safe next action. Take that action and nothing else. A run classified
+`running, and the worker reported activity` is left alone while the controller
+polls it.
 
 A run without a per-turn activity signal is neither alive nor dead as far as
 plan-exec can tell, and `/exec status` says so in those words. Absence of a
 signal is not evidence that the worker died. Do not treat
-`active operation, worker liveness unverified` or `long-running active
-operation` as permission to start a second run.
+`running, but nothing proves the worker is alive` or
+`running longer than its budget allows` as permission to start a second run.
+
+`/exec status` names `/exec stop <id>` because it writes for a human at a
+keyboard, and `/exec stop` asks whether to pause or to cancel. An agent has
+nobody to answer that: use `/exec pause` or `/exec cancel` instead.
 
 ## Recover a stuck run
 
@@ -130,7 +135,7 @@ true:
 - `/exec resume` fails, refuses the state, or returns without progress;
 - Pi reloaded, changed session, or handed off to another worktree;
 - `/exec doctor` reports an abandoned or ambiguous run;
-- the run is failed, paused, cancel-pending, or owned by another session;
+- the run is failed, paused, stopping, or owned by another session;
 - Bridge, Fusion, pi-subagents, or pi-tasks is missing or unavailable;
 - the plan structure changed or archive failed;
 - `/exec runs` cannot find a known run or reports a corrupt record;
@@ -147,9 +152,10 @@ second writer.
   child. It verifies the same repository and records the branch change before
   resuming.
 - A normal resume resets a no-progress implementation retry and preserves the
-  sequential checkbox contract. An external/manual blocker needs interactive
-  confirmation before retrying; implementation cannot be skipped.
-- A classified model/provider failure is different: the child is terminal, its
+  sequential checkbox contract. A task blocked by something outside the run
+  needs interactive confirmation before retrying; implementation cannot be
+  skipped.
+- A model or provider failure is different: the child is terminal, its
   error and operation are preserved, and the implementation retry budget is not
   consumed. Normal resume uses the current authenticated Pi model. Do not retry
   the same unusable model repeatedly.
