@@ -7,6 +7,10 @@ node_modules/
 .pi-subagents/
 .ralphex/
 
+# GitNexus index and its generated tool skills
+.gitnexus/
+.claude/skills/gitnexus/
+
 # Local environment
 .env
 .env.*
