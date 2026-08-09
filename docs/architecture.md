@@ -127,17 +127,22 @@ Terminal state is retired, not accumulated, in three steps:
 
 1. A successful `archive` stage stamps `retiredAt`.
 2. `/exec status` hides terminal runs 24 hours after their last update, counting
-   the hidden rows in a footer that names `--all` and `/exec cleanup`. The filter
-   keys on terminal status plus `updatedAt`, not on `retiredAt`, which is an audit
-   marker rather than a listing input.
+   the hidden rows in a footer that names `--all` and `/exec cleanup`. The listing
+   filter keys on terminal status plus `updatedAt`: a just-archived run is news for
+   a day whatever its stamp says.
 3. `RunRegistry.remove` deletes the run directory. `removalRefusal` gates it on
    the same two facts the `/exec cleanup` preview shows, so the preview can never
    promise a removal the registry would reject: a non-terminal run is refused, and
-   so is a run held by a live lease. `/exec cleanup` selects `completed`,
-   `completed_with_findings`, and `cancelled` runs more than 7 days past their last
-   update; `failed` is excluded unless `--include-failed` is passed, because the
-   registry entry is what `/exec resume` needs. Naming one full run ID bypasses the
-   retention window and the exclusion, never the refusal.
+   so is a run held by a live lease. Both are decided under the run's own lock,
+   with the record read inside it — deciding first and locking afterwards would let
+   a concurrent claim revive the run into the window before the delete.
+   `/exec cleanup` selects `completed`, `completed_with_findings`, and `cancelled`
+   runs that finished more than 7 days ago, measured from `retiredAt` where the
+   record carries one and from `updatedAt` otherwise, so a lease release does not
+   restart the clock; `failed` is excluded unless `--include-failed` is passed,
+   because the registry entry is what `/exec resume` needs. Naming one full run ID
+   bypasses the retention window and the exclusion, never the refusal. Each removal
+   is reported separately: one refusal cannot hide the deletions around it.
 
 Removal deletes the registry entry only. Worktrees, branches, and
 `.ralphex/progress/` logs are never touched, so a deleted record costs the ability
@@ -157,6 +162,21 @@ than the stall. Reconciliation clears the operation, records a `failed` status
 naming the evidence, stamps `reconciledAt`, appends the reason to the progress
 log, and leaves `taskAttempts` untouched — the worker never ran. Recovery is then
 the ordinary `/exec resume` path.
+
+Every evidence-driven decision reads the same three inputs at the moment it is
+made: the lease, the operation directory on disk, and the bridge. Nothing about
+liveness is persisted, because the record is only refreshed while its owning
+session polls — the instant that stops being true is the instant the question
+matters. Evidence measured here is also discarded for a run whose lease names
+another host: its directory and its bridge are on that machine, and an absence
+observed locally would be an absence of the wrong thing.
+
+One writer performs every reset, so both callers inherit its exclusions.
+A `cancel_pending` run is never reset however dead its worker: `failed` would
+erase the stop the operator asked for, and the next resume would restart plan
+work instead of finishing the cancellation. `/exec resume <id>` reconciles the
+single run it recovers; the registry-wide sweep behind `/exec doctor
+--reconcile` is dispatched as a write command and is unreachable from any read.
 
 ## Crash safety
 

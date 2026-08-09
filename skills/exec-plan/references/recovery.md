@@ -8,16 +8,20 @@ and worktree without creating another writer.
 Run these in order:
 
 ```text
-/exec doctor
-/exec runs
+/exec status
 /exec status <full-run-id>
 ```
 
-`/exec doctor` is read-only and comes first after a Pi restart or a session
-handoff. It groups every run that claims work in flight as `abandoned`,
-`ambiguous`, or `live`, names the evidence behind each verdict, and prints one
-next command per run. Pi prints a pointer to it at session start when its
-startup sweep finds an abandoned run.
+`/exec status` with no run ID is the read-only sweep, and it comes first after a
+Pi restart or a session handoff. It groups every run that claims work in flight
+as `abandoned`, `ambiguous`, or `live`, names the evidence behind each verdict,
+prints one next command per run, and reports any missing prerequisite package
+with its install command. It writes nothing. Pi prints `Use /exec status.` at
+session start when its startup sweep finds an abandoned run.
+
+`/exec status <full-run-id>` is the detail view for one run. It gathers the same
+live evidence the sweep does — the lease, the operation directory, and the
+bridge — so the two never disagree about whether a worker is still there.
 
 Capture:
 
@@ -42,7 +46,9 @@ merely because a child is slow.
 `/exec status` writes for a human at a keyboard, so it names `/exec stop <id>`,
 which asks whether to pause or to cancel. An agent has nobody to answer that
 question: use `/exec pause <full-run-id>` or `/exec cancel <full-run-id>`
-instead. Both still work and neither asks.
+instead. Neither asks — but all three claim the run first, so all three are
+refused with `Run <id> is controlled by another active Pi session.` while a
+live foreign lease holds it. Stop that session before trying to stop its run.
 
 ### `running, and the worker reported activity`
 
@@ -64,11 +70,13 @@ Absence of a signal is not evidence of death. Wait, then re-check:
 
 ### `running longer than its budget allows`
 
-The bridge still reports the operation running past the bound derived from its
+The run has claimed an active worker for longer than the bound derived from its
 own stage budget: two minutes per turn, so 150 minutes for the default 75-turn
-worker and 60 minutes for the default 30-turn reviewer. The bound fires only
-when no trustworthy activity signal exists, and elapsed time is not proof that
-the worker is stuck — a worker mid-model-call reports nothing for a long time.
+worker and 60 minutes for the default 30-turn reviewer. Nothing has reported on
+that worker since — the elapsed time is the whole of the evidence. The bound
+fires only when no trustworthy activity signal exists, and elapsed time is not
+proof that the worker is stuck: a worker mid-model-call reports nothing for a
+long time.
 
 Re-check first:
 
@@ -85,26 +93,38 @@ worktree:
 
 Never start a second run for the same plan.
 
-### `the worker's files are gone, so nothing is running`
+### `the worker is gone, so nothing is running`
 
-The operation's async directory no longer exists, so the worker is not running.
-
-When `/exec doctor` classifies the run `abandoned`, reset it:
-
-```text
-/exec doctor --reconcile
-```
-
-`--reconcile` takes no run ID: it resets every abandoned run in the registry,
-not only this one. Read the `/exec doctor` output first and accept the whole
-list.
-
-When `/exec doctor` classifies the run `live`, a session still holds its lease
-and `--reconcile` will not touch it. Stop the run and keep the worktree:
+Checked live at the moment status ran: the operation's async directory is absent
+from disk, or the bridge has no record of its operation. Either way no worker is
+writing. Reset this one run and continue it:
 
 ```text
-/exec cancel <full-run-id>
+/exec resume <full-run-id>
 ```
+
+Resume clears the dead worker, records the reset in the progress file, consumes
+no task attempt, and starts exactly one replacement. To end the run instead and
+keep its worktree, use `/exec cancel <full-run-id>`.
+
+`/exec doctor --reconcile` does the same reset for **every** abandoned run in
+the registry at once, without resuming any of them. It is the scripted answer
+for a restart that stranded several runs; for one named run, prefer resume.
+Neither touches a run whose lease is still live, and neither resets a
+`cancel_pending` run — that reset would erase the stop it is carrying.
+
+### `between steps`
+
+The run claims `running` or `starting` with no operation tracked at all, which
+is the gap between two stages. The controller opens the next one on its own
+tick. Wait, then re-check:
+
+```text
+/exec status <full-run-id>
+```
+
+If it never moves, its owning session is gone; the sweep classifies it
+`ambiguous`, and `/exec resume <full-run-id>` claims it and continues.
 
 ### `cannot check on the worker right now`
 
@@ -134,24 +154,27 @@ operation is provably gone, because its async directory is absent from disk or
 the bridge answers `absent` for its operation ID. Anything less is `ambiguous`
 and is never reset.
 
-Reset every abandoned run at once:
-
-```text
-/exec doctor --reconcile
-```
-
-`--reconcile` never launches a worker. Per abandoned run it clears the active
-operation, sets `failed` with the evidence as the reason, appends that reason to
-the progress file, and leaves `taskAttempts` unchanged. A run that a live
-session reclaimed between the scan and the write is skipped, not overwritten.
-
-A reset run is then an ordinary recoverable failure:
+Recover one named run — the usual case, and the smaller blast radius:
 
 ```text
 /exec resume <full-run-id>
 ```
 
-A run that was `cancel_pending` before the reset still wants cancelling:
+Resume reconciles that run first and then continues it. Reset every abandoned
+run in the registry at once, continuing none of them:
+
+```text
+/exec doctor --reconcile
+```
+
+Neither launches a second worker. Per abandoned run the reset clears the active
+operation, sets `failed` with the evidence as the reason, appends that reason to
+the progress file, and leaves `taskAttempts` unchanged. A run that a live
+session reclaimed between the scan and the write is skipped, not overwritten.
+
+A `cancel_pending` run is never reset, however dead its worker: `failed` would
+erase the stop it is carrying and the next resume would restart plan work. It
+still wants cancelling:
 
 ```text
 /exec cancel <full-run-id>
@@ -197,8 +220,8 @@ Inspect the stage, error, and active-operation fields first.
   provider, then `/exec resume <full-run-id>`. Do not launch another child.
 - Provider reports the operation absent after an unknown launch outcome:
   plan-exec refuses a blind replay because another writer cannot be ruled out.
-  Prove the worker is gone with `/exec doctor`; a run it classifies `abandoned`
-  is reset by `/exec doctor --reconcile`.
+  Prove the worker is gone with `/exec status <full-run-id>`; a run it
+  classifies `abandoned` is reset and continued by `/exec resume <full-run-id>`.
 
 Budget exhaustion is a plan-run failure. Resume the plan run ID, not the child
 ID shown in pi-subagents output. Recovery raises implementation and review
@@ -215,7 +238,7 @@ an implementation task attempt. Recover the same run with one of:
 ```text
 /exec resume <full-run-id>
 /exec resume <full-run-id> --model current
-/exec resume <full-run-id> --model <provider/model>
+/exec resume <full-run-id> --model openai/gpt-5-codex
 ```
 
 Normal resume uses the active authenticated Pi model. `current` uses that same
@@ -274,13 +297,14 @@ selected run before takeover:
 
 ```text
 /exec status <full-run-id>
-/exec adopt <full-run-id>
+/exec resume <full-run-id>
 /exec status <full-run-id>
 ```
 
-Adopt is active: it claims and may immediately advance the run. Use it only for
-an unfinished run owned by a stale or different session. If resume hands Pi into
-the execution worktree, continue recovery in that forked session.
+Resume is active: it takes the dead lease over and may immediately advance the
+run. Use it only for an unfinished run owned by a stale or different session.
+If resume hands Pi into the execution worktree, continue recovery in that
+forked session.
 
 A lease whose pid is dead on this host is stale at once, so no 30-second wait is
 needed. A lease recorded without a hostname — the shape of every record written
@@ -324,15 +348,15 @@ child is live.
 
 If `/exec` reports missing Bridge, Fusion, pi-subagents, or pi-tasks:
 
-1. Run `/exec setup`.
+1. Run `/exec status`. It names each missing or incompatible package and prints
+   the install commands above the run list.
 2. Install the reported compatible packages.
 3. Run `/reload`.
-4. Run `/exec runs` and `/exec status <id>`.
-5. Run `/exec resume <full-run-id>`. When a stale session still holds the lease,
-   run `/exec adopt <full-run-id>` first.
+4. Run `/exec status` and `/exec status <full-run-id>`.
+5. Run `/exec resume <full-run-id>`. It takes over a lease left by a session
+   that is provably gone; nothing else is needed for that.
 
-`/exec setup` only prints setup commands. Installation and reload do not advance
-the run.
+Installation and reload do not advance the run.
 
 If `/exec` itself is missing after reload, inspect `pi list` and the Pi package
 configuration. Restore the package before touching the preserved run.
@@ -356,8 +380,9 @@ Archive retry is idempotent when the completed move already committed.
 
 ## Run missing or registry corrupt
 
-A record the registry cannot parse is dropped from `/exec runs` with a warning.
-`/exec doctor` lists it under `unreadable run records` with its parse error.
+A record the registry cannot parse is dropped from the run list. `/exec status`
+lists it under `unreadable run records` with its parse error and the exact
+command that removes it.
 
 There is no supported command that repairs arbitrary `run.json` content. Do not
 hand-edit the registry to make the run appear resumable. Once no external
@@ -408,10 +433,12 @@ Status classifies every non-failed terminal run `finished` and names
 - `failed`: terminal for automatic polling but eligible for explicit recovery
   with `/exec resume <full-run-id>`.
 
-`/exec runs` hides a terminal run once it is a day old; `/exec runs --all` shows
-it again. A terminal record becomes removable 7 days after its last update, and
-`/exec cleanup --apply` deletes it. `failed` records are excluded until
-`--include-failed` is passed, because `/exec resume` needs them.
+`/exec status` hides a terminal run once it is a day old; `/exec status --all`
+shows it again. A terminal record becomes removable 7 days after it finished,
+and `/exec cleanup --apply` deletes it. `failed` records are excluded until
+`--include-failed` is passed, because `/exec resume` needs them. Naming one run
+— `/exec cleanup <full-run-id> --apply` — overrides both the window and that
+exclusion; the registry still refuses a non-terminal run or a live lease.
 
 ## Verify recovery
 

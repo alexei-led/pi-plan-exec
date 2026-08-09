@@ -86,7 +86,7 @@ Four verbs cover everything after the start:
   worktree preserved).
 - `/exec cleanup` retires run records. It previews by default and deletes
   nothing; `--apply` removes the registry entry — never the worktree, branch, or
-  progress file — for terminal runs more than 7 days past their last update.
+  progress file — for terminal runs that finished more than 7 days ago.
   `failed` runs are excluded, because their record is what `/exec resume` needs.
 
 Implementation checkboxes remain sequential and cannot be force-skipped. When a

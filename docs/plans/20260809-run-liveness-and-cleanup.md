@@ -921,6 +921,36 @@ the controller before acting.
   reaches a parser that consumes it. The retired names survive only inside the
   section that labels them retired
 
+### Review follow-up (phase 1)
+
+Behavior the review changed after Task 16, recorded because it contradicts
+checkboxes above:
+
+- Task 6's `stat` of `activeOperation.asyncDir` no longer happens during
+  observation and `workerSignal.asyncDirMissing` is gone from the schema. The
+  flag was stamped only by the owning session's poll loop, so it froze at the
+  moment that session died — exactly when the answer matters — while the sweep
+  probed live and disagreed. Liveness is now read live by both surfaces through
+  one `runEvidence`/`classifyAbandonment` pair, and `/exec status <run-id>`
+  probes for itself. The classification is `the worker is gone, so nothing is
+  running`, since bridge-absence proves the same thing without the directory
+  being the reason
+- a persisted `activity` value is trusted only while `lastObservedAt` is inside
+  the lease staleness window. A frozen string otherwise rendered as health
+- Task 8's reconcile never resets a `cancel_pending` run, however dead its
+  worker: `failed` would erase the stop the operator asked for. The exclusion
+  lives in the single writer both callers reach
+- `/exec doctor --reconcile` moved out of `execRead` into the write dispatch.
+  Nothing reachable from the read surface writes
+- `RunRegistry.remove` reads and refuses under the run's own lock, and
+  `archive`/`complete` write through a new `updateLatest`, which re-applies a
+  terminal status over a concurrent claim instead of dropping it
+- probes yield no evidence at all for a run whose lease names another host
+- cleanup measures retention from `retiredAt` where present and reports each
+  removal, refusal, and already-gone record separately
+- `/exec start` is refused with a message naming `/exec <plan>`, instead of
+  being read as the first word of a plan path
+
 ## Post-Completion
 
 Items requiring manual intervention or external systems — no checkboxes, informational

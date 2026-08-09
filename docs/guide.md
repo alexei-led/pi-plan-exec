@@ -181,8 +181,10 @@ them, `/exec cleanup` removes them.
 ### Retiring run records
 
 `/exec cleanup` previews and deletes nothing. `/exec cleanup --apply` deletes.
-A run is removable only when it is terminal, no live lease holds it, and its
-last update is more than 7 days old. `failed` runs are excluded by default,
+A run is removable only when it is terminal, no live lease holds it, and it
+finished more than 7 days ago — measured from the archive stamp when the record
+carries one, so releasing a lease does not restart the clock.
+`failed` runs are excluded by default,
 because their registry entry is what `/exec resume` needs; add
 `--include-failed` to consider them, or name one full run ID to act on exactly
 that run. Naming a run ID also bypasses the retention window — you named it —
@@ -198,12 +200,18 @@ Removal deletes the registry entry only. The worktree, the branch, and the
 caller cannot answer. Every prompt has a non-interactive equivalent, and the
 former subcommand names still dispatch. They are absent from `/exec help` on
 purpose; `/skill:exec-plan` collects them for agents. `/exec runs` and
-`/exec doctor` both mean `/exec status`, `/exec setup` still prints the install
-commands unconditionally where `/exec status` reports them only when a package is
-missing, `/exec adopt` means
-`/exec resume`, and `/exec pause` and
-`/exec cancel` are `/exec stop` without the question. `/exec start` was deleted
-outright: it was the same code path as bare `/exec`.
+`/exec doctor` both read exactly what `/exec status` reads, `/exec setup` still
+prints the install commands unconditionally where `/exec status` reports them
+only when a package is missing, `/exec adopt` means `/exec resume`, and
+`/exec pause` and `/exec cancel` are `/exec stop` without the question.
+`/exec start` was deleted outright: it was the same code path as bare `/exec`,
+and typing it now says so instead of reading the word as a plan path.
+
+One retired flag writes: `/exec doctor --reconcile` resets **every** provably
+abandoned run in the registry to a recoverable `failed`, launching nothing. It
+is dispatched as a write command, so no read path can reach it. `/exec resume
+<full-run-id>` performs the same reset for the one run it is recovering, which
+is the scoped answer to prefer.
 
 ### Following a run in flight
 
@@ -216,23 +224,35 @@ plain words and one safe next action.
 ### What status can prove about a worker
 
 A stored `running` status is a claim, not evidence, so status never renders the
-absence of a signal as health. Four in-flight situations read four different
-ways:
+absence of a signal as health. Every in-flight situation reads differently:
 
 - `running, and the worker reported activity` — the provider reported per-turn
-  activity. Wait for it.
+  activity, and the observation that carried it is recent enough that something
+  is still polling this run. Wait for it.
 - `running, but nothing proves the worker is alive` — nothing reports what the
-  worker is doing, so it is neither confirmed alive nor confirmed dead. Re-check
-  later; do not start a second run.
-- `running longer than its budget allows` — the bridge still reports the worker
-  running past a wall-clock bound derived from that stage's own turn budget
-  (75 turns for an implementation worker, 30 for a reviewer or the statistics
-  pass) times a per-turn allowance of 2 minutes. The allowance is a deliberately
-  generous placeholder pending measurement across real runs. It is a prompt to
-  look, never proof of a stall.
-- `the worker's files are gone, so nothing is running` — the directory the worker
-  was writing to no longer exists. `/exec resume` clears the dead worker and
-  continues without starting a second one.
+  worker is doing, so it is neither confirmed alive nor confirmed dead. An
+  activity value that no session has refreshed for 30 seconds counts as nothing
+  reported: it froze when its owner died. Re-check later; do not start a second
+  run.
+- `running longer than its budget allows` — the run has claimed an active worker
+  past a wall-clock bound derived from that stage's own turn budget (75 turns
+  for an implementation worker, 30 for a reviewer or the statistics pass) times
+  a per-turn allowance of 2 minutes. The allowance is a deliberately generous
+  placeholder pending measurement across real runs. It is a prompt to look,
+  never proof of a stall.
+- `the worker is gone, so nothing is running` — checked at the moment status
+  ran: the directory the worker was writing to is absent, or the bridge has no
+  record of its operation. `/exec resume` clears the dead worker and continues
+  without starting a second one.
+- `cannot check on the worker right now` — the provider could not be reached, or
+  the worker was launched and never named. Repair the provider and re-check.
+- `between steps` — nothing is tracked because the controller is between two
+  stages. Its next tick opens the next one.
+
+Both reads gather that evidence the same way, so `/exec status` and
+`/exec status <full-run-id>` cannot disagree about one run. Nothing about
+liveness is taken from the record itself: a directory that was there at the last
+poll proves nothing about now, and neither does one that was missing.
 
 A run spawned in workflow mode reports no trustworthy per-turn activity, so
 elapsed time is the only bound available for it. That limit is upstream and

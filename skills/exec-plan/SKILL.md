@@ -231,7 +231,7 @@ After recovery, report:
 ```text
 PLAN RECOVERY
 Run: <full ID>
-Action: <wait|reconcile|resume|adopt|cancel|cleanup|repair extension|blocked>
+Action: <wait|resume|stop|skip|cleanup|reconcile|repair extension|blocked>
 Before: <status/stage/operation/error>
 After: <status/stage/operation>
 Worktree: <path and git state>
