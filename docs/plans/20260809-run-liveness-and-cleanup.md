@@ -164,24 +164,30 @@ say so in a code comment. Classify only; never auto-fail, never auto-kill.
 - Modify: `test/registry.test.ts`
 - Modify: `test/index.test.ts`
 
-- [ ] add optional `hostname?: string` to the `lease` shape in `src/types.ts:236`; do not
+- [x] add optional `hostname?: string` to the `lease` shape in `src/types.ts:236`; do not
       bump `schemaVersion`
-- [ ] stamp `hostname: os.hostname()` when writing a lease in `RunRegistry.claim`
-      (`src/registry.ts:156`) and in `heartbeat`
-- [ ] add an exported `isLeaseLive(lease, sessionId)` predicate in `src/registry.ts`:
+- [x] stamp `hostname: os.hostname()` when writing a lease in `RunRegistry.claim`
+      (`src/registry.ts:156`) and in `heartbeat` — ➕ deviation: `claim` is the sole
+      writer of `lease.pid`/`lease.hostname` and `heartbeat` only advances
+      `heartbeatAt`. Stamping this host in `heartbeat` could pair a local hostname with
+      another session's pid, which would make an unrelated local process read as the
+      live owner. Every controller entry claims first, so the lease is always stamped
+- [x] add an exported `isLeaseLive(lease, sessionId)` predicate in `src/registry.ts`:
       own session ⇒ live; heartbeat older than `LEASE_STALE_MS` ⇒ dead; hostname absent
       or different ⇒ fall back to heartbeat freshness alone; same host ⇒ require
       `isProcessRunning(lease.pid)` (already defined at `src/registry.ts:319`)
-- [ ] use the predicate in `claim` so a foreign lease with a dead local pid no longer
+- [x] use the predicate in `claim` so a foreign lease with a dead local pid no longer
       blocks
-- [ ] use the same predicate for `isStaleOwner` in `src/index.ts:492` so status guidance
-      and claiming cannot disagree
-- [ ] write a table-driven test over
+- [x] use the same predicate for `isStaleOwner` in `src/index.ts:492` so status guidance
+      and claiming cannot disagree — called without a session ID, since status describes
+      the lease from the outside and must not assume ownership
+- [x] write a table-driven test over
       `(same session, heartbeat age, hostname present/matching, pid alive)` asserting the
       full matrix, including that a live foreign pid still blocks
-- [ ] write a test that a lease with no `hostname` (the on-disk shape of all existing
-      runs) is judged by heartbeat alone and never by pid
-- [ ] run `npm run test:all` — must pass before task 3
+- [x] write a test that a lease with no `hostname` (the on-disk shape of all existing
+      runs) is judged by heartbeat alone and never by pid — loaded from a hand-written
+      `run.json` fixture, which also proves old records still parse
+- [x] run `npm run test:all` — must pass before task 3
 
 ### Task 3: Registry removal and the `/exec cleanup` subcommand
 

@@ -232,7 +232,13 @@ export interface PlanExecRun {
   config: FrozenRunConfig;
   createdAt: number;
   updatedAt: number;
-  lease?: { sessionId: string; pid: number; heartbeatAt: number };
+  lease?: {
+    sessionId: string;
+    pid: number;
+    heartbeatAt: number;
+    /** Absent on leases written before this field existed: unknown host. */
+    hostname?: string;
+  };
   error?: string;
   unresolvedFindings: ReviewFinding[];
 }

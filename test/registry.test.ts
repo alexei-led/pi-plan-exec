@@ -1,10 +1,20 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { RunRegistry } from "../src/registry.js";
+import { isLeaseLive, LEASE_STALE_MS, RunRegistry } from "../src/registry.js";
 import type { PlanExecRun } from "../src/types.js";
+
+type RunLease = NonNullable<PlanExecRun["lease"]>;
+
+/** A pid that is reaped before spawnSync returns, so it is reliably gone. */
+function reapedPid(): number {
+  const { pid } = spawnSync("true");
+  assert.ok(pid, "spawnSync must report a child pid");
+  return pid;
+}
 
 const config = {
   taskRetries: 1,
@@ -56,6 +66,214 @@ test("registry persists runs, protects path traversal, and reclaims stale leases
   };
   const adopted = await registry.claim(stale, "session-2");
   assert.equal(adopted.lease?.sessionId, "session-2");
+  assert.equal(adopted.lease?.hostname, hostname());
+});
+
+test("lease liveness weighs session, heartbeat, hostname, and pid", () => {
+  const gone = reapedPid();
+  const fresh = Date.now();
+  const stale = Date.now() - LEASE_STALE_MS;
+  const here = hostname();
+  const cases: Array<{
+    name: string;
+    lease: RunLease;
+    sessionId?: string;
+    live: boolean;
+  }> = [
+    {
+      name: "the owning session is live whatever the lease says",
+      lease: { sessionId: "s1", pid: gone, heartbeatAt: stale, hostname: here },
+      sessionId: "s1",
+      live: true,
+    },
+    {
+      name: "a foreign lease with a running local pid still blocks",
+      lease: {
+        sessionId: "s1",
+        pid: process.pid,
+        heartbeatAt: fresh,
+        hostname: here,
+      },
+      sessionId: "s2",
+      live: true,
+    },
+    {
+      name: "a foreign lease with a dead local pid is dead now",
+      lease: { sessionId: "s1", pid: gone, heartbeatAt: fresh, hostname: here },
+      sessionId: "s2",
+      live: false,
+    },
+    {
+      name: "a stale heartbeat outranks a running pid",
+      lease: {
+        sessionId: "s1",
+        pid: process.pid,
+        heartbeatAt: stale,
+        hostname: here,
+      },
+      live: false,
+    },
+    {
+      name: "another host falls back to heartbeat freshness",
+      lease: {
+        sessionId: "s1",
+        pid: gone,
+        heartbeatAt: fresh,
+        hostname: "other-host",
+      },
+      live: true,
+    },
+    {
+      name: "another host with a stale heartbeat is dead",
+      lease: {
+        sessionId: "s1",
+        pid: process.pid,
+        heartbeatAt: stale,
+        hostname: "other-host",
+      },
+      live: false,
+    },
+    {
+      name: "an absent hostname falls back to heartbeat freshness",
+      lease: { sessionId: "s1", pid: gone, heartbeatAt: fresh },
+      live: true,
+    },
+    {
+      name: "an absent hostname with a stale heartbeat is dead",
+      lease: { sessionId: "s1", pid: process.pid, heartbeatAt: stale },
+      live: false,
+    },
+    {
+      name: "a lease with no session ID never matches an absent argument",
+      lease: {
+        pid: gone,
+        heartbeatAt: fresh,
+        hostname: here,
+      } as unknown as RunLease,
+      live: false,
+    },
+  ];
+
+  for (const testCase of cases)
+    assert.equal(
+      isLeaseLive(testCase.lease, testCase.sessionId),
+      testCase.live,
+      testCase.name,
+    );
+});
+
+test("a dead local pid frees the lease without waiting out the heartbeat", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-plan-exec-registry-"));
+  const registry = new RunRegistry(directory);
+  const run = await registry.create({
+    schemaVersion: 1,
+    repositoryRoot: "/repo",
+    planPath: "/repo/plan.md",
+    planHash: "hash",
+    worktreeCwd: "/repo",
+    branch: "feature",
+    defaultBranch: "main",
+    status: "running",
+    stage: "implementation",
+    taskAttempts: {},
+    stageAttempts: {},
+    reviewFindings: [],
+    unresolvedFindings: [],
+    config,
+    lease: {
+      sessionId: "session-1",
+      pid: reapedPid(),
+      heartbeatAt: Date.now(),
+      hostname: hostname(),
+    },
+  });
+
+  const claimed = await registry.claim(run, "session-2");
+
+  assert.equal(claimed.lease?.sessionId, "session-2");
+  assert.equal(claimed.lease?.pid, process.pid);
+});
+
+test("a heartbeat refreshes liveness without taking over lease identity", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-plan-exec-registry-"));
+  const registry = new RunRegistry(directory);
+  const gone = reapedPid();
+  const run = await registry.create({
+    schemaVersion: 1,
+    repositoryRoot: "/repo",
+    planPath: "/repo/plan.md",
+    planHash: "hash",
+    worktreeCwd: "/repo",
+    branch: "feature",
+    defaultBranch: "main",
+    status: "running",
+    stage: "implementation",
+    taskAttempts: {},
+    stageAttempts: {},
+    reviewFindings: [],
+    unresolvedFindings: [],
+    config,
+    lease: {
+      sessionId: "session-1",
+      pid: gone,
+      heartbeatAt: 1,
+      hostname: hostname(),
+    },
+  });
+
+  const lease = (await registry.heartbeat(run)).lease;
+
+  assert.ok(lease);
+  assert.equal(lease.pid, gone);
+  assert.equal(isLeaseLive(lease, "session-2"), false);
+});
+
+test("a lease written before hostname existed is judged by heartbeat alone", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-plan-exec-registry-"));
+  const registry = new RunRegistry(directory);
+  const runId = "22222222-2222-4222-8222-222222222222";
+  await mkdir(join(directory, runId), { recursive: true });
+  await writeFile(
+    join(directory, runId, "run.json"),
+    JSON.stringify({
+      schemaVersion: 1,
+      id: runId,
+      repositoryRoot: "/repo",
+      planPath: "/repo/plan.md",
+      planHash: "hash",
+      worktreeCwd: "/repo",
+      branch: "feature",
+      defaultBranch: "main",
+      status: "running",
+      stage: "implementation",
+      taskAttempts: {},
+      stageAttempts: {},
+      reviewFindings: [],
+      unresolvedFindings: [],
+      config,
+      createdAt: 1,
+      updatedAt: 1,
+      lease: {
+        sessionId: "session-1",
+        pid: reapedPid(),
+        heartbeatAt: Date.now(),
+      },
+    }),
+    "utf8",
+  );
+
+  const loaded = await registry.get(runId);
+
+  assert.ok(loaded);
+  const lease = loaded.lease;
+  assert.ok(lease);
+  assert.equal(lease.hostname, undefined);
+  // The pid is dead, so a pid check would free this lease; the heartbeat holds it.
+  assert.equal(isLeaseLive(lease, "session-2"), true);
+  await assert.rejects(
+    () => registry.claim(loaded, "session-2"),
+    /another active Pi session/,
+  );
 });
 
 test("concurrent claims allow only one session to acquire the lease", async () => {

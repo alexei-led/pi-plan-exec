@@ -9,7 +9,7 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
-import { homedir } from "node:os";
+import { homedir, hostname } from "node:os";
 import { dirname, join } from "node:path";
 import {
   DEFAULT_FROZEN_RUN_CONFIG,
@@ -33,6 +33,22 @@ const CONTROLLER_LOCK_STALE_MS = 120_000;
 const CLAIM_CAS_RETRIES = 5;
 const RUN_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+type RunLease = NonNullable<PlanExecRun["lease"]>;
+
+/**
+ * A stored lease is a claim, not evidence. It is live only when the caller owns
+ * it, or its heartbeat is fresh and — on this host, where the pid means
+ * something — the process still exists. A lease with no hostname was written
+ * before the field existed, so its pid is not ours to check: the heartbeat
+ * threshold is then the only evidence available.
+ */
+export function isLeaseLive(lease: RunLease, sessionId?: string): boolean {
+  if (sessionId !== undefined && lease.sessionId === sessionId) return true;
+  if (Date.now() - lease.heartbeatAt >= LEASE_STALE_MS) return false;
+  if (lease.hostname !== hostname()) return true;
+  return isProcessRunning(lease.pid);
+}
 
 /**
  * The global orchestration store. It is deliberately separate from pi-tasks:
@@ -159,7 +175,7 @@ export class RunRegistry {
       if (
         lease &&
         lease.sessionId !== sessionId &&
-        now - lease.heartbeatAt < LEASE_STALE_MS
+        isLeaseLive(lease, sessionId)
       ) {
         throw new Error(
           `Run ${current.id} is controlled by another active Pi session.`,
@@ -168,7 +184,12 @@ export class RunRegistry {
       const claimed = await this.updateIfCurrent(
         {
           ...current,
-          lease: { sessionId, pid: process.pid, heartbeatAt: now },
+          lease: {
+            sessionId,
+            pid: process.pid,
+            hostname: hostname(),
+            heartbeatAt: now,
+          },
         },
         current.updatedAt,
       );
@@ -206,6 +227,9 @@ export class RunRegistry {
     const heartbeat = await this.updateIfCurrent(
       {
         ...run,
+        // claim is the only writer of lease identity; a heartbeat that stamped
+        // this host over another session's pid would make an unrelated local
+        // process read as the live owner.
         lease: { ...run.lease, heartbeatAt: Date.now() },
       },
       run.updatedAt,

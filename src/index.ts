@@ -24,7 +24,7 @@ import {
   isSkippableStage,
   isTerminalStatus,
 } from "./lifecycle.js";
-import { LEASE_STALE_MS, RunRegistry } from "./registry.js";
+import { isLeaseLive, RunRegistry } from "./registry.js";
 import { readPlan } from "./plan.js";
 import { TaskProjector } from "./task-projection.js";
 import {
@@ -487,9 +487,10 @@ export function recoveryGuidance(run: PlanExecRun): RecoveryGuidance {
 }
 
 function isStaleOwner(run: PlanExecRun): boolean {
-  return Boolean(
-    run.lease && Date.now() - run.lease.heartbeatAt >= LEASE_STALE_MS,
-  );
+  // No session argument: status guidance describes the lease from the outside,
+  // so ownership is never assumed. The predicate is otherwise the one `claim`
+  // uses, so guidance and claiming cannot disagree.
+  return Boolean(run.lease && !isLeaseLive(run.lease));
 }
 
 function hasExecutionBranchMismatch(run: PlanExecRun): boolean {

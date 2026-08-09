@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdtemp, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
@@ -411,6 +412,36 @@ test("run status classifies recovery and gives one safe next action", () => {
   );
   assert.match(terminal, /recovery: terminal/);
   assert.match(terminal, /no recovery action/);
+});
+
+test("status guidance judges lease staleness the way claiming does", () => {
+  const { pid } = spawnSync("true");
+  assert.ok(pid, "spawnSync must report a child pid");
+  const deadLocalOwner = run({
+    lease: {
+      sessionId: "old-session",
+      pid,
+      heartbeatAt: Date.now(),
+      hostname: hostname(),
+    },
+  });
+  assert.match(formatRunStatus(deadLocalOwner), /owner: stale lease/);
+
+  const liveLocalOwner = run({
+    lease: {
+      sessionId: "old-session",
+      pid: process.pid,
+      heartbeatAt: Date.now(),
+      hostname: hostname(),
+    },
+  });
+  assert.doesNotMatch(formatRunStatus(liveLocalOwner), /owner: stale lease/);
+
+  // No hostname is the on-disk shape of every existing run: heartbeat only.
+  const legacyOwner = run({
+    lease: { sessionId: "old-session", pid, heartbeatAt: Date.now() },
+  });
+  assert.doesNotMatch(formatRunStatus(legacyOwner), /owner: stale lease/);
 });
 
 test("resume output explains a required second plan-structure review", () => {
