@@ -977,6 +977,31 @@ only.
   then tighten Task 7's deadline and reword its guidance from "long-running" to a genuine
   stall claim.
 
+**Deferred refactor — split `src/index.ts` (finding 9 of the code-smell review):**
+
+`src/index.ts` is 2670 lines and holds six unrelated responsibilities. The review
+recommended deferring the split, because it invalidates the completed review rounds for
+zero behavior change. Finding 3 (the `registry` -> `defaultRegistry` rename) was its
+precondition and is done, so every module below can take an injected `registry`
+parameter with no shadowing.
+
+The reviewer's own module table was not carried into the fix handoff. The table below is
+reconstructed from the file and is a starting point, not the reviewer's text.
+
+| Module | Holds | Notes |
+| --- | --- | --- |
+| `src/recovery.ts` | `RecoveryGuidance`, `RunCommands`, `recoveryGuidance`, `waitOrStop`, `abandonedGuidance`, `sameMachineRefusal`, `isStaleOwner`, `leaseNamesAnotherHost`, `hasExecutionBranchMismatch`, `reportedActivity`, `needsPlanStructureReview`, `isRecoverableFailure` | The verdict layer. Pure functions of a run and its evidence. |
+| `src/render.ts` | `formatRunStatus`, `workerSignalLines`, `settledRunLines`, `runGroupLines`, `sectionLines`, `stageWaiver*`, `nextRunCommand`, `runClaim`, `evidenceText`, `operationEvidence`, `nextCommand`, `runSelectorLabel`, `observationLabel`, `compactRunStatus`, `terminalMessage`, `shortRunId`, the duration labels | Every surface that turns a run into text. Depends on `recovery.ts`, never the reverse. |
+| `src/cleanup.ts` | `parseCleanupArguments`, `isRemovableRun`, `execCleanup`, `removeAll`, `removalReport`, `cleanupUnreadable`, `removableRun`, the `CLEANUP_*` constants | Already takes an injected registry. |
+| `src/diagnosis.ts` | `abandonmentProbe`, `runEvidence`, `sweepAbandonment`, `abandonedRunsNotice`, `execReconcile`, `reconcileLines`, `RECONCILE_SKIP`, `reconcileRun`, `reconcileReason`, `reconcileForResume`, `abandonedFooter`, `diagnosisGroup` | Evidence gathering and the single reconcile writer. |
+| `src/commands.ts` | `handleCommand`, `runActionFor`, `runAction`, `resumeRun`, `skipStage`, `chooseStopOutcome`, `resolveRunForAction`, `handoffToWorktree`, `isActionAllowed`, `assertActionAllowed`, the resume and skip parsers, `recoveryModelForResume`, `requestStatus`, `execHelp`, `execSetup`, `EXEC_COMMANDS` | The `/exec` dispatch. |
+
+`src/index.ts` keeps only the extension entry point: `planExecExtension`, the projection
+queue, notification plumbing, and the `defaultRegistry` singleton the dispatch is called
+with.
+
+Do the split on its own branch with no other change, so the diff is provably a move.
+
 **Manual verification:**
 
 - run a real plan through `/exec` end to end and confirm `/exec status` distinguishes a
