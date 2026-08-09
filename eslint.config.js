@@ -27,12 +27,13 @@ const DOMAIN_VALUE_PATTERN = [...new Set(
   .join("|");
 
 export default tseslint.config(
+  // Sole key, so these are global ignores. Paired with a `files` or
+  // `languageOptions` key they would only scope that one config object, and
+  // every other config would still lint the tool caches below.
+  { ignores: ["node_modules/", ".pi-subagents/", ".gitnexus/"] },
   js.configs.recommended,
   ...tseslint.configs.recommended,
-  {
-    languageOptions: { globals: globals.node },
-    ignores: ["node_modules/", ".pi-subagents/"],
-  },
+  { languageOptions: { globals: globals.node } },
   {
     files: ["src/**/*.ts"],
     ignores: ["src/types.ts"],

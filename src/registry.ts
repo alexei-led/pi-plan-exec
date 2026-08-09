@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { isSkippableStage } from "./lifecycle.js";
 import {
   mkdir,
   open,
@@ -9,8 +8,9 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
-import { homedir } from "node:os";
+import { homedir, hostname } from "node:os";
 import { dirname, join } from "node:path";
+import { isSkippableStage, isTerminalStatus } from "./lifecycle.js";
 import {
   DEFAULT_FROZEN_RUN_CONFIG,
   OPERATION_KIND,
@@ -24,6 +24,7 @@ import {
 } from "./types.js";
 
 const RUNS_DIRECTORY = join(homedir(), ".pi", "plan-exec", "runs");
+const INVALID_RUN_ENTRY = "Invalid plan-exec run registry entry";
 export const LEASE_STALE_MS = 30_000;
 const LOCK_RETRY_MS = 50;
 const LOCK_MAX_RETRIES = 100;
@@ -33,6 +34,87 @@ const CONTROLLER_LOCK_STALE_MS = 120_000;
 const CLAIM_CAS_RETRIES = 5;
 const RUN_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+type RunLease = NonNullable<PlanExecRun["lease"]>;
+
+/**
+ * Whether the name frozen on a lease is this machine. The whole name decides,
+ * never its first label: a shared or NFS home shows `build.a.corp.example` and
+ * `build.b.corp.example`, which are different hosts.
+ *
+ * A name that is not exactly ours is foreign, so nothing measured here speaks
+ * for it: such a run can reach AMBIGUOUS but never ABANDONED, and no second
+ * worker is launched. A renamed machine is foreign too, and not stuck —
+ * guidance names `/exec resume <id> --same-machine`.
+ */
+function isThisHost(name: string): boolean {
+  return name.toLowerCase() === hostname().toLowerCase();
+}
+
+/**
+ * A stored lease is a claim, not evidence. It is live only when the caller owns
+ * it, or its heartbeat is fresh and — on this host, where the pid means
+ * something — the process still exists. A lease with no hostname predates the
+ * field, so its pid is not ours to check: the heartbeat is the only evidence.
+ */
+export function isLeaseLive(lease: RunLease, sessionId?: string): boolean {
+  if (sessionId !== undefined && lease.sessionId === sessionId) return true;
+  if (Date.now() - lease.heartbeatAt >= LEASE_STALE_MS) return false;
+  if (lease.hostname === undefined || !isThisHost(lease.hostname)) return true;
+  return isProcessRunning(lease.pid);
+}
+
+/**
+ * Whether anything observed on this machine can speak for this run. A lease
+ * naming another host makes every local check meaningless: that directory and
+ * that bridge belong to a different machine. A lease with no hostname predates
+ * the field and stays local, as it always was.
+ */
+export function isLocalRun(run: PlanExecRun): boolean {
+  const host = run.lease?.hostname;
+  return host === undefined || isThisHost(host);
+}
+
+/**
+ * The run with the host on its lease read as this machine. Backs
+ * `/exec resume --same-machine`: no probe can tell a renamed machine from a
+ * foreign one, so the operator supplies that fact. It asserts a machine, never
+ * a verdict — a worker still writing here keeps the run ambiguous.
+ */
+export function asLocalRun(run: PlanExecRun): PlanExecRun {
+  return run.lease
+    ? { ...run, lease: { ...run.lease, hostname: hostname() } }
+    : run;
+}
+
+/**
+ * Why this session cannot take this run's lease, or undefined when it can.
+ * `claim` raises it, and the worktree handoff must ask it first: that handoff
+ * releases before re-claiming, and `release` deletes whatever is there, so the
+ * refusal `claim` would have raised comes too late.
+ */
+export function takeoverRefusal(
+  run: PlanExecRun,
+  sessionId: string,
+): string | undefined {
+  const lease = run.lease;
+  return lease && lease.sessionId !== sessionId && isLeaseLive(lease, sessionId)
+    ? `Run ${run.id} is controlled by another active Pi session.`
+    : undefined;
+}
+
+/**
+ * Why this run cannot be removed, or undefined when it can. `remove` and
+ * `/exec cleanup` share it so a preview never promises a removal the registry
+ * would refuse.
+ */
+export function removalRefusal(run: PlanExecRun): string | undefined {
+  if (!isTerminalStatus(run.status))
+    return `Run ${run.id} is ${run.status}; only a terminal run can be removed.`;
+  if (run.lease && isLeaseLive(run.lease))
+    return `Run ${run.id} is held by a live lease from session ${run.lease.sessionId}.`;
+  return undefined;
+}
 
 /**
  * The global orchestration store. It is deliberately separate from pi-tasks:
@@ -44,11 +126,7 @@ export class RunRegistry {
   async create(
     run: Omit<
       PlanExecRun,
-      | "id"
-      | "createdAt"
-      | "updatedAt"
-      | "skippedStages"
-      | "branchRebindings"
+      "id" | "createdAt" | "updatedAt" | "skippedStages" | "branchRebindings"
     > & {
       skippedStages?: PlanExecRun["skippedStages"];
       branchRebindings?: PlanExecRun["branchRebindings"];
@@ -117,8 +195,35 @@ export class RunRegistry {
     }
   }
 
+  /**
+   * Optimistic write: it lands only if nothing else wrote first, and otherwise
+   * returns the record that did. A write that must not be lost — a terminal
+   * status, a retirement stamp — belongs in `updateLatest`: this one drops it
+   * silently.
+   */
   async update(run: PlanExecRun): Promise<PlanExecRun> {
     return (await this.updateIfCurrent(run, run.updatedAt)).run;
+  }
+
+  /**
+   * Apply a change that must not be lost, re-reading and re-applying on top of
+   * whoever landed first. Use it when the work the write records has already
+   * happened on disk, so dropping the write would falsify the record.
+   */
+  async updateLatest(
+    runId: string,
+    apply: (current: PlanExecRun) => PlanExecRun,
+  ): Promise<PlanExecRun> {
+    for (let attempt = 0; attempt < CLAIM_CAS_RETRIES; attempt += 1) {
+      const current = await this.get(runId);
+      if (!current) throw new Error(`Plan execution run not found: ${runId}`);
+      const written = await this.updateIfCurrent(
+        apply(current),
+        current.updatedAt,
+      );
+      if (written.applied) return written.run;
+    }
+    throw new Error(`Run ${runId} changed repeatedly while being updated.`);
   }
 
   async updateIfCurrent(
@@ -159,20 +264,17 @@ export class RunRegistry {
     let current = run;
     for (let attempt = 0; attempt < CLAIM_CAS_RETRIES; attempt += 1) {
       const now = Date.now();
-      const lease = current.lease;
-      if (
-        lease &&
-        lease.sessionId !== sessionId &&
-        now - lease.heartbeatAt < LEASE_STALE_MS
-      ) {
-        throw new Error(
-          `Run ${current.id} is controlled by another active Pi session.`,
-        );
-      }
+      const refusal = takeoverRefusal(current, sessionId);
+      if (refusal) throw new Error(refusal);
       const claimed = await this.updateIfCurrent(
         {
           ...current,
-          lease: { sessionId, pid: process.pid, heartbeatAt: now },
+          lease: {
+            sessionId,
+            pid: process.pid,
+            hostname: hostname(),
+            heartbeatAt: now,
+          },
         },
         current.updatedAt,
       );
@@ -186,7 +288,7 @@ export class RunRegistry {
     runId: string,
     callback: () => Promise<T>,
   ): Promise<T | undefined> {
-    const path = `${this.pathFor(runId)}.controller.lock`;
+    const path = this.controllerLockPath(runId);
     let lock;
     try {
       lock = await acquireLock(
@@ -210,11 +312,77 @@ export class RunRegistry {
     const heartbeat = await this.updateIfCurrent(
       {
         ...run,
+        // Timestamp only. claim is the sole writer of lease identity: stamping
+        // this host over another session's pid would make an unrelated local
+        // process read as the live owner.
         lease: { ...run.lease, heartbeatAt: Date.now() },
       },
       run.updatedAt,
     );
     return heartbeat.run;
+  }
+
+  /**
+   * Delete the registry entry only; the worktree, branch, and progress file
+   * stay. An unparsable record is removable as-is, because `list` already drops
+   * it and nothing else could clean it up. Returns false for a record already
+   * gone, so it is not counted as a removal.
+   *
+   * The refusal is decided under the same lock as the deletion: reading first
+   * would let a concurrent `claim` revive the run in the window between, and
+   * this is the one irreversible path in the store.
+   *
+   * The controller lock comes first, in the order every controller takes it. A
+   * resume holds it across the whole recovery, and the record it is about to
+   * write must not be deleted underneath it.
+   */
+  async remove(runId: string): Promise<boolean> {
+    assertRunId(runId);
+    const controllerPath = this.controllerLockPath(runId);
+    let controllerLock;
+    try {
+      controllerLock = await acquireLock(
+        controllerPath,
+        CONTROLLER_LOCK_MAX_RETRIES,
+        CONTROLLER_LOCK_STALE_MS,
+      );
+    } catch (error: unknown) {
+      // No directory to lock is no directory to delete.
+      if (isNodeError(error, "ENOENT")) return false;
+      if (error instanceof LockTimeoutError)
+        throw new Error(
+          `Run ${runId} is being recovered by another controller; nothing was deleted.`,
+          { cause: error },
+        );
+      throw error;
+    }
+    try {
+      return await this.removeLocked(runId);
+    } finally {
+      await releaseLock(controllerPath, controllerLock);
+    }
+  }
+
+  private async removeLocked(runId: string): Promise<boolean> {
+    const path = this.pathFor(runId);
+    const lockPath = `${path}.lock`;
+    let lock;
+    try {
+      lock = await acquireLock(lockPath);
+    } catch (error: unknown) {
+      if (isNodeError(error, "ENOENT")) return false;
+      throw error;
+    }
+    try {
+      const run = await this.readForRemoval(runId);
+      if (run === undefined) return false;
+      const refusal = run === null ? undefined : removalRefusal(run);
+      if (refusal) throw new Error(refusal);
+      await rm(dirname(path), { recursive: true, force: true });
+      return true;
+    } finally {
+      await releaseLock(lockPath, lock);
+    }
   }
 
   async release(run: PlanExecRun): Promise<PlanExecRun> {
@@ -223,9 +391,31 @@ export class RunRegistry {
     return this.update(released);
   }
 
+  /** `undefined` when nothing is on disk, `null` when it is there but unreadable. */
+  private async readForRemoval(
+    runId: string,
+  ): Promise<PlanExecRun | null | undefined> {
+    try {
+      return await this.get(runId);
+    } catch (error: unknown) {
+      // Narrow on purpose: an unreadable file is removable, but an I/O or
+      // permission error is not evidence of anything and must not delete data.
+      if (
+        error instanceof SyntaxError ||
+        (error instanceof Error && error.message.startsWith(INVALID_RUN_ENTRY))
+      )
+        return null;
+      throw error;
+    }
+  }
+
   private pathFor(runId: string): string {
     assertRunId(runId);
     return join(this.directory, runId, "run.json");
+  }
+
+  private controllerLockPath(runId: string): string {
+    return `${this.pathFor(runId)}.controller.lock`;
   }
 
   private async write(run: PlanExecRun): Promise<void> {
@@ -332,7 +522,7 @@ function delay(ms: number): Promise<void> {
 function parseRun(raw: string, runId: string): PlanExecRun {
   const value: unknown = JSON.parse(raw);
   if (!isRecord(value) || value.id !== runId || value.schemaVersion !== 1) {
-    throw new Error(`Invalid plan-exec run registry entry: ${runId}`);
+    throw new Error(`${INVALID_RUN_ENTRY}: ${runId}`);
   }
   const migrated = migrateLegacyRun(value);
   assertRun(migrated);
@@ -340,8 +530,7 @@ function parseRun(raw: string, runId: string): PlanExecRun {
 }
 
 function migrateLegacyRun(value: Record<string, unknown>): PlanExecRun {
-  const stage =
-    value.stage === "tasks" ? RUN_STAGE.PROJECT_TASKS : value.stage;
+  const stage = value.stage === "tasks" ? RUN_STAGE.PROJECT_TASKS : value.stage;
   const config = isRecord(value.config) ? value.config : {};
   return {
     ...(value as unknown as PlanExecRun),
@@ -441,7 +630,7 @@ function assertRun(run: PlanExecRun): void {
     !isValidOperationForStage(run.activeOperation, run.stage) ||
     !isValidOperationForStage(run.failedOperation, run.stage)
   ) {
-    throw new Error(`Invalid plan-exec run registry entry: ${run.id}`);
+    throw new Error(`${INVALID_RUN_ENTRY}: ${run.id}`);
   }
 }
 

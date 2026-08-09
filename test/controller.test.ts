@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  parseWorkerSignal,
   PLAN_STRUCTURE_CHANGED_ERROR,
   PlanExecController,
 } from "../src/controller.js";
+import { execReconcile } from "../src/index.js";
 import { parsePlan } from "../src/plan.js";
 import { RunRegistry } from "../src/registry.js";
 import type { BridgeResult, PlanExecRun } from "../src/types.js";
@@ -509,7 +511,10 @@ test("resume keeps a preserved fixer recoverable when adoption is not ready", as
   assert.equal(resumed.status, "running");
   assert.equal(resumed.activeOperation?.operationId, "preserved-fix");
   assert.equal(resumed.activeOperation?.statusFailures, 2);
-  assert.match(resumed.activeOperation?.lastStatusError ?? "", /Status file not found/);
+  assert.match(
+    resumed.activeOperation?.lastStatusError ?? "",
+    /Status file not found/,
+  );
   assert.equal(bridge.spawnCount, 0);
 });
 
@@ -1573,6 +1578,34 @@ test("archive records completed_with_findings when findings remain", async () =>
   assert.match(await readFile(progressPath, "utf8"), /completed_with_findings/);
 });
 
+test("archive retires the run record with a persisted retiredAt", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
+  const planPath = join(root, "plan.md");
+  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
+  const registry = new RunRegistry(join(root, "runs"));
+  const controller = new PlanExecController(
+    registry,
+    new FakeBridge(join(root, "none.json")),
+    new FakeFusion(),
+    fakeGit(root),
+  );
+  const run = await registry.create({
+    ...baseRun(root, planPath),
+    stage: "archive",
+  });
+  assert.equal(run.retiredAt, undefined);
+  const before = Date.now();
+
+  const completed = await controller.advance(run);
+
+  assert.equal(completed.status, "completed");
+  // release() rewrites the record after archive; the stamp must survive to disk.
+  const reloaded = await registry.get(run.id);
+  assert.ok(reloaded?.retiredAt);
+  assert.ok(reloaded.retiredAt >= before);
+  assert.equal(reloaded.retiredAt, completed.retiredAt);
+});
+
 test("archive commit failure remains resumable and retries idempotently", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
   const planPath = join(root, "plan.md");
@@ -1672,10 +1705,7 @@ test("explicit recovery can adopt the verified current execution branch", async 
     error: "Execution directory is on feature/current, expected master.",
   });
 
-  const rebound = await controller.rebindBranchAndResume(
-    stale.id,
-    "session-1",
-  );
+  const rebound = await controller.rebindBranchAndResume(stale.id, "session-1");
 
   assert.equal(rebound.branch, "feature/current");
   assert.equal(rebound.activeOperation?.kind, "review");
@@ -1792,7 +1822,10 @@ test("force skip stops a live fixer before advancing", async () => {
   assert.equal(stopping.status, "skip_pending");
   assert.equal(stopping.stage, "comprehensive_review");
   assert.equal(stopping.activeOperation?.stopRequested, true);
-  assert.equal(stopping.pendingStageSkip?.reason, "operator accepted the remaining review risk");
+  assert.equal(
+    stopping.pendingStageSkip?.reason,
+    "operator accepted the remaining review risk",
+  );
   assert.equal(bridge.stopCount, 1);
   assert.equal(bridge.spawnCount, 0);
 
@@ -1942,10 +1975,7 @@ test("resume returns a failed pending skip to skip_pending", async () => {
   );
   const failed = await registry.create({
     ...baseRun(root, planPath),
-    planHash: parsePlan(
-      planPath,
-      "### Task 1: Implement\n- [x] Done\n",
-    ).hash,
+    planHash: parsePlan(planPath, "### Task 1: Implement\n- [x] Done\n").hash,
     status: "failed",
     stage: "comprehensive_review",
     pendingStageSkip: {
@@ -2235,6 +2265,251 @@ test("controller records unresolved capped review findings and completes honestl
   assert.equal(resolved.unresolvedFindings[0]?.severity, "MAJOR");
 });
 
+const WORKFLOW_STATUS_TEXT = `Run: worker-run-1
+State: running
+Activity: active 9m ago
+Mode: workflow
+Progress: implementation step 1
+Started: 2026-08-09T10:00:00.000Z
+Updated: 2026-08-09T10:00:00.023Z
+Dir: /tmp/async
+Workflow child main: worker running, active 9m ago
+Session: /tmp/session.jsonl`;
+
+const CHAIN_STATUS_TEXT = `Run: worker-run-1
+State: running
+Activity: active 12s ago
+Mode: chain
+Progress: step 2 of 3
+Updated: 2026-08-09T10:09:00.000Z
+Turn budget: 14/75+5 (within)
+Step 1: worker running, active 12s ago`;
+
+test("worker signal digest never carries a workflow-mode activity value", () => {
+  const cases: {
+    name: string;
+    text: unknown;
+    activity?: string;
+    mode?: string;
+    steps?: string[];
+    /** Asserted literally: "no digest" is not the same as "no activity". */
+    empty?: boolean;
+  }[] = [
+    {
+      name: "workflow mode suppresses activity and its step lines",
+      text: WORKFLOW_STATUS_TEXT,
+      mode: "workflow",
+    },
+    {
+      name: "workflow mode with no activity line is still suppressed",
+      text: WORKFLOW_STATUS_TEXT.replace("Activity: active 9m ago\n", ""),
+      mode: "workflow",
+    },
+    {
+      name: "non-workflow mode keeps activity and steps",
+      text: CHAIN_STATUS_TEXT,
+      mode: "chain",
+      activity: "active 12s ago",
+      steps: ["worker running, active 12s ago"],
+    },
+    {
+      name: "no activity line and no mode line yields neither",
+      text: "Run: worker-run-1\nState: running\nProgress: warming up",
+    },
+    { name: "empty text yields no digest", text: "", empty: true },
+    {
+      name: "non-string text yields no digest",
+      text: { state: "running" },
+      empty: true,
+    },
+    {
+      name: "a text with no readable field yields no digest",
+      text: "Run: worker-run-1\nState: running",
+      empty: true,
+    },
+  ];
+
+  for (const testCase of cases) {
+    const signal = parseWorkerSignal(testCase.text);
+    if (testCase.empty) {
+      assert.equal(signal, undefined, testCase.name);
+      continue;
+    }
+    assert.ok(signal, testCase.name);
+    assert.equal(signal?.activity, testCase.activity, testCase.name);
+    assert.equal(signal?.mode, testCase.mode, testCase.name);
+    assert.deepEqual(signal?.steps, testCase.steps, testCase.name);
+    if (testCase.mode !== "workflow") continue;
+    assert.equal(
+      JSON.stringify(signal).includes("9m ago"),
+      false,
+      `${testCase.name}: the launch-anchored age must not survive anywhere`,
+    );
+  }
+});
+
+test("worker signal digest caps the step lines it carries", () => {
+  const steps = Array.from(
+    { length: 8 },
+    (_, index) => `Step ${index + 1}: doing thing ${index + 1}`,
+  ).join("\n");
+
+  const signal = parseWorkerSignal(`Run: r\nState: running\nMode: chain\n${steps}`);
+
+  // The digest is persisted on every observation, so the list must be bounded.
+  assert.equal(signal?.steps?.length, 5);
+  assert.deepEqual(signal?.steps?.[4], "doing thing 5");
+});
+
+test("worker signal digest keeps the fields that are not activity", () => {
+  const signal = parseWorkerSignal(WORKFLOW_STATUS_TEXT);
+
+  assert.equal(signal?.progress, "implementation step 1");
+  assert.equal(signal?.updated, "2026-08-09T10:00:00.023Z");
+  assert.equal(
+    parseWorkerSignal(CHAIN_STATUS_TEXT)?.turnBudget,
+    "14/75+5 (within)",
+  );
+});
+
+test("observation persists the worker digest without the workflow activity", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
+  const planPath = join(root, "plan.md");
+  const plan = "### Task 1: Implement\n- [ ] Do the work\n";
+  await writeFile(planPath, plan);
+  const asyncDir = join(root, "async");
+  await mkdir(asyncDir);
+  const registry = new RunRegistry(join(root, "runs"));
+  const controller = new PlanExecController(
+    registry,
+    new StatusTextBridge(join(root, "none.json"), WORKFLOW_STATUS_TEXT),
+    new FakeFusion(),
+    fakeGit(root),
+  );
+  const run = await registry.create({
+    ...baseRun(root, planPath),
+    planHash: parsePlan(planPath, plan).hash,
+    stage: "implementation",
+    activeOperation: {
+      operationId: "operation-1",
+      service: "bridge",
+      kind: "implementation",
+      externalRunId: "worker-run-1",
+      asyncDir,
+      taskId: 1,
+      launchStartedAt: Date.now(),
+    },
+  });
+
+  await controller.advance(await registry.claim(run, "session-1"));
+  const stored = await registry.get(run.id);
+
+  assert.equal(stored?.activeOperation?.workerSignal?.mode, "workflow");
+  assert.equal(stored?.activeOperation?.workerSignal?.activity, undefined);
+  assert.equal(
+    stored?.activeOperation?.workerSignal?.progress,
+    "implementation step 1",
+  );
+  assert.ok(
+    stored?.activeOperation?.lastObservedAt,
+    "the digest is only trustworthy with the moment it was taken",
+  );
+});
+
+test("observation persists no liveness verdict of its own", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
+  const planPath = join(root, "plan.md");
+  const plan = "### Task 1: Implement\n- [ ] Do the work\n";
+  await writeFile(planPath, plan);
+  const registry = new RunRegistry(join(root, "runs"));
+  const controller = new PlanExecController(
+    registry,
+    new StatusTextBridge(join(root, "none.json"), WORKFLOW_STATUS_TEXT),
+    new FakeFusion(),
+    fakeGit(root),
+  );
+  const run = await registry.create({
+    ...baseRun(root, planPath),
+    planHash: parsePlan(planPath, plan).hash,
+    stage: "implementation",
+    activeOperation: {
+      operationId: "operation-1",
+      service: "bridge",
+      kind: "implementation",
+      externalRunId: "worker-run-1",
+      // Never created: the temp root is wiped while the bridge still answers.
+      asyncDir: join(root, "gone"),
+      taskId: 1,
+      launchStartedAt: Date.now(),
+    },
+  });
+
+  await controller.advance(await registry.claim(run, "session-1"));
+  const stored = await registry.get(run.id);
+
+  // No liveness fact is persisted: it would freeze when the polling session
+  // dies. The read surface measures it live instead.
+  assert.deepEqual(stored?.activeOperation?.workerSignal, {
+    mode: "workflow",
+    progress: "implementation step 1",
+    updated: "2026-08-09T10:00:00.023Z",
+  });
+  assert.equal(stored?.status, "running");
+});
+
+test("a reconciled run resumes through the normal recovery path", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
+  const planPath = join(root, "plan.md");
+  const plan = "### Task 1: Implement\n- [ ] Do the work\n";
+  await writeFile(planPath, plan);
+  const registry = new RunRegistry(join(root, "runs"));
+  const bridge = new FakeBridge(join(root, "none.json"));
+  const controller = new PlanExecController(
+    registry,
+    bridge,
+    new FakeFusion(),
+    fakeGit(root),
+  );
+  const created = await registry.create({
+    ...baseRun(root, planPath),
+    planHash: parsePlan(planPath, plan).hash,
+    stage: "implementation",
+    taskAttempts: { "1": 1 },
+    activeOperation: {
+      operationId: "operation-1",
+      service: "bridge",
+      kind: "implementation",
+      externalRunId: "external-1",
+      taskId: 1,
+      asyncDir: join(root, "async-directory-that-is-gone"),
+    },
+    lease: {
+      sessionId: "session-old",
+      pid: process.pid,
+      heartbeatAt: Date.now() - 10 * 60_000,
+      hostname: hostname(),
+    },
+  });
+
+  const report = await execReconcile(registry);
+
+  assert.match(report, /Reset 1 abandoned run to failed\./);
+  const reconciled = await registry.get(created.id);
+  assert.equal(reconciled?.status, "failed");
+  assert.equal(reconciled?.activeOperation, undefined);
+  assert.deepEqual(
+    reconciled?.taskAttempts,
+    { "1": 1 },
+    "reconcile must not consume a task attempt",
+  );
+
+  const resumed = await controller.resume(created.id, "session-new", true);
+
+  assert.equal(resumed.status, "running");
+  assert.equal(resumed.activeOperation?.kind, "implementation");
+  assert.equal(bridge.spawnCount, 1, "resume launches one replacement worker");
+});
+
 function baseRun(
   root: string,
   planPath: string,
@@ -2308,8 +2583,7 @@ class ModelFailureBridge extends FakeBridge {
   override async status() {
     return success({
       state: this.state,
-      text:
-        'Error: Run failed: OAuth refresh failed for anthropic-work: body={"error":"invalid_grant","error_description":"Refresh token expired"}.',
+      text: 'Error: Run failed: OAuth refresh failed for anthropic-work: body={"error":"invalid_grant","error_description":"Refresh token expired"}.',
     });
   }
 }
@@ -2433,6 +2707,22 @@ class RunningBridge extends FakeBridge {
     | { success: false; error: { message: string } }
   > {
     return success({ state: "running" });
+  }
+}
+
+class StatusTextBridge extends FakeBridge {
+  constructor(
+    resultPath: string,
+    private readonly statusText: string,
+  ) {
+    super(resultPath);
+  }
+
+  override async status(): Promise<
+    | { success: true; data: Record<string, unknown> }
+    | { success: false; error: { message: string } }
+  > {
+    return success({ state: "running", text: this.statusText });
   }
 }
 

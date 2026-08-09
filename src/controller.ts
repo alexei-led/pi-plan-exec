@@ -39,11 +39,13 @@ import {
   OPERATION_SERVICE,
   RUN_STAGE,
   RUN_STATUS,
+  WORKFLOW_MODE,
   type ActiveOperation,
   type FrozenRunConfig,
   type PlanExecRun,
   type ReviewFinding,
   type RunStage,
+  type WorkerSignal,
 } from "./types.js";
 
 export const MAX_STATUS_FAILURES = 3;
@@ -530,8 +532,7 @@ export class PlanExecController {
   }
 
   private async launchFusion(run: PlanExecRun): Promise<PlanExecRun> {
-    const iteration =
-      (run.stageAttempts[RUN_STAGE.FUSION_REVIEW] ?? 0) + 1;
+    const iteration = (run.stageAttempts[RUN_STAGE.FUSION_REVIEW] ?? 0) + 1;
     if (iteration > run.config.fusionIterations) {
       return this.advanceUnlocked(
         await this.recordUnresolvedAndAdvance(run, run.reviewFindings),
@@ -584,11 +585,7 @@ export class PlanExecController {
 
   private launchFinalizer(run: PlanExecRun): Promise<PlanExecRun> {
     if (!run.config.finalizeEnabled)
-      return this.transition(
-        run,
-        RUN_STAGE.STATS,
-        "Finalization disabled.",
-      );
+      return this.transition(run, RUN_STAGE.STATS, "Finalization disabled.");
     return this.launchBridge(run, {
       kind: OPERATION_KIND.FINALIZE,
       agent: run.config.workerAgent,
@@ -629,9 +626,7 @@ export class PlanExecController {
       context: "fresh",
       turnBudget: { maxTurns: input.maxTurns },
       acceptance: false,
-      ...(input.kind === OPERATION_KIND.FIX
-        ? { completionGuard: false }
-        : {}),
+      ...(input.kind === OPERATION_KIND.FIX ? { completionGuard: false } : {}),
     };
     const persisted = await this.registry.updateIfCurrent(
       {
@@ -740,7 +735,11 @@ export class PlanExecController {
     patch: Partial<ActiveOperation>,
   ): Promise<PlanExecRun> {
     let current = (await this.registry.get(run.id)) ?? run;
-    for (let attempt = 0; attempt < OPERATION_UPDATE_CAS_RETRIES; attempt += 1) {
+    for (
+      let attempt = 0;
+      attempt < OPERATION_UPDATE_CAS_RETRIES;
+      attempt += 1
+    ) {
       if (current.activeOperation?.operationId !== operationId) return current;
       const updated = await this.registry.updateIfCurrent(
         {
@@ -753,65 +752,6 @@ export class PlanExecController {
       current = updated.run;
     }
     return current;
-  }
-
-  private async reconstructBridgeParams(
-    run: PlanExecRun,
-    operation: ActiveOperation,
-  ): Promise<Record<string, unknown>> {
-    let task: string;
-    if (operation.kind === OPERATION_KIND.IMPLEMENTATION) {
-      const plan = await readPlan(run.planPath);
-      const taskData = plan.tasks.find(
-        (candidate) => candidate.id === operation.taskId,
-      );
-      if (!taskData)
-        throw new Error(
-          "Cannot recover an implementation task that no longer exists.",
-        );
-      task = workerPrompt(run, taskData.id, taskData.title, taskData.unchecked);
-    } else if (operation.kind === OPERATION_KIND.REVIEW) {
-      task = reviewerPrompt(run);
-    } else if (operation.kind === OPERATION_KIND.FIX) {
-      task = fixerPrompt(
-        run,
-        run.reviewFindings,
-        formatFindings(run.reviewFindings),
-      );
-    } else if (operation.kind === OPERATION_KIND.FINALIZE) {
-      task = finalizerPrompt(run);
-    } else if (operation.kind === OPERATION_KIND.STATS) {
-      task = statsPrompt(run);
-    } else {
-      throw new Error(
-        `Cannot recover unsupported bridge operation kind: ${operation.kind}.`,
-      );
-    }
-    const model = bridgeModel(run.config, operation.kind);
-    return {
-      agent:
-        operation.kind === OPERATION_KIND.STATS
-          ? run.config.statsAgent
-          : operation.kind === OPERATION_KIND.REVIEW
-            ? run.config.reviewerAgent
-            : run.config.workerAgent,
-      ...(model ? { model } : {}),
-      task,
-      cwd: run.worktreeCwd,
-      context: "fresh",
-      turnBudget: {
-        maxTurns:
-          operation.kind === OPERATION_KIND.STATS
-            ? run.config.statsMaxTurns
-            : operation.kind === OPERATION_KIND.REVIEW
-              ? run.config.reviewerMaxTurns
-              : run.config.workerMaxTurns,
-      },
-      acceptance: false,
-      ...(operation.kind === OPERATION_KIND.FIX
-        ? { completionGuard: false }
-        : {}),
-    };
   }
 
   private async observePausedOperation(run: PlanExecRun): Promise<PlanExecRun> {
@@ -827,7 +767,11 @@ export class PlanExecController {
         operation,
         status.error.message,
       );
-    const observed = await this.recordObservation(run, operation);
+    const observed = await this.recordObservation(
+      run,
+      operation,
+      status.data.text,
+    );
     if (!sameOperationState(run, observed, operation)) return observed;
     const state =
       operation.service === OPERATION_SERVICE.BRIDGE
@@ -874,7 +818,11 @@ export class PlanExecController {
         operation,
         status.error.message,
       );
-    const observed = await this.recordObservation(run, operation);
+    const observed = await this.recordObservation(
+      run,
+      operation,
+      status.data.text,
+    );
     if (!sameOperationState(run, observed, operation)) return observed;
     const state = text(status.data.state);
     if (
@@ -894,13 +842,7 @@ export class PlanExecController {
       );
     if (operation.kind === OPERATION_KIND.REVIEW) {
       if (!isSuccessfulOperationState(state))
-        return this.finishReview(
-          observed,
-          operation,
-          state,
-          "",
-          terminalError,
-        );
+        return this.finishReview(observed, operation, state, "", terminalError);
       let output: string;
       try {
         output = await this.bridgeOutput(operation);
@@ -970,10 +912,17 @@ export class PlanExecController {
   private async recordObservation(
     run: PlanExecRun,
     operation: ActiveOperation,
+    statusText?: unknown,
   ): Promise<PlanExecRun> {
-    const observedOperation = { ...operation, lastObservedAt: Date.now() };
+    const observedOperation: ActiveOperation = {
+      ...operation,
+      lastObservedAt: Date.now(),
+    };
     delete observedOperation.statusFailures;
     delete observedOperation.lastStatusError;
+    const signal = parseWorkerSignal(statusText);
+    if (signal) observedOperation.workerSignal = signal;
+    else delete observedOperation.workerSignal;
     return this.registry.heartbeat({
       ...run,
       activeOperation: observedOperation,
@@ -1414,11 +1363,14 @@ export class PlanExecController {
             commit.stderr.trim() || "Could not commit archived plan.",
           );
       }
-      const completed = await this.registry.update({
-        ...run,
+      // The plan is already renamed and committed, and that cannot be replayed,
+      // so the terminal status must not be lost to a concurrent claim.
+      const completed = await this.registry.updateLatest(run.id, (current) => ({
+        ...current,
         status,
         stage: RUN_STAGE.COMPLETE,
-      });
+        retiredAt: Date.now(),
+      }));
       return this.registry.release(completed);
     } catch (error: unknown) {
       return this.fail(
@@ -1430,11 +1382,13 @@ export class PlanExecController {
 
   private async complete(run: PlanExecRun): Promise<PlanExecRun> {
     const status = completionStatus(run);
-    const completed = await this.registry.update({
-      ...run,
+    // Merged onto the stored record, not onto `run`: the terminal status is the
+    // only thing this step decides.
+    const completed = await this.registry.updateLatest(run.id, (current) => ({
+      ...current,
       status,
       stage: RUN_STAGE.COMPLETE,
-    });
+    }));
     await appendProgress(completed, `Run completed as ${status}.`);
     return this.registry.release(completed);
   }
@@ -1461,7 +1415,10 @@ export class PlanExecController {
   private async advanceStageSkip(run: PlanExecRun): Promise<PlanExecRun> {
     const request = run.pendingStageSkip;
     if (!request || request.stage !== run.stage)
-      return this.fail(run, "Force-skip state does not match the current stage.");
+      return this.fail(
+        run,
+        "Force-skip state does not match the current stage.",
+      );
     const operation = run.activeOperation;
     if (!operation) return this.finishStageSkip(run, "no active operation");
 
@@ -1725,7 +1682,11 @@ export class PlanExecController {
         operation,
         terminal.error.message,
       );
-    const observed = await this.recordObservation(run, operation);
+    const observed = await this.recordObservation(
+      run,
+      operation,
+      terminal.data.text,
+    );
     const bridgeState =
       operation.service === OPERATION_SERVICE.BRIDGE
         ? text(terminal.data.state)
@@ -2139,7 +2100,8 @@ export function isRecoverableImplementationFailure(run: PlanExecRun): boolean {
     run.activeOperation === undefined &&
     (/^Worker .+ ended as .+ and left task \d+ checkboxes unchecked\.$/.test(
       run.error ?? "",
-    ) || /Task \d+ exhausted its retry limit\./.test(run.error ?? ""))
+    ) ||
+      /Task \d+ exhausted its retry limit\./.test(run.error ?? ""))
   );
 }
 
@@ -2156,7 +2118,8 @@ export function isTaskRetryConfirmationRequired(run: PlanExecRun): boolean {
     run.status === RUN_STATUS.FAILED &&
     run.stage === RUN_STAGE.IMPLEMENTATION &&
     run.activeOperation === undefined &&
-    !isModelProviderFailure(run) && isExternalManualBlocker(run)
+    !isModelProviderFailure(run) &&
+    isExternalManualBlocker(run)
   );
 }
 
@@ -2218,4 +2181,54 @@ async function pathExists(path: string): Promise<boolean> {
 
 function text(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+/** `Step 1:`, `Step 1/3 Agent 2/2:`, `Agent 1/2:`, `Workflow child build:`. */
+const WORKER_SIGNAL_STEP_LINE =
+  /^(?:Step\b|Agent \d|Workflow child\b)[^:]*:\s*(?<detail>.+)$/;
+const MAX_WORKER_SIGNAL_STEPS = 5;
+
+/**
+ * Digest the provider status blob. The format is upstream's, so nothing here
+ * may throw: unreadable status text yields no signal, not a failed run.
+ *
+ * No liveness fact is persisted. Anything stamped by the polling session
+ * freezes when that session dies, which is exactly when it matters; the read
+ * surface measures liveness live instead.
+ */
+export function parseWorkerSignal(value: unknown): WorkerSignal | undefined {
+  const blob = text(value);
+  if (!blob) return undefined;
+  const lines = blob.split("\n").map((line) => line.trim());
+  const field = (label: string): string | undefined => {
+    const prefix = `${label}: `;
+    return text(
+      lines.find((line) => line.startsWith(prefix))?.slice(prefix.length),
+    );
+  };
+  // Read every field before deciding: upstream renders `Mode:` after
+  // `Activity:`, so a single forward pass would judge activity too early.
+  const mode = field("Mode");
+  const workflow = mode === WORKFLOW_MODE;
+  // Workflow-mode step lines carry the same launch-anchored activity fragment
+  // as `Activity:`, so they are dropped whole rather than edited.
+  const steps = workflow
+    ? []
+    : lines
+        .map((line) => WORKER_SIGNAL_STEP_LINE.exec(line)?.groups?.detail)
+        .filter((detail): detail is string => Boolean(detail))
+        .slice(0, MAX_WORKER_SIGNAL_STEPS);
+  const activity = workflow ? undefined : field("Activity");
+  const progress = field("Progress");
+  const turnBudget = field("Turn budget");
+  const updated = field("Updated");
+  const signal: WorkerSignal = {
+    ...(mode ? { mode } : {}),
+    ...(activity ? { activity } : {}),
+    ...(progress ? { progress } : {}),
+    ...(turnBudget ? { turnBudget } : {}),
+    ...(updated ? { updated } : {}),
+    ...(steps.length > 0 ? { steps } : {}),
+  };
+  return Object.keys(signal).length > 0 ? signal : undefined;
 }

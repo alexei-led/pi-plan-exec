@@ -2,10 +2,12 @@ export const COMPLETED_PLANS_DIRECTORY = "completed";
 
 export const EXEC_ACTION = {
   HELP: "help",
-  START: "start",
   SETUP: "setup",
   RUNS: "runs",
+  CLEANUP: "cleanup",
+  DOCTOR: "doctor",
   STATUS: "status",
+  STOP: "stop",
   PAUSE: "pause",
   RESUME: "resume",
   ADOPT: "adopt",
@@ -13,11 +15,26 @@ export const EXEC_ACTION = {
   CANCEL: "cancel",
 } as const;
 
-export type RunAction =
-  (typeof EXEC_ACTION)[Exclude<
-    keyof typeof EXEC_ACTION,
-    "HELP" | "START" | "SETUP" | "RUNS"
-  >];
+/**
+ * Retired names that still dispatch, so a scripted caller never breaks on a
+ * renamed verb. Absent from /exec help; each names its replacement once in its
+ * own output.
+ */
+export const EXEC_ALIAS_ACTIONS = [
+  EXEC_ACTION.RUNS,
+  EXEC_ACTION.DOCTOR,
+  EXEC_ACTION.SETUP,
+  EXEC_ACTION.ADOPT,
+  EXEC_ACTION.PAUSE,
+  EXEC_ACTION.CANCEL,
+] as const;
+
+export type ExecAliasAction = (typeof EXEC_ALIAS_ACTIONS)[number];
+
+export type RunAction = (typeof EXEC_ACTION)[Exclude<
+  keyof typeof EXEC_ACTION,
+  "HELP" | "SETUP" | "RUNS" | "CLEANUP" | "DOCTOR" | "ADOPT"
+>];
 
 export const RUN_STAGE = {
   RESOLVE: "resolve",
@@ -181,6 +198,27 @@ export interface BranchRebinding {
   requestedBy: string;
 }
 
+/** `status.mode` value the bridge spawns; its activity fields are untrustworthy. */
+export const WORKFLOW_MODE = "workflow";
+
+/**
+ * Compact digest of the provider status text. The provider renders each line
+ * conditionally, so a missing field means "not reported", never "healthy".
+ */
+export interface WorkerSignal {
+  mode?: string;
+  /**
+   * Non-workflow modes only. Upstream anchors the workflow-mode value to launch
+   * time (nicobailon/pi-subagents#920), so it grows while the worker is healthy
+   * and must never be surfaced.
+   */
+  activity?: string;
+  progress?: string;
+  turnBudget?: string;
+  updated?: string;
+  steps?: string[];
+}
+
 export interface ActiveOperation {
   operationId: string;
   service: OperationService;
@@ -201,6 +239,8 @@ export interface ActiveOperation {
   terminalError?: string;
   skipFailures?: number;
   lastSkipError?: string;
+  /** Last digest parsed from the provider status text; absent when unreported. */
+  workerSignal?: WorkerSignal;
 }
 
 export interface PlanExecRun {
@@ -233,7 +273,21 @@ export interface PlanExecRun {
   config: FrozenRunConfig;
   createdAt: number;
   updatedAt: number;
-  lease?: { sessionId: string; pid: number; heartbeatAt: number };
+  /**
+   * When the archive stage finished; cleanup measures its retention window from
+   * here. Absent on runs archived before the field existed or finished without
+   * the archive stage, which fall back to `updatedAt`.
+   */
+  retiredAt?: number;
+  /** Stamped when an abandoned run was reset to failed, so the reset is auditable. */
+  reconciledAt?: number;
+  lease?: {
+    sessionId: string;
+    pid: number;
+    heartbeatAt: number;
+    /** Absent on leases written before this field existed: unknown host. */
+    hostname?: string;
+  };
   error?: string;
   unresolvedFindings: ReviewFinding[];
 }

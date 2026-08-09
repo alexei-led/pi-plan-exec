@@ -242,10 +242,7 @@ function implementationStatus(
   complete: boolean,
 ): TaskStatus {
   if (complete) return "completed";
-  if (
-    run.status !== RUN_STATUS.STARTING &&
-    run.status !== RUN_STATUS.RUNNING
-  )
+  if (run.status !== RUN_STATUS.STARTING && run.status !== RUN_STATUS.RUNNING)
     return "pending";
   const current = run.activeOperation?.taskId;
   return run.stage === RUN_STAGE.IMPLEMENTATION && current === taskId
@@ -264,10 +261,7 @@ function stageStatus(run: PlanExecRun, stage: RunStage): TaskStatus {
   if (currentIndex > projectedIndex) return "completed";
   if (run.status === RUN_STATUS.SKIP_PENDING && run.stage === stage)
     return "in_progress";
-  if (
-    run.status !== RUN_STATUS.STARTING &&
-    run.status !== RUN_STATUS.RUNNING
-  )
+  if (run.status !== RUN_STATUS.STARTING && run.status !== RUN_STATUS.RUNNING)
     return "pending";
   if (run.stage === stage) return "in_progress";
   return "pending";
