@@ -219,10 +219,10 @@ say so in a code comment. Classify only; never auto-fail, never auto-kill.
       default and included with the flag; a single explicit run-id removes just that run
 - [x] run `npm run test:all` — must pass before task 4
 - ➕ decision: an explicit `<run-id>` bypasses the retention window and the `failed`
-      exclusion — the user named that run — but still needs `--apply`, and `remove`
-      still enforces terminal status and a dead lease
+  exclusion — the user named that run — but still needs `--apply`, and `remove`
+  still enforces terminal status and a dead lease
 - ➕ decision: `execCleanup(registry, args)` takes its registry as a required argument,
-      so no test can reach the real `~/.pi/plan-exec/runs/`
+  so no test can reach the real `~/.pi/plan-exec/runs/`
 
 ### Task 4: Retire runs on archive
 
@@ -312,21 +312,87 @@ say so in a code comment. Classify only; never auto-fail, never auto-kill.
       is the regression test for the originally reported bug
 - [ ] run `npm run test:all` — must pass before task 8
 
-### Task 8: ➕ Bring the exec-plan skill up to the new behavior
+### Task 8: ➕ Reconcile abandoned runs after a Pi restart
+
+Tasks 6 and 7 make a stalled run _visible_. Nothing acts on it. After a Pi restart the
+registry can hold several runs that each claim `running` while no worker exists, in
+different stages, some weeks old. Today the operator must diagnose each one by hand, and
+`recoveryGuidance` answers `wait` for all of them.
+
+This task adds the acting half. It does **not** auto-launch anything: a silent relaunch
+can double-write a worktree, which is worse than the stall. It converts decisive evidence
+into the state that the existing `/exec resume` path already knows how to recover, and it
+does so for every affected run in one command.
+
+**Abandoned** means all of these hold at once:
+
+- `status` is `running`, `starting`, `skip_pending`, or `cancel_pending`
+- the lease is not live per `isLeaseLive` from Task 2
+- the operation is provably gone: `activeOperation.asyncDir` is absent from disk, or the
+  bridge lookup answers `absent` for its `operationId`
+
+Anything short of all three is **ambiguous** and must be reported, never reset.
+
+**Files:**
+
+- Modify: `src/registry.ts`
+- Modify: `src/controller.ts`
+- Modify: `src/index.ts`
+- Modify: `src/types.ts`
+- Modify: `test/registry.test.ts`, `test/index.test.ts`, `test/controller.test.ts`
+
+- [ ] add an exported `classifyAbandonment(run, evidence)` returning
+      `live | abandoned | ambiguous`, with the three-part rule above; no I/O inside the
+      predicate so it stays table-testable
+- [ ] add `/exec doctor` to `EXEC_ACTION`, `EXEC_COMMANDS`, and the help text: one
+      read-only sweep over every run that prints, per run, what it claims, what the
+      evidence shows, and the single next command
+- [ ] group the `doctor` output by classification so several stalled runs in different
+      stages read as one list, not as one paragraph per run
+- [ ] add `/exec doctor --reconcile` which, for `abandoned` runs only, clears
+      `activeOperation`, sets `status` to `failed` with an explicit reason naming the
+      evidence, and stamps the run so the reset is auditable
+- [ ] make `--reconcile` reuse `updateIfCurrent` compare-and-swap, so a run that a live
+      session reclaims between the scan and the write is skipped rather than overwritten
+- [ ] leave the recovery itself to the existing `/exec resume <id>`: after reconcile a run
+      is an ordinary recoverable failure, so no second retry path is introduced
+- [ ] append a line to each reconciled run's progress file recording the reset and its
+      evidence, so the plan's own history shows why the attempt counter did not advance
+- [ ] do not consume a task attempt on reconcile — the worker never ran, so
+      `taskAttempts` must not change
+- [ ] on extension load, run the read-only sweep and, when any run is `abandoned`, print
+      one line naming the count and pointing at `/exec doctor`; never write during startup
+- [ ] make `RunRegistry.remove` handle a corrupt `run.json` that `get` cannot parse, and
+      make `doctor` list corrupt directories as removable; today `list` drops them and
+      `remove` throws, so nothing can clean them up
+- [ ] write a table-driven test over
+      `(status, lease live, asyncDir present, bridge answer)` asserting `abandoned` needs
+      the full conjunction and that every partial case is `ambiguous`
+- [ ] write a test that `--reconcile` skips a run whose `updatedAt` changed during the
+      sweep, and one that it never touches an `ambiguous` or `live` run
+- [ ] write a test that a reconciled run is then recoverable through the normal resume
+      path, and that `taskAttempts` is unchanged
+- [ ] write a test that startup reconciliation performs no writes
+- [ ] run `npm run test:all` — must pass before task 9
+
+### Task 9: ➕ Bring the exec-plan skill up to the new behavior
 
 The skill is the agent-facing contract. It is how an agent decides what to do with a
 stuck run, so a skill that describes the old surface is itself a recovery failure.
-Tasks 1-7 add `/exec cleanup`, `/exec runs --all`, a `long-running active operation`
-classification, and immediate stale-lease detection. None of these appear in the skill
-today.
+Tasks 1-8 add `/exec cleanup`, `/exec runs --all`, `/exec doctor`, a
+`long-running active operation` classification, startup reconciliation, and immediate
+stale-lease detection. None of these appear in the skill today.
 
 **Files:**
 
 - Modify: `skills/exec-plan/SKILL.md`
 - Modify: `skills/exec-plan/references/recovery.md`
 
-- [ ] add `/exec cleanup` and `/exec runs --all` to the "Choose the job" list in
-      `SKILL.md`, with the retention window and the `failed` exclusion stated
+- [ ] add `/exec cleanup`, `/exec runs --all`, and `/exec doctor` to the "Choose the job"
+      list in `SKILL.md`, with the retention window and the `failed` exclusion stated
+- [ ] make `/exec doctor` the documented first step after a Pi restart or a session
+      handoff, ahead of `/exec runs`, and state that `--reconcile` resets only provably
+      abandoned runs and never launches a worker
 - [ ] state that a lease whose pid is dead on this host is stale at once, so `/exec adopt`
       no longer needs a 30-second wait; absent `hostname` still waits out the heartbeat
 - [ ] add the `long-running active operation` classification to `references/recovery.md`
@@ -341,9 +407,9 @@ today.
       every member of `EXEC_ACTION` is either documented or deliberately internal
 - [ ] add a test that asserts the skill's documented subcommand list matches `EXEC_ACTION`,
       so the two cannot drift again
-- [ ] run `npm run test:all` — must pass before task 9
+- [ ] run `npm run test:all` — must pass before task 10
 
-### Task 9: Verify acceptance criteria
+### Task 10: Verify acceptance criteria
 
 - [ ] verify every requirement in Overview is implemented
 - [ ] load each of the eight real run records under `~/.pi/plan-exec/runs/` through
@@ -355,7 +421,7 @@ today.
       command that exists, and that no branch ends without an action
 - [ ] run the full gate: `npm run test:all`
 
-### Task 10: [Final] Update documentation
+### Task 11: [Final] Update documentation
 
 **Files:**
 
