@@ -1,10 +1,25 @@
 import {
+  EXTERNAL_OPERATION_STATE,
+  OPERATION_KIND,
   RUN_STAGE,
   RUN_STATUS,
+  type FrozenRunConfig,
+  type OperationKind,
   type PlanExecRun,
   type RunStage,
   type RunStatus,
 } from "./types.js";
+
+/**
+ * Wall-clock allowance per turn, used to bound an operation against the turn
+ * budget its own stage was launched with instead of one flat number for every
+ * stage. PLACEHOLDER pending measurement across real runs: the only data point
+ * today is a single ~6-minute implementation task, so this is deliberately
+ * generous — a false "long-running" banner on a healthy worker recreates the
+ * non-discriminating guidance the bound exists to remove. Tighten it once a
+ * real per-turn activity signal exists (nicobailon/pi-subagents#920).
+ */
+const OPERATION_TURN_ALLOWANCE_MS = 120_000;
 
 export const PIPELINE_STAGES = [
   RUN_STAGE.COMPREHENSIVE_REVIEW,
@@ -95,4 +110,70 @@ export function isRecoverableRun(run: PlanExecRun): boolean {
   return (
     run.status === RUN_STATUS.FAILED || run.status === RUN_STATUS.CANCEL_PENDING
   );
+}
+
+/** Turn budget each launch path passes; fusion carries none of its own. */
+function operationMaxTurns(
+  config: FrozenRunConfig,
+  kind: OperationKind,
+): number {
+  if (kind === OPERATION_KIND.STATS) return config.statsMaxTurns;
+  if (kind === OPERATION_KIND.REVIEW) return config.reviewerMaxTurns;
+  return config.workerMaxTurns;
+}
+
+/**
+ * Bound an in-flight operation by its own stage's turn budget and report the
+ * breach; classification only, so nothing here fails or kills a run. An
+ * operation with no `launchStartedAt` — a record written before the field
+ * existed — cannot be bounded and is never reported as long-running.
+ */
+export function longRunningOperation(
+  run: PlanExecRun,
+  now = Date.now(),
+): { elapsedMs: number; boundMs: number; maxTurns: number } | undefined {
+  const operation = run.activeOperation;
+  if (!operation?.launchStartedAt) return undefined;
+  const maxTurns = operationMaxTurns(run.config, operation.kind);
+  const boundMs = maxTurns * OPERATION_TURN_ALLOWANCE_MS;
+  const elapsedMs = now - operation.launchStartedAt;
+  return elapsedMs > boundMs ? { elapsedMs, boundMs, maxTurns } : undefined;
+}
+
+export const ABANDONMENT = {
+  LIVE: "live",
+  ABANDONED: "abandoned",
+  AMBIGUOUS: "ambiguous",
+} as const;
+
+export type Abandonment = (typeof ABANDONMENT)[keyof typeof ABANDONMENT];
+
+/** What a sweep managed to observe about a run's claim. */
+export interface AbandonmentEvidence {
+  leaseLive: boolean;
+  /** Only `false` is evidence; undefined means no directory was recorded. */
+  asyncDirPresent?: boolean;
+  /** The bridge's own answer for the operation ID, when it was asked. */
+  bridgeState?: string;
+}
+
+/**
+ * `abandoned` is the full conjunction: an in-flight claim, a dead lease, and a
+ * tracked operation provably gone. Anything short of that is `ambiguous` — it
+ * is reported and never reset, because resetting a run whose worker is alive
+ * can double-write a worktree, which is worse than the stall. Pure by
+ * construction: the caller gathers the evidence, so the rule stays testable,
+ * and it is the single answer both the sweep and the detail view read.
+ */
+export function classifyAbandonment(
+  run: PlanExecRun,
+  evidence: AbandonmentEvidence,
+): Abandonment {
+  if (evidence.leaseLive) return ABANDONMENT.LIVE;
+  if (!isInFlightStatus(run.status) || !run.activeOperation)
+    return ABANDONMENT.AMBIGUOUS;
+  const gone =
+    evidence.asyncDirPresent === false ||
+    evidence.bridgeState === EXTERNAL_OPERATION_STATE.ABSENT;
+  return gone ? ABANDONMENT.ABANDONED : ABANDONMENT.AMBIGUOUS;
 }

@@ -12,7 +12,6 @@ import {
   isExternalManualBlocker,
   isModelProviderFailure,
   isTaskRetryConfirmationRequired,
-  longRunningOperation,
   MAX_STATUS_FAILURES,
   PLAN_STRUCTURE_CHANGED_ERROR,
   PlanExecController,
@@ -21,19 +20,22 @@ import {
 } from "./controller.js";
 import { FusionClient } from "./fusion.js";
 import {
+  ABANDONMENT,
+  classifyAbandonment,
   isInFlightStatus,
   isRecoverableRun,
   isSkippableStage,
   isTerminalStatus,
-} from "./lifecycle.js";
-import {
-  ABANDONMENT,
-  classifyAbandonment,
-  isLeaseLive,
-  removalRefusal,
-  RunRegistry,
+  longRunningOperation,
   type Abandonment,
   type AbandonmentEvidence,
+} from "./lifecycle.js";
+import {
+  isLeaseLive,
+  isLocalRun,
+  LEASE_STALE_MS,
+  removalRefusal,
+  RunRegistry,
 } from "./registry.js";
 import { readPlan } from "./plan.js";
 import { appendProgress } from "./progress.js";
@@ -41,6 +43,7 @@ import { TaskProjector } from "./task-projection.js";
 import {
   COMPLETED_PLANS_DIRECTORY,
   EXEC_ACTION,
+  EXEC_ALIAS_ACTIONS,
   EXTERNAL_OPERATION_STATE,
   OPERATION_SERVICE,
   RUN_STATUS,
@@ -90,22 +93,19 @@ const ALIAS_NOTES: Record<ExecAliasAction, string> = {
   [EXEC_ACTION.CANCEL]:
     "/exec cancel is now /exec stop; the old name still works and is the way to cancel without a human to ask.",
 };
+/** Every run verb the action dispatch owns; `status` is read and answered earlier. */
+type DispatchedAction = Exclude<RunAction, typeof EXEC_ACTION.STATUS>;
 /**
- * A retired verb and the action it runs. The mapping is the identity when only
- * the name was retired and the behavior stayed exactly where it was.
+ * Exhaustive by type, not by hand: a verb added to `EXEC_ACTION` widens
+ * `RunAction`, and this record then fails to compile until it is routed.
  */
-const RUN_ACTION_ALIASES = {
-  [EXEC_ACTION.ADOPT]: EXEC_ACTION.RESUME,
-  [EXEC_ACTION.PAUSE]: EXEC_ACTION.PAUSE,
-  [EXEC_ACTION.CANCEL]: EXEC_ACTION.CANCEL,
-} as const satisfies Partial<Record<ExecAliasAction, RunAction>>;
-const RUN_ACTIONS = new Set<string>([
-  EXEC_ACTION.STOP,
-  EXEC_ACTION.PAUSE,
-  EXEC_ACTION.RESUME,
-  EXEC_ACTION.SKIP,
-  EXEC_ACTION.CANCEL,
-]);
+const RUN_ACTIONS: Record<DispatchedAction, true> = {
+  [EXEC_ACTION.STOP]: true,
+  [EXEC_ACTION.PAUSE]: true,
+  [EXEC_ACTION.RESUME]: true,
+  [EXEC_ACTION.SKIP]: true,
+  [EXEC_ACTION.CANCEL]: true,
+};
 /**
  * The two outcomes of stopping, worded so the difference that matters —
  * reversibility — is read at the moment the choice is made instead of being
@@ -127,6 +127,8 @@ const STOP_OUTCOMES = [
 const STOP_REQUIRES_UI =
   "/exec stop asks whether to pause or cancel and needs an interactive session. Use /exec pause <run-id> to stop after the active operation and keep the run resumable, or /exec cancel <run-id> to stop it for good with its worktree preserved.";
 const RUN_LIST_TERMINAL_WINDOW_MS = MILLISECONDS_PER_DAY;
+/** Deleted, not retired: bare /exec is the same code path, picker included. */
+const RETIRED_START_ACTION = "start";
 const DOCTOR_RECONCILE_OPTION = "--reconcile";
 const REQUIRED_RUNTIME_TOOLS: Record<string, string> = {
   subagent: "pi-subagents",
@@ -489,7 +491,16 @@ type RecoveryGuidance = {
   action: string;
 };
 
-export function recoveryGuidance(run: PlanExecRun): RecoveryGuidance {
+/**
+ * The one next action for a run, keyed on live evidence when the caller
+ * gathered any. Without evidence nothing can be proven gone, so the guidance
+ * says so rather than guessing: a persisted claim is never read as proof in
+ * either direction.
+ */
+export function recoveryGuidance(
+  run: PlanExecRun,
+  evidence?: AbandonmentEvidence,
+): RecoveryGuidance {
   if (isTerminal(run.status) && run.status !== RUN_STATUS.FAILED)
     return {
       classification: "finished",
@@ -546,21 +557,25 @@ export function recoveryGuidance(run: PlanExecRun): RecoveryGuidance {
     // exists to fix.
     if (run.activeOperation) {
       const signal = run.activeOperation.workerSignal;
-      if (signal?.asyncDirMissing)
+      if (
+        evidence &&
+        classifyAbandonment(run, evidence) === ABANDONMENT.ABANDONED
+      )
         return {
-          classification: "the worker's files are gone, so nothing is running",
-          action: `The directory that worker was writing to no longer exists. Run /exec resume ${run.id}; it clears the dead worker and continues, without starting a second one. Run /exec stop ${run.id} instead to end the run and keep the worktree.`,
+          classification: "the worker is gone, so nothing is running",
+          action: `Checked just now: ${operationEvidence({ run, evidence })}. Run /exec resume ${run.id}; it clears the dead worker and continues, without starting a second one. Run /exec stop ${run.id} instead to end the run and keep the worktree.`,
         };
+      const activity = reportedActivity(run.activeOperation);
       // Elapsed time is weaker evidence than a fresh activity value, so the
       // bound only speaks when nothing else does. It prompts a look; it never
       // claims the worker is dead.
-      const overdue = signal?.activity ? undefined : longRunningOperation(run);
+      const overdue = activity ? undefined : longRunningOperation(run);
       if (overdue)
         return {
           classification: "running longer than its budget allows",
-          action: `The bridge still reports this worker running ${elapsedLabel(overdue.elapsedMs)} after launch, past the ${minutesLabel(overdue.boundMs)} allowed for its ${overdue.maxTurns}-turn budget, and nothing reports what it is doing${signal?.mode === WORKFLOW_MODE ? " for a workflow-mode run" : ""}. That is not proof the worker is stuck. Run /exec status ${run.id} to re-check, or /exec stop ${run.id} to end it and preserve the worktree. Do not resume or start a second run.`,
+          action: `This run has claimed an active worker for ${elapsedLabel(overdue.elapsedMs)} since launch, past the ${minutesLabel(overdue.boundMs)} allowed for its ${overdue.maxTurns}-turn budget, and nothing reports what it is doing${signal?.mode === WORKFLOW_MODE ? " for a workflow-mode run" : ""}. That is not proof the worker is stuck. Run /exec status ${run.id} to re-check, or /exec stop ${run.id} to end it and preserve the worktree. Do not resume or start a second run.`,
         };
-      if (!signal?.activity)
+      if (!activity)
         return {
           classification: "running, but nothing proves the worker is alive",
           action: `Wait and use /exec status ${run.id} to re-check; nothing reports what this worker is doing${signal?.mode === WORKFLOW_MODE ? " for a workflow-mode run" : ""}, so it is neither confirmed alive nor confirmed dead. Do not resume or start another run.`,
@@ -621,7 +636,26 @@ function hasExecutionBranchMismatch(run: PlanExecRun): boolean {
   return /Execution directory is on .+, expected .+\./.test(run.error ?? "");
 }
 
-export function formatRunStatus(run: PlanExecRun): string {
+/**
+ * A stored activity value is only current while something is polling it. The
+ * digest is stamped by the owning session's poll loop, so once that session is
+ * gone it freezes and would read as health forever. The lease's own staleness
+ * bound already decides whether anyone is watching, so it decides this too.
+ */
+function reportedActivity(
+  operation: ActiveOperation | undefined,
+): string | undefined {
+  const activity = operation?.workerSignal?.activity;
+  if (!activity || operation?.lastObservedAt === undefined) return undefined;
+  return Date.now() - operation.lastObservedAt < LEASE_STALE_MS
+    ? activity
+    : undefined;
+}
+
+export function formatRunStatus(
+  run: PlanExecRun,
+  evidence?: AbandonmentEvidence,
+): string {
   const operation = run.activeOperation;
   const operationText = operation
     ? `${operation.service}/${operation.kind}${
@@ -663,7 +697,7 @@ export function formatRunStatus(run: PlanExecRun): string {
     lines.push(
       `last observation: ${new Date(operation.lastObservedAt).toISOString()}`,
     );
-  lines.push(...workerSignalLines(operation));
+  lines.push(...workerSignalLines(run, evidence));
   if (operation?.statusFailures) {
     lines.push(
       `observation: unavailable (${operation.statusFailures}/${MAX_STATUS_FAILURES}); retrying${operation.lastStatusError ? ` — ${operation.lastStatusError}` : ""}`,
@@ -697,11 +731,13 @@ export function formatRunStatus(run: PlanExecRun): string {
         `- ${skip.stage} by ${skip.requestedBy}: ${skip.reason}${skip.terminalOperationState ? ` (operation: ${skip.terminalOperationState})` : ""}`,
       );
   }
-  const guidance = recoveryGuidance(run);
+  const guidance = recoveryGuidance(run, evidence);
   lines.push(`recovery: ${guidance.classification}`);
+  // States the fact only. What to do about a dead owner is the next safe
+  // action below, which knows whether the operation it left behind is gone.
   if (isStaleOwner(run))
     lines.push(
-      `owner: stale lease for ${run.lease?.sessionId ?? "unknown session"}; verify it is stopped before ${run.status === RUN_STATUS.FAILED ? "recovery" : "adoption"}.`,
+      `owner: stale lease for ${run.lease?.sessionId ?? "unknown session"}; that Pi session is no longer running.`,
     );
   lines.push(`next safe action: ${guidance.action}`);
   return lines.join("\n");
@@ -710,19 +746,25 @@ export function formatRunStatus(run: PlanExecRun): string {
 /**
  * Report what the provider actually said about the worker. Nothing here may
  * read as health on its own: with no trustworthy activity value the line
- * states the absence instead of staying silent.
+ * states the absence instead of staying silent, and a value nothing has
+ * refreshed since the owner died is not a trustworthy value.
  */
-function workerSignalLines(operation: ActiveOperation | undefined): string[] {
+function workerSignalLines(
+  run: PlanExecRun,
+  evidence?: AbandonmentEvidence,
+): string[] {
+  const operation = run.activeOperation;
   if (!operation) return [];
   const signal = operation.workerSignal;
+  const activity = reportedActivity(operation);
   const since = operation.launchStartedAt
     ? `, ${elapsedLabel(Date.now() - operation.launchStartedAt)} since launch`
     : "";
   const lines = [
-    signal?.asyncDirMissing
-      ? `worker: operation directory is gone; the operation is not running${since}`
-      : signal?.activity
-        ? `worker: ${signal.activity}${since}`
+    evidence && classifyAbandonment(run, evidence) === ABANDONMENT.ABANDONED
+      ? `worker: ${operationEvidence({ run, evidence })}; the operation is not running${since}`
+      : activity
+        ? `worker: ${activity}${since}`
         : `worker: no per-turn activity signal${
             signal?.mode === WORKFLOW_MODE ? " (workflow-mode run)" : ""
           }; liveness unverified${since}`,
@@ -764,14 +806,23 @@ export function settledRunLines(
 }
 
 function runGroupLines(heading: string, runs: PlanExecRun[]): string[] {
-  if (runs.length === 0) return [];
-  return [
-    `${heading}:`,
-    ...runs.flatMap((run) => [
+  return sectionLines(
+    heading,
+    runs.flatMap((run) => [
       `- ${runClaim(run)} updated ${relativeTime(run.updatedAt)}. Next: ${nextRunCommand(run)}`,
       ...stageWaiverLines(run),
     ]),
-  ];
+  );
+}
+
+/** One heading, its rows, and an optional trailer — or nothing when empty. */
+function sectionLines(
+  heading: string,
+  rows: string[],
+  footer?: string,
+): string[] {
+  if (rows.length === 0) return [];
+  return [`${heading}:`, ...rows, ...(footer ? [footer] : [])];
 }
 
 /**
@@ -830,11 +881,15 @@ export function parseStatusArguments(args: string[]): {
   return { selector, all };
 }
 
+/**
+ * The retired listing verb takes the same zoom flag and never took a run ID,
+ * so it reuses the one status parser rather than keeping a second one that
+ * could accept a different set.
+ */
 function parseRunsArguments(args: string[]): boolean {
-  for (const arg of args)
-    if (arg !== RUNS_ALL_OPTION)
-      throw new Error(`Usage: /exec runs [${RUNS_ALL_OPTION}]`);
-  return args.includes(RUNS_ALL_OPTION);
+  const { selector, all } = parseStatusArguments(args);
+  if (selector) throw new Error(`Usage: /exec runs [${RUNS_ALL_OPTION}]`);
+  return all;
 }
 
 export function parseCleanupArguments(args: string[]): {
@@ -861,6 +916,9 @@ export function parseCleanupArguments(args: string[]): {
  * Removable = retired past the retention window with nothing alive holding it.
  * `failed` is excluded by default: /exec resume is the documented recovery path
  * for a failed run, and its registry entry is what makes that path possible.
+ *
+ * The window is measured from when the run finished, not from its last write:
+ * releasing a lease bumps `updatedAt` and would otherwise restart the clock.
  */
 export function isRemovableRun(
   run: PlanExecRun,
@@ -872,7 +930,7 @@ export function isRemovableRun(
     !(includeFailed && run.status === RUN_STATUS.FAILED)
   )
     return false;
-  return Date.now() - run.updatedAt >= CLEANUP_RETENTION_MS;
+  return Date.now() - (run.retiredAt ?? run.updatedAt) >= CLEANUP_RETENTION_MS;
 }
 
 export async function execCleanup(
@@ -886,11 +944,14 @@ export async function execCleanup(
     );
     if (unreadable) return cleanupUnreadable(registry, unreadable, apply);
   }
-  const failedHint = includeFailed
-    ? []
-    : [
-        `Failed runs are excluded so /exec resume stays available; add ${CLEANUP_INCLUDE_FAILED_OPTION} to consider them.`,
-      ];
+  // Naming a run is the override: it says which record to drop, so neither the
+  // retention window nor the failed exclusion applies and neither is mentioned.
+  const failedHint =
+    includeFailed || runId
+      ? []
+      : [
+          `Failed runs are excluded so /exec resume stays available; add ${CLEANUP_INCLUDE_FAILED_OPTION} to consider them.`,
+        ];
   const targets = runId
     ? [await removableRun(registry, runId)]
     : (await registry.list()).filter((run) =>
@@ -898,25 +959,83 @@ export async function execCleanup(
       );
   if (targets.length === 0)
     return [
-      `No plan execution runs are removable. A terminal run becomes removable ${CLEANUP_RETENTION_DAYS} days after its last update.`,
+      `No plan execution runs are removable. A terminal run becomes removable ${CLEANUP_RETENTION_DAYS} days after it finished.`,
       ...failedHint,
     ].join("\n");
-  const rows = targets.map(
-    (run) =>
-      `${run.id} ${basename(run.planPath)} ${run.status}/${run.stage} updated ${relativeTime(run.updatedAt)}`,
-  );
+  const rows = targets.map(cleanupRow);
   if (!apply)
     return [
       "Removable plan execution runs (preview; nothing was deleted):",
       ...rows,
       "Removal deletes the registry entry only; the worktree, branch, and progress file are left in place.",
+      ...(runId
+        ? [
+            "Naming a run overrides both the retention window and the failed exclusion; the registry still refuses a non-terminal run or a live lease.",
+          ]
+        : []),
       ...failedHint,
       `Use /exec cleanup ${runId ? `${runId} ` : ""}${CLEANUP_APPLY_OPTION}${includeFailed ? ` ${CLEANUP_INCLUDE_FAILED_OPTION}` : ""} to remove them.`,
     ].join("\n");
-  for (const run of targets) await registry.remove(run.id);
+  return removalReport(await removeAll(registry, targets));
+}
+
+function cleanupRow(run: PlanExecRun): string {
+  return `${run.id} ${basename(run.planPath)} ${run.status}/${run.stage} updated ${relativeTime(run.updatedAt)}`;
+}
+
+/**
+ * Removal is per run and each one can still be refused — the targets were
+ * snapshotted from a listing, and the registry re-checks under its lock. One
+ * refusal must not hide the removals that already happened, so every outcome
+ * is collected and reported instead of thrown from the middle of the loop.
+ */
+interface RemovalOutcome {
+  run: PlanExecRun;
+  removed: boolean;
+  error?: string;
+}
+
+async function removeAll(
+  registry: RunRegistry,
+  targets: PlanExecRun[],
+): Promise<RemovalOutcome[]> {
+  const outcomes: RemovalOutcome[] = [];
+  for (const run of targets) {
+    try {
+      outcomes.push({ run, removed: await registry.remove(run.id) });
+    } catch (error: unknown) {
+      outcomes.push({
+        run,
+        removed: false,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  return outcomes;
+}
+
+function removalReport(outcomes: RemovalOutcome[]): string {
+  const removed = outcomes.filter((outcome) => outcome.removed);
+  const refused = outcomes.filter((outcome) => outcome.error);
+  const vanished = outcomes.filter(
+    (outcome) => !outcome.removed && !outcome.error,
+  );
   return [
-    `Removed ${targets.length} plan execution run${targets.length === 1 ? "" : "s"}; worktrees, branches, and progress files were left in place.`,
-    ...rows,
+    `Removed ${removed.length} plan execution run${removed.length === 1 ? "" : "s"}; worktrees, branches, and progress files were left in place.`,
+    ...removed.map((outcome) => cleanupRow(outcome.run)),
+    ...(vanished.length === 0
+      ? []
+      : [
+          `${vanished.length} record${vanished.length === 1 ? " was" : "s were"} already gone: ${vanished.map((outcome) => outcome.run.id).join(", ")}`,
+        ]),
+    ...(refused.length === 0
+      ? []
+      : [
+          `Kept ${refused.length} run${refused.length === 1 ? "" : "s"} the registry refused:`,
+          ...refused.map(
+            (outcome) => `- ${cleanupRow(outcome.run)} — ${outcome.error}`,
+          ),
+        ]),
   ].join("\n");
 }
 
@@ -979,13 +1098,18 @@ export interface AbandonmentSweep {
  * Filesystem evidence always; the bridge is asked only when a lookup is wired
  * in and the cheap check was not already decisive. Both are read-only, and a
  * lookup that cannot answer yields no evidence rather than a false verdict.
+ *
+ * A run whose lease names another host yields no evidence at all. Its worker
+ * writes to that machine's disk and registers with that machine's bridge, so
+ * an absence measured here would be an absence of the wrong thing — and the
+ * verdict it produces launches a second worker over a live one.
  */
 export function abandonmentProbe(
   lookupOperationState?: (operationId: string) => Promise<string | undefined>,
 ): EvidenceProbe {
   return async (run) => {
     const operation = run.activeOperation;
-    if (!operation) return {};
+    if (!operation || !isLocalRun(run)) return {};
     const asyncDirPresent = operation.asyncDir
       ? await pathExists(operation.asyncDir)
       : undefined;
@@ -1004,6 +1128,21 @@ export function abandonmentProbe(
 }
 
 /**
+ * Everything known about one run's claim, gathered live. Every caller that
+ * judges liveness — the sweep, the resume gate, and the detail view — goes
+ * through here, so no two of them can answer the same question differently.
+ * A live lease is decisive on its own, so nothing else is probed for it.
+ */
+export async function runEvidence(
+  run: PlanExecRun,
+  probe: EvidenceProbe = abandonmentProbe(),
+  sessionId?: string,
+): Promise<AbandonmentEvidence> {
+  const leaseLive = Boolean(run.lease && isLeaseLive(run.lease, sessionId));
+  return leaseLive ? { leaseLive } : { leaseLive, ...(await probe(run)) };
+}
+
+/**
  * Diagnose every run that claims work in flight. Read-only by construction: it
  * observes and classifies and writes nothing, so extension startup can call it.
  */
@@ -1015,10 +1154,7 @@ export async function sweepAbandonment(
   const claiming = runs.filter((run) => isInFlightStatus(run.status));
   const diagnoses = await Promise.all(
     claiming.map(async (run) => {
-      const leaseLive = Boolean(run.lease && isLeaseLive(run.lease));
-      const evidence: AbandonmentEvidence = leaseLive
-        ? { leaseLive }
-        : { leaseLive, ...(await probe(run)) };
+      const evidence = await runEvidence(run, probe);
       return {
         run,
         evidence,
@@ -1058,9 +1194,10 @@ export interface StatusOptions {
 
 /**
  * The whole read surface, with its registry injected so no caller can reach
- * the real one by accident. Returns undefined when the subcommand is not a
- * read command, and when `status` named a run the caller must resolve against
- * its own session.
+ * the real one by accident. Nothing reachable from here writes. It returns
+ * undefined when the subcommand is not a read command, when `status` named a
+ * run the caller must resolve against its own session, and for the one retired
+ * flag that writes, which the write dispatch owns.
  */
 export async function execRead(
   registry: RunRegistry,
@@ -1078,13 +1215,15 @@ export async function execRead(
       ),
       ALIAS_NOTES[EXEC_ACTION.RUNS],
     );
-  if (subcommand === EXEC_ACTION.DOCTOR)
+  if (subcommand === EXEC_ACTION.DOCTOR) {
+    // `--reconcile` resets every abandoned run in the registry. A read command
+    // must not be able to do that, so it is dispatched as a write instead.
+    if (parseDoctorArguments(rest).reconcile) return undefined;
     return withAliasNote(
-      await execDoctor(registry, rest, sources.probe),
-      parseDoctorArguments(rest).reconcile
-        ? `/exec doctor ${DOCTOR_RECONCILE_OPTION} still works for scripted callers; /exec status reports the same diagnosis without writing.`
-        : ALIAS_NOTES[EXEC_ACTION.DOCTOR],
+      await execStatus(registry, await statusOptions(false, sources)),
+      ALIAS_NOTES[EXEC_ACTION.DOCTOR],
     );
+  }
   if (subcommand === EXEC_ACTION.STATUS) {
     const { selector, all } = parseStatusArguments(rest);
     if (!selector)
@@ -1188,18 +1327,19 @@ function diagnosisGroup(
   );
 }
 
+/** The one line the retired writing flag adds to its own report. */
+const RECONCILE_ALIAS_NOTE = `/exec doctor ${DOCTOR_RECONCILE_OPTION} still works for scripted callers; /exec resume <run-id> resets one named run instead, and /exec status reports the same diagnosis without writing.`;
+
 /**
- * Retired: the read-only sweep is /exec status. Only the write half still lives
- * here, so a scripted `--reconcile` caller keeps working until it moves to
- * /exec resume.
+ * The registry-wide write behind the retired `/exec doctor --reconcile`. It is
+ * dispatched as a write command, never from the read surface: it resets every
+ * provably abandoned run in the registry, which is a wider blast radius than
+ * /exec cleanup, and that one demands `--apply`.
  */
-export async function execDoctor(
+export async function execReconcile(
   registry: RunRegistry,
-  args: string[],
   probe?: EvidenceProbe,
 ): Promise<string> {
-  const { reconcile } = parseDoctorArguments(args);
-  if (!reconcile) return execStatus(registry, probe ? { probe } : {});
   const sweep = await sweepAbandonment(registry, probe);
   const lines =
     sweep.diagnoses.length === 0
@@ -1234,46 +1374,65 @@ function groupLines(
   diagnoses: RunDiagnosis[],
   footer?: string,
 ): string[] {
-  if (diagnoses.length === 0) return [];
-  return [
-    `${heading}:`,
-    ...diagnoses.map(
+  return sectionLines(
+    heading,
+    diagnoses.map(
       (diagnosis) =>
         `- ${runClaim(diagnosis.run)} — ${evidenceText(diagnosis)}. Next: ${nextCommand(diagnosis)}`,
     ),
-    ...(footer ? [footer] : []),
-  ];
+    footer,
+  );
 }
 
 async function reconcileLines(
   registry: RunRegistry,
   abandoned: RunDiagnosis[],
 ): Promise<string[]> {
-  const reset: Array<{ diagnosis: RunDiagnosis; run: PlanExecRun }> = [];
-  const skipped: RunDiagnosis[] = [];
+  const reset: RunDiagnosis[] = [];
+  const reclaimed: RunDiagnosis[] = [];
+  const stopping: RunDiagnosis[] = [];
   for (const diagnosis of abandoned) {
-    const run = await reconcileRun(registry, diagnosis);
-    if (run) reset.push({ diagnosis, run });
-    else skipped.push(diagnosis);
+    const outcome = await reconcileRun(registry, diagnosis);
+    if (outcome.run) reset.push(diagnosis);
+    else if (outcome.skipped === RECONCILE_SKIP.STOP_REQUESTED)
+      stopping.push(diagnosis);
+    else reclaimed.push(diagnosis);
   }
   const lines: string[] = [];
   if (reset.length > 0)
     lines.push(
       `Reset ${reset.length} abandoned run${reset.length === 1 ? "" : "s"} to failed. No worker was launched and no task attempt was consumed.`,
       ...reset.map(
-        ({ diagnosis }) =>
+        (diagnosis) =>
           `- ${runClaim(diagnosis.run)} → failed. Next: ${recoveryCommand(diagnosis.run)}`,
       ),
     );
-  if (skipped.length > 0)
+  if (stopping.length > 0)
     lines.push(
-      `Skipped ${skipped.length} run${skipped.length === 1 ? "" : "s"} reclaimed while the sweep ran; nothing was overwritten:`,
-      ...skipped.map((diagnosis) => `- ${runClaim(diagnosis.run)}`),
+      `Left ${stopping.length} abandoned run${stopping.length === 1 ? "" : "s"} alone: each carries the stop you asked for, and a reset would drop it:`,
+      ...stopping.map(
+        (diagnosis) =>
+          `- ${runClaim(diagnosis.run)}. Next: ${recoveryCommand(diagnosis.run)}`,
+      ),
     );
-  if (reset.length === 0 && skipped.length === 0)
+  if (reclaimed.length > 0)
+    lines.push(
+      `Skipped ${reclaimed.length} run${reclaimed.length === 1 ? "" : "s"} reclaimed while the sweep ran; nothing was overwritten:`,
+      ...reclaimed.map((diagnosis) => `- ${runClaim(diagnosis.run)}`),
+    );
+  if (abandoned.length === 0)
     lines.push("No run is provably abandoned, so nothing was reset.");
   return lines;
 }
+
+const RECONCILE_SKIP = {
+  RECLAIMED: "reclaimed",
+  STOP_REQUESTED: "stop-requested",
+} as const;
+type ReconcileSkip = (typeof RECONCILE_SKIP)[keyof typeof RECONCILE_SKIP];
+type ReconcileOutcome =
+  | { run: PlanExecRun; skipped?: undefined }
+  | { run?: undefined; skipped: ReconcileSkip };
 
 /**
  * Convert decisive evidence into the recoverable failure that /exec resume
@@ -1281,12 +1440,20 @@ async function reconcileLines(
  * `updatedAt`, with no retry: a run reclaimed between the scan and this write
  * is skipped, never overwritten. `taskAttempts` is untouched because the worker
  * never ran, so the operator must not lose an attempt.
+ *
+ * Every reconcile goes through this one writer, so the exclusions cannot drift
+ * between the callers that reach it.
  */
 async function reconcileRun(
   registry: RunRegistry,
   diagnosis: RunDiagnosis,
   actor = `/exec ${EXEC_ACTION.DOCTOR}`,
-): Promise<PlanExecRun | undefined> {
+): Promise<ReconcileOutcome> {
+  // A cancel-pending run carries the stop the operator already asked for.
+  // Resetting it to failed would erase that request, and the next resume
+  // would restart plan work instead of finishing the cancellation.
+  if (isRecoverableRun(diagnosis.run))
+    return { skipped: RECONCILE_SKIP.STOP_REQUESTED };
   const reason = reconcileReason(diagnosis, actor);
   const reset = { ...diagnosis.run };
   delete reset.activeOperation;
@@ -1299,7 +1466,7 @@ async function reconcileRun(
     },
     diagnosis.run.updatedAt,
   );
-  if (!reconciled.applied) return undefined;
+  if (!reconciled.applied) return { skipped: RECONCILE_SKIP.RECLAIMED };
   try {
     await appendProgress(
       reconciled.run,
@@ -1308,7 +1475,7 @@ async function reconcileRun(
   } catch {
     // An abandoned run often outlived its worktree; the registry entry is the record.
   }
-  return reconciled.run;
+  return { run: reconciled.run };
 }
 
 /**
@@ -1340,10 +1507,7 @@ export async function reconcileForResume(
   probe: EvidenceProbe = abandonmentProbe(),
 ): Promise<{ run: PlanExecRun; note?: string }> {
   if (!isInFlightStatus(run.status) || isRecoverableRun(run)) return { run };
-  const leaseLive = Boolean(run.lease && isLeaseLive(run.lease, sessionId));
-  const evidence: AbandonmentEvidence = leaseLive
-    ? { leaseLive }
-    : { leaseLive, ...(await probe(run)) };
+  const evidence = await runEvidence(run, probe, sessionId);
   const diagnosis: RunDiagnosis = {
     run,
     evidence,
@@ -1361,12 +1525,12 @@ export async function reconcileForResume(
     diagnosis,
     `/exec ${EXEC_ACTION.RESUME}`,
   );
-  if (!reconciled)
+  if (!reconciled.run)
     throw new Error(
       `Run ${shortRunId(run.id)} was reclaimed while it was being diagnosed, so nothing was changed. Use /exec status ${run.id}.`,
     );
   return {
-    run: reconciled,
+    run: reconciled.run,
     note: `Run ${shortRunId(run.id)} was abandoned — ${evidenceText(diagnosis)} — so it was reset to failed before resuming. No task attempt was consumed.`,
   };
 }
@@ -1375,17 +1539,34 @@ function runClaim(run: PlanExecRun): string {
   return `${run.id} ${basename(run.planPath)} ${run.status}/${run.stage}`;
 }
 
-function evidenceText(diagnosis: RunDiagnosis): string {
+/** A run and what was observed about it; a diagnosis adds the verdict. */
+type ObservedRun = Pick<RunDiagnosis, "run" | "evidence">;
+
+function evidenceText(diagnosis: ObservedRun): string {
   const lease = diagnosis.run.lease;
   const leaseText = !lease
     ? "no session holds it"
     : diagnosis.evidence.leaseLive
       ? `session ${lease.sessionId} holds a live lease`
       : `its lease for session ${lease.sessionId} is dead, last beat ${relativeTime(lease.heartbeatAt)}`;
-  return `${leaseText}; ${operationEvidence(diagnosis)}`;
+  return `${leaseText}; ${operationEvidence(diagnosis)}${overdueText(diagnosis.run)}`;
 }
 
-function operationEvidence(diagnosis: RunDiagnosis): string {
+/**
+ * The stage's own turn budget, reported where the sweep reports everything
+ * else it knows. Without it a run three times past its bound reads in the
+ * primary view exactly like one launched a minute ago.
+ */
+function overdueText(run: PlanExecRun): string {
+  const overdue = reportedActivity(run.activeOperation)
+    ? undefined
+    : longRunningOperation(run);
+  return overdue
+    ? `; running ${elapsedLabel(overdue.elapsedMs)}, past the ${minutesLabel(overdue.boundMs)} allowed for its ${overdue.maxTurns}-turn budget`
+    : "";
+}
+
+function operationEvidence(diagnosis: ObservedRun): string {
   const operation = diagnosis.run.activeOperation;
   if (!operation) return "no operation is tracked";
   if (diagnosis.evidence.asyncDirPresent === false)
@@ -1456,13 +1637,33 @@ async function handleCommand(
     problems: runtimeProblems,
   });
   if (read !== undefined) return read;
-  if (subcommand === EXEC_ACTION.STATUS)
+  // The read surface answered everything it could, so the retired doctor verb
+  // can only be here with `--reconcile`: the write half of it.
+  if (subcommand === EXEC_ACTION.DOCTOR)
+    return withAliasNote(
+      await execReconcile(registry, doctorProbe),
+      RECONCILE_ALIAS_NOTE,
+    );
+  if (subcommand === EXEC_ACTION.STATUS) {
+    const target = await resolveRunForAction(
+      EXEC_ACTION.STATUS,
+      parseStatusArguments(rest).selector,
+      ctx,
+    );
+    // The detail view probes for itself. Reading the persisted digest alone
+    // would render an abandoned run exactly like a healthy one, which is the
+    // bug this whole change set exists to remove.
     return formatRunStatus(
-      await resolveRunForAction(
-        EXEC_ACTION.STATUS,
-        parseStatusArguments(rest).selector,
-        ctx,
-      ),
+      target,
+      await runEvidence(target, doctorProbe, ctx.sessionManager.getSessionId()),
+    );
+  }
+  // Deleted as the identical code path to bare /exec. Without this the token
+  // is read as the first word of a plan path, so the reader gets an isolation
+  // prompt and then a not-found error naming neither the cause nor the cure.
+  if (subcommand === RETIRED_START_ACTION)
+    throw new Error(
+      `/exec ${RETIRED_START_ACTION} was removed. Run /exec ${rest.join(" ") || "<path/to/plan.md>"} instead; bare /exec opens the plan picker.`,
     );
   const dispatched = runActionFor(subcommand);
   if (dispatched) {
@@ -1496,18 +1697,26 @@ async function handleCommand(
   return `Run ${shortRunId(run.id)} started: ${run.status} (${run.stage})\nbranch: ${run.branch}\nworktree: ${run.worktreeCwd}\nUse /exec status ${run.id} for live progress.`;
 }
 
-/** The subcommand's action and, when the name is retired, the note to append. */
+/**
+ * The subcommand's action and, when the name is retired, the note to append.
+ * Only `adopt` names a different action than itself; every other retired verb
+ * kept its behavior and needed nothing but the note.
+ */
 export function runActionFor(
   subcommand: string | undefined,
-): { action: RunAction; note?: string } | undefined {
+): { action: DispatchedAction; note?: string } | undefined {
   if (subcommand === undefined) return undefined;
-  if (Object.hasOwn(RUN_ACTION_ALIASES, subcommand)) {
-    const alias = subcommand as keyof typeof RUN_ACTION_ALIASES;
-    return { action: RUN_ACTION_ALIASES[alias], note: ALIAS_NOTES[alias] };
-  }
-  return RUN_ACTIONS.has(subcommand)
-    ? { action: subcommand as RunAction }
-    : undefined;
+  const action =
+    subcommand === EXEC_ACTION.ADOPT ? EXEC_ACTION.RESUME : subcommand;
+  if (!Object.hasOwn(RUN_ACTIONS, action)) return undefined;
+  return {
+    action: action as DispatchedAction,
+    ...(isAliasAction(subcommand) ? { note: ALIAS_NOTES[subcommand] } : {}),
+  };
+}
+
+function isAliasAction(subcommand: string): subcommand is ExecAliasAction {
+  return (EXEC_ALIAS_ACTIONS as readonly string[]).includes(subcommand);
 }
 
 async function runAction(
@@ -2035,7 +2244,7 @@ export function parseResumeOptions(args: string[]): {
 
 function resumeUsageError(): Error {
   return new Error(
-    `Usage: /exec resume [full-run-id] [--adopt-current-branch] [${RECOVERY_MODEL_OPTION} current|provider/model]`,
+    `Usage: /exec resume [full-run-id] [--adopt-current-branch] [${TASK_RETRY_OPTION}] [${RECOVERY_MODEL_OPTION} current|provider/model]`,
   );
 }
 

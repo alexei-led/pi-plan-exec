@@ -1,9 +1,5 @@
 import { randomUUID } from "node:crypto";
-import {
-  isInFlightStatus,
-  isSkippableStage,
-  isTerminalStatus,
-} from "./lifecycle.js";
+import { isSkippableStage, isTerminalStatus } from "./lifecycle.js";
 import {
   mkdir,
   open,
@@ -17,7 +13,6 @@ import { homedir, hostname } from "node:os";
 import { dirname, join } from "node:path";
 import {
   DEFAULT_FROZEN_RUN_CONFIG,
-  EXTERNAL_OPERATION_STATE,
   OPERATION_KIND,
   RUN_STAGE,
   RUN_STATUS,
@@ -56,41 +51,16 @@ export function isLeaseLive(lease: RunLease, sessionId?: string): boolean {
   return isProcessRunning(lease.pid);
 }
 
-export const ABANDONMENT = {
-  LIVE: "live",
-  ABANDONED: "abandoned",
-  AMBIGUOUS: "ambiguous",
-} as const;
-
-export type Abandonment = (typeof ABANDONMENT)[keyof typeof ABANDONMENT];
-
-/** What a sweep managed to observe about a run's claim. */
-export interface AbandonmentEvidence {
-  leaseLive: boolean;
-  /** Only `false` is evidence; undefined means no directory was recorded. */
-  asyncDirPresent?: boolean;
-  /** The bridge's own answer for the operation ID, when it was asked. */
-  bridgeState?: string;
-}
-
 /**
- * `abandoned` is the full conjunction: an in-flight claim, a dead lease, and a
- * tracked operation provably gone. Anything short of that is `ambiguous` — it
- * is reported and never reset, because resetting a run whose worker is alive
- * can double-write a worktree, which is worse than the stall. Pure by
- * construction: the caller gathers the evidence, so the rule stays testable.
+ * Whether anything observed on this machine can speak for this run. A lease
+ * naming another host makes every local check meaningless — that directory and
+ * that bridge belong to a different machine — on the same reasoning
+ * `isLeaseLive` already applies to `lease.pid`. A lease with no hostname was
+ * written before the field existed and is treated as local, as it always was.
  */
-export function classifyAbandonment(
-  run: PlanExecRun,
-  evidence: AbandonmentEvidence,
-): Abandonment {
-  if (evidence.leaseLive) return ABANDONMENT.LIVE;
-  if (!isInFlightStatus(run.status) || !run.activeOperation)
-    return ABANDONMENT.AMBIGUOUS;
-  const gone =
-    evidence.asyncDirPresent === false ||
-    evidence.bridgeState === EXTERNAL_OPERATION_STATE.ABSENT;
-  return gone ? ABANDONMENT.ABANDONED : ABANDONMENT.AMBIGUOUS;
+export function isLocalRun(run: PlanExecRun): boolean {
+  const host = run.lease?.hostname;
+  return host === undefined || host === hostname();
 }
 
 /**
@@ -185,8 +155,38 @@ export class RunRegistry {
     }
   }
 
+  /**
+   * Optimistic write: it lands only if nothing else wrote first, and otherwise
+   * returns the record that did. Callers that continue from the return value
+   * inherit the newer state, which is why several of them compare it against
+   * what they meant to write. A write that must not be lost — a terminal
+   * status, a retirement stamp — belongs in `updateLatest` instead, because
+   * this one drops it silently.
+   */
   async update(run: PlanExecRun): Promise<PlanExecRun> {
     return (await this.updateIfCurrent(run, run.updatedAt)).run;
+  }
+
+  /**
+   * Apply a change that must not be lost, re-reading and re-applying on top of
+   * whoever landed first. `update` refuses a stale write; a terminal status and
+   * its retirement stamp cannot simply be dropped, because the work they record
+   * has already happened on disk.
+   */
+  async updateLatest(
+    runId: string,
+    apply: (current: PlanExecRun) => PlanExecRun,
+  ): Promise<PlanExecRun> {
+    for (let attempt = 0; attempt < CLAIM_CAS_RETRIES; attempt += 1) {
+      const current = await this.get(runId);
+      if (!current) throw new Error(`Plan execution run not found: ${runId}`);
+      const written = await this.updateIfCurrent(
+        apply(current),
+        current.updatedAt,
+      );
+      if (written.applied) return written.run;
+    }
+    throw new Error(`Run ${runId} changed repeatedly while being updated.`);
   }
 
   async updateIfCurrent(
@@ -298,18 +298,34 @@ export class RunRegistry {
    * worktree, its branch, and the progress file are left in place. A record
    * that cannot be parsed is removable as-is: `list` already drops it, so
    * refusing here would leave it on disk with nothing able to clean it up.
+   *
+   * The refusal is decided under the same lock as the deletion. Reading first
+   * and locking afterwards would let a concurrent `claim` revive the run —
+   * relaunching a worker — in the window between, and this is the one
+   * irreversible path in the store.
+   *
+   * Returns whether a record was actually deleted; a record already gone is
+   * not an error, and must not be counted as a removal either.
    */
-  async remove(runId: string): Promise<void> {
+  async remove(runId: string): Promise<boolean> {
     assertRunId(runId);
-    const run = await this.readForRemoval(runId);
-    if (run === undefined) return;
-    const refusal = run === null ? undefined : removalRefusal(run);
-    if (refusal) throw new Error(refusal);
     const path = this.pathFor(runId);
     const lockPath = `${path}.lock`;
-    const lock = await acquireLock(lockPath);
+    let lock;
     try {
+      lock = await acquireLock(lockPath);
+    } catch (error: unknown) {
+      // No directory to lock is no directory to delete.
+      if (isNodeError(error, "ENOENT")) return false;
+      throw error;
+    }
+    try {
+      const run = await this.readForRemoval(runId);
+      if (run === undefined) return false;
+      const refusal = run === null ? undefined : removalRefusal(run);
+      if (refusal) throw new Error(refusal);
       await rm(dirname(path), { recursive: true, force: true });
+      return true;
     } finally {
       await releaseLock(lockPath, lock);
     }

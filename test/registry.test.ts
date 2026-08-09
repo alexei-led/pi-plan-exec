@@ -13,18 +13,26 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   classifyAbandonment,
+  type Abandonment,
+  type AbandonmentEvidence,
+} from "../src/lifecycle.js";
+import {
   isLeaseLive,
+  isLocalRun,
   LEASE_STALE_MS,
   removalRefusal,
   RunRegistry,
-  type Abandonment,
-  type AbandonmentEvidence,
 } from "../src/registry.js";
 import type { PlanExecRun } from "../src/types.js";
 
 type RunLease = NonNullable<PlanExecRun["lease"]>;
 
-/** A pid that is reaped before spawnSync returns, so it is reliably gone. */
+/**
+ * A pid that is reaped before spawnSync returns, so it is reliably gone.
+ * Assumes the OS does not recycle it inside one test run — the only
+ * nondeterministic input in the liveness matrix, and the first thing to
+ * suspect if a lease test ever flakes.
+ */
 function reapedPid(): number {
   const { pid } = spawnSync("true");
   assert.ok(pid, "spawnSync must report a child pid");
@@ -924,4 +932,125 @@ test("registry lists healthy runs when a sibling entry is corrupt", async () => 
   );
   assert.equal(result.errors[0]?.runId, corruptId);
   assert.notEqual(result.errors[0]?.message, "");
+});
+
+/** The seed every removal test starts from: a run the registry would delete. */
+async function seedRemovable(): Promise<{
+  directory: string;
+  registry: RunRegistry;
+  run: PlanExecRun;
+}> {
+  const directory = await mkdtemp(join(tmpdir(), "pi-plan-exec-registry-"));
+  const registry = new RunRegistry(directory);
+  const run = await registry.create({
+    schemaVersion: 1,
+    repositoryRoot: "/repo",
+    planPath: "/repo/plan.md",
+    planHash: "hash",
+    worktreeCwd: "/repo",
+    branch: "feature",
+    defaultBranch: "main",
+    status: "completed",
+    stage: "complete",
+    taskAttempts: {},
+    stageAttempts: {},
+    reviewFindings: [],
+    unresolvedFindings: [],
+    config,
+  });
+  return { directory, registry, run };
+}
+
+test("remove refuses a record it cannot read for an I/O reason", async () => {
+  const { directory, registry, run } = await seedRemovable();
+  // A directory where the file belongs yields EISDIR without needing root:
+  // unreadable, but not evidence of anything, so it must not be deleted.
+  await rm(join(directory, run.id, "run.json"));
+  await mkdir(join(directory, run.id, "run.json"), { recursive: true });
+
+  await assert.rejects(registry.remove(run.id), /EISDIR|illegal operation/i);
+  assert.ok(
+    await stat(join(directory, run.id)),
+    "an unreadable-for-I/O record survives",
+  );
+});
+
+test("remove decides refusal under the lock, not before it", async () => {
+  const { directory, registry, run } = await seedRemovable();
+  const path = join(directory, run.id, "run.json");
+  const lockPath = `${path}.lock`;
+  // Hold the run's lock the way a concurrent writer would.
+  await writeFile(
+    lockPath,
+    `${JSON.stringify({ pid: process.pid, createdAt: Date.now(), token: "held" })}\n`,
+  );
+
+  const removal = registry.remove(run.id);
+  // The run is revived while the removal waits for the lock. A refusal decided
+  // before locking would delete the directory a live worker is writing to.
+  await writeFile(
+    path,
+    `${JSON.stringify({ ...run, status: "running", stage: "implementation" })}\n`,
+  );
+  await rm(lockPath);
+
+  await assert.rejects(removal, /only a terminal run can be removed/);
+  assert.equal((await registry.get(run.id))?.status, "running");
+});
+
+test("remove reports whether a record was actually deleted", async () => {
+  const { registry, run } = await seedRemovable();
+
+  assert.equal(await registry.remove(run.id), true);
+  assert.equal(await registry.remove(run.id), false, "already gone is not a removal");
+});
+
+test("updateLatest re-applies a write that update would have dropped", async () => {
+  const { registry, run } = await seedRemovable();
+  const stale = await registry.update({ ...run, branch: "first" });
+  await registry.update({ ...stale, branch: "second" });
+
+  // The optimistic write is silently dropped: whoever wrote second wins, and
+  // the caller is handed that record back rather than an error.
+  const dropped = await registry.update({ ...stale, branch: "third" });
+  assert.equal(dropped.branch, "second");
+  assert.equal((await registry.get(run.id))?.branch, "second");
+
+  // A terminal write cannot be dropped like that: the work it records has
+  // already happened on disk, so it is re-applied on top of the newer record.
+  const merged = await registry.updateLatest(run.id, (current) => ({
+    ...current,
+    status: "cancelled",
+  }));
+
+  assert.equal(merged.status, "cancelled");
+  assert.equal(merged.branch, "second", "the other writer's change survives");
+  await assert.rejects(
+    registry.updateLatest("11111111-1111-4111-8111-111111111111", (it) => it),
+    /Plan execution run not found/,
+  );
+});
+
+test("only this host's evidence speaks for a run", () => {
+  const local = (lease?: RunLease): PlanExecRun =>
+    ({ id: "11111111-1111-4111-8111-111111111111", lease }) as PlanExecRun;
+
+  assert.equal(isLocalRun(local()), true, "no lease is no other host");
+  assert.equal(
+    isLocalRun(local({ sessionId: "s", pid: 1, heartbeatAt: 0 })),
+    true,
+    "a pre-upgrade lease is treated as local, as it always was",
+  );
+  assert.equal(
+    isLocalRun(
+      local({ sessionId: "s", pid: 1, heartbeatAt: 0, hostname: hostname() }),
+    ),
+    true,
+  );
+  assert.equal(
+    isLocalRun(
+      local({ sessionId: "s", pid: 1, heartbeatAt: 0, hostname: "other-host" }),
+    ),
+    false,
+  );
 });

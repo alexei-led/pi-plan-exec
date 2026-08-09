@@ -42,7 +42,6 @@ import {
   WORKFLOW_MODE,
   type ActiveOperation,
   type FrozenRunConfig,
-  type OperationKind,
   type PlanExecRun,
   type ReviewFinding,
   type RunStage,
@@ -63,16 +62,6 @@ const OPERATION_RECOVERY_DELAY_MS = 35_000;
 const RECOVERY_WORKER_MAX_TURNS = 75;
 const RECOVERY_REVIEWER_MAX_TURNS = 75;
 const MAX_TERMINAL_ERROR_LENGTH = 2_000;
-/**
- * Wall-clock allowance per turn, used to bound an operation against the turn
- * budget its own stage was launched with instead of one flat number for every
- * stage. PLACEHOLDER pending measurement across real runs: the only data point
- * today is a single ~6-minute implementation task, so this is deliberately
- * generous — a false "long-running" banner on a healthy worker recreates the
- * non-discriminating guidance the bound exists to remove. Tighten it once a
- * real per-turn activity signal exists (nicobailon/pi-subagents#920).
- */
-const OPERATION_TURN_ALLOWANCE_MS = 120_000;
 export const PLAN_STRUCTURE_CHANGED_ERROR =
   "Plan task structure changed outside checkbox completion.";
 
@@ -931,7 +920,7 @@ export class PlanExecController {
     };
     delete observedOperation.statusFailures;
     delete observedOperation.lastStatusError;
-    const signal = await workerSignal(operation, statusText);
+    const signal = parseWorkerSignal(statusText);
     if (signal) observedOperation.workerSignal = signal;
     else delete observedOperation.workerSignal;
     return this.registry.heartbeat({
@@ -1374,12 +1363,16 @@ export class PlanExecController {
             commit.stderr.trim() || "Could not commit archived plan.",
           );
       }
-      const completed = await this.registry.update({
-        ...run,
+      // The plan has already been renamed and committed by now, and several
+      // awaits stand between this write and the record it was computed from.
+      // A concurrent claim must not silently discard the terminal status: the
+      // rename cannot be replayed, so the write is re-applied on top instead.
+      const completed = await this.registry.updateLatest(run.id, (current) => ({
+        ...current,
         status,
         stage: RUN_STAGE.COMPLETE,
         retiredAt: Date.now(),
-      });
+      }));
       return this.registry.release(completed);
     } catch (error: unknown) {
       return this.fail(
@@ -1391,11 +1384,11 @@ export class PlanExecController {
 
   private async complete(run: PlanExecRun): Promise<PlanExecRun> {
     const status = completionStatus(run);
-    const completed = await this.registry.update({
-      ...run,
+    const completed = await this.registry.updateLatest(run.id, (current) => ({
+      ...current,
       status,
       stage: RUN_STAGE.COMPLETE,
-    });
+    }));
     await appendProgress(completed, `Run completed as ${status}.`);
     return this.registry.release(completed);
   }
@@ -2199,22 +2192,12 @@ const MAX_WORKER_SIGNAL_STEPS = 5;
  * Digest the provider status blob. Every line is optional and the format is
  * upstream's, so nothing here may throw: a status text that cannot be read
  * yields no signal rather than a failed run.
+ *
+ * Nothing about the operation's own liveness is persisted here. Whether its
+ * directory still exists is stamped by whichever session happens to be
+ * polling, so it freezes the moment that session dies — exactly when the
+ * answer matters. The read surface stats it live instead.
  */
-/**
- * Digest plus the one corroborating check available at observation time. A
- * missing async directory is decisive: an operation cannot still be running
- * out of a directory that no longer exists.
- */
-async function workerSignal(
-  operation: ActiveOperation,
-  statusText: unknown,
-): Promise<WorkerSignal | undefined> {
-  const parsed = parseWorkerSignal(statusText);
-  if (!operation.asyncDir || (await pathExists(operation.asyncDir)))
-    return parsed;
-  return { ...parsed, asyncDirMissing: true };
-}
-
 export function parseWorkerSignal(value: unknown): WorkerSignal | undefined {
   const blob = text(value);
   if (!blob) return undefined;
@@ -2251,32 +2234,4 @@ export function parseWorkerSignal(value: unknown): WorkerSignal | undefined {
     ...(steps.length > 0 ? { steps } : {}),
   };
   return Object.keys(signal).length > 0 ? signal : undefined;
-}
-
-/** Turn budget each launch path passes; fusion carries none of its own. */
-function operationMaxTurns(
-  config: FrozenRunConfig,
-  kind: OperationKind,
-): number {
-  if (kind === OPERATION_KIND.STATS) return config.statsMaxTurns;
-  if (kind === OPERATION_KIND.REVIEW) return config.reviewerMaxTurns;
-  return config.workerMaxTurns;
-}
-
-/**
- * Bound an in-flight operation by its own stage's turn budget and report the
- * breach; classification only, so nothing here fails or kills a run. An
- * operation with no `launchStartedAt` — a record written before the field
- * existed — cannot be bounded and is never reported as long-running.
- */
-export function longRunningOperation(
-  run: PlanExecRun,
-  now = Date.now(),
-): { elapsedMs: number; boundMs: number; maxTurns: number } | undefined {
-  const operation = run.activeOperation;
-  if (!operation?.launchStartedAt) return undefined;
-  const maxTurns = operationMaxTurns(run.config, operation.kind);
-  const boundMs = maxTurns * OPERATION_TURN_ALLOWANCE_MS;
-  const elapsedMs = now - operation.launchStartedAt;
-  return elapsedMs > boundMs ? { elapsedMs, boundMs, maxTurns } : undefined;
 }

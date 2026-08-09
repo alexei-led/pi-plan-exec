@@ -8,7 +8,7 @@ import {
   PLAN_STRUCTURE_CHANGED_ERROR,
   PlanExecController,
 } from "../src/controller.js";
-import { execDoctor } from "../src/index.js";
+import { execReconcile } from "../src/index.js";
 import { parsePlan } from "../src/plan.js";
 import { RunRegistry } from "../src/registry.js";
 import type { BridgeResult, PlanExecRun } from "../src/types.js";
@@ -2292,6 +2292,8 @@ test("worker signal digest never carries a workflow-mode activity value", () => 
     activity?: string;
     mode?: string;
     steps?: string[];
+    /** Asserted literally: "no digest" is not the same as "no activity". */
+    empty?: boolean;
   }[] = [
     {
       name: "workflow mode suppresses activity and its step lines",
@@ -2314,12 +2316,26 @@ test("worker signal digest never carries a workflow-mode activity value", () => 
       name: "no activity line and no mode line yields neither",
       text: "Run: worker-run-1\nState: running\nProgress: warming up",
     },
-    { name: "empty text yields no digest", text: "" },
-    { name: "non-string text yields no digest", text: { state: "running" } },
+    { name: "empty text yields no digest", text: "", empty: true },
+    {
+      name: "non-string text yields no digest",
+      text: { state: "running" },
+      empty: true,
+    },
+    {
+      name: "a text with no readable field yields no digest",
+      text: "Run: worker-run-1\nState: running",
+      empty: true,
+    },
   ];
 
   for (const testCase of cases) {
     const signal = parseWorkerSignal(testCase.text);
+    if (testCase.empty) {
+      assert.equal(signal, undefined, testCase.name);
+      continue;
+    }
+    assert.ok(signal, testCase.name);
     assert.equal(signal?.activity, testCase.activity, testCase.name);
     assert.equal(signal?.mode, testCase.mode, testCase.name);
     assert.deepEqual(signal?.steps, testCase.steps, testCase.name);
@@ -2330,6 +2346,20 @@ test("worker signal digest never carries a workflow-mode activity value", () => 
       `${testCase.name}: the launch-anchored age must not survive anywhere`,
     );
   }
+});
+
+test("worker signal digest caps the step lines it carries", () => {
+  const steps = Array.from(
+    { length: 8 },
+    (_, index) => `Step ${index + 1}: doing thing ${index + 1}`,
+  ).join("\n");
+
+  const signal = parseWorkerSignal(`Run: r\nState: running\nMode: chain\n${steps}`);
+
+  // The digest is persisted on every observation, so an unbounded step list
+  // would grow the record without bound.
+  assert.equal(signal?.steps?.length, 5);
+  assert.deepEqual(signal?.steps?.[4], "doing thing 5");
 });
 
 test("worker signal digest keeps the fields that are not activity", () => {
@@ -2378,16 +2408,16 @@ test("observation persists the worker digest without the workflow activity", asy
   assert.equal(stored?.activeOperation?.workerSignal?.mode, "workflow");
   assert.equal(stored?.activeOperation?.workerSignal?.activity, undefined);
   assert.equal(
-    stored?.activeOperation?.workerSignal?.asyncDirMissing,
-    undefined,
-  );
-  assert.equal(
     stored?.activeOperation?.workerSignal?.progress,
     "implementation step 1",
   );
+  assert.ok(
+    stored?.activeOperation?.lastObservedAt,
+    "the digest is only trustworthy with the moment it was taken",
+  );
 });
 
-test("observation reports a missing async directory as decisive", async () => {
+test("observation persists no liveness verdict of its own", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
   const planPath = join(root, "plan.md");
   const plan = "### Task 1: Implement\n- [ ] Do the work\n";
@@ -2418,7 +2448,14 @@ test("observation reports a missing async directory as decisive", async () => {
   await controller.advance(await registry.claim(run, "session-1"));
   const stored = await registry.get(run.id);
 
-  assert.equal(stored?.activeOperation?.workerSignal?.asyncDirMissing, true);
+  // Whether the directory still exists is stamped by whoever is polling, so it
+  // freezes the moment that session dies. The read surface stats it live
+  // instead; nothing here may record an answer that will go stale.
+  assert.deepEqual(stored?.activeOperation?.workerSignal, {
+    mode: "workflow",
+    progress: "implementation step 1",
+    updated: "2026-08-09T10:00:00.023Z",
+  });
   assert.equal(stored?.status, "running");
 });
 
@@ -2456,7 +2493,7 @@ test("a reconciled run resumes through the normal recovery path", async () => {
     },
   });
 
-  const report = await execDoctor(registry, ["--reconcile"]);
+  const report = await execReconcile(registry);
 
   assert.match(report, /Reset 1 abandoned run to failed\./);
   const reconciled = await registry.get(created.id);

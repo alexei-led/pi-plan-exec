@@ -218,8 +218,6 @@ export interface WorkerSignal {
   turnBudget?: string;
   updated?: string;
   steps?: string[];
-  /** Only the `true` case is decisive: the operation directory is gone. */
-  asyncDirMissing?: boolean;
 }
 
 export interface ActiveOperation {
@@ -276,9 +274,16 @@ export interface PlanExecRun {
   config: FrozenRunConfig;
   createdAt: number;
   updatedAt: number;
-  /** Set when the archive stage completes; absent on runs archived before this field existed. */
+  /**
+   * When the archive stage finished. Cleanup measures its retention window
+   * from here, falling back to `updatedAt` on runs archived before this field
+   * existed or completed without the archive stage.
+   */
   retiredAt?: number;
-  /** Set when /exec doctor --reconcile reset an abandoned run, so the reset is auditable. */
+  /**
+   * Set when an abandoned run was reset to failed, by /exec resume or by
+   * /exec doctor --reconcile, so the reset is auditable in the record itself.
+   */
   reconciledAt?: number;
   lease?: {
     sessionId: string;
