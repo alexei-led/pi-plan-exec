@@ -42,6 +42,7 @@ import {
   WORKFLOW_MODE,
   type ActiveOperation,
   type FrozenRunConfig,
+  type OperationKind,
   type PlanExecRun,
   type ReviewFinding,
   type RunStage,
@@ -62,6 +63,16 @@ const OPERATION_RECOVERY_DELAY_MS = 35_000;
 const RECOVERY_WORKER_MAX_TURNS = 75;
 const RECOVERY_REVIEWER_MAX_TURNS = 75;
 const MAX_TERMINAL_ERROR_LENGTH = 2_000;
+/**
+ * Wall-clock allowance per turn, used to bound an operation against the turn
+ * budget its own stage was launched with instead of one flat number for every
+ * stage. PLACEHOLDER pending measurement across real runs: the only data point
+ * today is a single ~6-minute implementation task, so this is deliberately
+ * generous — a false "long-running" banner on a healthy worker recreates the
+ * non-discriminating guidance the bound exists to remove. Tighten it once a
+ * real per-turn activity signal exists (nicobailon/pi-subagents#920).
+ */
+const OPERATION_TURN_ALLOWANCE_MS = 120_000;
 export const PLAN_STRUCTURE_CHANGED_ERROR =
   "Plan task structure changed outside checkbox completion.";
 
@@ -752,65 +763,6 @@ export class PlanExecController {
       current = updated.run;
     }
     return current;
-  }
-
-  private async reconstructBridgeParams(
-    run: PlanExecRun,
-    operation: ActiveOperation,
-  ): Promise<Record<string, unknown>> {
-    let task: string;
-    if (operation.kind === OPERATION_KIND.IMPLEMENTATION) {
-      const plan = await readPlan(run.planPath);
-      const taskData = plan.tasks.find(
-        (candidate) => candidate.id === operation.taskId,
-      );
-      if (!taskData)
-        throw new Error(
-          "Cannot recover an implementation task that no longer exists.",
-        );
-      task = workerPrompt(run, taskData.id, taskData.title, taskData.unchecked);
-    } else if (operation.kind === OPERATION_KIND.REVIEW) {
-      task = reviewerPrompt(run);
-    } else if (operation.kind === OPERATION_KIND.FIX) {
-      task = fixerPrompt(
-        run,
-        run.reviewFindings,
-        formatFindings(run.reviewFindings),
-      );
-    } else if (operation.kind === OPERATION_KIND.FINALIZE) {
-      task = finalizerPrompt(run);
-    } else if (operation.kind === OPERATION_KIND.STATS) {
-      task = statsPrompt(run);
-    } else {
-      throw new Error(
-        `Cannot recover unsupported bridge operation kind: ${operation.kind}.`,
-      );
-    }
-    const model = bridgeModel(run.config, operation.kind);
-    return {
-      agent:
-        operation.kind === OPERATION_KIND.STATS
-          ? run.config.statsAgent
-          : operation.kind === OPERATION_KIND.REVIEW
-            ? run.config.reviewerAgent
-            : run.config.workerAgent,
-      ...(model ? { model } : {}),
-      task,
-      cwd: run.worktreeCwd,
-      context: "fresh",
-      turnBudget: {
-        maxTurns:
-          operation.kind === OPERATION_KIND.STATS
-            ? run.config.statsMaxTurns
-            : operation.kind === OPERATION_KIND.REVIEW
-              ? run.config.reviewerMaxTurns
-              : run.config.workerMaxTurns,
-      },
-      acceptance: false,
-      ...(operation.kind === OPERATION_KIND.FIX
-        ? { completionGuard: false }
-        : {}),
-    };
   }
 
   private async observePausedOperation(run: PlanExecRun): Promise<PlanExecRun> {
@@ -2299,4 +2251,32 @@ export function parseWorkerSignal(value: unknown): WorkerSignal | undefined {
     ...(steps.length > 0 ? { steps } : {}),
   };
   return Object.keys(signal).length > 0 ? signal : undefined;
+}
+
+/** Turn budget each launch path passes; fusion carries none of its own. */
+function operationMaxTurns(
+  config: FrozenRunConfig,
+  kind: OperationKind,
+): number {
+  if (kind === OPERATION_KIND.STATS) return config.statsMaxTurns;
+  if (kind === OPERATION_KIND.REVIEW) return config.reviewerMaxTurns;
+  return config.workerMaxTurns;
+}
+
+/**
+ * Bound an in-flight operation by its own stage's turn budget and report the
+ * breach; classification only, so nothing here fails or kills a run. An
+ * operation with no `launchStartedAt` — a record written before the field
+ * existed — cannot be bounded and is never reported as long-running.
+ */
+export function longRunningOperation(
+  run: PlanExecRun,
+  now = Date.now(),
+): { elapsedMs: number; boundMs: number; maxTurns: number } | undefined {
+  const operation = run.activeOperation;
+  if (!operation?.launchStartedAt) return undefined;
+  const maxTurns = operationMaxTurns(run.config, operation.kind);
+  const boundMs = maxTurns * OPERATION_TURN_ALLOWANCE_MS;
+  const elapsedMs = now - operation.launchStartedAt;
+  return elapsedMs > boundMs ? { elapsedMs, boundMs, maxTurns } : undefined;
 }

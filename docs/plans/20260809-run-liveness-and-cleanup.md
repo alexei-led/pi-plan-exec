@@ -319,6 +319,7 @@ say so in a code comment. Classify only; never auto-fail, never auto-kill.
   no signal at all. It now asserts the honest classification plus `doesNotMatch(/healthy/)`,
   and a second case with a trustworthy non-workflow activity value keeps the `healthy`
   branch covered, so the text is proven to discriminate rather than merely to be cautious
+
 ### Task 7: Long-running operation classification
 
 **Files:**
@@ -327,19 +328,33 @@ say so in a code comment. Classify only; never auto-fail, never auto-kill.
 - Modify: `src/index.ts`
 - Modify: `test/index.test.ts`
 
-- [ ] derive an operation deadline from the stage's own turn budget
+- [x] derive an operation deadline from the stage's own turn budget
       (`config.workerMaxTurns`, `config.reviewerMaxTurns`) times a per-turn allowance;
       add a code comment stating the allowance is a placeholder pending measurement
-- [ ] add a `long-running active operation` branch to `recoveryGuidance`
+- [x] add a `long-running active operation` branch to `recoveryGuidance`
       (`src/index.ts:396`) that fires when elapsed since `launchStartedAt` exceeds the
       deadline while the bridge still reports running
-- [ ] word the guidance to name the uncertainty rather than assert death, and to offer
+- [x] word the guidance to name the uncertainty rather than assert death, and to offer
       re-check and cancel while warning against starting a second run
-- [ ] classify only — no auto-fail, no auto-kill, no change to the polling loop
-- [ ] write a table-driven test over `(elapsed, activity signal present, bridge state)`
+- [x] classify only — no auto-fail, no auto-kill, no change to the polling loop
+- [x] write a table-driven test over `(elapsed, activity signal present, bridge state)`
       asserting a worker mid-model-call at nine minutes is never reported as dead; this
       is the regression test for the originally reported bug
-- [ ] run `npm run test:all` — must pass before task 8
+- [x] run `npm run test:all` — must pass before task 8
+- ➕ decision: the branch is gated on the absence of a trustworthy `activity` value and
+  sits after Task 6's `asyncDirMissing` check. Elapsed time is weaker evidence than
+  either, so it must not shadow a decisive one: a live worker with `active 12s ago` at
+  three hours still classifies `healthy`, and a gone async directory still classifies
+  gone. A test pins both
+- ➕ decision: the per-turn allowance is 2 minutes, giving 150m for a 75-turn worker and
+  60m for a 30-turn reviewer. `stats` uses `statsMaxTurns` and `fusion` falls through to
+  `workerMaxTurns`, mirroring what each launch path passes
+- ➕ decision: an operation with no `launchStartedAt` (a pre-upgrade record) cannot be
+  bounded and is never reported as long-running. Task 8 handles those runs by evidence
+  instead of by clock
+- ➕ deviation: deleted the dead private `reconstructBridgeParams` in `src/controller.ts`
+  — unreferenced, predates this branch, and `tsconfig` has no `noUnusedLocals` so `tsc`
+  never flagged it. Every helper it called retains other callers
 
 ### Task 8: ➕ Reconcile abandoned runs after a Pi restart
 

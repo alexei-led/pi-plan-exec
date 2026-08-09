@@ -25,6 +25,7 @@ import {
   parseSkipReason,
   resumeResultMessage,
   prioritizeRunCandidates,
+  recoveryGuidance,
   reviewedPlanHashForResume,
 } from "../src/index.js";
 import type { PlanExecRun } from "../src/types.js";
@@ -473,6 +474,118 @@ test("run status classifies recovery and gives one safe next action", () => {
   );
   assert.match(terminal, /recovery: terminal/);
   assert.match(terminal, /no recovery action/);
+});
+
+test("an overdue operation is classified without being called dead", () => {
+  const MINUTE_MS = 60_000;
+  // Test config: workerMaxTurns 50 => 100m bound, reviewerMaxTurns 30 => 60m.
+  const active = (
+    agoMinutes: number | undefined,
+    overrides: Partial<PlanExecRun["activeOperation"]> = {},
+    runOverrides: Partial<PlanExecRun> = {},
+  ): PlanExecRun =>
+    run({
+      status: "running",
+      activeOperation: {
+        operationId: "active-operation",
+        service: "bridge",
+        kind: "implementation",
+        taskId: 1,
+        externalRunId: "worker-run-1",
+        ...(agoMinutes === undefined
+          ? {}
+          : { launchStartedAt: Date.now() - agoMinutes * MINUTE_MS }),
+        ...overrides,
+      },
+      ...runOverrides,
+    });
+
+  const cases: [string, PlanExecRun, string][] = [
+    // The reported bug: a healthy worker mid-model-call at nine minutes.
+    [
+      "nine minutes, no signal",
+      active(9),
+      "active operation, worker liveness unverified",
+    ],
+    [
+      "nine minutes, workflow-mode signal with no activity",
+      active(9, { workerSignal: { mode: "workflow" } }),
+      "active operation, worker liveness unverified",
+    ],
+    [
+      "inside the worker bound, no signal",
+      active(99),
+      "active operation, worker liveness unverified",
+    ],
+    [
+      "past the worker bound, no signal",
+      active(101),
+      "long-running active operation",
+    ],
+    // Same elapsed time, different stage budget: the bound is derived, not flat.
+    [
+      "past the reviewer bound but inside the worker bound",
+      active(65),
+      "active operation, worker liveness unverified",
+    ],
+    [
+      "past the reviewer bound on a review operation",
+      active(65, { kind: "review" }),
+      "long-running active operation",
+    ],
+    // Fresh activity outranks the timer; the operation is provably alive.
+    [
+      "past the bound with a trustworthy activity value",
+      active(180, {
+        workerSignal: { mode: "chain", activity: "active 12s ago" },
+      }),
+      "healthy active operation",
+    ],
+    // Decisive death still wins over a mere bound breach.
+    [
+      "past the bound with the async directory gone",
+      active(180, { workerSignal: { asyncDirMissing: true } }),
+      "active operation directory is gone",
+    ],
+    [
+      "past the bound while observation is unavailable",
+      active(180, { statusFailures: 1 }),
+      "active operation observation unavailable",
+    ],
+    [
+      "past the bound while still starting",
+      active(180, {}, { status: "starting" }),
+      "long-running active operation",
+    ],
+    // A pre-upgrade record carries no launch time and cannot be bounded.
+    [
+      "no launch time recorded",
+      active(undefined),
+      "active operation, worker liveness unverified",
+    ],
+    // The bound only speaks while the bridge still reports the run in flight.
+    [
+      "past the bound on a failed run",
+      active(180, {}, { status: "failed", error: "worker crashed" }),
+      "preserved operation needs reconciliation",
+    ],
+  ];
+  for (const [name, candidate, classification] of cases)
+    assert.equal(
+      recoveryGuidance(candidate).classification,
+      classification,
+      name,
+    );
+
+  const overdue = formatRunStatus(active(180));
+  assert.match(overdue, /recovery: long-running active operation/);
+  assert.match(overdue, /past the 100m allowed for its 50-turn budget/);
+  // Names the uncertainty, offers both escapes, and forbids a second writer.
+  assert.match(overdue, /not proof the worker is stuck/);
+  assert.match(overdue, /\/exec status .* to re-check/);
+  assert.match(overdue, /\/exec cancel .* preserve the worktree/);
+  assert.match(overdue, /Do not resume or start a second run/);
+  assert.doesNotMatch(overdue, /healthy|dead|stalled/);
 });
 
 test("status guidance judges lease staleness the way claiming does", () => {

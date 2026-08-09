@@ -12,6 +12,7 @@ import {
   isExternalManualBlocker,
   isModelProviderFailure,
   isTaskRetryConfirmationRequired,
+  longRunningOperation,
   MAX_STATUS_FAILURES,
   PLAN_STRUCTURE_CHANGED_ERROR,
   PlanExecController,
@@ -466,6 +467,15 @@ export function recoveryGuidance(run: PlanExecRun): RecoveryGuidance {
         return {
           classification: "active operation directory is gone",
           action: `The operation's async directory no longer exists, so the worker is not running. Use /exec status ${run.id} to re-check; if it stays absent, /exec cancel ${run.id} stops the run and preserves the worktree. Do not start a second run.`,
+        };
+      // Elapsed time is weaker evidence than a fresh activity value, so the
+      // bound only speaks when nothing else does. It prompts a look; it never
+      // claims the worker is dead.
+      const overdue = signal?.activity ? undefined : longRunningOperation(run);
+      if (overdue)
+        return {
+          classification: "long-running active operation",
+          action: `The bridge still reports this operation running ${elapsedLabel(overdue.elapsedMs)} after launch, past the ${minutesLabel(overdue.boundMs)} allowed for its ${overdue.maxTurns}-turn budget, and no per-turn activity signal is available${signal?.mode === WORKFLOW_MODE ? " for a workflow-mode run" : ""}. That is not proof the worker is stuck. Use /exec status ${run.id} to re-check, or /exec cancel ${run.id} to stop it and preserve the worktree. Do not resume or start a second run.`,
         };
       if (!signal?.activity)
         return {
@@ -1483,6 +1493,11 @@ function elapsedLabel(milliseconds: number): string {
   const minutes = Math.floor(seconds / SECONDS_PER_MINUTE);
   if (minutes < MINUTES_PER_HOUR) return `${minutes}m`;
   return `${Math.floor(minutes / MINUTES_PER_HOUR)}h`;
+}
+
+/** Minute precision, so a derived bound is never rounded down to a lie. */
+function minutesLabel(milliseconds: number): string {
+  return `${Math.round(milliseconds / (MILLISECONDS_PER_SECOND * SECONDS_PER_MINUTE))}m`;
 }
 
 function relativeTime(timestamp: number): string {
