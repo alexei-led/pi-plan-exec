@@ -1363,10 +1363,8 @@ export class PlanExecController {
             commit.stderr.trim() || "Could not commit archived plan.",
           );
       }
-      // The plan has already been renamed and committed by now, and several
-      // awaits stand between this write and the record it was computed from.
-      // A concurrent claim must not silently discard the terminal status: the
-      // rename cannot be replayed, so the write is re-applied on top instead.
+      // The plan is already renamed and committed, and that cannot be replayed,
+      // so the terminal status must not be lost to a concurrent claim.
       const completed = await this.registry.updateLatest(run.id, (current) => ({
         ...current,
         status,
@@ -1385,8 +1383,7 @@ export class PlanExecController {
   private async complete(run: PlanExecRun): Promise<PlanExecRun> {
     const status = completionStatus(run);
     // Merged onto the stored record, not onto `run`: the terminal status is the
-    // only thing this step decides, and anything else it changed in memory
-    // would be dropped here rather than fight a concurrent writer.
+    // only thing this step decides.
     const completed = await this.registry.updateLatest(run.id, (current) => ({
       ...current,
       status,
@@ -2192,14 +2189,12 @@ const WORKER_SIGNAL_STEP_LINE =
 const MAX_WORKER_SIGNAL_STEPS = 5;
 
 /**
- * Digest the provider status blob. Every line is optional and the format is
- * upstream's, so nothing here may throw: a status text that cannot be read
- * yields no signal rather than a failed run.
+ * Digest the provider status blob. The format is upstream's, so nothing here
+ * may throw: unreadable status text yields no signal, not a failed run.
  *
- * Nothing about the operation's own liveness is persisted here. Whether its
- * directory still exists is stamped by whichever session happens to be
- * polling, so it freezes the moment that session dies — exactly when the
- * answer matters. The read surface stats it live instead.
+ * No liveness fact is persisted. Anything stamped by the polling session
+ * freezes when that session dies, which is exactly when it matters; the read
+ * surface measures liveness live instead.
  */
 export function parseWorkerSignal(value: unknown): WorkerSignal | undefined {
   const blob = text(value);
@@ -2216,8 +2211,7 @@ export function parseWorkerSignal(value: unknown): WorkerSignal | undefined {
   const mode = field("Mode");
   const workflow = mode === WORKFLOW_MODE;
   // Workflow-mode step lines carry the same launch-anchored activity fragment
-  // as the top-level `Activity:` line, so they are dropped whole rather than
-  // edited — surfacing either would restore the false signal.
+  // as `Activity:`, so they are dropped whole rather than edited.
   const steps = workflow
     ? []
     : lines

@@ -11,13 +11,10 @@ import {
 } from "./types.js";
 
 /**
- * Wall-clock allowance per turn, used to bound an operation against the turn
- * budget its own stage was launched with instead of one flat number for every
- * stage. PLACEHOLDER pending measurement across real runs: the only data point
- * today is a single ~6-minute implementation task, so this is deliberately
- * generous — a false "long-running" banner on a healthy worker recreates the
- * non-discriminating guidance the bound exists to remove. Tighten it once a
- * real per-turn activity signal exists (nicobailon/pi-subagents#920).
+ * Wall-clock allowance per turn, so each stage is bounded by its own turn
+ * budget. PLACEHOLDER, deliberately generous: a false "long-running" banner on
+ * a healthy worker is worse than a late one. Tighten it once a real per-turn
+ * activity signal exists (nicobailon/pi-subagents#920).
  */
 const OPERATION_TURN_ALLOWANCE_MS = 120_000;
 
@@ -123,10 +120,9 @@ function operationMaxTurns(
 }
 
 /**
- * Bound an in-flight operation by its own stage's turn budget and report the
- * breach; classification only, so nothing here fails or kills a run. An
- * operation with no `launchStartedAt` — a record written before the field
- * existed — cannot be bounded and is never reported as long-running.
+ * Report an operation past its stage's turn budget. Classification only:
+ * nothing here fails or kills a run. An operation with no `launchStartedAt`
+ * predates the field, cannot be bounded, and is never reported.
  */
 export function longRunningOperation(
   run: PlanExecRun,
@@ -159,11 +155,10 @@ export interface AbandonmentEvidence {
 
 /**
  * `abandoned` is the full conjunction: an in-flight claim, a dead lease, and a
- * tracked operation provably gone. Anything short of that is `ambiguous` — it
- * is reported and never reset, because resetting a run whose worker is alive
- * can double-write a worktree, which is worse than the stall. Pure by
- * construction: the caller gathers the evidence, so the rule stays testable,
- * and it is the single answer both the sweep and the detail view read.
+ * tracked operation provably gone. Anything short of that is `ambiguous`,
+ * reported and never reset — resetting a run whose worker is alive can
+ * double-write a worktree, which is worse than the stall. The sweep, the resume
+ * gate, and the detail view all read this one answer.
  */
 export function classifyAbandonment(
   run: PlanExecRun,

@@ -39,29 +39,13 @@ type RunLease = NonNullable<PlanExecRun["lease"]>;
 
 /**
  * Whether the name frozen on a lease is this machine. The whole name decides,
- * case-folded — never its first label, because two machines can share one:
- * `build.a.corp.example` and `build.b.corp.example` are different hosts, and a
- * registry on a shared or NFS home shows both. Matching on the label alone made
- * one read as this host, so a foreign pid was checked in the wrong namespace
- * and a foreign directory was stat-ed here — declaring a live remote worker
- * abandoned and resetting the run under it.
+ * never its first label: a shared or NFS home shows `build.a.corp.example` and
+ * `build.b.corp.example`, which are different hosts.
  *
- * Two properties hold at once, and this comparison is what holds them:
- *
- * - Nothing measured here ever speaks for another machine. A name that is not
- *   exactly ours is foreign, so `isLeaseLive` falls back to the heartbeat,
- *   erring toward live, and `isLocalRun` is false, so `abandonmentProbe`
- *   gathers no evidence at all. Such a run can end AMBIGUOUS; it can never end
- *   ABANDONED on local evidence, so a second writer is never launched.
- * - A renamed machine is never stuck. `foo.local` becoming `foo.lan` also reads
- *   as foreign, so it ends AMBIGUOUS too — with guidance that names
- *   `/exec resume <id> --same-machine`. That flag (`asLocalRun` below) supplies
- *   the one fact no probe can derive, and everything downstream then observes
- *   normally. It asserts a machine, never a verdict, so a worker still writing
- *   here keeps the run ambiguous and resume still refuses.
- *
- * The guess is handed to the operator on purpose: guessing "same machine" costs
- * two workers in one worktree, while guessing "other machine" costs one flag.
+ * A name that is not exactly ours is foreign, so nothing measured here speaks
+ * for it: such a run can reach AMBIGUOUS but never ABANDONED, and no second
+ * worker is launched. A renamed machine is foreign too, and not stuck —
+ * guidance names `/exec resume <id> --same-machine`.
  */
 function isThisHost(name: string): boolean {
   return name.toLowerCase() === hostname().toLowerCase();
@@ -70,9 +54,8 @@ function isThisHost(name: string): boolean {
 /**
  * A stored lease is a claim, not evidence. It is live only when the caller owns
  * it, or its heartbeat is fresh and — on this host, where the pid means
- * something — the process still exists. A lease with no hostname was written
- * before the field existed, so its pid is not ours to check: the heartbeat
- * threshold is then the only evidence available.
+ * something — the process still exists. A lease with no hostname predates the
+ * field, so its pid is not ours to check: the heartbeat is the only evidence.
  */
 export function isLeaseLive(lease: RunLease, sessionId?: string): boolean {
   if (sessionId !== undefined && lease.sessionId === sessionId) return true;
@@ -83,10 +66,9 @@ export function isLeaseLive(lease: RunLease, sessionId?: string): boolean {
 
 /**
  * Whether anything observed on this machine can speak for this run. A lease
- * naming another host makes every local check meaningless — that directory and
- * that bridge belong to a different machine — on the same reasoning
- * `isLeaseLive` already applies to `lease.pid`. A lease with no hostname was
- * written before the field existed and is treated as local, as it always was.
+ * naming another host makes every local check meaningless: that directory and
+ * that bridge belong to a different machine. A lease with no hostname predates
+ * the field and stays local, as it always was.
  */
 export function isLocalRun(run: PlanExecRun): boolean {
   const host = run.lease?.hostname;
@@ -94,13 +76,10 @@ export function isLocalRun(run: PlanExecRun): boolean {
 }
 
 /**
- * The run with the host on its lease read as this machine. Any rename at all —
- * `foo.local` to `foo.lan`, or a DHCP-assigned corporate name — otherwise
- * leaves the run undiagnosable here forever, and no probe can tell that apart
- * from a genuinely foreign host. `/exec resume --same-machine` lets the operator
- * supply that one fact; everything downstream then gathers evidence normally.
- * It asserts a machine, never a verdict: a worker still writing here keeps the
- * run ambiguous and resume still refuses.
+ * The run with the host on its lease read as this machine. Backs
+ * `/exec resume --same-machine`: no probe can tell a renamed machine from a
+ * foreign one, so the operator supplies that fact. It asserts a machine, never
+ * a verdict — a worker still writing here keeps the run ambiguous.
  */
 export function asLocalRun(run: PlanExecRun): PlanExecRun {
   return run.lease
@@ -110,11 +89,9 @@ export function asLocalRun(run: PlanExecRun): PlanExecRun {
 
 /**
  * Why this session cannot take this run's lease, or undefined when it can.
- * `claim` raises it, and the worktree handoff asks it first: the handoff
- * releases the lease before re-claiming it for the forked session, and
- * `release` deletes whatever is there. Without this the delete walks straight
- * past the refusal `claim` would have raised, and a run held by a live session
- * — on this machine or another — gets a second writer in its worktree.
+ * `claim` raises it, and the worktree handoff must ask it first: that handoff
+ * releases before re-claiming, and `release` deletes whatever is there, so the
+ * refusal `claim` would have raised comes too late.
  */
 export function takeoverRefusal(
   run: PlanExecRun,
@@ -220,11 +197,9 @@ export class RunRegistry {
 
   /**
    * Optimistic write: it lands only if nothing else wrote first, and otherwise
-   * returns the record that did. Callers that continue from the return value
-   * inherit the newer state, which is why several of them compare it against
-   * what they meant to write. A write that must not be lost — a terminal
-   * status, a retirement stamp — belongs in `updateLatest` instead, because
-   * this one drops it silently.
+   * returns the record that did. A write that must not be lost — a terminal
+   * status, a retirement stamp — belongs in `updateLatest`: this one drops it
+   * silently.
    */
   async update(run: PlanExecRun): Promise<PlanExecRun> {
     return (await this.updateIfCurrent(run, run.updatedAt)).run;
@@ -232,9 +207,8 @@ export class RunRegistry {
 
   /**
    * Apply a change that must not be lost, re-reading and re-applying on top of
-   * whoever landed first. `update` refuses a stale write; a terminal status and
-   * its retirement stamp cannot simply be dropped, because the work they record
-   * has already happened on disk.
+   * whoever landed first. Use it when the work the write records has already
+   * happened on disk, so dropping the write would falsify the record.
    */
   async updateLatest(
     runId: string,
@@ -338,7 +312,7 @@ export class RunRegistry {
     const heartbeat = await this.updateIfCurrent(
       {
         ...run,
-        // claim is the only writer of lease identity; a heartbeat that stamped
+        // Timestamp only. claim is the sole writer of lease identity: stamping
         // this host over another session's pid would make an unrelated local
         // process read as the live owner.
         lease: { ...run.lease, heartbeatAt: Date.now() },
@@ -349,18 +323,14 @@ export class RunRegistry {
   }
 
   /**
-   * Retire a run from the registry. Only the registry entry is deleted: the
-   * worktree, its branch, and the progress file are left in place. A record
-   * that cannot be parsed is removable as-is: `list` already drops it, so
-   * refusing here would leave it on disk with nothing able to clean it up.
+   * Delete the registry entry only; the worktree, branch, and progress file
+   * stay. An unparsable record is removable as-is, because `list` already drops
+   * it and nothing else could clean it up. Returns false for a record already
+   * gone, so it is not counted as a removal.
    *
-   * The refusal is decided under the same lock as the deletion. Reading first
-   * and locking afterwards would let a concurrent `claim` revive the run —
-   * relaunching a worker — in the window between, and this is the one
-   * irreversible path in the store.
-   *
-   * Returns whether a record was actually deleted; a record already gone is
-   * not an error, and must not be counted as a removal either.
+   * The refusal is decided under the same lock as the deletion: reading first
+   * would let a concurrent `claim` revive the run in the window between, and
+   * this is the one irreversible path in the store.
    */
   async remove(runId: string): Promise<boolean> {
     assertRunId(runId);

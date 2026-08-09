@@ -79,10 +79,7 @@ const CLEANUP_STATUSES = new Set<PlanExecRun["status"]>([
   RUN_STATUS.CANCELLED,
 ]);
 const RUNS_ALL_OPTION = "--all";
-/**
- * A retired verb keeps working and says so once. The record is keyed by
- * `ExecAliasAction`, so retiring another name forces a note with it.
- */
+/** Keyed by `ExecAliasAction`, so retiring another name forces a note with it. */
 const ALIAS_NOTES: Record<ExecAliasAction, string> = {
   [EXEC_ACTION.RUNS]:
     "/exec runs is now /exec status; the old name still works.",
@@ -99,10 +96,7 @@ const ALIAS_NOTES: Record<ExecAliasAction, string> = {
 };
 /** Every run verb the action dispatch owns; `status` is read and answered earlier. */
 type DispatchedAction = Exclude<RunAction, typeof EXEC_ACTION.STATUS>;
-/**
- * Exhaustive by type, not by hand: a verb added to `EXEC_ACTION` widens
- * `RunAction`, and this record then fails to compile until it is routed.
- */
+/** A verb added to `EXEC_ACTION` fails to compile here until it is routed. */
 const RUN_ACTIONS: Record<DispatchedAction, true> = {
   [EXEC_ACTION.STOP]: true,
   [EXEC_ACTION.PAUSE]: true,
@@ -110,11 +104,7 @@ const RUN_ACTIONS: Record<DispatchedAction, true> = {
   [EXEC_ACTION.SKIP]: true,
   [EXEC_ACTION.CANCEL]: true,
 };
-/**
- * The two outcomes of stopping, worded so the difference that matters —
- * reversibility — is read at the moment the choice is made instead of being
- * encoded in two verb names the reader has to know in advance.
- */
+/** Labels lead with reversibility: it is the difference the reader chooses on. */
 const STOP_OUTCOMES = [
   {
     action: EXEC_ACTION.PAUSE,
@@ -146,10 +136,7 @@ const SETUP_COMMANDS = [
   "pi install npm:@alexeiled/pi-plan-exec",
 ];
 
-/**
- * Autocomplete offers the primary verbs only. A retired name still dispatches,
- * so a scripted caller keeps working; completing it would teach it back.
- */
+/** Primary verbs only: a retired name still dispatches, but is never taught. */
 const EXEC_COMMANDS: AutocompleteItem[] = [
   {
     value: EXEC_ACTION.HELP,
@@ -235,9 +222,8 @@ export default function planExecExtension(pi: ExtensionAPI): void {
     },
   );
 
-  // A diagnosis must never hang: /exec doctor is the first step after a restart,
-  // which is exactly when the bridge may not be up yet. It gets the same short
-  // budget as the runtime probe, and no answer is simply no evidence.
+  // Bounded: a diagnosis runs right after a restart, when the bridge may not be
+  // up yet. No answer within the budget is simply no evidence.
   const doctorProbe = abandonmentProbe(async (operationId) => {
     const lookup = await new BridgeClient(
       pi.events,
@@ -436,14 +422,13 @@ export default function planExecExtension(pi: ExtensionAPI): void {
         startBackgroundController(run, sessionId, ctx.cwd, ctx);
       }
     }
-    // Read-only on purpose: startup reports what it found and points at the
-    // command that can act, and never writes. A diagnosis failure is advisory,
-    // so it must not take the session down with it.
+    // Advisory only: startup never writes, and a failed diagnosis must not take
+    // the session down with it.
     try {
       const notice = abandonedRunsNotice(await sweepAbandonment(registry));
       if (notice) notify(ctx, notice, "warning");
     } catch {
-      // Startup diagnosis is advisory; the registry stays authoritative.
+      // The registry stays authoritative.
     }
   });
 
@@ -496,10 +481,9 @@ type RecoveryGuidance = {
 };
 
 /**
- * The one next action for a run, keyed on live evidence when the caller
- * gathered any. Without evidence nothing can be proven gone, so the guidance
- * says so rather than guessing: a persisted claim is never read as proof in
- * either direction.
+ * The one next action for a run. Branch order matters throughout: each branch
+ * assumes the ones above it did not fire. Without evidence nothing is proven
+ * gone, and a persisted claim is never read as proof in either direction.
  */
 export function recoveryGuidance(
   run: PlanExecRun,
@@ -510,10 +494,9 @@ export function recoveryGuidance(
       classification: "finished",
       action: `This run is over and there is nothing to recover. Run /exec cleanup once you no longer need its record.`,
     };
-  // Only when nothing is tracked: a dead owner holding an unresolved operation
-  // is answered by the operation branches below, which know whether that
-  // operation is gone. Naming a takeover here would recommend a resume the
-  // recovery gate then refuses.
+  // Only when nothing is tracked. With an unresolved operation this would
+  // recommend a takeover the recovery gate then refuses; the operation branches
+  // below answer that case instead.
   if (
     isStaleOwner(run) &&
     run.status !== RUN_STATUS.FAILED &&
@@ -534,12 +517,8 @@ export function recoveryGuidance(
       classification: "the plan file changed shape since this run started",
       action: `Put the original headings and checkboxes back, or run interactive /exec resume ${run.id} to accept the plan as it now reads. If the first resume only records this pause, run it once more after you have read the plan.`,
     };
-  // Ahead of every branch that tells the reader to wait. Each of those waits —
-  // for a waiver to land, for a stop to arrive, for a provider to answer, for
-  // the poll loop to tick — needs something still running, so once the probe
-  // has proven the worker gone they are all false. The sweep and the resume
-  // gate read this same verdict, so anything below this line could only
-  // contradict them.
+  // Ahead of every branch that tells the reader to wait: each such wait needs
+  // something still running, so a proven-gone worker falsifies them all.
   if (evidence && classifyAbandonment(run, evidence) === ABANDONMENT.ABANDONED)
     return abandonedGuidance(run, evidence);
   if (run.status === RUN_STATUS.SKIP_PENDING)
@@ -552,13 +531,9 @@ export function recoveryGuidance(
       classification: "waiting for the stop you asked for",
       action: `Run /exec status ${run.id} until it reads cancelled or failed. If the stop itself failed, /exec resume ${run.id} retries only the stop and cannot start plan work.`,
     };
-  // Ahead of every other unknown, because it is the one that blocks all of
-  // them: a lease frozen with a name this machine no longer answers to makes
-  // the directory stat and the bridge lookup describe the wrong machine, so
-  // nothing local can ever settle this run. Only the operator knows whether
-  // that name was this machine, so naming the override is the sole action that
-  // can move it. The run with nothing tracked is left to the takeover branch
-  // above, which already recovers it without an override.
+  // Ahead of every other unknown: no local probe can settle a run whose lease
+  // names another machine, so the operator's override is the only action left.
+  // A run with nothing tracked belongs to the takeover branch above.
   if (leaseNamesAnotherHost(run) && run.activeOperation)
     return {
       classification: "its lease names a machine that is not this one",
@@ -575,16 +550,13 @@ export function recoveryGuidance(
         classification: "cannot check on the worker right now",
         action: `The provider could not be reached, so nothing here can see what the worker is doing. Repair the provider and polling picks up on its own, then run /exec status ${run.id} to re-check. Do not start another worker while this one's outcome is unknown.`,
       };
-    // A stored `running` claim is not evidence. Only a trustworthy activity
-    // signal earns a word that says the worker is alive; anything else says so
-    // in words, because absence of signal read as health is the bug this branch
-    // exists to fix.
+    // A stored `running` claim is not evidence: only a trustworthy activity
+    // signal earns wording that says the worker is alive.
     if (run.activeOperation) {
       const signal = run.activeOperation.workerSignal;
       const activity = reportedActivity(run.activeOperation);
       // Elapsed time is weaker evidence than a fresh activity value, so the
-      // bound only speaks when nothing else does. It prompts a look; it never
-      // claims the worker is dead.
+      // bound only speaks when nothing else does.
       const overdue = activity ? undefined : longRunningOperation(run);
       if (overdue)
         return {
@@ -594,9 +566,8 @@ export function recoveryGuidance(
       if (!activity)
         return {
           classification: "running, but nothing proves the worker is alive",
-          // `/exec stop` is named because the wait can be unbounded: when the
-          // lease behind this run is dead, nothing is polling the worker, so
-          // re-checking alone would never settle it.
+          // `/exec stop` is offered because the wait can be unbounded: with a
+          // dead lease nothing polls, so re-checking alone never settles it.
           action: `Wait and use /exec status ${run.id} to re-check; nothing reports what this worker is doing${signal?.mode === WORKFLOW_MODE ? " for a workflow-mode run" : ""}, so it is neither confirmed alive nor confirmed dead. Run /exec stop ${run.id} to end it and preserve the worktree rather than wait. Do not resume or start another run.`,
         };
       return {
@@ -645,11 +616,9 @@ export function recoveryGuidance(
 }
 
 /**
- * The one shape the evidence settled: nothing is running. The command named
- * here is the command the sweep prints for the same run — `recoveryCommand`
- * makes the same split on the same status — so the two views can never send a
- * reader to different places. A run already told to stop is not reset by the
- * gate, so it is told to finish the stop rather than to resume.
+ * The one shape the evidence settled: nothing is running. Splits on status the
+ * same way `recoveryCommand` does, so the sweep and this view cannot name
+ * different commands for the same run.
  */
 function abandonedGuidance(
   run: PlanExecRun,
@@ -674,9 +643,8 @@ function abandonedGuidance(
 
 /**
  * Why `--same-machine` does not apply to this run, or undefined when it does.
- * Scoped to the one thing the flag asserts so it can never widen into a general
- * force: a run this machine can already observe has no frozen host to correct,
- * and saying so beats accepting a flag that would change nothing.
+ * Refusing where the flag would change nothing keeps it from widening into a
+ * general force.
  */
 export function sameMachineRefusal(run: PlanExecRun): string | undefined {
   return isLocalRun(run)
@@ -690,9 +658,10 @@ function leaseNamesAnotherHost(run: PlanExecRun): boolean {
 }
 
 function isStaleOwner(run: PlanExecRun): boolean {
-  // No session argument: status guidance describes the lease from the outside,
-  // so ownership is never assumed. The predicate is otherwise the one `claim`
-  // uses, so guidance and claiming cannot disagree.
+  // No session argument, here or in any caller that judges liveness: passing
+  // one makes `isLeaseLive` answer LIVE on a name match whatever the heartbeat
+  // says, so a session would read its own dead lease as live and disagree with
+  // the sweep. The predicate is otherwise `claim`'s, so the two cannot drift.
   return Boolean(run.lease && !isLeaseLive(run.lease));
 }
 
@@ -701,10 +670,9 @@ function hasExecutionBranchMismatch(run: PlanExecRun): boolean {
 }
 
 /**
- * A stored activity value is only current while something is polling it. The
- * digest is stamped by the owning session's poll loop, so once that session is
- * gone it freezes and would read as health forever. The lease's own staleness
- * bound already decides whether anyone is watching, so it decides this too.
+ * A stored activity value freezes when the polling session dies and would read
+ * as health forever. Bounded by the lease staleness threshold, which already
+ * decides whether anyone is watching.
  */
 function reportedActivity(
   operation: ActiveOperation | undefined,
@@ -762,11 +730,8 @@ export function formatRunStatus(
       `last observation: ${new Date(operation.lastObservedAt).toISOString()}`,
     );
   lines.push(...workerSignalLines(run, evidence));
-  // Retrying and polling are things a session does, and only the session
-  // holding a live lease does them. The counts below are stored facts and are
-  // reported either way; the claim that something is still trying is added only
-  // where a live lease was actually observed. Without evidence nothing is
-  // claimed in either direction.
+  // The failure counts below are stored facts and print either way. Only an
+  // observed live lease adds the claim that something is still trying.
   const polling = evidence?.leaseLive === true ? "; retrying" : "";
   if (operation?.statusFailures) {
     lines.push(
@@ -803,8 +768,8 @@ export function formatRunStatus(
   }
   const guidance = recoveryGuidance(run, evidence);
   lines.push(`recovery: ${guidance.classification}`);
-  // States the fact only. What to do about a dead owner is the next safe
-  // action below, which knows whether the operation it left behind is gone.
+  // The fact only. What to do about it is the next safe action below, which
+  // knows whether the operation the dead owner left behind is gone.
   if (isStaleOwner(run))
     lines.push(
       `owner: stale lease for ${run.lease?.sessionId ?? "unknown session"}; that Pi session is no longer running.`,
@@ -814,10 +779,9 @@ export function formatRunStatus(
 }
 
 /**
- * Report what the provider actually said about the worker. Nothing here may
- * read as health on its own: with no trustworthy activity value the line
- * states the absence instead of staying silent, and a value nothing has
- * refreshed since the owner died is not a trustworthy value.
+ * Report what the provider actually said about the worker. Silence must never
+ * be read as health, so with no trustworthy activity value the line states the
+ * absence rather than printing nothing.
  */
 function workerSignalLines(
   run: PlanExecRun,
@@ -849,8 +813,8 @@ function workerSignalLines(
 
 /**
  * Rows for the runs that claim nothing in flight, grouped by what they need.
- * A terminal run stops being news once it is a day old, so hidden rows are
- * counted in a footer rather than dropped silently.
+ * Terminal runs older than a day are hidden, but counted in a footer rather
+ * than dropped silently.
  */
 export function settledRunLines(
   runs: PlanExecRun[],
@@ -897,15 +861,13 @@ function sectionLines(
 
 /**
  * A blocked review, finalize, or stats stage moves only by waiver, so the row
- * that reports it spells the waiver out with the run ID already filled in.
- * `skip` keeps its full ID, its mandatory reason, and its confirm: still hard
- * to run by accident, now easy to run on purpose.
+ * spells the waiver out with the run ID filled in.
  */
 function stageWaiverLines(run: PlanExecRun): string[] {
   if (!isStageWaiverAvailable(run)) return [];
   return [
-    // Unquoted, like every other usage string here: `parseSkipReason` joins the
-    // remaining tokens verbatim, so pasted quotes end up inside the waiver.
+    // Unquoted: `parseSkipReason` joins the remaining tokens verbatim, so
+    // pasted quotes end up inside the waiver.
     `  If ${run.stage} cannot pass, waive it: /exec skip ${run.id} --reason <why the residual risk is accepted>`,
   ];
 }
@@ -951,11 +913,7 @@ export function parseStatusArguments(args: string[]): {
   return { selector, all };
 }
 
-/**
- * The retired listing verb takes the same zoom flag and never took a run ID,
- * so it reuses the one status parser rather than keeping a second one that
- * could accept a different set.
- */
+/** Reuses the status parser: the retired verb must accept no wider a set. */
 function parseRunsArguments(args: string[]): boolean {
   const { selector, all } = parseStatusArguments(args);
   if (selector) throw new Error(`Usage: /exec runs [${RUNS_ALL_OPTION}]`);
@@ -984,11 +942,9 @@ export function parseCleanupArguments(args: string[]): {
 
 /**
  * Removable = retired past the retention window with nothing alive holding it.
- * `failed` is excluded by default: /exec resume is the documented recovery path
- * for a failed run, and its registry entry is what makes that path possible.
- *
- * The window is measured from when the run finished, not from its last write:
- * releasing a lease bumps `updatedAt` and would otherwise restart the clock.
+ * `failed` is excluded by default: its registry entry is what makes /exec
+ * resume possible. The window runs from `retiredAt`, because releasing a lease
+ * bumps `updatedAt` and would restart the clock.
  */
 export function isRemovableRun(
   run: PlanExecRun,
@@ -1014,8 +970,8 @@ export async function execCleanup(
     );
     if (unreadable) return cleanupUnreadable(registry, unreadable, apply);
   }
-  // Naming a run is the override: it says which record to drop, so neither the
-  // retention window nor the failed exclusion applies and neither is mentioned.
+  // Naming a run overrides both the retention window and the failed exclusion,
+  // so mentioning either would describe a filter that is not applied.
   const failedHint =
     includeFailed || runId
       ? []
@@ -1054,10 +1010,9 @@ function cleanupRow(run: PlanExecRun): string {
 }
 
 /**
- * Removal is per run and each one can still be refused — the targets were
- * snapshotted from a listing, and the registry re-checks under its lock. One
- * refusal must not hide the removals that already happened, so every outcome
- * is collected and reported instead of thrown from the middle of the loop.
+ * The registry re-checks each target under its lock, so any one can still be
+ * refused. Outcomes are collected rather than thrown, so one refusal cannot
+ * hide the removals that already happened.
  */
 interface RemovalOutcome {
   run: PlanExecRun;
@@ -1109,10 +1064,7 @@ function removalReport(outcomes: RemovalOutcome[]): string {
   ].join("\n");
 }
 
-/**
- * A record the registry cannot parse has nothing left to protect: `list` drops
- * it, so removal is the only action that applies to it.
- */
+/** `list` drops an unparsable record, so removal is the only action left. */
 async function cleanupUnreadable(
   registry: RunRegistry,
   unreadable: { runId: string; message: string },
@@ -1166,14 +1118,10 @@ export interface AbandonmentSweep {
 }
 
 /**
- * Filesystem evidence always; the bridge is asked only when a lookup is wired
- * in and the cheap check was not already decisive. Both are read-only, and a
- * lookup that cannot answer yields no evidence rather than a false verdict.
- *
- * A run whose lease names another host yields no evidence at all. Its worker
- * writes to that machine's disk and registers with that machine's bridge, so
- * an absence measured here would be an absence of the wrong thing — and the
- * verdict it produces launches a second worker over a live one.
+ * Filesystem evidence always; the bridge only when a lookup is wired in and the
+ * cheap check was not decisive. A lookup that cannot answer yields no evidence
+ * rather than a false verdict, and a run whose lease names another host yields
+ * none at all — see `isLocalRun`.
  */
 export function abandonmentProbe(
   lookupOperationState?: (operationId: string) => Promise<string | undefined>,
@@ -1199,27 +1147,20 @@ export function abandonmentProbe(
 }
 
 /**
- * Everything known about one run's claim, gathered live. Every caller that
- * judges liveness — the sweep, the resume gate, and the detail view — goes
- * through here, so no two of them can answer the same question differently.
- * A live lease is decisive on its own, so nothing else is probed for it.
+ * Everything known about one run's claim, gathered live. The sweep, the resume
+ * gate, and the detail view all come through here, so none can answer
+ * differently. A live lease is decisive, so nothing else is probed for it.
+ * Takes no session, for the reason `isStaleOwner` gives.
  */
 export async function runEvidence(
   run: PlanExecRun,
   probe: EvidenceProbe = abandonmentProbe(),
 ): Promise<AbandonmentEvidence> {
-  // No session argument, for any caller: `isLeaseLive` answers LIVE on a name
-  // match whatever the heartbeat says, so a caller that named itself would see
-  // a live worker where the sweep and the detail view see a dead one, and walk
-  // past the gate that sent it here.
   const leaseLive = Boolean(run.lease && isLeaseLive(run.lease));
   return leaseLive ? { leaseLive } : { leaseLive, ...(await probe(run)) };
 }
 
-/**
- * Diagnose every run that claims work in flight. Read-only by construction: it
- * observes and classifies and writes nothing, so extension startup can call it.
- */
+/** Diagnose every run that claims work in flight. Writes nothing, so startup can call it. */
 export async function sweepAbandonment(
   registry: RunRegistry,
   probe: EvidenceProbe = abandonmentProbe(),
@@ -1267,11 +1208,9 @@ export interface StatusOptions {
 }
 
 /**
- * The whole read surface, with its registry injected so no caller can reach
- * the real one by accident. Nothing reachable from here writes. It returns
- * undefined when the subcommand is not a read command, when `status` named a
- * run the caller must resolve against its own session, and for the one retired
- * flag that writes, which the write dispatch owns.
+ * The whole read surface; nothing reachable from here writes. Returns undefined
+ * for a non-read subcommand, for a `status` naming a run the caller must
+ * resolve itself, and for the one retired flag that writes.
  */
 export async function execRead(
   registry: RunRegistry,
@@ -1324,10 +1263,9 @@ async function statusOptions(
 }
 
 /**
- * One read for "what is going on": every run, grouped by what it needs, each
- * row ending in a single next command. Listing, diagnosis, and the missing
- * package report are the same question at different zoom levels, so they are
- * one answer; `--all` is the zoom control.
+ * Every run, grouped by what it needs, each row ending in a single next
+ * command. Listing, diagnosis, and the missing-package report are one answer;
+ * `--all` is the zoom control.
  */
 export async function execStatus(
   registry: RunRegistry,
@@ -1394,10 +1332,8 @@ function unreadableLines(
 }
 
 /**
- * What the abandoned group promises, worded for the rows it actually holds.
- * `reconcileRun` refuses every run already told to stop, so a footer saying
- * each one resets is false for a group made only of those, and half true for a
- * mixed one. Undefined leaves the rows to speak for themselves.
+ * Worded for the rows the group actually holds. `reconcileRun` refuses every
+ * run already told to stop, so promising that each one resets would be false.
  */
 function abandonedFooter(diagnoses: RunDiagnosis[]): string | undefined {
   const resettable = diagnoses.filter(
@@ -1422,10 +1358,9 @@ function diagnosisGroup(
 const RECONCILE_ALIAS_NOTE = `/exec doctor ${DOCTOR_RECONCILE_OPTION} still works for scripted callers; /exec resume <run-id> resets one named run instead, and /exec status reports the same diagnosis without writing.`;
 
 /**
- * The registry-wide write behind the retired `/exec doctor --reconcile`. It is
- * dispatched as a write command, never from the read surface: it resets every
- * provably abandoned run in the registry, which is a wider blast radius than
- * /exec cleanup, and that one demands `--apply`.
+ * The registry-wide write behind the retired `/exec doctor --reconcile`. It
+ * resets every provably abandoned run — a wider blast radius than /exec
+ * cleanup, which demands `--apply` — so only the write dispatch reaches it.
  */
 export async function execReconcile(
   registry: RunRegistry,
@@ -1526,23 +1461,17 @@ type ReconcileOutcome =
   | { run?: undefined; skipped: ReconcileSkip };
 
 /**
- * Convert decisive evidence into the recoverable failure that /exec resume
- * already knows how to handle, and stop there. Compare-and-swap on the scanned
- * `updatedAt`, with no retry: a run reclaimed between the scan and this write
- * is skipped, never overwritten. `taskAttempts` is untouched because the worker
- * never ran, so the operator must not lose an attempt.
- *
- * Every reconcile goes through this one writer, so the exclusions cannot drift
- * between the callers that reach it.
+ * The single writer behind every reconcile, so its exclusions cannot drift.
+ * Compare-and-swap on the scanned `updatedAt` with no retry: a run reclaimed
+ * since the scan is skipped. `taskAttempts` is untouched; the worker never ran.
  */
 async function reconcileRun(
   registry: RunRegistry,
   diagnosis: RunDiagnosis,
   actor = `/exec ${EXEC_ACTION.DOCTOR}`,
 ): Promise<ReconcileOutcome> {
-  // A cancel-pending run carries the stop the operator already asked for.
-  // Resetting it to failed would erase that request, and the next resume
-  // would restart plan work instead of finishing the cancellation.
+  // Resetting a cancel-pending run to failed would erase the stop it carries,
+  // and the next resume would restart plan work instead of finishing it.
   if (isRecoverableRun(diagnosis.run))
     return { skipped: RECONCILE_SKIP.STOP_REQUESTED };
   const reason = reconcileReason(diagnosis, actor);
@@ -1564,15 +1493,16 @@ async function reconcileRun(
       `${reason} The task attempt counter was left unchanged.`,
     );
   } catch {
-    // An abandoned run often outlived its worktree; the registry entry is the record.
+    // An abandoned run often outlived its worktree; the registry entry is the
+    // record.
   }
   return { run: reconciled.run };
 }
 
 /**
- * Name the evidence in the stored error, so the reset is legible later. Worded
- * to describe this reconciliation only: recovery classification reads run.error
- * back, and a stray "provider" or "external" here would reclassify the run.
+ * Name the evidence in the stored error, so the reset is legible later.
+ * Recovery classification reads `run.error` back, so a stray "provider" or
+ * "external" in this text would reclassify the run.
  */
 function reconcileReason(diagnosis: RunDiagnosis, actor: string): string {
   const operation = diagnosis.run.activeOperation;
@@ -1580,28 +1510,14 @@ function reconcileReason(diagnosis: RunDiagnosis, actor: string): string {
 }
 
 /**
- * The recovery gate in front of every resume. It reconciles only on Task 8's
- * full conjunction — an in-flight claim, a dead lease, and a tracked operation
- * provably gone — and otherwise leaves the record exactly as it found it.
+ * The recovery gate in front of every resume. It reconciles only on the
+ * `classifyAbandonment` conjunction, and refuses one shape: an unresolved
+ * operation that could not be proven gone. Takes no session, for the reason
+ * `isStaleOwner` gives.
  *
- * Statuses resume already recovers (`failed`, `cancel_pending`) pass straight
- * through: resetting a cancel-pending run would drop the cancellation it is
- * carrying. A run with nothing tracked also passes through — nothing can
- * double-write when no operation exists, and claiming it is what the retired
- * `/exec adopt` did. What is refused is the one shape that could add a second
- * writer: an unresolved operation that could not be proven gone.
- *
- * `sameMachine` is the operator asserting that the host frozen on the lease was
- * this machine under an older name. It unblocks evidence gathering and nothing
- * else — the conjunction below is unchanged, so an assertion cannot force a
- * resume past a worker that is still writing. It is never written back either:
- * the reset's own `claim` re-stamps the current host, and an assertion that
- * ends ambiguous must leave the record exactly as it found it.
- *
- * It takes no session: the gate judges the lease from the outside, exactly as
- * `/exec status` and the sweep judge it. Knowing who is asking could only make
- * a dead lease read as live for the one caller most likely to be recovering
- * its own crashed session.
+ * `sameMachine` unblocks evidence gathering and nothing else, so it cannot
+ * force a resume past a worker still writing. It is never written back — the
+ * reset's own `claim` re-stamps the current host.
  */
 export async function reconcileForResume(
   registry: RunRegistry,
@@ -1662,11 +1578,7 @@ function evidenceText(diagnosis: ObservedRun): string {
   return `${leaseText}; ${operationEvidence(diagnosis)}${overdueText(diagnosis.run)}`;
 }
 
-/**
- * The stage's own turn budget, reported where the sweep reports everything
- * else it knows. Without it a run three times past its bound reads in the
- * primary view exactly like one launched a minute ago.
- */
+/** Without it a run far past its bound reads like one launched a minute ago. */
 function overdueText(run: PlanExecRun): string {
   const overdue = reportedActivity(run.activeOperation)
     ? undefined
@@ -1685,8 +1597,8 @@ function operationEvidence(diagnosis: ObservedRun): string {
     return "the bridge has no record of its operation";
   if (diagnosis.evidence.asyncDirPresent === true)
     return "its operation directory is still on disk";
-  // Last, so it can never mask evidence: a foreign host is exactly the case
-  // where the probe gathered none, and "could not be observed" would hide why.
+  // Last, so it cannot mask evidence — but ahead of the generic fallback, which
+  // would hide why nothing was gathered.
   if (!isLocalRun(diagnosis.run))
     return `its lease names ${diagnosis.run.lease?.hostname}, not this machine, so nothing here could observe its operation`;
   return "its operation could not be observed";
@@ -1764,19 +1676,12 @@ async function handleCommand(
       parseStatusArguments(rest).selector,
       ctx,
     );
-    // The detail view probes for itself. Reading the persisted digest alone
-    // would render an abandoned run exactly like a healthy one, which is the
-    // bug this whole change set exists to remove.
-    //
-    // No session ID, exactly as the sweep gathers it: status describes a lease
-    // from the outside and never assumes ownership. Passing one would make
-    // this session's own stale lease read as live here and dead in the sweep —
-    // the same two views disagreeing, one step narrower.
+    // Probes for itself: the persisted digest alone renders an abandoned run
+    // exactly like a healthy one.
     return formatRunStatus(target, await runEvidence(target, doctorProbe));
   }
-  // Deleted as the identical code path to bare /exec. Without this the token
-  // is read as the first word of a plan path, so the reader gets an isolation
-  // prompt and then a not-found error naming neither the cause nor the cure.
+  // Without this the token reads as the first word of a plan path, so the
+  // reader gets an isolation prompt and then an unexplained not-found error.
   if (subcommand === RETIRED_START_ACTION)
     throw new Error(
       `/exec ${RETIRED_START_ACTION} was removed. Run /exec ${rest.join(" ") || "<path/to/plan.md>"} instead; bare /exec opens the plan picker.`,
@@ -1815,8 +1720,8 @@ async function handleCommand(
 
 /**
  * The subcommand's action and, when the name is retired, the note to append.
- * Only `adopt` names a different action than itself; every other retired verb
- * kept its behavior and needed nothing but the note.
+ * Only `adopt` maps to a different action; every other retired verb kept its
+ * behavior and needs nothing but the note.
  */
 export function runActionFor(
   subcommand: string | undefined,
@@ -1862,8 +1767,8 @@ async function runAction(
     throw new Error(
       "Usage: /exec skip <full-run-id> --reason <non-empty reason>",
     );
-  // Refuse before resolving a run, so the answer is the same one question
-  // whether or not this repository has several candidates.
+  // Before resolving a run, so a repository with several candidates does not
+  // ask a picker question first and then refuse anyway.
   if (action === EXEC_ACTION.STOP && !ctx.hasUI)
     throw new Error(STOP_REQUIRES_UI);
   const sessionId = ctx.sessionManager.getSessionId();
@@ -1879,8 +1784,8 @@ async function runAction(
   }
   if (action === EXEC_ACTION.RESUME || action === EXEC_ACTION.SKIP) {
     await checkRuntime();
-    // Reconcile before anything else touches the run: from here on resume is
-    // working with a state it has evidence for.
+    // Before anything else touches the run, so the rest of resume works from a
+    // state it has evidence for.
     const recovered =
       action === EXEC_ACTION.RESUME
         ? await reconcileForResume(
@@ -1910,8 +1815,7 @@ async function runAction(
       retryTask = true;
     }
     // A branch mismatch cannot advance without rebinding, so an interactive
-    // resume asks instead of requiring the caller to know the flag. The flag
-    // stays for callers with no human to ask.
+    // resume asks. The flag stays for callers with no human to ask.
     const adoptCurrentBranch =
       resumeArguments.adoptCurrentBranch ||
       (action === EXEC_ACTION.RESUME &&
@@ -1930,9 +1834,8 @@ async function runAction(
           ? `skip ${run.id} --reason ${skipReason}`
           : undefined,
     );
-    // The forked session re-enters the gate on an already-reset run, so the
-    // note has no second chance to be printed: it is what the source session
-    // still has to say.
+    // The forked session re-enters the gate on an already-reset run, so this is
+    // the note's only chance to be printed.
     if (handedOff) return recovered.note;
     if (action === EXEC_ACTION.SKIP) {
       if (!ctx.hasUI)
@@ -1999,8 +1902,7 @@ async function runAction(
       { cwd: ctx.cwd, sessionId },
     );
     startBackgroundController(resumed, sessionId, ctx.cwd, ctx);
-    // The reset is reported where the operator asked for it, not only in the
-    // progress file it was appended to.
+    // Reported where the operator asked, not only in the progress file.
     return recovered.note
       ? `${recovered.note}\n${resumeResultMessage(resumed)}`
       : resumeResultMessage(resumed);
@@ -2027,11 +1929,9 @@ async function runAction(
 }
 
 /**
- * One verb, two outcomes: the reader chooses between them here, where the
- * difference can be stated, instead of choosing a verb name before it is
- * explained. Only the outcomes this run can still take are offered, and the
- * single-outcome case is still asked rather than assumed — a final cancel the
- * reader did not pick is exactly the damage this question prevents.
+ * Offers only the outcomes this run can still take. A single remaining outcome
+ * is still asked, never assumed: an unwanted final cancel is the damage this
+ * question prevents.
  */
 export async function chooseStopOutcome(
   run: PlanExecRun,
@@ -2131,12 +2031,9 @@ async function handoffToWorktree(
   if (!sourceSessionFile) return false;
 
   const sourceSessionId = ctx.sessionManager.getSessionId();
-  // Before the fork, not merely before the release below. The handoff drops the
-  // lease to re-claim it for the worktree session, and `release` deletes
-  // whatever is there without asking — so a lease held by another live session
-  // has to be refused here, exactly as `claim` would refuse it, or that
-  // session's worktree gets a second writer. Refusing after the fork would
-  // strand a session file for a run that is not going anywhere.
+  // Before the fork, not merely before the release below: `release` deletes any
+  // lease without asking, and refusing after the fork would strand a session
+  // file for a run that is not going anywhere.
   const refusal = takeoverRefusal(run, sourceSessionId);
   if (refusal) throw new Error(refusal);
 
@@ -2199,10 +2096,8 @@ function matchesContext(run: PlanExecRun, cwd: string): boolean {
 }
 
 /**
- * Whether this run can take this action at all. It takes no session: no
- * action's permission depends on who is asking any more — the lease decides
- * liveness and it is read from the outside — and a caller's own identity was
- * the last thing that could make a dead lease look held.
+ * Whether this run can take this action at all. No action's permission depends
+ * on who is asking: the lease decides liveness, judged from the outside.
  */
 export function isActionAllowed(
   action: RunAction,
@@ -2210,8 +2105,7 @@ export function isActionAllowed(
   adoptCurrentBranch = false,
 ): boolean {
   if (action === EXEC_ACTION.STATUS) return true;
-  // Stop is whichever of its two outcomes this run can still take; the choice
-  // between them belongs to the reader, not to a lookup they run first.
+  // Stop is allowed when either of its outcomes is; the reader picks which.
   if (action === EXEC_ACTION.STOP)
     return STOP_OUTCOMES.some((outcome) =>
       isActionAllowed(outcome.action, run),
@@ -2241,7 +2135,7 @@ export function isActionAllowed(
 /**
  * Whether a waiver is what this run needs: a blocked non-implementation stage
  * that a person must release. The lease never enters it, so `/exec status` can
- * offer the waiver from the outside on the same terms `skip` will accept it.
+ * offer the waiver on the same terms `skip` will accept it.
  */
 export function isStageWaiverAvailable(run: PlanExecRun): boolean {
   return (
@@ -2253,15 +2147,9 @@ export function isStageWaiverAvailable(run: PlanExecRun): boolean {
 }
 
 /**
- * The lease that used to force a reader to choose `/exec adopt`: a session
- * still holds this run and that session is provably gone. Resume reads the
- * lease itself and takes it over.
- *
- * Whose name is on the lease never enters it. A Pi that restarted under the
- * same session ID left a dead lease naming the caller, and that is precisely
- * the run `/exec status` tells that caller to resume — refusing it here would
- * print a next command this gate rejects. The same predicate the detail view
- * uses for `owner: stale lease`, so the two cannot drift apart.
+ * A live-looking claim whose session is provably gone; resume takes it over.
+ * Whose name is on the lease never enters it: a Pi restarted under the same
+ * session ID left that lease, and is told by `/exec status` to resume the run.
  */
 function isClaimableDeadLease(run: PlanExecRun): boolean {
   return !isTerminal(run.status) && isStaleOwner(run);

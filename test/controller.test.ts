@@ -2356,8 +2356,7 @@ test("worker signal digest caps the step lines it carries", () => {
 
   const signal = parseWorkerSignal(`Run: r\nState: running\nMode: chain\n${steps}`);
 
-  // The digest is persisted on every observation, so an unbounded step list
-  // would grow the record without bound.
+  // The digest is persisted on every observation, so the list must be bounded.
   assert.equal(signal?.steps?.length, 5);
   assert.deepEqual(signal?.steps?.[4], "doing thing 5");
 });
@@ -2448,9 +2447,8 @@ test("observation persists no liveness verdict of its own", async () => {
   await controller.advance(await registry.claim(run, "session-1"));
   const stored = await registry.get(run.id);
 
-  // Whether the directory still exists is stamped by whoever is polling, so it
-  // freezes the moment that session dies. The read surface stats it live
-  // instead; nothing here may record an answer that will go stale.
+  // No liveness fact is persisted: it would freeze when the polling session
+  // dies. The read surface measures it live instead.
   assert.deepEqual(stored?.activeOperation?.workerSignal, {
     mode: "workflow",
     progress: "implementation step 1",

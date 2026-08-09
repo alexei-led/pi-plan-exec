@@ -153,10 +153,7 @@ async function snapshotRuns(
   return snapshot;
 }
 
-/**
- * This machine's first label, for building names that look like this machine
- * and are not it. Only the whole name is machine identity.
- */
+/** This machine's first label: a name that looks like this machine and is not it. */
 function thisHost(): string {
   return hostname().split(".")[0]!;
 }
@@ -171,9 +168,9 @@ const DEAD_LEASE = {
 const LIVE_SESSION_ID = "session-live";
 
 /**
- * Built per use. A module-level `Date.now()` is frozen at import and the
- * staleness bound is 30 seconds, so a shared constant would quietly become a
- * dead lease as the suite grows.
+ * Built per use: a module-level `Date.now()` freezes at import, and the 30s
+ * staleness bound would turn a shared constant into a dead lease as the suite
+ * grows.
  */
 function liveLease() {
   return {
@@ -448,9 +445,6 @@ test("run status classifies recovery and gives one safe next action", () => {
       },
     }),
   );
-  // No reported signal is not health. This assertion is the regression guard
-  // for the original bug: the old text said the operation was healthy here,
-  // which read identically for a live worker and a dead one.
   assert.match(
     active,
     /recovery: running, but nothing proves the worker is alive/,
@@ -459,9 +453,6 @@ test("run status classifies recovery and gives one safe next action", () => {
   assert.match(active, /Do not resume/);
   assert.doesNotMatch(active, /reported activity/);
 
-  // A trustworthy activity value still earns the alive reading. Without this
-  // pair the status text would be honest but undiscriminating, which is its own
-  // failure.
   const signalled = formatRunStatus(
     run({
       status: "running",
@@ -481,8 +472,7 @@ test("run status classifies recovery and gives one safe next action", () => {
     /recovery: running, and the worker reported activity/,
   );
 
-  // The same value, last refreshed an hour ago: nothing is polling this run,
-  // so the string is a memory and must not read as health.
+  // The same value, last refreshed an hour ago: a memory, not health.
   const frozen = formatRunStatus(
     run({
       status: "running",
@@ -654,7 +644,6 @@ test("an overdue operation is classified without being called dead", () => {
     });
 
   const cases: [string, PlanExecRun, string][] = [
-    // The reported bug: a healthy worker mid-model-call at nine minutes.
     [
       "nine minutes, no signal",
       active(9),
@@ -675,7 +664,6 @@ test("an overdue operation is classified without being called dead", () => {
       active(101),
       "running longer than its budget allows",
     ],
-    // Same elapsed time, different stage budget: the bound is derived, not flat.
     [
       "past the reviewer bound but inside the worker bound",
       active(65),
@@ -701,7 +689,6 @@ test("an overdue operation is classified without being called dead", () => {
       active(101, { kind: "finalize" }, { stage: "finalize" }),
       "running longer than its budget allows",
     ],
-    // Fresh activity outranks the timer; the operation is provably alive.
     [
       "past the bound with a trustworthy activity value",
       active(180, {
@@ -728,13 +715,12 @@ test("an overdue operation is classified without being called dead", () => {
       active(180, {}, { status: "starting" }),
       "running longer than its budget allows",
     ],
-    // A pre-upgrade record carries no launch time and cannot be bounded.
     [
       "no launch time recorded",
       active(undefined),
       "running, but nothing proves the worker is alive",
     ],
-    // The bound only speaks while the bridge still reports the run in flight.
+    // The bound only speaks while the run still claims work in flight.
     [
       "past the bound on a failed run",
       active(180, {}, { status: "failed", error: "worker crashed" }),
@@ -748,9 +734,9 @@ test("an overdue operation is classified without being called dead", () => {
       name,
     );
 
-  // The bound is exclusive, and only `longRunningOperation` can be asked that:
-  // `recoveryGuidance` reads its own clock, so a run built to sit exactly on
-  // the bound is already past it by the time the classification runs.
+  // Only `longRunningOperation` can be asked about the exact bound:
+  // `recoveryGuidance` reads its own clock, so a run built to sit on the bound
+  // is already past it by the time it runs.
   const launchStartedAt = Date.parse("2026-08-09T12:00:00Z");
   const onTheBound = active(undefined, { launchStartedAt });
   assert.equal(
@@ -763,8 +749,7 @@ test("an overdue operation is classified without being called dead", () => {
     "one millisecond past it is",
   );
 
-  // Decisive death still wins over a mere bound breach — but only live
-  // evidence can establish it, never a flag some earlier poll left behind.
+  // Decisive death outranks a bound breach.
   const gone = { leaseLive: false, asyncDirPresent: false };
   assert.equal(
     recoveryGuidance(active(180), gone).classification,
@@ -784,7 +769,6 @@ test("an overdue operation is classified without being called dead", () => {
   const overdue = formatRunStatus(active(180));
   assert.match(overdue, /recovery: running longer than its budget allows/);
   assert.match(overdue, /past the 100m allowed for its 50-turn budget/);
-  // Names the uncertainty, offers both escapes, and forbids a second writer.
   assert.match(overdue, /not proof the worker is stuck/);
   assert.match(overdue, /\/exec status .* to re-check/);
   assert.match(overdue, /\/exec stop .* preserve the worktree/);
@@ -793,15 +777,13 @@ test("an overdue operation is classified without being called dead", () => {
 });
 
 test("no recovery classification names a controller internal", async () => {
-  // Scraped from source, not from a shape table: a table only guards the
-  // branches it lists, and the point is that a branch added later cannot
-  // reintroduce the vocabulary either.
+  // Scraped from source, not from a shape table, so a branch added later cannot
+  // reintroduce the vocabulary. Every quote style, or such a branch could evade
+  // the guard with a template literal.
   const source = await readFile(
     new URL("../src/index.ts", import.meta.url),
     "utf8",
   );
-  // Every quote style, or a branch could evade the guard by using a template
-  // literal that eslint and tsc are equally happy with.
   const classifications = [
     ...source.matchAll(/classification:\s*(?:"([^"]+)"|'([^']+)'|`([^`]+)`)/g),
   ].map((match) => match[1] ?? match[2] ?? match[3] ?? "");
@@ -912,7 +894,6 @@ test("every recovery classification ends at a primary verb", () => {
     );
   }
 
-  // The two collapses: one situation each, not two words for the same answer.
   assert.equal(
     recoveryGuidance(unnamedOperation).classification,
     recoveryGuidance(unobservable).classification,
@@ -1439,9 +1420,6 @@ test("doctor --reconcile resets only provably abandoned runs", async () => {
     report,
     new RegExp(`- ${abandoned.id} [^\\n]*Next: /exec resume ${abandoned.id}`),
   );
-  // A cancel-pending run is abandoned by the evidence and still not reset:
-  // failed would erase the stop it is carrying, and the next resume would
-  // restart plan work instead of finishing the cancellation.
   assert.match(report, /Left 1 abandoned run alone: each carries the stop/);
   assert.match(
     report,
@@ -1821,8 +1799,6 @@ test("the doctor alias keeps --reconcile for scripted callers", async () => {
   const { registry, directory } = await seedDirectory([abandoned]);
   const before = await snapshotRuns(directory);
 
-  // The read surface refuses to run it: --reconcile writes, so the write
-  // dispatch owns it. Everything reachable from execRead only observes.
   assert.equal(await execRead(registry, "doctor", ["--reconcile"]), undefined);
   assert.deepEqual(await snapshotRuns(directory), before, "no read wrote");
 
@@ -1867,8 +1843,7 @@ test("the exec-plan skill documents exactly the subcommands /exec implements", a
   assert.ok(documented.size > 0, "no /exec subcommand was found in the skill");
   for (const token of documented)
     assert.ok(actions.has(token), `skill documents unknown: /exec ${token}`);
-  // A hidden alias may appear in the skill but is never required there: it is
-  // absent from /exec help and exists only so an in-flight run keeps working.
+  // A hidden alias may appear in the skill but is never required there.
   for (const action of actions)
     if (!aliases.has(action))
       assert.ok(
@@ -1878,13 +1853,11 @@ test("the exec-plan skill documents exactly the subcommands /exec implements", a
 });
 
 test("resume takes over a lease whose session is provably gone", () => {
-  // A dead lease is claimable whoever it names: the session ID never enters
-  // the answer, so a Pi that restarted under the same ID is not locked out of
-  // the run the sweep just told it to resume.
+  // DEAD_LEASE names the caller: a Pi restarted under the same session ID must
+  // not be locked out of the run the sweep just told it to resume.
   const stranded = run({ status: "skip_pending", lease: DEAD_LEASE });
   assert.equal(isActionAllowed("resume", stranded), true);
 
-  // A live lease still blocks it, and no lease and terminal answer as before.
   const held = run({ status: "skip_pending", lease: liveLease() });
   assert.equal(isActionAllowed("resume", held), false);
   const unheld = run({ status: "skip_pending" });
@@ -1897,7 +1870,7 @@ test("a live foreign lease still blocks a second worker", async () => {
   const held = run({ status: "running", lease: liveLease() });
   const registry = await seedRegistry([held]);
 
-  // Resume is reachable by status, and the claim is what refuses it.
+  // Reachable by status; the claim is what refuses it.
   assert.equal(isActionAllowed("resume", held), true);
   await assert.rejects(
     registry.claim(held, "session-new"),
@@ -1972,7 +1945,6 @@ test("resume reconciles a provably abandoned run, then continues", async () => {
     await readFile(progressPath, "utf8"),
     /Reset by \/exec resume[\s\S]*attempt counter was left unchanged/,
   );
-  // The reset lands on the state the ordinary resume path already recovers.
   assert.equal(isRecoverableFailure(recovered.run), true);
   assert.equal(
     isActionAllowed("resume", recovered.run),
@@ -2051,9 +2023,8 @@ test("every run whose guidance names resume survives the resume gate", async () 
     delete shape.activeOperation;
     return shape;
   };
-  // Each shape must actually produce the classification its name implies: with
-  // an activeOperation left in place, "cannot check on the worker right now"
-  // fires ahead of the paused and failed branches and the loop tests nothing.
+  // `withoutOperation` matters: an activeOperation left in place fires the
+  // unobservable-worker branch first and the loop tests nothing.
   const shapes: Array<[PlanExecRun, AbandonmentEvidence | undefined]> = [
     [
       withoutOperation({ status: "paused", stage: "comprehensive_review" }),
@@ -2064,17 +2035,15 @@ test("every run whose guidance names resume survives the resume gate", async () 
       undefined,
     ],
     [withoutOperation({ status: "running", lease: DEAD_LEASE }), undefined],
-    // The one in-flight shape whose guidance names resume: proven gone. It is
-    // the only one the gate writes for, so it is the one that is seeded.
+    // The only shape the gate writes for, so the only one seeded.
     [abandoned, { leaseLive: false, asyncDirPresent: false }],
   ];
 
   let exercised = 0;
   for (const [shape, evidence] of shapes) {
     const guidance = recoveryGuidance(shape, evidence);
-    // A resume the guidance qualifies is not the bare resume this gate takes:
-    // `--same-machine` names a fact the operator supplies, and the gate is
-    // meant to refuse without it. Such a shape does not belong in `shapes`.
+    // A qualified resume such as `--same-machine` is not the bare resume this
+    // gate takes; the gate is meant to refuse without the flag.
     if (guidance.action.includes(`${shape.id} --`)) continue;
     if (!guidance.action.includes(`/exec resume ${shape.id}`)) continue;
     exercised += 1;
@@ -2085,8 +2054,7 @@ test("every run whose guidance names resume survives the resume gate", async () 
   }
   assert.equal(exercised, shapes.length, "every shape must reach the gate");
 
-  // The pairing only proves something if the other branch is exercised too:
-  // with no evidence, the same abandoned run is told to wait, not to resume.
+  // The counter-case: with no evidence, the same run is told to wait.
   assert.match(
     recoveryGuidance(abandonedRun()).action,
     /Wait and use \/exec status/,
@@ -2125,11 +2093,9 @@ test("stop reaches both outcomes and asks for the one it takes", async () => {
   assert.equal(await chooseStopOutcome(running, pick(1)), EXEC_ACTION.CANCEL);
   assert.equal(asked.length, 2, "each stop asks before it acts");
   assert.match(asked[0]!.title, new RegExp(running.id.slice(0, 8)));
-  // Reversibility is what the two differ by, so it is what the labels say.
   assert.match(asked[0]!.options[0]!, /^Pause — .*\/exec resume continues/);
   assert.match(asked[0]!.options[1]!, /^Cancel — final.*worktree is preserved/);
 
-  // A cancelled dialog stops at the dialog.
   await assert.rejects(
     chooseStopOutcome(running, {
       hasUI: true,
@@ -2226,7 +2192,6 @@ test("status hands a blocked stage its skip command with the run ID filled in", 
 
   const report = (await execRead(registry, "status", [])) ?? "";
 
-  // The row keeps its single next command; the waiver is the line under it.
   assert.match(
     report,
     new RegExp(
@@ -2254,7 +2219,6 @@ test("help lists every primary verb and no retired alias", () => {
   assert.match(help, /^\/exec \[plan-path\]/m);
   for (const alias of aliases)
     assert.doesNotMatch(help, new RegExp(`/exec ${alias}`), alias);
-  // Autocomplete teaches the same surface the help lists.
   assert.deepEqual(
     (getExecArgumentCompletions("") ?? []).map((item) => item.value).sort(),
     [...primary].sort(),
@@ -2289,10 +2253,8 @@ test("what help drops, the skill keeps for scripted callers", async () => {
 });
 
 test("the detail view checks the worker itself instead of trusting the record", async () => {
-  // Dead lease, operation directory gone, and a digest no one has refreshed
-  // since the owning session died: the shape the original bug rendered as
-  // healthy. Three hours in, so the elapsed bound would answer if the
-  // decisive evidence did not.
+  // Three hours in, so the elapsed bound would answer if the decisive evidence
+  // did not.
   const abandoned = abandonedRun({
     activeOperation: {
       operationId: "operation-1",
@@ -2315,8 +2277,7 @@ test("the detail view checks the worker itself instead of trusting the record", 
   assert.match(detail, new RegExp(`Run /exec resume ${abandoned.id}`));
   assert.doesNotMatch(detail, /Do not resume/);
 
-  // The same record read without probing cannot claim the worker is gone, and
-  // must not claim the opposite either.
+  // Unprobed, the same record can claim neither death nor health.
   const unprobed = formatRunStatus(abandoned);
   assert.match(
     unprobed,
@@ -2324,8 +2285,7 @@ test("the detail view checks the worker itself instead of trusting the record", 
   );
   assert.doesNotMatch(unprobed, /reported activity/);
 
-  // The sweep over the same registry reaches the same verdict; the two views
-  // disagreeing about one run is the defect this pairing pins.
+  // The two views disagreeing about one run is the defect this pairing pins.
   const sweep = await execStatus(registry);
   assert.match(
     sweep,
@@ -2336,10 +2296,9 @@ test("the detail view checks the worker itself instead of trusting the record", 
 });
 
 test("the two views judge a lease the same way, including this session's own", async () => {
-  // A session claims a run and starts no controller — /exec pause and the
-  // worktree handoff both do. Thirty seconds later its own lease is stale and
-  // nothing is polling. Reading the lease as live because the caller owns it
-  // would put the detail view back at odds with the sweep.
+  // A session that claims a run and starts no controller — /exec pause and the
+  // worktree handoff both do — owns a stale lease 30s later with nothing
+  // polling behind it.
   const mine = abandonedRun({
     lease: { ...DEAD_LEASE, sessionId: LIVE_SESSION_ID },
   });
@@ -2357,9 +2316,6 @@ test("the two views judge a lease the same way, including this session's own", a
     true,
     "the sweep must not print a next command its own gate refuses",
   );
-  // And the gate itself, which takes no session for exactly this reason: it
-  // used to read its caller's own dead lease as live and wave the run through
-  // without clearing the worker both views had just called gone.
   assert.equal(
     (await reconcileForResume(registry, mine)).run.status,
     "failed",
@@ -2367,10 +2323,7 @@ test("the two views judge a lease the same way, including this session's own", a
   );
 });
 
-/**
- * The four claims that each used to be answered before the evidence was read.
- * Every one names a wait, and every wait needs something still running.
- */
+/** Every one names a wait, and every wait needs something still running. */
 const PREEMPTING_SHAPES: Array<[string, Partial<PlanExecRun>]> = [
   [
     "the provider stopped answering",
@@ -2428,8 +2381,7 @@ test("decisive evidence outranks every claim that would say wait", async () => {
     const evidence = await runEvidence(gone, abandonmentProbe());
     const guidance = recoveryGuidance(gone, evidence);
     const sweep = await execStatus(registry);
-    // The one command the sweep prints for this row; the detail view has to
-    // name the same one or the two views send a reader to different places.
+    // The command the sweep prints for this row; the detail view must match it.
     const next =
       gone.status === "cancel_pending"
         ? `/exec stop ${gone.id}`
@@ -2443,8 +2395,7 @@ test("decisive evidence outranks every claim that would say wait", async () => {
     );
     assert.ok(guidance.action.includes(next), `${label}: names ${next}`);
     assert.match(sweep, new RegExp(`Next: ${next.replace("/", "\\/")}`), label);
-    // The gate must not refuse the command the row just printed, for any
-    // caller — including the session named on the dead lease.
+    // Including for the session named on the dead lease.
     assert.equal(
       isActionAllowed(
         gone.status === "cancel_pending" ? "stop" : "resume",
@@ -2490,8 +2441,7 @@ test("nothing claims a poll loop that no live lease was observed for", async () 
     await runEvidence(stalled, abandonmentProbe()),
   );
 
-  // The count is a stored fact and stays; the claim that something is still
-  // trying does not survive a dead lease.
+  // The count is a stored fact and stays; "retrying" does not.
   assert.match(
     dead,
     /observation: unavailable \(2\/3\) — bridge status failed/,
@@ -2509,7 +2459,6 @@ test("nothing claims a poll loop that no live lease was observed for", async () 
     formatRunStatus(polling, await runEvidence(polling, abandonmentProbe())),
     /observation: polling continues/,
   );
-  // Unprobed, the view knows nothing about a poll loop and claims nothing.
   assert.doesNotMatch(formatRunStatus(polling), /polling continues/);
 });
 
@@ -2522,8 +2471,7 @@ test("the abandoned group promises a reset only where one happens", async () => 
   const footer =
     /Each resets to a recoverable failure before it continues; no second worker is launched\./;
 
-  // reconcileRun refuses a run already told to stop, so a group of only those
-  // resets nothing and must promise nothing.
+  // reconcileRun refuses a run already told to stop.
   const onlyStopping = await execStatus(await seedRegistry([stopping]));
   assert.match(onlyStopping, /abandoned — no worker is running/);
   assert.doesNotMatch(onlyStopping, /Each resets/);
@@ -2566,9 +2514,8 @@ test("evidence gathered here says nothing about a run on another host", async ()
     return "absent";
   });
 
-  // The directory and the bridge here belong to this machine. An absence
-  // measured locally would be an absence of the wrong thing, and the reset it
-  // produces would launch a second worker over a live one.
+  // The probe gathers nothing: an absence measured on this machine's disk would
+  // be an absence of the wrong thing.
   assert.deepEqual(await probe(remote), {});
   const report = await execReconcile(registry, probe);
 
@@ -2587,8 +2534,7 @@ test("evidence gathered here says nothing about a run on another host", async ()
 });
 
 test("a renamed machine can still diagnose and resume its own run", async () => {
-  // Not a suffix `hostIdentity` can absorb: this is the DHCP rename that leaves
-  // the lease naming something no probe can connect back to this machine.
+  // A DHCP rename: the lease names something no probe can connect back here.
   const renamed = abandonedRun({
     lease: { ...DEAD_LEASE, hostname: `${thisHost()}-corp-dhcp` },
   });
@@ -2606,7 +2552,6 @@ test("a renamed machine can still diagnose and resume its own run", async () => 
     new RegExp(`/exec resume ${renamed.id} --same-machine`),
     "status names the one command that can move this run",
   );
-  // Refused without the assertion — but the refusal names the way out.
   await assert.rejects(
     reconcileForResume(registry, renamed),
     new RegExp(`/exec resume ${renamed.id} --same-machine`),
@@ -2636,9 +2581,8 @@ test("a renamed machine can still diagnose and resume its own run", async () => 
 });
 
 test("a machine that shares this one's first label keeps its live worker", async () => {
-  // The precondition is a registry two machines can see: a shared or NFS home.
-  // Corporate DNS hands `build.a.corp.example` and `build.b.corp.example` the
-  // same first label, and the worker on the other one is alive and beating.
+  // Precondition: a registry on a shared or NFS home, where corporate DNS gives
+  // two machines the same first label and the other one is alive and beating.
   const collided = abandonedRun({
     lease: {
       sessionId: "session-on-the-other-machine",
@@ -2685,8 +2629,8 @@ test("a stale lease from a colliding name stays ambiguous, never abandoned", asy
   const { registry, directory } = await seedDirectory([collided]);
   const before = await snapshotRuns(directory);
 
-  // A silent heartbeat proves the *lease* is stale, never that the worker
-  // behind it is gone: that worker's disk is on the other machine.
+  // A silent heartbeat proves the lease is stale, never that the worker is
+  // gone: that worker's disk is on the other machine.
   await assert.rejects(
     reconcileForResume(registry, collided),
     /evidence is incomplete[\s\S]*not this machine/,
@@ -2701,8 +2645,8 @@ test("a network rename of this machine is one documented flag from recovery", as
   const { registry, directory } = await seedDirectory([churned]);
   const before = await snapshotRuns(directory);
 
-  // Indistinguishable from the colliding machine above by name alone, so it is
-  // refused the same way — and the refusal names the operator's way out.
+  // Indistinguishable by name from the colliding machine above, so it is
+  // refused the same way.
   await assert.rejects(
     reconcileForResume(registry, churned),
     new RegExp(`/exec resume ${churned.id} --same-machine`),
@@ -2741,16 +2685,14 @@ test("--same-machine supplies a machine, never a verdict", async () => {
   const { registry, directory } = await seedDirectory([stillWriting]);
   const before = await snapshotRuns(directory);
 
-  // The assertion only unblocks the evidence. What that evidence then says is
-  // unchanged, so a worker still writing here keeps the run ambiguous.
+  // The assertion only unblocks the evidence; what it then says is unchanged.
   await assert.rejects(
     reconcileForResume(registry, stillWriting, abandonmentProbe(), true),
     /evidence is incomplete[\s\S]*operation directory is still on disk/,
   );
   assert.deepEqual(await snapshotRuns(directory), before);
 
-  // Same for the other half of the conjunction: a bridge that still knows the
-  // operation is not an absence, whoever asserted the machine.
+  // The other half of the conjunction: a bridge that still knows the operation.
   const bridgeKnowsIt = abandonedRun({
     lease: foreignLease,
     activeOperation: {
@@ -2775,8 +2717,6 @@ test("--same-machine supplies a machine, never a verdict", async () => {
     (await seeded.registry.get(bridgeKnowsIt.id))?.status,
     "running",
   );
-  // And it is refused outright on a run this machine can already observe, so
-  // it cannot be reached for by an operator who just wants resume to proceed.
   assert.match(
     sameMachineRefusal(abandonedRun()) ?? "",
     /only applies to a run whose lease names another host/,
@@ -2807,8 +2747,8 @@ test("cleanup reports every outcome instead of stopping at the first refusal", a
   const first = retiredRun({ id: "33333333-3333-4333-8333-333333333333" });
   const second = retiredRun({ id: "44444444-4444-4444-8444-444444444444" });
   const { directory } = await seedDirectory([first, second]);
-  // The registry re-checks under its lock, so a target snapshotted from the
-  // listing can still be refused. One refusal must not hide the other removal.
+  // Stands in for the registry's own re-check under its lock, which can refuse
+  // a target the listing snapshotted.
   class RefusingRegistry extends RunRegistry {
     override async remove(runId: string): Promise<boolean> {
       if (runId === second.id)
@@ -2839,8 +2779,6 @@ test("cleanup does not offer --include-failed to a caller naming one run", async
 
   const preview = await execCleanup(registry, [failed.id]);
 
-  // Naming the run already overrode both filters, so a hint to add the flag
-  // would describe an exclusion that is not being applied.
   assert.match(preview, new RegExp(failed.id));
   assert.doesNotMatch(preview, /Failed runs are excluded/);
   assert.match(preview, /overrides both the retention window/);
@@ -2852,8 +2790,8 @@ test("cleanup does not offer --include-failed to a caller naming one run", async
 });
 
 test("retention is measured from when a run finished, not from its last write", () => {
-  // A lease release writes the record after the run is over; keying the window
-  // on updatedAt would restart the clock on it.
+  // A lease release writes the record after the run is over, so `updatedAt`
+  // would restart the clock.
   assert.equal(
     isRemovableRun(
       retiredRun({ retiredAt: PAST_RETENTION, updatedAt: Date.now() }),

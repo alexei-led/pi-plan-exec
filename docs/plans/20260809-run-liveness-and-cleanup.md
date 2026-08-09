@@ -77,6 +77,11 @@ Patterns to follow:
 - **CRITICAL: update this plan file when scope changes during implementation**
 - maintain backward compatibility with existing on-disk run records — eight real runs
   exist and must keep loading after every task
+- **comments: sparse and focused.** Source comments use Simplified Technical English —
+  short sentences, one fact each. Keep a comment only when the reader cannot derive the
+  fact from the code: a non-obvious invariant, a rejected alternative and why, an accepted
+  tradeoff naming its ceiling. Tests get a comment only for genuinely unobvious setup; a
+  test name that says what it tests needs none. No essays, no restating the signature.
 
 ## Testing Strategy
 

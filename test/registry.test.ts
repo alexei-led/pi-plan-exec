@@ -30,10 +30,9 @@ import type { PlanExecRun } from "../src/types.js";
 type RunLease = NonNullable<PlanExecRun["lease"]>;
 
 /**
- * A pid that is reaped before spawnSync returns, so it is reliably gone.
- * Assumes the OS does not recycle it inside one test run — the only
- * nondeterministic input in the liveness matrix, and the first thing to
- * suspect if a lease test ever flakes.
+ * A pid reaped before spawnSync returns, so it is reliably gone. Assumes the OS
+ * does not recycle it within one test run: suspect this first if a lease test
+ * ever flakes.
  */
 function reapedPid(): number {
   const { pid } = spawnSync("true");
@@ -140,8 +139,7 @@ test("lease liveness weighs session, heartbeat, hostname, and pid", () => {
       live: false,
     },
     {
-      // The pid on that lease belongs to whatever machine answers to that
-      // name, so it is not ours to check: only the heartbeat can speak.
+      // A foreign pid is not ours to check, so only the heartbeat can speak.
       name: "a name sharing this one's first label is not this machine",
       lease: {
         sessionId: "s1",
@@ -1024,8 +1022,8 @@ test("remove decides refusal under the lock, not before it", async () => {
   );
 
   const removal = registry.remove(run.id);
-  // The run is revived while the removal waits for the lock. A refusal decided
-  // before locking would delete the directory a live worker is writing to.
+  // Revived while the removal waits for the lock: a refusal decided before
+  // locking would delete a directory a live worker is writing to.
   await writeFile(
     path,
     `${JSON.stringify({ ...run, status: "running", stage: "implementation" })}\n`,
@@ -1048,14 +1046,11 @@ test("updateLatest re-applies a write that update would have dropped", async () 
   const stale = await registry.update({ ...run, branch: "first" });
   await registry.update({ ...stale, branch: "second" });
 
-  // The optimistic write is silently dropped: whoever wrote second wins, and
-  // the caller is handed that record back rather than an error.
+  // Dropped silently, and the newer record is handed back instead of an error.
   const dropped = await registry.update({ ...stale, branch: "third" });
   assert.equal(dropped.branch, "second");
   assert.equal((await registry.get(run.id))?.branch, "second");
 
-  // A terminal write cannot be dropped like that: the work it records has
-  // already happened on disk, so it is re-applied on top of the newer record.
   const merged = await registry.updateLatest(run.id, (current) => ({
     ...current,
     status: "cancelled",
@@ -1155,8 +1150,7 @@ test("a live lease survives the release-then-claim of a worktree handoff", async
   );
 
   // The handoff releases before it claims, so `claim`'s own refusal comes too
-  // late: it must be asked first, or the delete hands a live session's worktree
-  // to a second writer.
+  // late; this one must be asked first.
   assert.match(
     takeoverRefusal(held, "session-b") ?? "",
     /controlled by another active Pi session/,

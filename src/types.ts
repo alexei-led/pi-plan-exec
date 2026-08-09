@@ -16,9 +16,9 @@ export const EXEC_ACTION = {
 } as const;
 
 /**
- * Retired names that still dispatch. They are absent from /exec help and name
- * their replacement once in their own output, so a run in flight during an
- * upgrade — or a scripted caller — never breaks on a renamed verb.
+ * Retired names that still dispatch, so a scripted caller never breaks on a
+ * renamed verb. Absent from /exec help; each names its replacement once in its
+ * own output.
  */
 export const EXEC_ALIAS_ACTIONS = [
   EXEC_ACTION.RUNS,
@@ -202,16 +202,15 @@ export interface BranchRebinding {
 export const WORKFLOW_MODE = "workflow";
 
 /**
- * Compact digest of the provider status text. Every field is optional: the
- * provider renders each line conditionally, so a missing field means "not
- * reported", never "healthy".
+ * Compact digest of the provider status text. The provider renders each line
+ * conditionally, so a missing field means "not reported", never "healthy".
  */
 export interface WorkerSignal {
   mode?: string;
   /**
-   * Only ever set for non-workflow modes. Upstream anchors the workflow-mode
-   * value to launch time (nicobailon/pi-subagents#920), so it grows without
-   * bound while the worker is healthy and must never be surfaced.
+   * Non-workflow modes only. Upstream anchors the workflow-mode value to launch
+   * time (nicobailon/pi-subagents#920), so it grows while the worker is healthy
+   * and must never be surfaced.
    */
   activity?: string;
   progress?: string;
@@ -275,15 +274,12 @@ export interface PlanExecRun {
   createdAt: number;
   updatedAt: number;
   /**
-   * When the archive stage finished. Cleanup measures its retention window
-   * from here, falling back to `updatedAt` on runs archived before this field
-   * existed or completed without the archive stage.
+   * When the archive stage finished; cleanup measures its retention window from
+   * here. Absent on runs archived before the field existed or finished without
+   * the archive stage, which fall back to `updatedAt`.
    */
   retiredAt?: number;
-  /**
-   * Set when an abandoned run was reset to failed, by /exec resume or by
-   * /exec doctor --reconcile, so the reset is auditable in the record itself.
-   */
+  /** Stamped when an abandoned run was reset to failed, so the reset is auditable. */
   reconciledAt?: number;
   lease?: {
     sessionId: string;
