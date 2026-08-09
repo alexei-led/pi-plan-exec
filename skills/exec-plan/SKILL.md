@@ -205,8 +205,8 @@ second writer.
   skips any run a live session reclaimed while it was being diagnosed. Recovery
   is still `/exec resume <full-run-id>`.
 - `/exec cleanup` deletes registry entries only. It never touches the worktree,
-  branch, or progress file, and it refuses a non-terminal run or one held by a
-  live lease.
+  branch, or progress file, and it refuses a non-terminal run, one held by a
+  live lease, or one a controller is recovering.
 - Do not use `subagent resume` for a child owned by plan-exec.
 - Do not start a new run as a substitute for `/exec resume`.
 - Do not hand-edit `~/.pi/plan-exec/runs/<id>/run.json`.

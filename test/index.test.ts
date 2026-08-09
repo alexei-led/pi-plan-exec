@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  writeFile,
+} from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -2022,6 +2029,43 @@ test("resume refuses a run whose worker cannot be proven gone", async () => {
     before,
     "an ambiguous run is reported, never reset",
   );
+});
+
+test("resume refuses a run whose operation directory cannot be read", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-plan-exec-async-denied-"));
+  const asyncDir = join(parent, "operation");
+  await mkdir(asyncDir);
+  // Mode 000 on the parent makes access() fail with EACCES instead of ENOENT.
+  // It needs no root and destroys nothing.
+  await chmod(parent, 0o000);
+  const unreadable = abandonedRun({
+    activeOperation: {
+      operationId: "operation-1",
+      service: "bridge",
+      kind: "implementation",
+      externalRunId: "external-1",
+      asyncDir,
+    },
+  });
+  const { registry, directory } = await seedDirectory([unreadable]);
+  const before = await snapshotRuns(directory);
+
+  try {
+    const evidence = await runEvidence(unreadable, abandonmentProbe());
+    assert.equal(
+      evidence.asyncDirPresent,
+      undefined,
+      "a check that failed is not proof the directory is gone",
+    );
+    await assert.rejects(
+      reconcileForResume(registry, unreadable),
+      /evidence is incomplete/,
+      "an unreadable directory must not license a reset",
+    );
+    assert.deepEqual(await snapshotRuns(directory), before);
+  } finally {
+    await chmod(parent, 0o700);
+  }
 });
 
 test("resume passes through what it has no evidence against", async () => {

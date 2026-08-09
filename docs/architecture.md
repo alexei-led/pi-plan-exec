@@ -146,7 +146,11 @@ Terminal state is retired, not accumulated, in three steps:
    promise a removal the registry would reject: a non-terminal run is refused, and
    so is a run held by a live lease. Both are decided under the run's own lock,
    with the record read inside it — deciding first and locking afterwards would let
-   a concurrent claim revive the run into the window before the delete.
+   a concurrent claim revive the run into the window before the delete. The
+   controller lock is taken first, in the order every controller takes it: a
+   `/exec resume` holds it from before its claim until the recovery ends, and a
+   removal that ignored it would delete the record mid-recovery. A removal that
+   cannot take it refuses rather than waits.
    `/exec cleanup` selects `completed`, `completed_with_findings`, and `cancelled`
    runs that finished more than 7 days ago, measured from `retiredAt` where the
    record carries one and from `updatedAt` otherwise, so a lease release does not

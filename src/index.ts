@@ -1124,7 +1124,7 @@ export async function execCleanup(
       "Removal deletes the registry entry only; the worktree, branch, and progress file are left in place.",
       ...(runId
         ? [
-            "Naming a run overrides both the retention window and the failed exclusion; the registry still refuses a non-terminal run or a live lease.",
+            "Naming a run overrides both the retention window and the failed exclusion; the registry still refuses a non-terminal run, a live lease, or a run a controller is recovering.",
           ]
         : []),
       ...failedHint,
@@ -1733,12 +1733,19 @@ function bridgeOperationState(
   return typeof state === "string" && state.trim() ? state.trim() : undefined;
 }
 
-async function pathExists(path: string): Promise<boolean> {
+/**
+ * `undefined` when the check itself failed. Only ENOENT and ENOTDIR prove a
+ * path is not there; EACCES or EIO prove nothing, and absence of evidence must
+ * never reach the caller as evidence of absence.
+ */
+async function pathExists(path: string): Promise<boolean | undefined> {
   try {
     await access(path);
     return true;
-  } catch {
-    return false;
+  } catch (error: unknown) {
+    return isNodeError(error, "ENOENT") || isNodeError(error, "ENOTDIR")
+      ? false
+      : undefined;
   }
 }
 

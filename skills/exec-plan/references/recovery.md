@@ -499,7 +499,8 @@ shows it again. A terminal record becomes removable 7 days after it finished,
 and `/exec cleanup --apply` deletes it. `failed` records are excluded until
 `--include-failed` is passed, because `/exec resume` needs them. Naming one run
 — `/exec cleanup <full-run-id> --apply` — overrides both the window and that
-exclusion; the registry still refuses a non-terminal run or a live lease.
+exclusion; the registry still refuses a non-terminal run, a live lease, or a run
+a controller is recovering.
 
 ## Verify recovery
 

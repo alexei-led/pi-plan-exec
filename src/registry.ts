@@ -288,7 +288,7 @@ export class RunRegistry {
     runId: string,
     callback: () => Promise<T>,
   ): Promise<T | undefined> {
-    const path = `${this.pathFor(runId)}.controller.lock`;
+    const path = this.controllerLockPath(runId);
     let lock;
     try {
       lock = await acquireLock(
@@ -331,16 +331,45 @@ export class RunRegistry {
    * The refusal is decided under the same lock as the deletion: reading first
    * would let a concurrent `claim` revive the run in the window between, and
    * this is the one irreversible path in the store.
+   *
+   * The controller lock comes first, in the order every controller takes it. A
+   * resume holds it across the whole recovery, and the record it is about to
+   * write must not be deleted underneath it.
    */
   async remove(runId: string): Promise<boolean> {
     assertRunId(runId);
+    const controllerPath = this.controllerLockPath(runId);
+    let controllerLock;
+    try {
+      controllerLock = await acquireLock(
+        controllerPath,
+        CONTROLLER_LOCK_MAX_RETRIES,
+        CONTROLLER_LOCK_STALE_MS,
+      );
+    } catch (error: unknown) {
+      // No directory to lock is no directory to delete.
+      if (isNodeError(error, "ENOENT")) return false;
+      if (error instanceof LockTimeoutError)
+        throw new Error(
+          `Run ${runId} is being recovered by another controller; nothing was deleted.`,
+          { cause: error },
+        );
+      throw error;
+    }
+    try {
+      return await this.removeLocked(runId);
+    } finally {
+      await releaseLock(controllerPath, controllerLock);
+    }
+  }
+
+  private async removeLocked(runId: string): Promise<boolean> {
     const path = this.pathFor(runId);
     const lockPath = `${path}.lock`;
     let lock;
     try {
       lock = await acquireLock(lockPath);
     } catch (error: unknown) {
-      // No directory to lock is no directory to delete.
       if (isNodeError(error, "ENOENT")) return false;
       throw error;
     }
@@ -383,6 +412,10 @@ export class RunRegistry {
   private pathFor(runId: string): string {
     assertRunId(runId);
     return join(this.directory, runId, "run.json");
+  }
+
+  private controllerLockPath(runId: string): string {
+    return `${this.pathFor(runId)}.controller.lock`;
   }
 
   private async write(run: PlanExecRun): Promise<void> {

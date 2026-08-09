@@ -825,6 +825,24 @@ test("remove decides refusal under the lock, not before it", async () => {
   assert.equal((await registry.get(run.id))?.status, "running");
 });
 
+test("remove refuses a run a controller is recovering", async () => {
+  const { directory, registry, run } = await seedRemovable({
+    status: "failed",
+  });
+  // The controller lock as /exec resume holds it: this process, taken now, so
+  // the stale-lock breaker leaves it alone.
+  await writeFile(
+    join(directory, run.id, "run.json.controller.lock"),
+    `${JSON.stringify({ pid: process.pid, createdAt: Date.now(), token: "held" })}\n`,
+  );
+
+  await assert.rejects(registry.remove(run.id), /being recovered/);
+  assert.ok(
+    await stat(join(directory, run.id, "run.json")),
+    "a run under recovery survives",
+  );
+});
+
 test("remove reports whether a record was actually deleted", async () => {
   const { registry, run } = await seedRemovable();
 
