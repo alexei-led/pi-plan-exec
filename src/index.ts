@@ -533,6 +533,14 @@ export function recoveryGuidance(
       classification: "the plan file changed shape since this run started",
       action: `Put the original headings and checkboxes back, or run interactive /exec resume ${run.id} to accept the plan as it now reads. If the first resume only records this pause, run it once more after you have read the plan.`,
     };
+  // Ahead of every branch that tells the reader to wait. Each of those waits —
+  // for a waiver to land, for a stop to arrive, for a provider to answer, for
+  // the poll loop to tick — needs something still running, so once the probe
+  // has proven the worker gone they are all false. The sweep and the resume
+  // gate read this same verdict, so anything below this line could only
+  // contradict them.
+  if (evidence && classifyAbandonment(run, evidence) === ABANDONMENT.ABANDONED)
+    return abandonedGuidance(run, evidence);
   if (run.status === RUN_STATUS.SKIP_PENDING)
     return {
       classification: "waiting for the stage you waived to stop",
@@ -572,14 +580,6 @@ export function recoveryGuidance(
     // exists to fix.
     if (run.activeOperation) {
       const signal = run.activeOperation.workerSignal;
-      if (
-        evidence &&
-        classifyAbandonment(run, evidence) === ABANDONMENT.ABANDONED
-      )
-        return {
-          classification: "the worker is gone, so nothing is running",
-          action: `Checked just now: ${operationEvidence({ run, evidence })}. Run /exec resume ${run.id}; it clears the dead worker and continues, without starting a second one. Run /exec stop ${run.id} instead to end the run and keep the worktree.`,
-        };
       const activity = reportedActivity(run.activeOperation);
       // Elapsed time is weaker evidence than a fresh activity value, so the
       // bound only speaks when nothing else does. It prompts a look; it never
@@ -637,6 +637,34 @@ export function recoveryGuidance(
   return {
     classification: "not recognised",
     action: `Run /exec status ${run.id} again; no next step could be worked out from this state.`,
+  };
+}
+
+/**
+ * The one shape the evidence settled: nothing is running. The command named
+ * here is the command the sweep prints for the same run — `recoveryCommand`
+ * makes the same split on the same status — so the two views can never send a
+ * reader to different places. A run already told to stop is not reset by the
+ * gate, so it is told to finish the stop rather than to resume.
+ */
+function abandonedGuidance(
+  run: PlanExecRun,
+  evidence: AbandonmentEvidence,
+): RecoveryGuidance {
+  const checked = `Checked just now: ${operationEvidence({ run, evidence })}`;
+  if (run.status === RUN_STATUS.CANCEL_PENDING)
+    return {
+      classification: "the worker is gone, so the stop cannot land by itself",
+      action: `${checked}, so this run will never reach cancelled on its own. Run /exec stop ${run.id} to finish the cancellation; its worktree is kept either way.`,
+    };
+  if (run.status === RUN_STATUS.SKIP_PENDING)
+    return {
+      classification: "the worker is gone, so the waived stage cannot finish",
+      action: `${checked}, so there is nothing left to stop and the run cannot move on by itself. Run /exec resume ${run.id}; it clears the dead worker and continues, without starting a second one.`,
+    };
+  return {
+    classification: "the worker is gone, so nothing is running",
+    action: `${checked}. Run /exec resume ${run.id}; it clears the dead worker and continues, without starting a second one. Run /exec stop ${run.id} instead to end the run and keep the worktree.`,
   };
 }
 
@@ -730,16 +758,22 @@ export function formatRunStatus(
       `last observation: ${new Date(operation.lastObservedAt).toISOString()}`,
     );
   lines.push(...workerSignalLines(run, evidence));
+  // Retrying and polling are things a session does, and only the session
+  // holding a live lease does them. The counts below are stored facts and are
+  // reported either way; the claim that something is still trying is added only
+  // where a live lease was actually observed. Without evidence nothing is
+  // claimed in either direction.
+  const polling = evidence?.leaseLive === true ? "; retrying" : "";
   if (operation?.statusFailures) {
     lines.push(
-      `observation: unavailable (${operation.statusFailures}/${MAX_STATUS_FAILURES}); retrying${operation.lastStatusError ? ` — ${operation.lastStatusError}` : ""}`,
+      `observation: unavailable (${operation.statusFailures}/${MAX_STATUS_FAILURES})${polling}${operation.lastStatusError ? ` — ${operation.lastStatusError}` : ""}`,
     );
   }
   if (operation?.skipFailures) {
     lines.push(
-      `waived stage: could not stop the worker (${operation.skipFailures}/${MAX_STATUS_FAILURES}); retrying${operation.lastSkipError ? ` — ${operation.lastSkipError}` : ""}`,
+      `waived stage: could not stop the worker (${operation.skipFailures}/${MAX_STATUS_FAILURES})${polling}${operation.lastSkipError ? ` — ${operation.lastSkipError}` : ""}`,
     );
-  } else if (operation && !operation.statusFailures) {
+  } else if (operation && !operation.statusFailures && polling) {
     lines.push(
       "observation: polling continues; worker output is available when its operation completes.",
     );
@@ -1169,9 +1203,12 @@ export function abandonmentProbe(
 export async function runEvidence(
   run: PlanExecRun,
   probe: EvidenceProbe = abandonmentProbe(),
-  sessionId?: string,
 ): Promise<AbandonmentEvidence> {
-  const leaseLive = Boolean(run.lease && isLeaseLive(run.lease, sessionId));
+  // No session argument, for any caller: `isLeaseLive` answers LIVE on a name
+  // match whatever the heartbeat says, so a caller that named itself would see
+  // a live worker where the sweep and the detail view see a dead one, and walk
+  // past the gate that sent it here.
+  const leaseLive = Boolean(run.lease && isLeaseLive(run.lease));
   return leaseLive ? { leaseLive } : { leaseLive, ...(await probe(run)) };
 }
 
@@ -1304,12 +1341,13 @@ export async function execStatus(
       "\n",
     );
   const inFlight = sweep.diagnoses.length;
+  const abandoned = diagnosisGroup(sweep, ABANDONMENT.ABANDONED);
   lines.push(
     `Plan execution runs: ${total}${inFlight > 0 ? ` (${inFlight} claiming work in flight)` : ""}`,
     ...groupLines(
       "abandoned — no worker is running",
-      diagnosisGroup(sweep, ABANDONMENT.ABANDONED),
-      "Each resets to a recoverable failure before it continues; no second worker is launched.",
+      abandoned,
+      abandonedFooter(abandoned),
     ),
     ...groupLines(
       "ambiguous — evidence is incomplete, so nothing was reset",
@@ -1349,6 +1387,22 @@ function unreadableLines(
         `- ${record.runId} — ${record.message}. Next: /exec cleanup ${record.runId} ${CLEANUP_APPLY_OPTION}`,
     ),
   ];
+}
+
+/**
+ * What the abandoned group promises, worded for the rows it actually holds.
+ * `reconcileRun` refuses every run already told to stop, so a footer saying
+ * each one resets is false for a group made only of those, and half true for a
+ * mixed one. Undefined leaves the rows to speak for themselves.
+ */
+function abandonedFooter(diagnoses: RunDiagnosis[]): string | undefined {
+  const resettable = diagnoses.filter(
+    (diagnosis) => !isRecoverableRun(diagnosis.run),
+  ).length;
+  if (resettable === 0) return undefined;
+  return resettable === diagnoses.length
+    ? "Each resets to a recoverable failure before it continues; no second worker is launched."
+    : "Each resets to a recoverable failure before it continues, except the ones already told to stop, which keep that request; no second worker is launched.";
 }
 
 function diagnosisGroup(
@@ -1539,20 +1593,20 @@ function reconcileReason(diagnosis: RunDiagnosis, actor: string): string {
  * resume past a worker that is still writing. It is never written back either:
  * the reset's own `claim` re-stamps the current host, and an assertion that
  * ends ambiguous must leave the record exactly as it found it.
+ *
+ * It takes no session: the gate judges the lease from the outside, exactly as
+ * `/exec status` and the sweep judge it. Knowing who is asking could only make
+ * a dead lease read as live for the one caller most likely to be recovering
+ * its own crashed session.
  */
 export async function reconcileForResume(
   registry: RunRegistry,
   run: PlanExecRun,
-  sessionId: string,
   probe: EvidenceProbe = abandonmentProbe(),
   sameMachine = false,
 ): Promise<{ run: PlanExecRun; note?: string }> {
   if (!isInFlightStatus(run.status) || isRecoverableRun(run)) return { run };
-  const evidence = await runEvidence(
-    sameMachine ? asLocalRun(run) : run,
-    probe,
-    sessionId,
-  );
+  const evidence = await runEvidence(sameMachine ? asLocalRun(run) : run, probe);
   const diagnosis: RunDiagnosis = {
     run,
     evidence,
@@ -1825,7 +1879,6 @@ async function runAction(
         ? await reconcileForResume(
             registry,
             resolved,
-            sessionId,
             doctorProbe,
             resumeArguments.sameMachine,
           )
@@ -2161,7 +2214,7 @@ export function isActionAllowed(
           run.status === RUN_STATUS.RUNNING ||
           run.status === RUN_STATUS.PAUSED ||
           isRecoverableFailure(run) ||
-          isClaimableForeignRun(run, sessionId);
+          isClaimableDeadLease(run);
   if (action === EXEC_ACTION.SKIP) return isStageWaiverAvailable(run);
   if (action === EXEC_ACTION.CANCEL)
     return (
@@ -2186,18 +2239,18 @@ export function isStageWaiverAvailable(run: PlanExecRun): boolean {
 }
 
 /**
- * The lease that used to force a reader to choose `/exec adopt`: another
- * session still holds this run and that session is provably gone. Resume reads
- * the lease itself and takes it over.
+ * The lease that used to force a reader to choose `/exec adopt`: a session
+ * still holds this run and that session is provably gone. Resume reads the
+ * lease itself and takes it over.
+ *
+ * Whose name is on the lease never enters it. A Pi that restarted under the
+ * same session ID left a dead lease naming the caller, and that is precisely
+ * the run `/exec status` tells that caller to resume — refusing it here would
+ * print a next command this gate rejects. The same predicate the detail view
+ * uses for `owner: stale lease`, so the two cannot drift apart.
  */
-function isClaimableForeignRun(run: PlanExecRun, sessionId: string): boolean {
-  const lease = run.lease;
-  return (
-    !isTerminal(run.status) &&
-    lease !== undefined &&
-    lease.sessionId !== sessionId &&
-    !isLeaseLive(lease, sessionId)
-  );
+function isClaimableDeadLease(run: PlanExecRun): boolean {
+  return !isTerminal(run.status) && isStaleOwner(run);
 }
 
 export function isRecoverableFailure(run: PlanExecRun): boolean {

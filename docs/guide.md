@@ -244,6 +244,13 @@ absence of a signal as health. Every in-flight situation reads differently:
   ran: the directory the worker was writing to is absent, or the bridge has no
   record of its operation. `/exec resume` clears the dead worker and continues
   without starting a second one.
+- `the worker is gone, so the waived stage cannot finish` — the same evidence on
+  a run whose waiver is still pending. Nothing is left to stop, so the run
+  cannot move on by itself; `/exec resume` clears the dead worker and continues.
+- `the worker is gone, so the stop cannot land by itself` — the same evidence on
+  a run already told to stop. It will never reach `cancelled` on its own, and
+  the reset that recovers the others would erase the stop it carries, so
+  `/exec stop` finishes the cancellation instead.
 - `cannot check on the worker right now` — the provider could not be reached, or
   the worker was launched and never named. Repair the provider and re-check.
 - `its lease names a machine that is not this one` — the host frozen on the
@@ -255,19 +262,27 @@ absence of a signal as health. Every in-flight situation reads differently:
   stages. Its next tick opens the next one.
 
 Both reads gather that evidence the same way, so `/exec status` and
-`/exec status <full-run-id>` cannot disagree about one run. Nothing about
-liveness is taken from the record itself: a directory that was there at the last
-poll proves nothing about now, and neither does one that was missing.
+`/exec status <full-run-id>` cannot disagree about one run. The resume gate
+reads the same evidence too, and none of the three asks who is calling: a lease
+is judged from the outside, so a Pi that restarted under the same session ID
+gets the same answer everyone else does. Nothing about liveness is taken from
+the record itself: a directory that was there at the last poll proves nothing
+about now, and neither does one that was missing. A classification that tells
+you to wait is only ever printed when nothing proved the worker gone — decisive
+evidence outranks a pending waiver, a pending stop, and an unreachable provider
+alike.
 
 A run spawned in workflow mode reports no trustworthy per-turn activity, so
 elapsed time is the only bound available for it. That limit is upstream and
 temporary: `nicobailon/pi-subagents#920`.
 
-A lease is live only when the calling session owns it, or its heartbeat is fresh
-and — on this host, where the pid means something — that process still exists. A
-lease whose pid is dead on this host is stale at once, so `/exec resume` takes
-the run over with no wait. A lease recorded before the hostname field existed is
-judged by its 30-second heartbeat window alone.
+A lease is live only when its heartbeat is fresh and — on this host, where the
+pid means something — that process still exists. Whose session ID is on it never
+enters that answer for status, the sweep, or the resume gate; only re-claiming a
+run reads the name, so a session can renew its own lease. A lease whose pid is
+dead on this host is stale at once, so `/exec resume` takes the run over with no
+wait, including when the dead lease names the caller. A lease recorded before
+the hostname field existed is judged by its 30-second heartbeat window alone.
 
 The host on a lease is frozen when the run is claimed, and only the first label
 of it identifies the machine: a Mac that republishes itself as `foo.local`,

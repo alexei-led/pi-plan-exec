@@ -130,8 +130,11 @@ If it never moves, its owning session is gone; the sweep classifies it
 
 Either the provider could not be polled, or a worker was launched and plan-exec
 never learned its name. Both mean the same thing: nothing can say whether that
-worker is still writing, so a resume would risk a second writer. Repair the
-provider; the controller resumes polling on its own. Then re-check:
+worker is still writing, so a resume would risk a second writer. This is only
+printed while nothing has proven the worker gone — with decisive evidence the
+run reads `the worker is gone, so nothing is running` instead, whatever the
+failure counter says. Repair the provider; the session holding the run resumes
+polling on its own. Then re-check:
 
 ```text
 /exec status <full-run-id>
@@ -276,7 +279,10 @@ launching a child directly.
 
 While the waiver is pending, status classifies the run
 `waiting for the stage you waived to stop`; wait it out with
-`/exec status <full-run-id>`.
+`/exec status <full-run-id>`. If the worker is provably gone the classification
+is `the worker is gone, so the waived stage cannot finish` instead — nothing is
+left to stop, so waiting can never end. Use `/exec resume <full-run-id>`, which
+clears the dead worker and continues without starting a second one.
 
 Use this only after inspecting the findings and active operation:
 
@@ -308,6 +314,15 @@ then use:
 That retries cancellation. It does not resume normal plan work. Never start a
 replacement worker while cancellation is unresolved.
 
+When the worker is provably gone the classification is
+`the worker is gone, so the stop cannot land by itself`, and the run will never
+reach `cancelled` on its own. The registry-wide reset skips it — that reset
+would erase the stop it carries — so finish the cancellation instead:
+
+```text
+/exec stop <full-run-id>
+```
+
 ## Stale owner or different session
 
 Status classifies this
@@ -321,7 +336,9 @@ selected run before takeover:
 ```
 
 Resume is active: it takes the dead lease over and may immediately advance the
-run. Use it only for an unfinished run owned by a stale or different session.
+run. Use it only for an unfinished run whose lease is stale. Whose session ID is
+on that lease does not matter — a Pi that restarted under the same ID left a
+dead lease naming the caller, and resume takes that one over on the same terms.
 If resume hands Pi into the execution worktree, continue recovery in that
 forked session.
 

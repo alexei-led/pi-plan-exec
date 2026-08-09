@@ -1950,11 +1950,7 @@ test("resume reconciles a provably abandoned run, then continues", async () => {
   const abandoned = abandonedRun({ progressPath });
   const registry = await seedRegistry([abandoned]);
 
-  const recovered = await reconcileForResume(
-    registry,
-    abandoned,
-    "session-new",
-  );
+  const recovered = await reconcileForResume(registry, abandoned);
 
   assert.equal(recovered.run.status, "failed");
   assert.equal(recovered.run.activeOperation, undefined);
@@ -1994,7 +1990,7 @@ test("resume refuses a run whose worker cannot be proven gone", async () => {
   const before = await snapshotRuns(directory);
 
   await assert.rejects(
-    reconcileForResume(registry, ambiguous, "session-new"),
+    reconcileForResume(registry, ambiguous),
     /evidence is incomplete[\s\S]*could add a second writer[\s\S]*\/exec status/,
   );
   assert.deepEqual(
@@ -2018,11 +2014,7 @@ test("resume passes through what it has no evidence against", async () => {
     ["cancellation must survive, not be reset", cancelling],
     ["resume already recovers a failure", failed],
   ] as const) {
-    const recovered = await reconcileForResume(
-      registry,
-      candidate,
-      LIVE_SESSION_ID,
-    );
+    const recovered = await reconcileForResume(registry, candidate);
     assert.equal(recovered.run, candidate, label);
     assert.equal(recovered.note, undefined, label);
   }
@@ -2038,7 +2030,7 @@ test("resume skips a run reclaimed while it was being diagnosed", async () => {
   };
 
   await assert.rejects(
-    reconcileForResume(registry, abandoned, "session-new", probe),
+    reconcileForResume(registry, abandoned, probe),
     /reclaimed while it was being diagnosed/,
   );
   assert.equal((await registry.get(abandoned.id))?.status, "running");
@@ -2081,7 +2073,7 @@ test("every run whose guidance names resume survives the resume gate", async () 
     if (!guidance.action.includes(`/exec resume ${shape.id}`)) continue;
     exercised += 1;
     await assert.doesNotReject(
-      reconcileForResume(registry, shape, "session-new"),
+      reconcileForResume(registry, shape),
       `guidance recommends resume but the gate refuses it: ${guidance.classification}`,
     );
   }
@@ -2328,11 +2320,7 @@ test("the detail view checks the worker itself instead of trusting the record", 
   });
   const registry = await seedRegistry([abandoned]);
 
-  const evidence = await runEvidence(
-    abandoned,
-    abandonmentProbe(),
-    "session-new",
-  );
+  const evidence = await runEvidence(abandoned, abandonmentProbe());
   const detail = formatRunStatus(abandoned, evidence);
 
   assert.match(detail, /recovery: the worker is gone, so nothing is running/);
@@ -2377,6 +2365,188 @@ test("the two views judge a lease the same way, including this session's own", a
   assert.match(detail, /recovery: the worker is gone, so nothing is running/);
   assert.match(sweep, /abandoned — no worker is running/);
   assert.match(sweep, new RegExp(`Next: /exec resume ${mine.id}`));
+  assert.equal(
+    isActionAllowed("resume", mine, LIVE_SESSION_ID),
+    true,
+    "the sweep must not print a next command its own gate refuses",
+  );
+  // And the gate itself, which takes no session for exactly this reason: it
+  // used to read its own caller's dead lease as live and wave the run through
+  // without clearing the worker both views had just called gone.
+  assert.equal(
+    (await reconcileForResume(registry, mine)).run.status,
+    "failed",
+    "the gate must reset what both views call abandoned",
+  );
+});
+
+/**
+ * The four claims that each used to be answered before the evidence was read.
+ * Every one names a wait, and every wait needs something still running.
+ */
+const PREEMPTING_SHAPES: Array<[string, Partial<PlanExecRun>]> = [
+  [
+    "the provider stopped answering",
+    {
+      activeOperation: {
+        operationId: "operation-1",
+        service: "bridge",
+        kind: "implementation",
+        externalRunId: "external-1",
+        asyncDir: MISSING_ASYNC_DIR,
+        statusFailures: 2,
+        lastStatusError: "bridge status failed: ENOENT",
+      },
+    },
+  ],
+  [
+    "the worker's name was never learned",
+    {
+      activeOperation: {
+        operationId: "operation-1",
+        service: "bridge",
+        kind: "implementation",
+        asyncDir: MISSING_ASYNC_DIR,
+      },
+    },
+  ],
+  [
+    "a stage was waived",
+    {
+      status: "skip_pending",
+      stage: "comprehensive_review",
+      activeOperation: {
+        operationId: "operation-1",
+        service: "bridge",
+        kind: "review",
+        externalRunId: "external-1",
+        reviewIteration: 1,
+        asyncDir: MISSING_ASYNC_DIR,
+      },
+      pendingStageSkip: {
+        stage: "comprehensive_review",
+        reason: "waived",
+        requestedAt: Date.now() - 6 * 60_000,
+        requestedBy: "operator",
+      },
+    },
+  ],
+  ["a stop was requested", { status: "cancel_pending" }],
+];
+
+test("decisive evidence outranks every claim that would say wait", async () => {
+  for (const [label, overrides] of PREEMPTING_SHAPES) {
+    const gone = abandonedRun(overrides);
+    const registry = await seedRegistry([gone]);
+    const evidence = await runEvidence(gone, abandonmentProbe());
+    const guidance = recoveryGuidance(gone, evidence);
+    const sweep = await execStatus(registry);
+    // The one command the sweep prints for this row; the detail view has to
+    // name the same one or the two views send a reader to different places.
+    const next =
+      gone.status === "cancel_pending"
+        ? `/exec stop ${gone.id}`
+        : `/exec resume ${gone.id}`;
+
+    assert.match(guidance.classification, /^the worker is gone/, label);
+    assert.doesNotMatch(
+      guidance.action,
+      /Do not resume|Do not start another|moves on by itself|until it reads cancelled|polling picks up/,
+      `${label}: guidance still tells the reader to wait for a dead worker`,
+    );
+    assert.ok(guidance.action.includes(next), `${label}: names ${next}`);
+    assert.match(sweep, new RegExp(`Next: ${next.replace("/", "\\/")}`), label);
+    // Asked as the session named on the dead lease: a Pi that restarted under
+    // the same ID is the caller most likely to be reading this row, and the
+    // gate must not refuse it the command the row just printed.
+    assert.equal(
+      isActionAllowed(
+        gone.status === "cancel_pending" ? "stop" : "resume",
+        gone,
+        gone.lease!.sessionId,
+      ),
+      true,
+      `${label}: the sweep prints a next command its own gate refuses`,
+    );
+  }
+});
+
+test("a live lease keeps every one of those claims exactly as it was", async () => {
+  const waits = [
+    /cannot check on the worker right now/,
+    /cannot check on the worker right now/,
+    /waiting for the stage you waived to stop/,
+    /waiting for the stop you asked for/,
+  ];
+  for (const [index, [label, overrides]] of PREEMPTING_SHAPES.entries()) {
+    const held = abandonedRun({ ...overrides, lease: liveLease() });
+    const guidance = recoveryGuidance(
+      held,
+      await runEvidence(held, abandonmentProbe()),
+    );
+    assert.match(guidance.classification, waits[index]!, label);
+  }
+});
+
+test("nothing claims a poll loop that no live lease was observed for", async () => {
+  const stalled = abandonedRun({
+    activeOperation: {
+      operationId: "operation-1",
+      service: "bridge",
+      kind: "implementation",
+      externalRunId: "external-1",
+      asyncDir: MISSING_ASYNC_DIR,
+      statusFailures: 2,
+      lastStatusError: "bridge status failed: ENOENT",
+    },
+  });
+  const dead = formatRunStatus(
+    stalled,
+    await runEvidence(stalled, abandonmentProbe()),
+  );
+
+  // The count is a stored fact and stays; the claim that something is still
+  // trying does not survive a dead lease.
+  assert.match(dead, /observation: unavailable \(2\/3\) — bridge status failed/);
+  assert.doesNotMatch(dead, /retrying/);
+  assert.doesNotMatch(dead, /polling continues/);
+
+  const held = { ...stalled, lease: liveLease() };
+  assert.match(
+    formatRunStatus(held, await runEvidence(held, abandonmentProbe())),
+    /observation: unavailable \(2\/3\); retrying/,
+  );
+  const polling = abandonedRun({ lease: liveLease() });
+  assert.match(
+    formatRunStatus(polling, await runEvidence(polling, abandonmentProbe())),
+    /observation: polling continues/,
+  );
+  // Unprobed, the view knows nothing about a poll loop and claims nothing.
+  assert.doesNotMatch(formatRunStatus(polling), /polling continues/);
+});
+
+test("the abandoned group promises a reset only where one happens", async () => {
+  const stopping = abandonedRun({
+    id: "22222222-2222-4222-8222-222222222222",
+    status: "cancel_pending",
+  });
+  const resettable = abandonedRun();
+  const footer =
+    /Each resets to a recoverable failure before it continues; no second worker is launched\./;
+
+  // reconcileRun refuses a run already told to stop, so a group of only those
+  // resets nothing and must promise nothing.
+  const onlyStopping = await execStatus(await seedRegistry([stopping]));
+  assert.match(onlyStopping, /abandoned — no worker is running/);
+  assert.doesNotMatch(onlyStopping, /Each resets/);
+
+  assert.match(await execStatus(await seedRegistry([resettable])), footer);
+
+  const mixed = await execStatus(await seedRegistry([stopping, resettable]));
+  assert.match(
+    mixed,
+    /except the ones already told to stop, which keep that request/,
+  );
 });
 
 test("the sweep reports how far past its budget a run has gone", async () => {
@@ -2423,7 +2593,7 @@ test("evidence gathered here says nothing about a run on another host", async ()
   assert.equal((await registry.get(remote.id))?.status, "running");
   assert.deepEqual(asked, [], "no local bridge lookup for a remote worker");
   await assert.rejects(
-    reconcileForResume(registry, remote, "session-new", probe),
+    reconcileForResume(registry, remote, probe),
     /evidence is incomplete[\s\S]*lease names another-host, not this machine/,
   );
 });
@@ -2450,7 +2620,7 @@ test("a renamed machine can still diagnose and resume its own run", async () => 
   );
   // Refused without the assertion — but the refusal names the way out.
   await assert.rejects(
-    reconcileForResume(registry, renamed, "session-new"),
+    reconcileForResume(registry, renamed),
     new RegExp(`/exec resume ${renamed.id} --same-machine`),
   );
   assert.deepEqual(
@@ -2462,7 +2632,6 @@ test("a renamed machine can still diagnose and resume its own run", async () => 
   const recovered = await reconcileForResume(
     registry,
     renamed,
-    "session-new",
     abandonmentProbe(),
     true,
   );
@@ -2484,7 +2653,7 @@ test("a network rename of this machine needs no assertion at all", async () => {
   });
   const registry = await seedRegistry([churned]);
 
-  const recovered = await reconcileForResume(registry, churned, "session-new");
+  const recovered = await reconcileForResume(registry, churned);
 
   assert.equal(
     recovered.run.status,
@@ -2517,13 +2686,7 @@ test("--same-machine supplies a machine, never a verdict", async () => {
   // The assertion only unblocks the evidence. What that evidence then says is
   // unchanged, so a worker still writing here keeps the run ambiguous.
   await assert.rejects(
-    reconcileForResume(
-      registry,
-      stillWriting,
-      "session-new",
-      abandonmentProbe(),
-      true,
-    ),
+    reconcileForResume(registry, stillWriting, abandonmentProbe(), true),
     /evidence is incomplete[\s\S]*operation directory is still on disk/,
   );
   assert.deepEqual(await snapshotRuns(directory), before);
@@ -2545,7 +2708,6 @@ test("--same-machine supplies a machine, never a verdict", async () => {
     reconcileForResume(
       seeded.registry,
       bridgeKnowsIt,
-      "session-new",
       abandonmentProbe(async () => "running"),
       true,
     ),
