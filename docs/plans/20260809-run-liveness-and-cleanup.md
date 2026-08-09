@@ -305,7 +305,38 @@ say so in a code comment. Classify only; never auto-fail, never auto-kill.
       is the regression test for the originally reported bug
 - [ ] run `npm run test:all` — must pass before task 8
 
-### Task 8: Verify acceptance criteria
+### Task 8: ➕ Bring the exec-plan skill up to the new behavior
+
+The skill is the agent-facing contract. It is how an agent decides what to do with a
+stuck run, so a skill that describes the old surface is itself a recovery failure.
+Tasks 1-7 add `/exec cleanup`, `/exec runs --all`, a `long-running active operation`
+classification, and immediate stale-lease detection. None of these appear in the skill
+today.
+
+**Files:**
+
+- Modify: `skills/exec-plan/SKILL.md`
+- Modify: `skills/exec-plan/references/recovery.md`
+
+- [ ] add `/exec cleanup` and `/exec runs --all` to the "Choose the job" list in
+      `SKILL.md`, with the retention window and the `failed` exclusion stated
+- [ ] state that a lease whose pid is dead on this host is stale at once, so `/exec adopt`
+      no longer needs a 30-second wait; absent `hostname` still waits out the heartbeat
+- [ ] add the `long-running active operation` classification to `references/recovery.md`
+      with its decision branch: re-check, or cancel, and never start a second run
+- [ ] record that a workflow-mode run reports no trustworthy per-turn activity, so
+      elapsed time is the only bound; cite `nicobailon/pi-subagents#920` so a reader knows
+      the limit is upstream and temporary
+- [ ] remove guidance that the new surface makes obsolete, and make sure every recovery
+      branch names one command; prefer deleting a branch over adding a caveat
+- [ ] fix the stale `@^0.2.2` pin at `skills/exec-plan/SKILL.md:172` to `>=0.2.2`
+- [ ] verify every `/exec` subcommand named in the skill exists in `EXEC_ACTION`, and that
+      every member of `EXEC_ACTION` is either documented or deliberately internal
+- [ ] add a test that asserts the skill's documented subcommand list matches `EXEC_ACTION`,
+      so the two cannot drift again
+- [ ] run `npm run test:all` — must pass before task 9
+
+### Task 9: Verify acceptance criteria
 
 - [ ] verify every requirement in Overview is implemented
 - [ ] load each of the eight real run records under `~/.pi/plan-exec/runs/` through
@@ -313,9 +344,11 @@ say so in a code comment. Classify only; never auto-fail, never auto-kill.
 - [ ] verify `/exec cleanup` preview against the real registry reports the two
       `completed_with_findings` runs and excludes the five `failed` ones
 - [ ] verify no `schemaVersion` bump was introduced anywhere
+- [ ] verify every recovery branch in `skills/exec-plan/references/recovery.md` names a
+      command that exists, and that no branch ends without an action
 - [ ] run the full gate: `npm run test:all`
 
-### Task 9: [Final] Update documentation
+### Task 10: [Final] Update documentation
 
 **Files:**
 
