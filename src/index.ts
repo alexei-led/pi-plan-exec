@@ -475,151 +475,245 @@ export function getExecArgumentCompletions(
   return EXEC_COMMANDS.filter((command) => command.value.startsWith(trimmed));
 }
 
+/**
+ * One verdict and the one command that acts on it. `command` is always a
+ * command `action` names, so a surface that renders only the command and a
+ * surface that renders the whole sentence cannot disagree.
+ */
 type RecoveryGuidance = {
   classification: string;
   action: string;
+  command: string;
 };
 
 /**
  * The one next action for a run. Branch order matters throughout: each branch
  * assumes the ones above it did not fire. Without evidence nothing is proven
  * gone, and a persisted claim is never read as proof in either direction.
+ *
+ * `/exec status` is named only where the next read can differ: something is
+ * polling, or an operation is left to probe. Anywhere else it would loop the
+ * reader on a record nothing updates, so a command that moves the run is named.
  */
 export function recoveryGuidance(
   run: PlanExecRun,
   evidence?: AbandonmentEvidence,
 ): RecoveryGuidance {
+  const status = `/exec status ${run.id}`;
+  const resume = `/exec resume ${run.id}`;
+  const stop = `/exec stop ${run.id}`;
+  const polled = evidence?.leaseLive === true;
   if (isTerminal(run.status) && run.status !== RUN_STATUS.FAILED)
     return {
       classification: "finished",
       action: `This run is over and there is nothing to recover. Run /exec cleanup once you no longer need its record.`,
+      command: `/exec cleanup ${run.id}`,
     };
   // Only when nothing is tracked. With an unresolved operation this would
   // recommend a takeover the recovery gate then refuses; the operation branches
-  // below answer that case instead.
-  if (
-    isStaleOwner(run) &&
-    run.status !== RUN_STATUS.FAILED &&
-    !run.activeOperation
-  )
+  // below answer that case instead. A run already told to stop, or already
+  // failed, keeps that request and is answered by its own branch.
+  if (isStaleOwner(run) && !isRecoverableRun(run) && !run.activeOperation)
     return {
       classification:
         "someone else's session was holding this run, and it is gone",
-      action: `Check that the other session really stopped, then run /exec resume ${run.id}; it takes the run over from the dead one.`,
+      action: `Check that the other session really stopped, then run ${resume}; it takes the run over from the dead one.`,
+      command: resume,
     };
   if (hasExecutionBranchMismatch(run))
     return {
       classification: "this run belongs to a branch you are not on",
-      action: `Check the branch you are on, then run interactive /exec resume ${run.id}; it asks before moving the run to that branch.`,
+      action: `Check the branch you are on, then run interactive ${resume}; it asks before moving the run to that branch.`,
+      command: resume,
     };
   if (needsPlanStructureReview(run))
     return {
       classification: "the plan file changed shape since this run started",
-      action: `Put the original headings and checkboxes back, or run interactive /exec resume ${run.id} to accept the plan as it now reads. If the first resume only records this pause, run it once more after you have read the plan.`,
+      action: `Put the original headings and checkboxes back, or run interactive ${resume} to accept the plan as it now reads. If the first resume only records this pause, run it once more after you have read the plan.`,
+      command: resume,
     };
   // Ahead of every branch that tells the reader to wait: each such wait needs
   // something still running, so a proven-gone worker falsifies them all.
   if (evidence && classifyAbandonment(run, evidence) === ABANDONMENT.ABANDONED)
     return abandonedGuidance(run, evidence);
-  if (run.status === RUN_STATUS.SKIP_PENDING)
+  if (run.status === RUN_STATUS.CANCEL_PENDING)
+    return polled
+      ? {
+          classification: "waiting for the stop you asked for",
+          action: `Run ${status} until it reads cancelled or failed. If the stop itself failed, ${resume} retries only the stop and cannot start plan work.`,
+          command: status,
+        }
+      : {
+          classification: "waiting for the stop you asked for",
+          action: `No live session holds this run, so the stop cannot land by itself. Run ${stop} to finish the cancellation; its worktree is kept either way.`,
+          command: stop,
+        };
+  if (run.status === RUN_STATUS.SKIP_PENDING) {
+    if (polled)
+      return {
+        classification: "waiting for the stage you waived to stop",
+        action: `The worker on that stage was told to stop, and the run moves on by itself once it has. Run ${status} to re-check. Do not resume or start another run.`,
+        command: status,
+      };
+    if (!run.activeOperation)
+      return {
+        classification: "the waived stage has no worker left to stop",
+        action: `No live session holds this run and no worker is tracked, so it cannot move on by itself. Run ${resume}; it applies the waiver without starting a worker.`,
+        command: resume,
+      };
     return {
       classification: "waiting for the stage you waived to stop",
-      action: `The worker on that stage was told to stop, and the run moves on by itself once it has. Run /exec status ${run.id} to re-check. Do not resume or start another run.`,
+      // The one state with no command that moves it: resume refuses a worker it
+      // cannot prove gone, and stop is refused while a waiver is pending. The
+      // probe behind /exec status is what changes the answer, so it is honest
+      // here in a way it is not where nothing is left to observe.
+      action: `The worker on that stage was told to stop, but no live session is polling it, so nothing here notices when it does. Run ${status} again; the probe reports that worker gone as soon as it is, and only then can this run move. Do not resume or start another run before it does.`,
+      command: status,
     };
-  if (run.status === RUN_STATUS.CANCEL_PENDING)
-    return {
-      classification: "waiting for the stop you asked for",
-      action: `Run /exec status ${run.id} until it reads cancelled or failed. If the stop itself failed, /exec resume ${run.id} retries only the stop and cannot start plan work.`,
-    };
+  }
   // Ahead of every other unknown: no local probe can settle a run whose lease
   // names another machine, so the operator's override is the only action left.
-  // A run with nothing tracked belongs to the takeover branch above.
-  if (leaseNamesAnotherHost(run) && run.activeOperation)
+  // A run with nothing tracked belongs to the takeover branch above; a settled
+  // one needs no override, because its resume gathers no evidence at all.
+  if (
+    isInFlightStatus(run.status) &&
+    leaseNamesAnotherHost(run) &&
+    run.activeOperation
+  )
     return {
       classification: "its lease names a machine that is not this one",
-      action: `The lease was stamped on ${run.lease?.hostname} and this machine answers to ${hostname()}, so nothing here can observe its worker. If that name was this machine before it was renamed, run /exec resume ${run.id} ${SAME_MACHINE_OPTION}; it checks the worker here and still refuses while one is running. If it was a different machine, recover the run there.`,
+      action: `The lease was stamped on ${run.lease?.hostname} and this machine answers to ${hostname()}, so nothing here can observe its worker. If that name was this machine before it was renamed, run ${resume} ${SAME_MACHINE_OPTION}; it checks the worker here and still refuses while one is running. If it was a different machine, recover the run there.`,
+      command: `${resume} ${SAME_MACHINE_OPTION}`,
     };
-  if (run.activeOperation && !run.activeOperation.externalRunId)
-    return {
-      classification: "cannot check on the worker right now",
-      action: `A worker was launched and the tool never learned its name, so nothing here can tell whether it is still writing to the worktree. Run /exec status ${run.id} to re-check once the provider answers again. Do not start another worker while that is unknown.`,
-    };
+  // In-flight only. A settled run's own record says the controller stopped, and
+  // its resume looks the operation up by ID rather than launching a second one.
+  if (
+    isInFlightStatus(run.status) &&
+    run.activeOperation &&
+    !run.activeOperation.externalRunId
+  )
+    return waitOrStop(
+      run,
+      polled,
+      "cannot check on the worker right now",
+      `A worker was launched and the tool never learned its name, so nothing here can tell whether it is still writing to the worktree.`,
+    );
   if (run.status === RUN_STATUS.RUNNING || run.status === RUN_STATUS.STARTING) {
     if (run.activeOperation?.statusFailures)
-      return {
-        classification: "cannot check on the worker right now",
-        action: `The provider could not be reached, so nothing here can see what the worker is doing. Repair the provider and polling picks up on its own, then run /exec status ${run.id} to re-check. Do not start another worker while this one's outcome is unknown.`,
-      };
+      return waitOrStop(
+        run,
+        polled,
+        "cannot check on the worker right now",
+        `The provider could not be reached, so nothing here can see what the worker is doing.`,
+      );
     // A stored `running` claim is not evidence: only a trustworthy activity
     // signal earns wording that says the worker is alive.
     if (run.activeOperation) {
       const signal = run.activeOperation.workerSignal;
-      const activity = reportedActivity(run.activeOperation);
+      const workflow =
+        signal?.mode === WORKFLOW_MODE ? " for a workflow-mode run" : "";
+      const activity = reportedActivity(run.activeOperation, evidence);
       // Elapsed time is weaker evidence than a fresh activity value, so the
       // bound only speaks when nothing else does.
       const overdue = activity ? undefined : longRunningOperation(run);
       if (overdue)
-        return {
-          classification: "running longer than its budget allows",
-          action: `This run has claimed an active worker for ${elapsedLabel(overdue.elapsedMs)} since launch, past the ${minutesLabel(overdue.boundMs)} allowed for its ${overdue.maxTurns}-turn budget, and nothing reports what it is doing${signal?.mode === WORKFLOW_MODE ? " for a workflow-mode run" : ""}. That is not proof the worker is stuck. Run /exec status ${run.id} to re-check, or /exec stop ${run.id} to end it and preserve the worktree. Do not resume or start a second run.`,
-        };
+        return waitOrStop(
+          run,
+          polled,
+          "running longer than its budget allows",
+          `This run has claimed an active worker for ${elapsedLabel(overdue.elapsedMs)} since launch, past the ${minutesLabel(overdue.boundMs)} allowed for its ${overdue.maxTurns}-turn budget, and nothing reports what it is doing${workflow}. That is not proof the worker is stuck.`,
+        );
       if (!activity)
-        return {
-          classification: "running, but nothing proves the worker is alive",
-          // `/exec stop` is offered because the wait can be unbounded: with a
-          // dead lease nothing polls, so re-checking alone never settles it.
-          action: `Wait and use /exec status ${run.id} to re-check; nothing reports what this worker is doing${signal?.mode === WORKFLOW_MODE ? " for a workflow-mode run" : ""}, so it is neither confirmed alive nor confirmed dead. Run /exec stop ${run.id} to end it and preserve the worktree rather than wait. Do not resume or start another run.`,
-        };
+        return waitOrStop(
+          run,
+          polled,
+          "running, but nothing proves the worker is alive",
+          `Nothing reports what this worker is doing${workflow}, so it is neither confirmed alive nor confirmed dead.`,
+        );
       return {
         classification: "running, and the worker reported activity",
-        action: `Wait; the controller is polling this worker. Run /exec status ${run.id} to look again later. Do not resume or start another run.`,
+        action: `Wait; the controller is polling this worker. Run ${status} to look again later. Do not resume or start another run.`,
+        command: status,
       };
     }
-    return {
-      classification: "between steps",
-      action: `Wait for the next controller tick, then run /exec status ${run.id}.`,
-    };
+    return polled
+      ? {
+          classification: "between steps",
+          action: `Wait for the next controller tick, then run ${status}.`,
+          command: status,
+        }
+      : {
+          classification: "between steps, with no session driving them",
+          action: `No live session holds this run and no worker is tracked, so no tick is coming. Run ${resume}; it continues from the recorded stage without starting a second worker.`,
+          command: resume,
+        };
   }
   if (run.status === RUN_STATUS.PAUSED)
     return {
       classification: "paused, waiting for you to continue it",
-      action: `Run /exec resume ${run.id}; it applies the paused stage or its finished worker without starting a second one.`,
+      action: `Run ${resume}; it applies the paused stage or its finished worker without starting a second one.`,
+      command: resume,
     };
   if (run.status === RUN_STATUS.FAILED) {
     if (isModelProviderFailure(run))
       return {
         classification:
           "stopped because the model or provider could not be used",
-        action: `Run /exec resume ${run.id}. It retries the failed worker with the model this Pi session is signed in to, and does not spend another task attempt.`,
+        action: `Run ${resume}. It retries the failed worker with the model this Pi session is signed in to, and does not spend another task attempt.`,
+        command: resume,
       };
     // Reachable only here: `isTaskRetryConfirmationRequired` conjoins this same
     // predicate, so a separate branch below it could never fire.
     if (isExternalManualBlocker(run))
       return {
         classification: "a task is blocked by something outside this run",
-        action: `Fix the outside cause first — billing, credentials, quota, network, or a manual step — then run interactive /exec resume ${run.id}; it asks before retrying that task. Implementation work cannot be waived, so there is no way past it.`,
+        action: `Fix the outside cause first — billing, credentials, quota, network, or a manual step — then run interactive ${resume}; it asks before retrying that task. Implementation work cannot be waived, so there is no way past it.`,
+        command: resume,
       };
     if (run.activeOperation?.externalRunId)
       return {
         classification: "stopped, and you can continue it",
-        action: `Run /exec resume ${run.id}; it first checks what the tracked ${run.activeOperation.service}/${run.activeOperation.kind} worker did, then retries the same stage in the worktree that was kept.`,
+        action: `Run ${resume}; it first checks what the tracked ${run.activeOperation.service}/${run.activeOperation.kind} worker did, then retries the same stage in the worktree that was kept.`,
+        command: resume,
       };
     return {
       classification: "stopped, and you can continue it",
-      action: `Run /exec resume ${run.id}; it retries the same stage (${run.stage}) in the worktree that was kept.`,
+      action: `Run ${resume}; it retries the same stage (${run.stage}) in the worktree that was kept.`,
+      command: resume,
     };
   }
   return {
     classification: "not recognised",
-    action: `Run /exec status ${run.id} again; no next step could be worked out from this state.`,
+    action: `Run ${status} again; no next step could be worked out from this state.`,
+    command: status,
   };
 }
 
 /**
- * The one shape the evidence settled: nothing is running. Splits on status the
- * same way `recoveryCommand` does, so the sweep and this view cannot name
- * different commands for the same run.
+ * A wait, worded for whether anything is left to do the waiting. With a live
+ * lease the controller reports back; without one the same words send the reader
+ * round a record nothing updates, so the command that ends it leads instead.
  */
+function waitOrStop(
+  run: PlanExecRun,
+  polled: boolean,
+  classification: string,
+  reason: string,
+): RecoveryGuidance {
+  return polled
+    ? {
+        classification,
+        action: `${reason} The controller is still polling it, so run /exec status ${run.id} to look again later. Do not resume or start another run.`,
+        command: `/exec status ${run.id}`,
+      }
+    : {
+        classification,
+        action: `${reason} No live session is polling it, so waiting alone never settles it. Run /exec stop ${run.id} to end it and preserve the worktree. Do not resume or start another run.`,
+        command: `/exec stop ${run.id}`,
+      };
+}
+
+/** The one shape the evidence settled: nothing is running. */
 function abandonedGuidance(
   run: PlanExecRun,
   evidence: AbandonmentEvidence,
@@ -629,27 +723,34 @@ function abandonedGuidance(
     return {
       classification: "the worker is gone, so the stop cannot land by itself",
       action: `${checked}, so this run will never reach cancelled on its own. Run /exec stop ${run.id} to finish the cancellation; its worktree is kept either way.`,
+      command: `/exec stop ${run.id}`,
     };
   if (run.status === RUN_STATUS.SKIP_PENDING)
     return {
       classification: "the worker is gone, so the waived stage cannot finish",
       action: `${checked}, so there is nothing left to stop and the run cannot move on by itself. Run /exec resume ${run.id}; it clears the dead worker and continues, without starting a second one.`,
+      command: `/exec resume ${run.id}`,
     };
   return {
     classification: "the worker is gone, so nothing is running",
     action: `${checked}. Run /exec resume ${run.id}; it clears the dead worker and continues, without starting a second one. Run /exec stop ${run.id} instead to end the run and keep the worktree.`,
+    command: `/exec resume ${run.id}`,
   };
 }
 
 /**
  * Why `--same-machine` does not apply to this run, or undefined when it does.
  * Refusing where the flag would change nothing keeps it from widening into a
- * general force.
+ * general force. A beating heartbeat is refused whatever host it names: the
+ * flag asserts a machine, and no assertion about a machine can outrank a worker
+ * that is still writing on it.
  */
 export function sameMachineRefusal(run: PlanExecRun): string | undefined {
-  return isLocalRun(run)
-    ? `${SAME_MACHINE_OPTION} only applies to a run whose lease names another host; run ${shortRunId(run.id)} is already observable here.`
-    : undefined;
+  if (isLocalRun(run))
+    return `${SAME_MACHINE_OPTION} only applies to a run whose lease names another host; run ${shortRunId(run.id)} is already observable here.`;
+  if (run.lease && isLeaseLive(run.lease))
+    return `Run ${shortRunId(run.id)} still has a beating lease from session ${run.lease.sessionId}, so ${SAME_MACHINE_OPTION} cannot act on it. Wait ${elapsedLabel(LEASE_STALE_MS)} for the heartbeat to go stale, then resume.`;
+  return undefined;
 }
 
 /** A dead lease naming a host this machine is not: no local check can speak. */
@@ -662,7 +763,7 @@ function isStaleOwner(run: PlanExecRun): boolean {
   // one makes `isLeaseLive` answer LIVE on a name match whatever the heartbeat
   // says, so a session would read its own dead lease as live and disagree with
   // the sweep. The predicate is otherwise `claim`'s, so the two cannot drift.
-  return Boolean(run.lease && !isLeaseLive(run.lease));
+  return Boolean(run.lease) && !hasLiveLease(run);
 }
 
 function hasExecutionBranchMismatch(run: PlanExecRun): boolean {
@@ -671,12 +772,15 @@ function hasExecutionBranchMismatch(run: PlanExecRun): boolean {
 
 /**
  * A stored activity value freezes when the polling session dies and would read
- * as health forever. Bounded by the lease staleness threshold, which already
- * decides whether anyone is watching.
+ * as health forever. Two gates, because either alone is passable: a live lease
+ * proves someone is still writing the value, and the staleness bound proves
+ * this one was written recently. With no evidence, nothing is proven.
  */
 function reportedActivity(
   operation: ActiveOperation | undefined,
+  evidence: AbandonmentEvidence | undefined,
 ): string | undefined {
+  if (evidence?.leaseLive !== true) return undefined;
   const activity = operation?.workerSignal?.activity;
   if (!activity || operation?.lastObservedAt === undefined) return undefined;
   return Date.now() - operation.lastObservedAt < LEASE_STALE_MS
@@ -790,7 +894,7 @@ function workerSignalLines(
   const operation = run.activeOperation;
   if (!operation) return [];
   const signal = operation.workerSignal;
-  const activity = reportedActivity(operation);
+  const activity = reportedActivity(operation, evidence);
   const since = operation.launchStartedAt
     ? `, ${elapsedLabel(Date.now() - operation.launchStartedAt)} since launch`
     : "";
@@ -823,10 +927,7 @@ export function settledRunLines(
   const visible = showAll ? runs : runs.filter(isRecentlyRelevantRun);
   const hidden = runs.length - visible.length;
   return [
-    ...runGroupLines(
-      "waiting for you — no worker is running",
-      visible.filter(needsOperator),
-    ),
+    ...runGroupLines("waiting for you", visible.filter(needsOperator)),
     ...runGroupLines(
       "finished",
       visible.filter((run) => !needsOperator(run)),
@@ -877,9 +978,13 @@ function needsOperator(run: PlanExecRun): boolean {
   return run.status === RUN_STATUS.PAUSED || isRecoverableFailure(run);
 }
 
+/**
+ * The same verdict the detail view renders. A finished run has no verdict to
+ * render — nothing is pending — so its row points at the record instead.
+ */
 function nextRunCommand(run: PlanExecRun): string {
   return needsOperator(run)
-    ? `/exec resume ${run.id}`
+    ? recoveryGuidance(run).command
     : `/exec status ${run.id}`;
 }
 
@@ -1430,7 +1535,7 @@ async function reconcileLines(
       `Reset ${reset.length} abandoned run${reset.length === 1 ? "" : "s"} to failed. No worker was launched and no task attempt was consumed.`,
       ...reset.map(
         (diagnosis) =>
-          `- ${runClaim(diagnosis.run)} → failed. Next: ${recoveryCommand(diagnosis.run)}`,
+          `- ${runClaim(diagnosis.run)} → failed. Next: ${nextCommand(diagnosis)}`,
       ),
     );
   if (stopping.length > 0)
@@ -1438,7 +1543,7 @@ async function reconcileLines(
       `Left ${stopping.length} abandoned run${stopping.length === 1 ? "" : "s"} alone: each carries the stop you asked for, and a reset would drop it:`,
       ...stopping.map(
         (diagnosis) =>
-          `- ${runClaim(diagnosis.run)}. Next: ${recoveryCommand(diagnosis.run)}`,
+          `- ${runClaim(diagnosis.run)}. Next: ${nextCommand(diagnosis)}`,
       ),
     );
   if (reclaimed.length > 0)
@@ -1516,8 +1621,10 @@ function reconcileReason(diagnosis: RunDiagnosis, actor: string): string {
  * `isStaleOwner` gives.
  *
  * `sameMachine` unblocks evidence gathering and nothing else, so it cannot
- * force a resume past a worker still writing. It is never written back — the
- * reset's own `claim` re-stamps the current host.
+ * force a resume past a worker still writing: only the probe sees the rewritten
+ * host, while `leaseLive` keeps reading the stored lease. A beating heartbeat
+ * therefore still reads LIVE, whichever machine stamped it. The rewritten host
+ * is never written back — the reset's own `claim` re-stamps the current host.
  */
 export async function reconcileForResume(
   registry: RunRegistry,
@@ -1526,10 +1633,10 @@ export async function reconcileForResume(
   sameMachine = false,
 ): Promise<{ run: PlanExecRun; note?: string }> {
   if (!isInFlightStatus(run.status) || isRecoverableRun(run)) return { run };
-  const evidence = await runEvidence(
-    sameMachine ? asLocalRun(run) : run,
-    probe,
-  );
+  // The operator asserted the host, so every text below reads the run that way
+  // too; only the record written back keeps the stored lease.
+  const subject = sameMachine ? asLocalRun(run) : run;
+  const evidence = await runEvidence(run, () => probe(subject));
   const diagnosis: RunDiagnosis = {
     run,
     evidence,
@@ -1538,12 +1645,8 @@ export async function reconcileForResume(
   if (diagnosis.classification === ABANDONMENT.LIVE) return { run };
   if (diagnosis.classification === ABANDONMENT.AMBIGUOUS) {
     if (!run.activeOperation) return { run };
-    const override =
-      sameMachine || isLocalRun(run)
-        ? ""
-        : ` If ${run.lease?.hostname} was this machine before it was renamed, run /exec resume ${run.id} ${SAME_MACHINE_OPTION} to check the worker here.`;
     throw new Error(
-      `Run ${shortRunId(run.id)} still claims ${run.status} and the evidence is incomplete: ${evidenceText(diagnosis)}. Resuming could add a second writer, so nothing was changed.${override} Use /exec status ${run.id} to re-check, or /exec stop ${run.id} to end it and preserve the worktree.`,
+      `Run ${shortRunId(run.id)} still claims ${run.status} and the evidence is incomplete: ${evidenceText({ run: subject, evidence })}. Resuming could add a second writer, so nothing was changed. ${recoveryGuidance(subject, evidence).action}`,
     );
   }
   const reconciled = await reconcileRun(
@@ -1575,12 +1678,13 @@ function evidenceText(diagnosis: ObservedRun): string {
     : diagnosis.evidence.leaseLive
       ? `session ${lease.sessionId} holds a live lease`
       : `its lease for session ${lease.sessionId} is dead, last beat ${relativeTime(lease.heartbeatAt)}`;
-  return `${leaseText}; ${operationEvidence(diagnosis)}${overdueText(diagnosis.run)}`;
+  return `${leaseText}; ${operationEvidence(diagnosis)}${overdueText(diagnosis)}`;
 }
 
 /** Without it a run far past its bound reads like one launched a minute ago. */
-function overdueText(run: PlanExecRun): string {
-  const overdue = reportedActivity(run.activeOperation)
+function overdueText(diagnosis: ObservedRun): string {
+  const run = diagnosis.run;
+  const overdue = reportedActivity(run.activeOperation, diagnosis.evidence)
     ? undefined
     : longRunningOperation(run);
   return overdue
@@ -1605,16 +1709,7 @@ function operationEvidence(diagnosis: ObservedRun): string {
 }
 
 function nextCommand(diagnosis: RunDiagnosis): string {
-  if (diagnosis.classification === ABANDONMENT.ABANDONED)
-    return recoveryCommand(diagnosis.run);
-  return `/exec status ${diagnosis.run.id}`;
-}
-
-/** A run already told to stop still wants stopping, before or after a reset. */
-function recoveryCommand(run: PlanExecRun): string {
-  return run.status === RUN_STATUS.CANCEL_PENDING
-    ? `/exec stop ${run.id}`
-    : `/exec resume ${run.id}`;
+  return recoveryGuidance(diagnosis.run, diagnosis.evidence).command;
 }
 
 function bridgeOperationState(
@@ -2122,7 +2217,7 @@ export function isActionAllowed(
           run.status === RUN_STATUS.RUNNING ||
           run.status === RUN_STATUS.PAUSED ||
           isRecoverableFailure(run) ||
-          isClaimableDeadLease(run);
+          isClaimableRun(run);
   if (action === EXEC_ACTION.SKIP) return isStageWaiverAvailable(run);
   if (action === EXEC_ACTION.CANCEL)
     return (
@@ -2147,12 +2242,18 @@ export function isStageWaiverAvailable(run: PlanExecRun): boolean {
 }
 
 /**
- * A live-looking claim whose session is provably gone; resume takes it over.
- * Whose name is on the lease never enters it: a Pi restarted under the same
- * session ID left that lease, and is told by `/exec status` to resume the run.
+ * A run no live session holds; resume takes it over. Whose name is on the lease
+ * never enters it: a Pi restarted under the same session ID left that lease,
+ * and is told by `/exec status` to resume the run. A missing lease counts the
+ * same as a dead one — a worktree handoff that failed between `release` and
+ * `claim` leaves none, and the run would otherwise have no way forward.
  */
-function isClaimableDeadLease(run: PlanExecRun): boolean {
-  return !isTerminal(run.status) && isStaleOwner(run);
+function isClaimableRun(run: PlanExecRun): boolean {
+  return !isTerminal(run.status) && !hasLiveLease(run);
+}
+
+function hasLiveLease(run: PlanExecRun): boolean {
+  return Boolean(run.lease && isLeaseLive(run.lease));
 }
 
 export function isRecoverableFailure(run: PlanExecRun): boolean {

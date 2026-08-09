@@ -81,7 +81,8 @@ Flags that answer a prompt in advance:
 - `/exec resume <full-run-id> --same-machine` states that the host frozen on the
   lease was this machine under an older name. Only use it when that is a fact;
   it unblocks the local checks and nothing else, so a worker still running keeps
-  the run refused.
+  the run refused. It is also refused while the lease heartbeat is under 30
+  seconds old, whatever host it names.
 - `/exec resume <full-run-id> --model current|provider/model` overrides the
   model for one replacement child after a model or provider failure.
 - `/exec cleanup <full-run-id> --apply` removes one named record;

@@ -253,7 +253,10 @@ absence of a signal as health. Every in-flight situation reads differently:
   the reset that recovers the others would erase the stop it carries, so
   `/exec stop` finishes the cancellation instead.
 - `cannot check on the worker right now` — the provider could not be reached, or
-  the worker was launched and never named. Repair the provider and re-check.
+  the worker was launched and never named, while the run still claims work in
+  flight. Repair the provider and re-check. On a settled run the same unnamed
+  operation reads as the failure it is: resume looks the operation up by its ID
+  rather than launching a second worker.
 - `its lease names a machine that is not this one` — the host frozen on the
   lease when the run was claimed is not the host this machine answers to now, so
   every local check would measure the wrong machine. If that name was this
@@ -298,7 +301,10 @@ names the way out. Only you know whether that name was this machine, so
 `/exec resume <run-id> --same-machine` is how you say it. The flag supplies the
 machine, not the verdict: resume then checks the
 worker here as usual and still refuses while one is running. It is refused
-outright on a run this machine can already observe.
+outright on a run this machine can already observe, and refused while the lease
+is still beating — a heartbeat under 30 seconds old is a worker writing
+somewhere, and no claim about which machine changes that. Wait for it to go
+stale and resume as usual.
 
 ### Recovering a failure
 

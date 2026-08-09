@@ -166,6 +166,9 @@ Only the operator knows whether that name was this machine. When it was, say so:
 
 That supplies the machine, not the verdict. Resume then gathers the same
 evidence it always does, so a worker still writing here keeps the run refused.
+The flag is refused outright while the lease heartbeat is under 30 seconds old:
+a beating heartbeat is a worker writing somewhere, and which machine it sits on
+does not change that. Wait for it to go stale.
 When the lease really does name a different machine, recover the run there.
 
 ### Why no per-turn activity signal exists
@@ -211,11 +214,20 @@ still wants cancelling:
 /exec cancel <full-run-id>
 ```
 
-An `ambiguous` run is never reset, because the evidence is incomplete. Gather
-more:
+An `ambiguous` run is never reset, because the evidence is incomplete. Every
+surface names the same next command for it, and which command that is turns on
+whether anything is still polling. With a live lease the controller reports
+back, so re-reading works:
 
 ```text
 /exec status <full-run-id>
+```
+
+With a dead lease nothing polls, so re-reading never changes. End the run
+instead and keep its worktree:
+
+```text
+/exec stop <full-run-id>
 ```
 
 ## Paused

@@ -174,6 +174,17 @@ naming the evidence, stamps `reconciledAt`, appends the reason to the progress
 log, and leaves `taskAttempts` untouched — the worker never ran. Recovery is then
 the ordinary `/exec resume` path.
 
+One function maps a run and its evidence to a verdict and exactly one next
+command. The sweep row, the settled row, the detail view, and the refusal the
+resume gate raises all render that one result, so no two of them can name
+different commands for the same record. The command is always one the sentence
+beside it names first, and always one the run will accept. `/exec status` is
+named only where the next read can differ — something is polling, or an
+operation is left to probe. Where nothing polls, the command has to move the
+run: a takeover for a dead owner, `/exec stop` for a worker that cannot be
+proven gone, `/exec stop` again for a stop nothing will land. Naming a re-read
+there would loop the reader on a record nothing updates.
+
 Every evidence-driven decision reads the same three inputs at the moment it is
 made: the lease, the operation directory on disk, and the bridge. Nothing about
 liveness is persisted, because the record is only refreshed while its owning
@@ -186,10 +197,13 @@ settle such a run and it would stay `ambiguous` forever. The
 operator breaks that tie: `/exec resume <id> --same-machine` asserts that the
 frozen name was this machine, unblocks the local checks, and changes nothing
 else — the abandonment conjunction still decides, so a worker still writing here
-keeps the run `ambiguous` and resume still refuses. The assertion is never
-written back; the reset's own `claim` re-stamps the current host. It is refused
-on a run this machine can already observe, and `/exec doctor --reconcile` has no
-equivalent: a registry-wide host assertion would speak for every run at once.
+keeps the run `ambiguous` and resume still refuses. Only the probe reads the
+asserted host; lease liveness keeps reading the stored lease, so a beating
+heartbeat still reads `live` whichever machine stamped it. The assertion is
+never written back; the reset's own `claim` re-stamps the current host. It is
+refused on a run this machine can already observe, refused while the lease is
+still beating, and `/exec doctor --reconcile` has no equivalent: a
+registry-wide host assertion would speak for every run at once.
 
 One writer performs every reset, so both callers inherit its exclusions.
 A `cancel_pending` run is never reset however dead its worker: `failed` would
