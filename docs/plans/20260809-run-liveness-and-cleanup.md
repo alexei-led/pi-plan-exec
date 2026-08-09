@@ -260,15 +260,27 @@ say so in a code comment. Classify only; never auto-fail, never auto-kill.
 - Modify: `src/index.ts`
 - Modify: `test/index.test.ts`
 
-- [ ] change `formatRunList` to show, by default, all non-terminal runs plus terminal
+- [x] change `formatRunList` to show, by default, all non-terminal runs plus terminal
       runs from the last 24 hours
-- [ ] support `/exec runs --all` to show everything, and add it to the help text
-- [ ] when rows are hidden, print a footer naming the count and both escapes, e.g.
+- [x] support `/exec runs --all` to show everything, and add it to the help text
+- [x] when rows are hidden, print a footer naming the count and both escapes, e.g.
       `3 older terminal runs hidden. /exec runs --all to show, /exec cleanup to remove.`
-- [ ] keep the existing sort by `updatedAt` descending and the existing row format
-- [ ] write tests: a retired run is absent by default and present under `--all`; the
+- [x] keep the existing sort by `updatedAt` descending and the existing row format —
+      `formatRunList` filters only; the descending sort stays in `RunRegistry.list`
+- [x] write tests: a retired run is absent by default and present under `--all`; the
       footer count matches the number hidden; no footer when nothing is hidden
-- [ ] run `npm run test:all` — must pass before task 6
+- [x] run `npm run test:all` — must pass before task 6
+- ➕ decision: the filter keys on terminal status plus `updatedAt`, never on `retiredAt`
+  — that stamp is Task 4's audit marker. A just-archived run is both retired and inside
+  the window, so it stays visible for a day and then drops out; a test pins that
+- ➕ decision: `isTerminalStatus` includes `failed`, so a failed run older than a day is
+  hidden too. It stays resumable and both escapes still land: `--all` surfaces it, and
+  `/exec cleanup` reports it as not removable plus the `--include-failed` hint
+- ➕ decision: `--all` is a flag, not an `EXEC_ACTION` member, so Task 9's
+  skill-vs-`EXEC_ACTION` assertion stays clean. `parseRunsArguments` stays unexported and
+  rejects any other argument, where `/exec runs garbage` was previously ignored
+- ➕ decision: when every run is hidden the listing prints a "no recent runs" line plus
+  the footer, rather than a header with no rows under it
 
 ### Task 6: Surface the bridge observation text
 

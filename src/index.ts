@@ -54,6 +54,8 @@ const CLEANUP_STATUSES = new Set<PlanExecRun["status"]>([
   RUN_STATUS.COMPLETED_WITH_FINDINGS,
   RUN_STATUS.CANCELLED,
 ]);
+const RUNS_ALL_OPTION = "--all";
+const RUN_LIST_TERMINAL_WINDOW_MS = MILLISECONDS_PER_DAY;
 const REQUIRED_RUNTIME_TOOLS: Record<string, string> = {
   subagent: "pi-subagents",
   TaskCreate: "@tintinweb/pi-tasks",
@@ -597,16 +599,46 @@ export function formatRunStatus(run: PlanExecRun): string {
   return lines.join("\n");
 }
 
-export function formatRunList(runs: PlanExecRun[]): string {
+/**
+ * A terminal run stops being news once it is a day old, so the default view is
+ * everything still in flight plus whatever finished recently. Hidden rows are
+ * counted in a footer rather than dropped silently.
+ */
+export function formatRunList(runs: PlanExecRun[], showAll = false): string {
   if (runs.length === 0) return "No plan execution runs. Start one with /exec.";
+  const visible = showAll ? runs : runs.filter(isRecentlyRelevantRun);
+  const hidden = runs.length - visible.length;
+  const footer =
+    hidden === 0
+      ? []
+      : [
+          `${hidden} older terminal run${hidden === 1 ? "" : "s"} hidden. /exec runs ${RUNS_ALL_OPTION} to show, /exec cleanup to remove.`,
+        ];
+  if (visible.length === 0)
+    return ["No recent plan execution runs.", ...footer].join("\n");
   return [
     "Plan execution runs:",
-    ...runs.map(
+    ...visible.map(
       (run) =>
         `${run.id} ${basename(run.planPath)} ${run.status}/${run.stage} ${activeOperationLabel(run)} updated ${relativeTime(run.updatedAt)}`,
     ),
     "Use /exec status, pause, resume, adopt, skip, or cancel. Force-skip requires a full run ID and reason.",
+    ...footer,
   ].join("\n");
+}
+
+function isRecentlyRelevantRun(run: PlanExecRun): boolean {
+  return (
+    !isTerminal(run.status) ||
+    Date.now() - run.updatedAt < RUN_LIST_TERMINAL_WINDOW_MS
+  );
+}
+
+function parseRunsArguments(args: string[]): boolean {
+  for (const arg of args)
+    if (arg !== RUNS_ALL_OPTION)
+      throw new Error(`Usage: /exec runs [${RUNS_ALL_OPTION}]`);
+  return args.includes(RUNS_ALL_OPTION);
 }
 
 export function parseCleanupArguments(args: string[]): {
@@ -709,7 +741,7 @@ async function handleCommand(
   if (subcommand === EXEC_ACTION.HELP) return execHelp();
   if (subcommand === EXEC_ACTION.SETUP) return execSetup();
   if (subcommand === EXEC_ACTION.RUNS)
-    return formatRunList(await registry.list());
+    return formatRunList(await registry.list(), parseRunsArguments(rest));
   if (subcommand === EXEC_ACTION.CLEANUP) return execCleanup(registry, rest);
   if (
     subcommand === EXEC_ACTION.STATUS ||
@@ -1364,7 +1396,7 @@ export function execHelp(): string {
     "/exec start [plan-path] Start a plan explicitly.",
     "/exec setup             Show required packages and install commands.",
     "/exec status [run-id]   Show progress; run-id is optional when unambiguous.",
-    "/exec runs              List runs and their full IDs.",
+    `/exec runs [${RUNS_ALL_OPTION}]      List active runs plus terminal runs from the last day; ${RUNS_ALL_OPTION} shows every run.`,
     `/exec cleanup [full-run-id] [${CLEANUP_APPLY_OPTION}] [${CLEANUP_INCLUDE_FAILED_OPTION}]`,
     `                        Preview retired runs older than ${CLEANUP_RETENTION_DAYS} days; ${CLEANUP_APPLY_OPTION} deletes their registry entries only. Failed runs need ${CLEANUP_INCLUDE_FAILED_OPTION}.`,
     "/exec pause [run-id]    Pause after the active child finishes.",

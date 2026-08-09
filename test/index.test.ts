@@ -75,6 +75,7 @@ function run(overrides: Partial<PlanExecRun> = {}): PlanExecRun {
   };
 }
 
+const HOUR_MS = 3_600_000;
 const DAY_MS = 86_400_000;
 const PAST_RETENTION = Date.now() - 8 * DAY_MS;
 const INSIDE_RETENTION = Date.now() - 6 * DAY_MS;
@@ -892,4 +893,50 @@ test("run list tells users how to inspect an unambiguous run", () => {
   const list = formatRunList([run()]);
   assert.match(list, /example\.md running\/implementation/);
   assert.match(list, /\/exec status/);
+  assert.doesNotMatch(list, /hidden/, "nothing hidden means no footer");
+});
+
+test("run list hides older terminal runs behind --all", () => {
+  const active = run();
+  // Retired an hour ago: the archive stamp does not hide a run, age does.
+  const justArchived = retiredRun({
+    id: "22222222-2222-4222-8222-222222222222",
+    updatedAt: Date.now() - HOUR_MS,
+    retiredAt: Date.now() - HOUR_MS,
+  });
+  const oldCompleted = retiredRun({
+    id: "33333333-3333-4333-8333-333333333333",
+  });
+  const oldCancelled = retiredRun({
+    id: "44444444-4444-4444-8444-444444444444",
+    status: "cancelled",
+  });
+  const runs = [active, justArchived, oldCompleted, oldCancelled];
+
+  const listed = formatRunList(runs);
+
+  assert.ok(listed.includes(active.id), "an active run always lists");
+  assert.ok(listed.includes(justArchived.id), "a fresh terminal run lists");
+  assert.ok(!listed.includes(oldCompleted.id), "an old terminal run is hidden");
+  assert.ok(!listed.includes(oldCancelled.id), "an old terminal run is hidden");
+  assert.match(
+    listed,
+    /2 older terminal runs hidden\. \/exec runs --all to show, \/exec cleanup to remove\./,
+  );
+
+  const all = formatRunList(runs, true);
+
+  for (const shown of runs) assert.ok(all.includes(shown.id), shown.id);
+  assert.doesNotMatch(all, /hidden/, "--all hides nothing, so no footer");
+});
+
+test("run list reports a hidden-only registry instead of an empty one", () => {
+  const listed = formatRunList([retiredRun()]);
+
+  assert.match(listed, /^No recent plan execution runs\./);
+  assert.match(listed, /1 older terminal run hidden\./);
+  assert.equal(
+    formatRunList([]),
+    "No plan execution runs. Start one with /exec.",
+  );
 });
