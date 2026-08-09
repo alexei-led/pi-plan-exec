@@ -232,14 +232,26 @@ say so in a code comment. Classify only; never auto-fail, never auto-kill.
 - Modify: `src/controller.ts`
 - Modify: `test/controller.test.ts`
 
-- [ ] add optional `retiredAt?: number` to `PlanExecRun` in `src/types.ts`; keep it
+- [x] add optional `retiredAt?: number` to `PlanExecRun` in `src/types.ts`; keep it
       optional and do not bump `schemaVersion`
-- [ ] stamp `retiredAt` on successful completion of the `archive` stage
+- [x] stamp `retiredAt` on successful completion of the `archive` stage
       (`src/controller.ts:1361`)
-- [ ] confirm `assertRun` still accepts records both with and without the field
-- [ ] write a test asserting a successful archive stamps `retiredAt` and that a run
+- [x] confirm `assertRun` still accepts records both with and without the field —
+      confirmed, no change needed: `assertRun` validates no optional field, and
+      `migrateLegacyRun`'s spread passes the key through when present
+- [x] write a test asserting a successful archive stamps `retiredAt` and that a run
       record lacking it still parses and validates
-- [ ] run `npm run test:all` — must pass before task 5
+- [x] run `npm run test:all` — must pass before task 5
+- ➕ decision: the archive test asserts on the record reloaded through `registry.get`,
+  not on the returned object — `archive` calls `registry.release` after `update`, so a
+  returned-value assertion would pass even if the stamp never reached disk
+- ➕ decision: the "record lacking `retiredAt` still parses" assertion extends the
+  hand-written `run.json` fixture Task 2 added in `test/registry.test.ts` rather than
+  duplicating the fixture in `test/controller.test.ts`; a `registry.create` round-trip
+  would not exercise `parseRun` on a pre-upgrade file
+- ➕ decision: `complete()` (`src/controller.ts:1422`) is left unstamped — the plan
+  scopes `retiredAt` to the archive stage, and Task 5's default listing filter keys on
+  terminal status plus `updatedAt`, not on `retiredAt`
 
 ### Task 5: Listing hygiene for `/exec runs`
 

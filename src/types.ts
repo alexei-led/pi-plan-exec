@@ -233,6 +233,8 @@ export interface PlanExecRun {
   config: FrozenRunConfig;
   createdAt: number;
   updatedAt: number;
+  /** Set when the archive stage completes; absent on runs archived before this field existed. */
+  retiredAt?: number;
   lease?: {
     sessionId: string;
     pid: number;

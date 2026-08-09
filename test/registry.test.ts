@@ -280,6 +280,7 @@ test("a lease written before hostname existed is judged by heartbeat alone", asy
   const lease = loaded.lease;
   assert.ok(lease);
   assert.equal(lease.hostname, undefined);
+  assert.equal(loaded.retiredAt, undefined);
   // The pid is dead, so a pid check would free this lease; the heartbeat holds it.
   assert.equal(isLeaseLive(lease, "session-2"), true);
   await assert.rejects(

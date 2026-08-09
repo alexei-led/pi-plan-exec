@@ -1576,6 +1576,34 @@ test("archive records completed_with_findings when findings remain", async () =>
   assert.match(await readFile(progressPath, "utf8"), /completed_with_findings/);
 });
 
+test("archive retires the run record with a persisted retiredAt", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
+  const planPath = join(root, "plan.md");
+  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
+  const registry = new RunRegistry(join(root, "runs"));
+  const controller = new PlanExecController(
+    registry,
+    new FakeBridge(join(root, "none.json")),
+    new FakeFusion(),
+    fakeGit(root),
+  );
+  const run = await registry.create({
+    ...baseRun(root, planPath),
+    stage: "archive",
+  });
+  assert.equal(run.retiredAt, undefined);
+  const before = Date.now();
+
+  const completed = await controller.advance(run);
+
+  assert.equal(completed.status, "completed");
+  // release() rewrites the record after archive; the stamp must survive to disk.
+  const reloaded = await registry.get(run.id);
+  assert.ok(reloaded?.retiredAt);
+  assert.ok(reloaded.retiredAt >= before);
+  assert.equal(reloaded.retiredAt, completed.retiredAt);
+});
+
 test("archive commit failure remains resumable and retries idempotently", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
   const planPath = join(root, "plan.md");

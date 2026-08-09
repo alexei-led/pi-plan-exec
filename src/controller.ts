@@ -1409,6 +1409,7 @@ export class PlanExecController {
         ...run,
         status,
         stage: RUN_STAGE.COMPLETE,
+        retiredAt: Date.now(),
       });
       return this.registry.release(completed);
     } catch (error: unknown) {
