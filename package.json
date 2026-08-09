@@ -1,7 +1,7 @@
 {
   "name": "@alexeiled/pi-plan-exec",
-  "version": "0.4.5",
-  "description": "A discoverable /exec command and exec-plan skill for reliable, resumable ralphex-style plan execution in Pi",
+  "version": "1.0.0",
+  "description": "Turn a Markdown execution plan into an isolated, resumable Pi run - durable controller state, one writer, deliberate recovery",
   "keywords": [
     "pi-package",
     "pi-extension",

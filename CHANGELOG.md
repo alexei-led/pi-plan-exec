@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+## 1.0.0 - 2026-08-09
+
+Breaking:
+
+- Removed `/exec start`. Use `/exec <path/to/plan.md>`. Bare `/exec` opens the
+  plan picker. The retired name stops with an error that names the replacement.
+- Removed `/exec status --reconcile`. Use `/exec resume <full-run-id>`, which
+  resets one named run and continues it. `/exec status` never writes.
+  `/exec doctor --reconcile` still works for a scripted caller.
+
+Added:
+
+- `/exec stop` replaces the `pause`/`cancel` pair with one question: pause
+  (resumable) or cancel (final, worktree preserved).
+- `/exec cleanup` retires run records. It previews by default. `--apply`
+  removes the registry entry — never the worktree, branch, or progress file —
+  for terminal runs that finished more than 7 days ago. `failed` runs are
+  excluded because their record is what `/exec resume` needs.
+- Runs receive a durable `retiredAt` stamp on archive, and `/exec status` hides
+  terminal runs older than a day unless `--all` is given.
+
+Changed:
+
+- Collapsed the read surface into `/exec status` and the recovery surface into
+  `/exec resume`. `runs`, `doctor`, `setup`, `adopt`, `pause`, and `cancel`
+  still dispatch as aliases and each names its replacement once in its output.
+- Report worker liveness from live evidence instead of a frozen health record,
+  judge a lease by both pid and whole hostname, and let a renamed machine
+  diagnose and resume its own run.
+- Bound an in-flight operation by the turn budget of its own stage, and report
+  an overdue operation without claiming it is proof of a stuck worker.
+- Rewrote recovery classifications and `/exec help` around the next action, and
+  dropped internal state names from the run status view.
+- Unpinned the printed Bridge setup version so a copied line is not a
+  downgrade, and declared Prettier style for the repository.
+
 ## 0.4.5 - 2026-08-08
 
 - Clear legacy recovery model pins on an explicit resume without changing a
