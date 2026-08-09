@@ -1856,23 +1856,10 @@ async function runAction(
   ctx: ExtensionCommandContext,
   dependencies: CommandDependencies,
 ): Promise<string | undefined> {
-  const {
-    controller,
-    startBackgroundController,
-    syncProjection,
-    checkRuntime,
-    doctorProbe,
-  } = dependencies;
+  const { startBackgroundController, syncProjection } = dependencies;
+  // Only resume takes flags, so only resume parses them.
   const resumeArguments =
-    action === EXEC_ACTION.RESUME
-      ? parseResumeArguments(rest)
-      : {
-          selector: rest[0],
-          adoptCurrentBranch: false,
-          retryTask: false,
-          sameMachine: false,
-          model: undefined,
-        };
+    action === EXEC_ACTION.RESUME ? parseResumeArguments(rest) : undefined;
   if (action === EXEC_ACTION.SKIP && (!rest[0] || rest[0] === "--reason"))
     throw skipUsageError();
   // Before resolving a run, so a repository with several candidates does not
@@ -1882,139 +1869,19 @@ async function runAction(
   const sessionId = ctx.sessionManager.getSessionId();
   const resolved = await resolveRunForAction(
     action,
-    resumeArguments.selector,
+    resumeArguments ? resumeArguments.selector : rest[0],
     ctx,
-    resumeArguments.adoptCurrentBranch,
+    resumeArguments?.adoptCurrentBranch,
   );
-  if (resumeArguments.sameMachine) {
-    const refusal = sameMachineRefusal(resolved);
-    if (refusal) throw new Error(refusal);
+  if (resumeArguments) {
+    if (resumeArguments.sameMachine) {
+      const refusal = sameMachineRefusal(resolved);
+      if (refusal) throw new Error(refusal);
+    }
+    return resumeRun(resolved, resumeArguments, ctx, dependencies);
   }
-  if (action === EXEC_ACTION.RESUME || action === EXEC_ACTION.SKIP) {
-    await checkRuntime();
-    // Before anything else touches the run, so the rest of resume works from a
-    // state it has evidence for.
-    const recovered =
-      action === EXEC_ACTION.RESUME
-        ? await reconcileForResume(
-            defaultRegistry,
-            resolved,
-            doctorProbe,
-            resumeArguments.sameMachine,
-          )
-        : { run: resolved, note: undefined };
-    const run = recovered.run;
-    const recoveryModel =
-      action === EXEC_ACTION.RESUME
-        ? await recoveryModelForResume(run, resumeArguments.model, ctx)
-        : undefined;
-    let retryTask = resumeArguments.retryTask;
-    if (
-      action === EXEC_ACTION.RESUME &&
-      isTaskRetryConfirmationRequired(run) &&
-      !retryTask
-    ) {
-      if (!ctx.hasUI) throw new Error(taskRetryRequiredMessage(run));
-      const accepted = await ctx.ui.confirm(
-        "Retry externally blocked task?",
-        `${taskRetryRequiredMessage(run)}\n\nRetry it now?`,
-      );
-      if (!accepted) throw new Error("Task retry cancelled.");
-      retryTask = true;
-    }
-    // A branch mismatch cannot advance without rebinding, so an interactive
-    // resume asks. The flag stays for callers with no human to ask.
-    const adoptCurrentBranch =
-      resumeArguments.adoptCurrentBranch ||
-      (action === EXEC_ACTION.RESUME &&
-        ctx.hasUI &&
-        hasExecutionBranchMismatch(run) &&
-        run.activeOperation === undefined);
-    const skipReason =
-      action === EXEC_ACTION.SKIP ? parseSkipReason(rest.slice(1)) : undefined;
-    const handedOff = await handoffToWorktree(
-      ctx,
-      run,
-      syncProjection,
-      action === EXEC_ACTION.RESUME
-        ? `resume ${run.id}${adoptCurrentBranch ? " --adopt-current-branch" : ""}${retryTask ? ` ${TASK_RETRY_OPTION}` : ""}${recoveryModel ? ` ${RECOVERY_MODEL_OPTION} ${recoveryModel}` : ""}`
-        : action === EXEC_ACTION.SKIP
-          ? `skip ${run.id} --reason ${skipReason}`
-          : undefined,
-    );
-    // The forked session re-enters the gate on an already-reset run, so this is
-    // the note's only chance to be printed.
-    if (handedOff) return recovered.note;
-    if (action === EXEC_ACTION.SKIP) {
-      if (!ctx.hasUI)
-        throw new Error("Force-skip requires interactive confirmation.");
-      const operation = run.activeOperation;
-      const accepted = await ctx.ui.confirm(
-        `Force-skip ${run.stage}?`,
-        [
-          `Run: ${run.id}`,
-          `Reason: ${skipReason}`,
-          operation
-            ? `Active operation: ${operation.service}/${operation.kind} ${operation.externalRunId ?? operation.operationId}`
-            : "Active operation: none",
-          `Known findings: ${run.reviewFindings.length}`,
-          "The controller will stop any tracked child before advancing.",
-          "Final status will be completed_with_findings.",
-        ].join("\n"),
-      );
-      if (!accepted) throw new Error("Force-skip cancelled.");
-      const skipped = await syncProjection(
-        await controller.skip(run.id, sessionId, skipReason!),
-        { cwd: ctx.cwd, sessionId },
-      );
-      startBackgroundController(skipped, sessionId, ctx.cwd, ctx);
-      return `Run ${shortRunId(skipped.id)} force-skip requested: ${skipped.status} (${skipped.stage}).\nUse /exec status ${skipped.id} for live progress.`;
-    }
-    if (adoptCurrentBranch) {
-      if (!ctx.hasUI)
-        throw new Error("Branch adoption requires interactive confirmation.");
-      if (run.activeOperation)
-        throw new Error(
-          "Cannot adopt the current branch while an external operation is tracked.",
-        );
-      const accepted = await ctx.ui.confirm(
-        "Adopt current execution branch?",
-        [
-          `Run: ${run.id}`,
-          `Recorded branch: ${run.branch}`,
-          `Worktree: ${run.worktreeCwd}`,
-          "The controller will verify the repository, record the actual named branch, and resume the same run.",
-        ].join("\n"),
-      );
-      if (!accepted) throw new Error("Branch adoption cancelled.");
-      const rebound = await syncProjection(
-        await controller.rebindBranchAndResume(run.id, sessionId),
-        { cwd: ctx.cwd, sessionId },
-      );
-      startBackgroundController(rebound, sessionId, ctx.cwd, ctx);
-      return `Run ${shortRunId(rebound.id)} adopted branch ${rebound.branch}: ${rebound.status} (${rebound.stage}).\nUse /exec status ${rebound.id} for live progress.`;
-    }
-    const reviewedPlanHash =
-      action === EXEC_ACTION.RESUME
-        ? await reviewedPlanHashForResume(run, ctx)
-        : undefined;
-    const resumed = await syncProjection(
-      await controller.resume(
-        run.id,
-        sessionId,
-        true,
-        reviewedPlanHash,
-        retryTask,
-        recoveryModel,
-      ),
-      { cwd: ctx.cwd, sessionId },
-    );
-    startBackgroundController(resumed, sessionId, ctx.cwd, ctx);
-    // Reported where the operator asked, not only in the progress file.
-    return recovered.note
-      ? `${recovered.note}\n${resumeResultMessage(resumed)}`
-      : resumeResultMessage(resumed);
-  }
+  if (action === EXEC_ACTION.SKIP)
+    return skipStage(resolved, rest, ctx, dependencies);
   // Ask before claiming: an abandoned dialog must not have taken the lease.
   const outcome =
     action === EXEC_ACTION.STOP
@@ -2034,6 +1901,148 @@ async function runAction(
   );
   startBackgroundController(cancelled, sessionId, ctx.cwd, ctx);
   return `Run ${shortRunId(cancelled.id)} marked cancel-pending. Its worktree is preserved.`;
+}
+
+async function resumeRun(
+  resolved: PlanExecRun,
+  options: ResumeOptions,
+  ctx: ExtensionCommandContext,
+  dependencies: CommandDependencies,
+): Promise<string | undefined> {
+  const {
+    controller,
+    startBackgroundController,
+    syncProjection,
+    checkRuntime,
+    doctorProbe,
+  } = dependencies;
+  const sessionId = ctx.sessionManager.getSessionId();
+  await checkRuntime();
+  // Before anything else touches the run, so the rest of resume works from a
+  // state it has evidence for.
+  const recovered = await reconcileForResume(
+    defaultRegistry,
+    resolved,
+    doctorProbe,
+    options.sameMachine,
+  );
+  const run = recovered.run;
+  const recoveryModel = await recoveryModelForResume(run, options.model, ctx);
+  let retryTask = options.retryTask;
+  if (isTaskRetryConfirmationRequired(run) && !retryTask) {
+    if (!ctx.hasUI) throw new Error(taskRetryRequiredMessage(run));
+    const accepted = await ctx.ui.confirm(
+      "Retry externally blocked task?",
+      `${taskRetryRequiredMessage(run)}\n\nRetry it now?`,
+    );
+    if (!accepted) throw new Error("Task retry cancelled.");
+    retryTask = true;
+  }
+  // A branch mismatch cannot advance without rebinding, so an interactive
+  // resume asks. The flag stays for callers with no human to ask.
+  const adoptCurrentBranch =
+    options.adoptCurrentBranch ||
+    (ctx.hasUI &&
+      hasExecutionBranchMismatch(run) &&
+      run.activeOperation === undefined);
+  const handedOff = await handoffToWorktree(
+    ctx,
+    run,
+    syncProjection,
+    `resume ${run.id}${adoptCurrentBranch ? " --adopt-current-branch" : ""}${retryTask ? ` ${TASK_RETRY_OPTION}` : ""}${recoveryModel ? ` ${RECOVERY_MODEL_OPTION} ${recoveryModel}` : ""}`,
+  );
+  // The forked session re-enters the gate on an already-reset run, so this is
+  // the note's only chance to be printed.
+  if (handedOff) return recovered.note;
+  if (adoptCurrentBranch) {
+    if (!ctx.hasUI)
+      throw new Error("Branch adoption requires interactive confirmation.");
+    if (run.activeOperation)
+      throw new Error(
+        "Cannot adopt the current branch while an external operation is tracked.",
+      );
+    const accepted = await ctx.ui.confirm(
+      "Adopt current execution branch?",
+      [
+        `Run: ${run.id}`,
+        `Recorded branch: ${run.branch}`,
+        `Worktree: ${run.worktreeCwd}`,
+        "The controller will verify the repository, record the actual named branch, and resume the same run.",
+      ].join("\n"),
+    );
+    if (!accepted) throw new Error("Branch adoption cancelled.");
+    const rebound = await syncProjection(
+      await controller.rebindBranchAndResume(run.id, sessionId),
+      { cwd: ctx.cwd, sessionId },
+    );
+    startBackgroundController(rebound, sessionId, ctx.cwd, ctx);
+    return `Run ${shortRunId(rebound.id)} adopted branch ${rebound.branch}: ${rebound.status} (${rebound.stage}).\nUse /exec status ${rebound.id} for live progress.`;
+  }
+  const reviewedPlanHash = await reviewedPlanHashForResume(run, ctx);
+  const resumed = await syncProjection(
+    await controller.resume(
+      run.id,
+      sessionId,
+      true,
+      reviewedPlanHash,
+      retryTask,
+      recoveryModel,
+    ),
+    { cwd: ctx.cwd, sessionId },
+  );
+  startBackgroundController(resumed, sessionId, ctx.cwd, ctx);
+  // Reported where the operator asked, not only in the progress file.
+  return recovered.note
+    ? `${recovered.note}\n${resumeResultMessage(resumed)}`
+    : resumeResultMessage(resumed);
+}
+
+/** The waiver never reconciles the run: it stops the worker and moves on. */
+async function skipStage(
+  run: PlanExecRun,
+  rest: string[],
+  ctx: ExtensionCommandContext,
+  dependencies: CommandDependencies,
+): Promise<string | undefined> {
+  const {
+    controller,
+    startBackgroundController,
+    syncProjection,
+    checkRuntime,
+  } = dependencies;
+  const sessionId = ctx.sessionManager.getSessionId();
+  await checkRuntime();
+  const reason = parseSkipReason(rest.slice(1));
+  const handedOff = await handoffToWorktree(
+    ctx,
+    run,
+    syncProjection,
+    `skip ${run.id} --reason ${reason}`,
+  );
+  if (handedOff) return undefined;
+  if (!ctx.hasUI)
+    throw new Error("Force-skip requires interactive confirmation.");
+  const operation = run.activeOperation;
+  const accepted = await ctx.ui.confirm(
+    `Force-skip ${run.stage}?`,
+    [
+      `Run: ${run.id}`,
+      `Reason: ${reason}`,
+      operation
+        ? `Active operation: ${operation.service}/${operation.kind} ${operation.externalRunId ?? operation.operationId}`
+        : "Active operation: none",
+      `Known findings: ${run.reviewFindings.length}`,
+      "The controller will stop any tracked child before advancing.",
+      "Final status will be completed_with_findings.",
+    ].join("\n"),
+  );
+  if (!accepted) throw new Error("Force-skip cancelled.");
+  const skipped = await syncProjection(
+    await controller.skip(run.id, sessionId, reason),
+    { cwd: ctx.cwd, sessionId },
+  );
+  startBackgroundController(skipped, sessionId, ctx.cwd, ctx);
+  return `Run ${shortRunId(skipped.id)} force-skip requested: ${skipped.status} (${skipped.stage}).\nUse /exec status ${skipped.id} for live progress.`;
 }
 
 /**
@@ -2342,13 +2351,16 @@ function modelReference(model: { provider: string; id: string }): string {
   return `${model.provider}/${model.id}`;
 }
 
-export function parseResumeArguments(args: string[]): {
-  selector: string | undefined;
+/** Every flag `/exec resume` accepts. A run selector is not one of them. */
+type ResumeOptions = {
   adoptCurrentBranch: boolean;
   retryTask: boolean;
   sameMachine: boolean;
   model: string | undefined;
-} {
+};
+type ResumeArguments = ResumeOptions & { selector: string | undefined };
+
+export function parseResumeArguments(args: string[]): ResumeArguments {
   const first = args[0];
   const selector = first?.startsWith("--") ? undefined : first;
   return {
@@ -2357,18 +2369,8 @@ export function parseResumeArguments(args: string[]): {
   };
 }
 
-export function parseResumeOptions(args: string[]): {
-  adoptCurrentBranch: boolean;
-  retryTask: boolean;
-  sameMachine: boolean;
-  model: string | undefined;
-} {
-  const options: {
-    adoptCurrentBranch: boolean;
-    retryTask: boolean;
-    sameMachine: boolean;
-    model: string | undefined;
-  } = {
+export function parseResumeOptions(args: string[]): ResumeOptions {
+  const options: ResumeOptions = {
     adoptCurrentBranch: false,
     retryTask: false,
     sameMachine: false,
