@@ -54,25 +54,52 @@ const config = {
   statsMaxTurns: 30,
 };
 
-test("registry persists runs, protects path traversal, and reclaims stale leases", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "pi-plan-exec-registry-"));
-  const registry = new RunRegistry(directory);
-  const run = await registry.create({
+type RunSeed = Parameters<RunRegistry["create"]>[0];
+
+/** The create payload every registry test starts from. */
+function runSeed(overrides: Partial<RunSeed> = {}): RunSeed {
+  return {
     schemaVersion: 1,
     repositoryRoot: "/repo",
-    planPath: "/repo/docs/plans/example.md",
+    planPath: "/repo/plan.md",
     planHash: "hash",
-    worktreeCwd: "/worktree",
+    worktreeCwd: "/repo",
     branch: "feature",
     defaultBranch: "main",
-    status: "starting",
-    stage: "resolve",
+    status: "running",
+    stage: "implementation",
     taskAttempts: {},
     stageAttempts: {},
     reviewFindings: [],
     unresolvedFindings: [],
     config,
-  });
+    ...overrides,
+  };
+}
+
+async function seedRegistry(): Promise<{
+  directory: string;
+  registry: RunRegistry;
+}> {
+  const directory = await mkdtemp(join(tmpdir(), "pi-plan-exec-registry-"));
+  return { directory, registry: new RunRegistry(directory) };
+}
+
+/** This machine's first DNS label: a name that looks like it and is not it. */
+function thisHost(): string {
+  return hostname().split(".")[0]!;
+}
+
+test("registry persists runs, protects path traversal, and reclaims stale leases", async () => {
+  const { registry } = await seedRegistry();
+  const run = await registry.create(
+    runSeed({
+      planPath: "/repo/docs/plans/example.md",
+      worktreeCwd: "/worktree",
+      status: "starting",
+      stage: "resolve",
+    }),
+  );
 
   const claimed = await registry.claim(run, "session-1");
   await assert.rejects(
@@ -98,7 +125,7 @@ test("lease liveness weighs session, heartbeat, hostname, and pid", () => {
   const fresh = Date.now();
   const stale = Date.now() - LEASE_STALE_MS;
   const here = hostname();
-  const shortHere = here.split(".")[0]!;
+  const shortHere = thisHost();
   const cases: Array<{
     name: string;
     lease: RunLease;
@@ -222,30 +249,17 @@ test("lease liveness weighs session, heartbeat, hostname, and pid", () => {
 });
 
 test("a dead local pid frees the lease without waiting out the heartbeat", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "pi-plan-exec-registry-"));
-  const registry = new RunRegistry(directory);
-  const run = await registry.create({
-    schemaVersion: 1,
-    repositoryRoot: "/repo",
-    planPath: "/repo/plan.md",
-    planHash: "hash",
-    worktreeCwd: "/repo",
-    branch: "feature",
-    defaultBranch: "main",
-    status: "running",
-    stage: "implementation",
-    taskAttempts: {},
-    stageAttempts: {},
-    reviewFindings: [],
-    unresolvedFindings: [],
-    config,
-    lease: {
-      sessionId: "session-1",
-      pid: reapedPid(),
-      heartbeatAt: Date.now(),
-      hostname: hostname(),
-    },
-  });
+  const { registry } = await seedRegistry();
+  const run = await registry.create(
+    runSeed({
+      lease: {
+        sessionId: "session-1",
+        pid: reapedPid(),
+        heartbeatAt: Date.now(),
+        hostname: hostname(),
+      },
+    }),
+  );
 
   const claimed = await registry.claim(run, "session-2");
 
@@ -254,31 +268,18 @@ test("a dead local pid frees the lease without waiting out the heartbeat", async
 });
 
 test("a heartbeat refreshes liveness without taking over lease identity", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "pi-plan-exec-registry-"));
-  const registry = new RunRegistry(directory);
+  const { registry } = await seedRegistry();
   const gone = reapedPid();
-  const run = await registry.create({
-    schemaVersion: 1,
-    repositoryRoot: "/repo",
-    planPath: "/repo/plan.md",
-    planHash: "hash",
-    worktreeCwd: "/repo",
-    branch: "feature",
-    defaultBranch: "main",
-    status: "running",
-    stage: "implementation",
-    taskAttempts: {},
-    stageAttempts: {},
-    reviewFindings: [],
-    unresolvedFindings: [],
-    config,
-    lease: {
-      sessionId: "session-1",
-      pid: gone,
-      heartbeatAt: 1,
-      hostname: hostname(),
-    },
-  });
+  const run = await registry.create(
+    runSeed({
+      lease: {
+        sessionId: "session-1",
+        pid: gone,
+        heartbeatAt: 1,
+        hostname: hostname(),
+      },
+    }),
+  );
 
   const lease = (await registry.heartbeat(run)).lease;
 
@@ -288,8 +289,7 @@ test("a heartbeat refreshes liveness without taking over lease identity", async 
 });
 
 test("a lease written before hostname existed is judged by heartbeat alone", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "pi-plan-exec-registry-"));
-  const registry = new RunRegistry(directory);
+  const { directory, registry } = await seedRegistry();
   const runId = "22222222-2222-4222-8222-222222222222";
   await mkdir(join(directory, runId), { recursive: true });
   await writeFile(
@@ -337,43 +337,22 @@ test("a lease written before hostname existed is judged by heartbeat alone", asy
 });
 
 test("remove retires a terminal run and refuses anything still in play", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "pi-plan-exec-registry-"));
-  const registry = new RunRegistry(directory);
-  const seed = {
-    schemaVersion: 1 as const,
-    repositoryRoot: "/repo",
-    planPath: "/repo/plan.md",
-    planHash: "hash",
-    worktreeCwd: "/repo",
-    branch: "feature",
-    defaultBranch: "main",
-    taskAttempts: {},
-    stageAttempts: {},
-    reviewFindings: [],
-    unresolvedFindings: [],
-    config,
-  };
-  const retired = await registry.create({
-    ...seed,
-    status: "completed",
-    stage: "complete",
-  });
-  const running = await registry.create({
-    ...seed,
-    status: "running",
-    stage: "implementation",
-  });
-  const held = await registry.create({
-    ...seed,
-    status: "cancelled",
-    stage: "implementation",
-    lease: {
-      sessionId: "session-1",
-      pid: process.pid,
-      heartbeatAt: Date.now(),
-      hostname: hostname(),
-    },
-  });
+  const { directory, registry } = await seedRegistry();
+  const retired = await registry.create(
+    runSeed({ status: "completed", stage: "complete" }),
+  );
+  const running = await registry.create(runSeed());
+  const held = await registry.create(
+    runSeed({
+      status: "cancelled",
+      lease: {
+        sessionId: "session-1",
+        pid: process.pid,
+        heartbeatAt: Date.now(),
+        hostname: hostname(),
+      },
+    }),
+  );
 
   await registry.remove(retired.id);
 
@@ -398,8 +377,7 @@ test("remove retires a terminal run and refuses anything still in play", async (
 });
 
 test("remove deletes an unreadable record instead of throwing on it", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "pi-plan-exec-registry-"));
-  const registry = new RunRegistry(directory);
+  const { directory, registry } = await seedRegistry();
   const corruptId = "22222222-2222-4222-8222-222222222222";
   const wrongSchemaId = "33333333-3333-4333-8333-333333333333";
   await mkdir(join(directory, corruptId), { recursive: true });
@@ -420,20 +398,8 @@ test("remove deletes an unreadable record instead of throwing on it", async () =
 
 test("abandonment needs a dead lease, an in-flight claim, and a gone operation", () => {
   const subject = (overrides: Partial<PlanExecRun> = {}): PlanExecRun => ({
-    schemaVersion: 1,
+    ...runSeed(),
     id: "11111111-1111-4111-8111-111111111111",
-    repositoryRoot: "/repo",
-    planPath: "/repo/plan.md",
-    planHash: "hash",
-    worktreeCwd: "/repo",
-    branch: "feature",
-    defaultBranch: "main",
-    status: "running",
-    stage: "implementation",
-    taskAttempts: {},
-    stageAttempts: {},
-    reviewFindings: [],
-    unresolvedFindings: [],
     skippedStages: [],
     branchRebindings: [],
     activeOperation: {
@@ -442,7 +408,6 @@ test("abandonment needs a dead lease, an in-flight claim, and a gone operation",
       kind: "implementation",
       asyncDir: "/tmp/async",
     },
-    config,
     createdAt: 1,
     updatedAt: 2,
     ...overrides,
@@ -549,24 +514,8 @@ test("abandonment needs a dead lease, an in-flight claim, and a gone operation",
 });
 
 test("concurrent claims allow only one session to acquire the lease", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "pi-plan-exec-registry-"));
-  const registry = new RunRegistry(directory);
-  const run = await registry.create({
-    schemaVersion: 1,
-    repositoryRoot: "/repo",
-    planPath: "/repo/plan.md",
-    planHash: "hash",
-    worktreeCwd: "/repo",
-    branch: "feature",
-    defaultBranch: "main",
-    status: "running",
-    stage: "resolve",
-    taskAttempts: {},
-    stageAttempts: {},
-    reviewFindings: [],
-    unresolvedFindings: [],
-    config,
-  });
+  const { registry } = await seedRegistry();
+  const run = await registry.create(runSeed({ stage: "resolve" }));
 
   const claims = await Promise.allSettled([
     registry.claim(run, "session-1"),
@@ -587,24 +536,8 @@ test("concurrent claims allow only one session to acquire the lease", async () =
 });
 
 test("claiming from a stale snapshot preserves newer run state", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "pi-plan-exec-registry-"));
-  const registry = new RunRegistry(directory);
-  const run = await registry.create({
-    schemaVersion: 1,
-    repositoryRoot: "/repo",
-    planPath: "/repo/plan.md",
-    planHash: "hash",
-    worktreeCwd: "/repo",
-    branch: "feature",
-    defaultBranch: "main",
-    status: "running",
-    stage: "implementation",
-    taskAttempts: {},
-    stageAttempts: {},
-    reviewFindings: [],
-    unresolvedFindings: [],
-    config,
-  });
+  const { registry } = await seedRegistry();
+  const run = await registry.create(runSeed());
   await registry.update({
     ...run,
     activeOperation: {
@@ -621,24 +554,8 @@ test("claiming from a stale snapshot preserves newer run state", async () => {
 });
 
 test("ordinary stale updates cannot erase a newer active operation", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "pi-plan-exec-registry-"));
-  const registry = new RunRegistry(directory);
-  const run = await registry.create({
-    schemaVersion: 1,
-    repositoryRoot: "/repo",
-    planPath: "/repo/plan.md",
-    planHash: "hash",
-    worktreeCwd: "/repo",
-    branch: "feature",
-    defaultBranch: "main",
-    status: "running",
-    stage: "implementation",
-    taskAttempts: {},
-    stageAttempts: {},
-    reviewFindings: [],
-    unresolvedFindings: [],
-    config,
-  });
+  const { registry } = await seedRegistry();
+  const run = await registry.create(runSeed());
   const launching = await registry.update({
     ...run,
     activeOperation: {
@@ -657,25 +574,10 @@ test("ordinary stale updates cannot erase a newer active operation", async () =>
 });
 
 test("stale heartbeat preserves a newer cancellation request", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "pi-plan-exec-registry-"));
-  const registry = new RunRegistry(directory);
-  const run = await registry.create({
-    schemaVersion: 1,
-    repositoryRoot: "/repo",
-    planPath: "/repo/plan.md",
-    planHash: "hash",
-    worktreeCwd: "/repo",
-    branch: "feature",
-    defaultBranch: "main",
-    status: "running",
-    stage: "implementation",
-    taskAttempts: {},
-    stageAttempts: {},
-    reviewFindings: [],
-    unresolvedFindings: [],
-    config,
-    lease: { sessionId: "session-1", pid: 123, heartbeatAt: 1 },
-  });
+  const { registry } = await seedRegistry();
+  const run = await registry.create(
+    runSeed({ lease: { sessionId: "session-1", pid: 123, heartbeatAt: 1 } }),
+  );
   const cancelling = await registry.update({
     ...run,
     status: "cancel_pending",
@@ -688,24 +590,8 @@ test("stale heartbeat preserves a newer cancellation request", async () => {
 });
 
 test("controller lock recovers an orphan from the same live Pi process", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "pi-plan-exec-registry-"));
-  const registry = new RunRegistry(directory);
-  const run = await registry.create({
-    schemaVersion: 1,
-    repositoryRoot: "/repo",
-    planPath: "/repo/plan.md",
-    planHash: "hash",
-    worktreeCwd: "/repo",
-    branch: "feature",
-    defaultBranch: "main",
-    status: "running",
-    stage: "implementation",
-    taskAttempts: {},
-    stageAttempts: {},
-    reviewFindings: [],
-    unresolvedFindings: [],
-    config,
-  });
+  const { directory, registry } = await seedRegistry();
+  const run = await registry.create(runSeed());
   const lockPath = join(directory, run.id, "run.json.controller.lock");
   await writeFile(
     lockPath,
@@ -723,24 +609,8 @@ test("controller lock recovers an orphan from the same live Pi process", async (
 });
 
 test("controller lock does not steal a fresh live provider request", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "pi-plan-exec-registry-"));
-  const registry = new RunRegistry(directory);
-  const run = await registry.create({
-    schemaVersion: 1,
-    repositoryRoot: "/repo",
-    planPath: "/repo/plan.md",
-    planHash: "hash",
-    worktreeCwd: "/repo",
-    branch: "feature",
-    defaultBranch: "main",
-    status: "running",
-    stage: "implementation",
-    taskAttempts: {},
-    stageAttempts: {},
-    reviewFindings: [],
-    unresolvedFindings: [],
-    config,
-  });
+  const { directory, registry } = await seedRegistry();
+  const run = await registry.create(runSeed());
   const lockPath = join(directory, run.id, "run.json.controller.lock");
   await writeFile(
     lockPath,
@@ -759,24 +629,8 @@ test("controller lock does not steal a fresh live provider request", async () =>
 });
 
 test("registry update timestamps are monotonic for compare-and-set safety", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "pi-plan-exec-registry-"));
-  const registry = new RunRegistry(directory);
-  const run = await registry.create({
-    schemaVersion: 1,
-    repositoryRoot: "/repo",
-    planPath: "/repo/plan.md",
-    planHash: "hash",
-    worktreeCwd: "/repo",
-    branch: "feature",
-    defaultBranch: "main",
-    status: "running",
-    stage: "resolve",
-    taskAttempts: {},
-    stageAttempts: {},
-    reviewFindings: [],
-    unresolvedFindings: [],
-    config,
-  });
+  const { registry } = await seedRegistry();
+  const run = await registry.create(runSeed({ stage: "resolve" }));
 
   const updated = await registry.update({ ...run, status: "paused" });
 
@@ -784,24 +638,8 @@ test("registry update timestamps are monotonic for compare-and-set safety", asyn
 });
 
 test("registry rejects stale compare-and-set updates", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "pi-plan-exec-registry-"));
-  const registry = new RunRegistry(directory);
-  const run = await registry.create({
-    schemaVersion: 1,
-    repositoryRoot: "/repo",
-    planPath: "/repo/plan.md",
-    planHash: "hash",
-    worktreeCwd: "/repo",
-    branch: "feature",
-    defaultBranch: "main",
-    status: "running",
-    stage: "resolve",
-    taskAttempts: {},
-    stageAttempts: {},
-    reviewFindings: [],
-    unresolvedFindings: [],
-    config,
-  });
+  const { registry } = await seedRegistry();
+  const run = await registry.create(runSeed({ stage: "resolve" }));
   const newer = await registry.update({ ...run, status: "paused" });
   const result = await registry.updateIfCurrent(
     { ...run, status: "cancel_pending" },
@@ -812,7 +650,7 @@ test("registry rejects stale compare-and-set updates", async () => {
 });
 
 test("registry migrates vertical-slice runs missing review metadata", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "pi-plan-exec-registry-"));
+  const { directory, registry } = await seedRegistry();
   const runId = "11111111-1111-4111-8111-111111111111";
   const path = join(directory, runId, "run.json");
   await mkdir(join(directory, runId), { recursive: true });
@@ -842,7 +680,6 @@ test("registry migrates vertical-slice runs missing review metadata", async () =
     }) + "\n",
   );
 
-  const registry = new RunRegistry(directory);
   const migrated = await registry.get(runId);
   assert.equal(migrated?.stage, "project_tasks");
   assert.equal(migrated?.config.taskRetries, 1);
@@ -857,24 +694,8 @@ test("registry migrates vertical-slice runs missing review metadata", async () =
 });
 
 test("registry rejects invalid persisted lifecycle shapes", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "pi-plan-exec-registry-"));
-  const registry = new RunRegistry(directory);
-  const run = await registry.create({
-    schemaVersion: 1,
-    repositoryRoot: "/repo",
-    planPath: "/repo/plan.md",
-    planHash: "hash",
-    worktreeCwd: "/repo",
-    branch: "feature",
-    defaultBranch: "main",
-    status: "running",
-    stage: "implementation",
-    taskAttempts: {},
-    stageAttempts: {},
-    reviewFindings: [],
-    unresolvedFindings: [],
-    config,
-  });
+  const { directory, registry } = await seedRegistry();
+  const run = await registry.create(runSeed());
   const missingConfig = structuredClone(run) as unknown as PlanExecRun;
   delete (missingConfig.config as Partial<typeof config>).workerAgent;
 
@@ -938,24 +759,8 @@ test("registry rejects invalid persisted lifecycle shapes", async () => {
 });
 
 test("registry lists healthy runs when a sibling entry is corrupt", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "pi-plan-exec-registry-"));
-  const registry = new RunRegistry(directory);
-  const healthy = await registry.create({
-    schemaVersion: 1,
-    repositoryRoot: "/repo",
-    planPath: "/repo/plan.md",
-    planHash: "hash",
-    worktreeCwd: "/repo",
-    branch: "feature",
-    defaultBranch: "main",
-    status: "running",
-    stage: "resolve",
-    taskAttempts: {},
-    stageAttempts: {},
-    reviewFindings: [],
-    unresolvedFindings: [],
-    config,
-  });
+  const { directory, registry } = await seedRegistry();
+  const healthy = await registry.create(runSeed({ stage: "resolve" }));
   const corruptId = "22222222-2222-4222-8222-222222222222";
   await mkdir(join(directory, corruptId), { recursive: true });
   await writeFile(join(directory, corruptId, "run.json"), "{not-json\n");
@@ -971,29 +776,15 @@ test("registry lists healthy runs when a sibling entry is corrupt", async () => 
 });
 
 /** The seed every removal test starts from: a run the registry would delete. */
-async function seedRemovable(): Promise<{
+async function seedRemovable(overrides: Partial<RunSeed> = {}): Promise<{
   directory: string;
   registry: RunRegistry;
   run: PlanExecRun;
 }> {
-  const directory = await mkdtemp(join(tmpdir(), "pi-plan-exec-registry-"));
-  const registry = new RunRegistry(directory);
-  const run = await registry.create({
-    schemaVersion: 1,
-    repositoryRoot: "/repo",
-    planPath: "/repo/plan.md",
-    planHash: "hash",
-    worktreeCwd: "/repo",
-    branch: "feature",
-    defaultBranch: "main",
-    status: "completed",
-    stage: "complete",
-    taskAttempts: {},
-    stageAttempts: {},
-    reviewFindings: [],
-    unresolvedFindings: [],
-    config,
-  });
+  const { directory, registry } = await seedRegistry();
+  const run = await registry.create(
+    runSeed({ status: "completed", stage: "complete", ...overrides }),
+  );
   return { directory, registry, run };
 }
 
@@ -1098,7 +889,7 @@ test("only this host's evidence speaks for a run", () => {
     true,
     "DNS names are case-insensitive, so case alone is not another machine",
   );
-  const shortHere = hostname().split(".")[0]!;
+  const shortHere = thisHost();
   assert.equal(
     isLocalRun(
       local({
@@ -1126,26 +917,14 @@ test("only this host's evidence speaks for a run", () => {
 });
 
 test("a live lease survives the release-then-claim of a worktree handoff", async () => {
-  const registry = new RunRegistry(
-    await mkdtemp(join(tmpdir(), "pi-plan-exec-handoff-")),
-  );
+  const { registry } = await seedRegistry();
   const held = await registry.claim(
-    await registry.create({
-      schemaVersion: 1,
-      repositoryRoot: "/repo",
-      planPath: "/repo/docs/plans/example.md",
-      planHash: "hash",
-      worktreeCwd: "/worktree",
-      branch: "feature",
-      defaultBranch: "main",
-      status: "running",
-      stage: "implementation",
-      taskAttempts: {},
-      stageAttempts: {},
-      reviewFindings: [],
-      unresolvedFindings: [],
-      config,
-    }),
+    await registry.create(
+      runSeed({
+        planPath: "/repo/docs/plans/example.md",
+        worktreeCwd: "/worktree",
+      }),
+    ),
     "session-a",
   );
 
