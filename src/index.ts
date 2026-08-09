@@ -1080,9 +1080,9 @@ export function isRemovableRun(
   run: PlanExecRun,
   includeFailed = false,
 ): boolean {
-  // The refusal above already rejected every non-terminal status, so `failed`
-  // is the only terminal status left to exclude.
   if (removalRefusal(run)) return false;
+  // The refusal rejected every non-terminal status, so `failed` is the only
+  // status left to exclude.
   if (run.status === RUN_STATUS.FAILED && !includeFailed) return false;
   return Date.now() - (run.retiredAt ?? run.updatedAt) >= CLEANUP_RETENTION_MS;
 }
