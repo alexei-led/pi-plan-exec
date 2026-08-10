@@ -1655,6 +1655,37 @@ test("failed and cancelled Fusion runs preserve terminal phase errors", async ()
   }
 });
 
+test("Fusion terminal errors are bounded before persistence", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
+  const planPath = join(root, "plan.md");
+  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
+  const longError = "x".repeat(5000);
+  const registry = new RunRegistry(join(root, "runs"));
+  const controller = new PlanExecController(
+    registry,
+    new FakeBridge(join(root, "none.json")),
+    new TerminalFusion("failed", longError),
+    fakeGit(root),
+  );
+  const run = await registry.create({
+    ...baseRun(root, planPath),
+    stage: "fusion_review",
+    activeOperation: {
+      operationId: "fusion-operation",
+      service: "fusion",
+      kind: "fusion",
+      externalRunId: "fusion-1",
+    },
+  });
+
+  const failed = await controller.advance(run);
+
+  assert.equal(
+    failed.error,
+    `Fusion run failed: ${longError.slice(0, 2_000)}`,
+  );
+});
+
 test("Fusion recovery reuses the persisted prompt and profile", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
   const planPath = join(root, "plan.md");

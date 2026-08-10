@@ -140,11 +140,6 @@ const REQUIRED_SETUP_COMMANDS = [
 const OPTIONAL_SETUP_COMMANDS = [
   "pi install 'npm:@alexeiled/pi-fusion@>=0.7.0'",
 ];
-const SETUP_COMMANDS = [
-  ...REQUIRED_SETUP_COMMANDS,
-  ...OPTIONAL_SETUP_COMMANDS,
-  "pi install npm:@alexeiled/pi-plan-exec",
-];
 
 /** Primary verbs only: a retired name still dispatches, but is never taught. */
 const EXEC_COMMANDS: AutocompleteItem[] = [
@@ -1442,7 +1437,7 @@ export async function execStatus(
 function prerequisiteLines(problems: string[]): string[] {
   return [
     `${prerequisiteProblem(problems)} Install them, then /reload:`,
-    ...SETUP_COMMANDS,
+    ...REQUIRED_SETUP_COMMANDS,
     "",
   ];
 }

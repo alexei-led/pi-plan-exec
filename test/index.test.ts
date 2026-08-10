@@ -1788,6 +1788,7 @@ test("status reports a missing package with its install commands", async () => {
 
   assert.match(report, /Plan-exec prerequisites — missing: pi-subagents\./);
   assert.match(report, /^pi install npm:pi-subagents$/m);
+  assert.doesNotMatch(report, /pi-fusion/);
   assert.match(report, /No plan execution runs\. Start one with \/exec\./);
   assert.equal(
     await execStatus(registry),

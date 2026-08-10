@@ -1898,7 +1898,10 @@ function fusionTerminalError(
   state: Pick<FusionRunState, "phase" | "error">,
   fallbackError?: string,
 ): string {
-  const error = state.error ?? fallbackError;
+  const error = (state.error ?? fallbackError)?.trim().slice(
+    0,
+    MAX_TERMINAL_ERROR_LENGTH,
+  );
   return error
     ? `Fusion run ${state.phase}: ${error}`
     : `Fusion run ${state.phase}.`;
