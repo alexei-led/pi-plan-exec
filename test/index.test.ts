@@ -273,7 +273,10 @@ test("help and setup explain the installed command surface", () => {
     execSetup(),
     /pi install npm:@alexeiled\/pi-subagents-bridge@>=0\.2\.2/,
   );
-  assert.match(execSetup(), /pi install npm:@alexeiled\/pi-fusion/);
+  assert.match(
+    execSetup(),
+    /pi install 'npm:@alexeiled\/pi-fusion@>=0\.7\.0'/,
+  );
   assert.match(execSetup(), /pi install npm:@alexeiled\/pi-plan-exec/);
 });
 

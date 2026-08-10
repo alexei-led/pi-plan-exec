@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { FusionClient, FUSION_REQUEST_EVENT } from "../src/fusion.js";
+import {
+  FusionClient,
+  FUSION_REQUEST_EVENT,
+  parseFusionCallerOutput,
+  PLAN_REVIEW_OUTPUT_CONTRACT,
+} from "../src/fusion.js";
 
 const FUSION_REPLY_PREFIX = "fusion:rpc:v1:reply:";
 
@@ -18,6 +23,7 @@ test("Fusion client sends operation IDs and parses a structured start response",
     operationId: "operation-1",
     prompt: "Review this diff.",
     profile: "quality",
+    outputContract: PLAN_REVIEW_OUTPUT_CONTRACT,
   });
   bus.emit(`${FUSION_REPLY_PREFIX}${request.requestId}`, {
     version: 1,
@@ -39,6 +45,55 @@ test("Fusion client sends operation IDs and parses a structured start response",
       run: { runId: "fusion-1", phase: "panel", terminal: false },
     },
   });
+});
+
+test("every Fusion start, including replay, requests the plan review contract", async () => {
+  const bus = new FakeEventBus();
+  const client = new FusionClient(bus, 100);
+
+  for (const operationId of ["operation-1", "operation-1"]) {
+    const started = client.start(operationId, "Review this diff.");
+    const request = bus.last(FUSION_REQUEST_EVENT);
+    assert.ok(isRecord(request));
+    assert.deepEqual(request.params, {
+      operationId,
+      prompt: "Review this diff.",
+      outputContract: PLAN_REVIEW_OUTPUT_CONTRACT,
+    });
+    bus.emit(`${FUSION_REPLY_PREFIX}${request.requestId}`, {
+      version: 1,
+      requestId: request.requestId,
+      method: "start",
+      success: true,
+      data: {
+        operationId,
+        run: { runId: "fusion-1", phase: "panel", terminal: false },
+      },
+    });
+    await started;
+  }
+  assert.equal(bus.count(FUSION_REQUEST_EVENT), 2);
+});
+
+test("parses only validated plan review caller output", () => {
+  assert.deepEqual(
+    parseFusionCallerOutput({
+      contract: PLAN_REVIEW_OUTPUT_CONTRACT,
+      output: "NO_FINDINGS",
+    }),
+    { contract: PLAN_REVIEW_OUTPUT_CONTRACT, output: "NO_FINDINGS" },
+  );
+  for (const value of [
+    undefined,
+    null,
+    "NO_FINDINGS",
+    { contract: PLAN_REVIEW_OUTPUT_CONTRACT, output: "   " },
+    { contract: PLAN_REVIEW_OUTPUT_CONTRACT },
+    { contract: "other-contract", output: "NO_FINDINGS" },
+    { contract: PLAN_REVIEW_OUTPUT_CONTRACT, output: 42 },
+  ]) {
+    assert.equal(parseFusionCallerOutput(value), undefined);
+  }
 });
 
 test("Fusion client rejects ambiguous selectors without emitting a request", async () => {

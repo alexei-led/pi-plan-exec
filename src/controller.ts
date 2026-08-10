@@ -2,7 +2,12 @@ import { randomUUID } from "node:crypto";
 import { access, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, sep } from "node:path";
 import { readSubagentArtifact } from "./artifact.js";
-import { fusionState } from "./fusion.js";
+import {
+  FUSION_PHASE,
+  fusionState,
+  parseFusionCallerOutput,
+  type FusionRunState,
+} from "./fusion.js";
 import {
   branchNameFromPlan,
   createWorktree,
@@ -573,10 +578,15 @@ export class PlanExecController {
       text(intended.activeOperation?.params?.profile) ??
         intended.config.fusionProfile,
     );
-    if (!reply.success) return this.fail(intended, reply.error.message, true);
+    if (!reply.success)
+      return this.launchFusionFallback(intended, operationId);
     const state = fusionState(reply.data);
-    if (!state)
-      return this.fail(intended, "Fusion start returned no run ID.", true);
+    if (
+      !state ||
+      state.phase === FUSION_PHASE.FAILED ||
+      state.phase === FUSION_PHASE.CANCELLED
+    )
+      return this.launchFusionFallback(intended, operationId);
     return this.updateActiveOperation(intended, operationId, {
       externalRunId: state.runId,
       recovery: OPERATION_RECOVERY.OBSERVE,
@@ -603,9 +613,28 @@ export class PlanExecController {
     });
   }
 
+  private launchFusionFallback(
+    run: PlanExecRun,
+    operationId: string,
+    reviewIteration?: number,
+  ): Promise<PlanExecRun> {
+    return this.launchBridge(run, {
+      operationId,
+      kind: OPERATION_KIND.REVIEW,
+      reviewIteration:
+        reviewIteration ??
+        run.stageAttempts[RUN_STAGE.FUSION_REVIEW] ??
+        1,
+      agent: run.config.reviewerAgent,
+      maxTurns: run.config.reviewerMaxTurns,
+      task: fusionPrompt(run),
+    });
+  }
+
   private async launchBridge(
     run: PlanExecRun,
     input: {
+      operationId?: string;
       kind: ActiveOperation["kind"];
       taskId?: number;
       reviewIteration?: number;
@@ -614,7 +643,7 @@ export class PlanExecController {
       task: string;
     },
   ): Promise<PlanExecRun> {
-    const operationId = randomUUID();
+    const operationId = input.operationId ?? randomUUID();
     const launchStartedAt = Date.now();
     const model = run.recoveryModel ?? bridgeModel(run.config, input.kind);
     const runWithoutRecoveryModel = withoutRecoveryModel(run);
@@ -631,7 +660,10 @@ export class PlanExecController {
     const persisted = await this.registry.updateIfCurrent(
       {
         ...runWithoutRecoveryModel,
-        status: RUN_STATUS.RUNNING,
+        status:
+          run.status === RUN_STATUS.SKIP_PENDING
+            ? RUN_STATUS.SKIP_PENDING
+            : RUN_STATUS.RUNNING,
         activeOperation: {
           operationId,
           service: OPERATION_SERVICE.BRIDGE,
@@ -720,9 +752,23 @@ export class PlanExecController {
       text(operation.params?.prompt) ?? fusionPrompt(run),
       text(operation.params?.profile) ?? run.config.fusionProfile,
     );
-    if (!reply.success) return this.fail(run, reply.error.message, true);
+    if (!reply.success)
+      return this.launchFusionFallback(
+        run,
+        operation.operationId,
+        operation.reviewIteration,
+      );
     const state = fusionState(reply.data);
-    if (!state) return this.fail(run, "Fusion start returned no run ID.", true);
+    if (
+      !state ||
+      state.phase === FUSION_PHASE.FAILED ||
+      state.phase === FUSION_PHASE.CANCELLED
+    )
+      return this.launchFusionFallback(
+        run,
+        operation.operationId,
+        operation.reviewIteration,
+      );
     return this.updateActiveOperation(run, operation.operationId, {
       externalRunId: state.runId,
       recovery: OPERATION_RECOVERY.OBSERVE,
@@ -897,16 +943,54 @@ export class PlanExecController {
     const state = fusionState(status.data);
     if (!state || !state.terminal) return observed;
     const result = await this.fusion.result(state.runId);
-    if (!result.success) return this.fail(observed, result.error.message, true);
+    if (!result.success)
+      return this.fail(
+        observed,
+        fusionTerminalError(state, result.error.message),
+        true,
+      );
     const current = (await this.registry.get(run.id)) ?? observed;
     if (!sameOperationState(observed, current, operation)) return current;
     const final = fusionState(result.data);
-    if (!final?.report)
+    if (!final) {
       return this.fail(
         current,
-        "Fusion completed without a machine-readable report.",
+        state.phase === FUSION_PHASE.FAILED ||
+          state.phase === FUSION_PHASE.CANCELLED
+          ? fusionTerminalError(state)
+          : "Fusion result omitted a valid terminal run state.",
+        true,
       );
-    return this.finishReview(current, operation, final.phase, final.report);
+    }
+    if (
+      state.phase === FUSION_PHASE.FAILED ||
+      state.phase === FUSION_PHASE.CANCELLED ||
+      final.phase === FUSION_PHASE.FAILED ||
+      final.phase === FUSION_PHASE.CANCELLED
+    )
+      return this.fail(
+        current,
+        fusionTerminalError(
+          final.phase === FUSION_PHASE.FAILED ||
+            final.phase === FUSION_PHASE.CANCELLED
+            ? final
+            : state,
+        ),
+        true,
+      );
+    if (final.phase !== FUSION_PHASE.DONE)
+      return this.fail(
+        current,
+        `Fusion result ended in unexpected phase ${final.phase}.`,
+        true,
+      );
+    const callerOutput = parseFusionCallerOutput(result.data.callerOutput);
+    if (!callerOutput)
+      return this.fail(
+        current,
+        "Fusion completed without validated caller output.",
+      );
+    return this.finishReview(current, operation, final.phase, callerOutput.output);
   }
 
   private async recordObservation(
@@ -1438,17 +1522,21 @@ export class PlanExecController {
           text(params.profile),
         );
         if (!launched.success)
-          return this.recordStageSkipFailure(
+          return this.launchFusionFallback(
             run,
-            operation,
-            `Unable to recover Fusion operation before force-skip: ${launched.error.message}`,
+            operation.operationId,
+            operation.reviewIteration,
           );
         const state = fusionState(launched.data);
-        if (!state)
-          return this.recordStageSkipFailure(
+        if (
+          !state ||
+          state.phase === FUSION_PHASE.FAILED ||
+          state.phase === FUSION_PHASE.CANCELLED
+        )
+          return this.launchFusionFallback(
             run,
-            operation,
-            "Fusion recovery omitted the run ID or phase during force-skip.",
+            operation.operationId,
+            operation.reviewIteration,
           );
         const attached = await this.updateActiveOperation(
           run,
@@ -1804,6 +1892,16 @@ function bridgeTerminalError(
   if (!statusText) return undefined;
   const error = statusText.match(/^Error:\s*(.+)$/m)?.[1] ?? statusText;
   return error.trim().slice(0, MAX_TERMINAL_ERROR_LENGTH);
+}
+
+function fusionTerminalError(
+  state: Pick<FusionRunState, "phase" | "error">,
+  fallbackError?: string,
+): string {
+  const error = state.error ?? fallbackError;
+  return error
+    ? `Fusion run ${state.phase}: ${error}`
+    : `Fusion run ${state.phase}.`;
 }
 
 function operationFailureMessage(

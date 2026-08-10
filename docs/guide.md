@@ -16,7 +16,7 @@ contracts and component ownership.
   - `pi-subagents`;
   - `@tintinweb/pi-tasks`;
   - `@alexeiled/pi-subagents-bridge`;
-  - `@alexeiled/pi-fusion`;
+  - optional `@alexeiled/pi-fusion` for the preferred Fusion review provider;
   - `@alexeiled/pi-plan-exec`.
 
 `pi-plan-exec` uses pi-subagents’ built-in `worker` and `reviewer` agents. It
@@ -28,7 +28,7 @@ does not require cc-thingz agents.
 pi install npm:pi-subagents
 pi install npm:@tintinweb/pi-tasks
 pi install 'npm:@alexeiled/pi-subagents-bridge@>=0.2.2'
-pi install npm:@alexeiled/pi-fusion
+pi install 'npm:@alexeiled/pi-fusion@>=0.7.0'
 pi install npm:@alexeiled/pi-plan-exec
 ```
 
@@ -389,7 +389,7 @@ A run:
 4. Runs implementation tasks in order with fresh `worker` subagents.
 5. Re-reads plan checkboxes after every worker; worker prose is not completion
    evidence.
-6. Runs comprehensive, smells, Fusion, and critical review/fix stages.
+6. Runs comprehensive, smells, optional Fusion (or pi-subagents fallback), and critical review/fix stages.
 7. Finalizes, collects statistics, and archives the completed plan best effort.
 
 Only one writer is active in the execution worktree. Every implementation,
@@ -411,9 +411,15 @@ Evidence: src/input.ts:17 accepts an empty value and later throws.
 Fix: Reject empty input at the boundary.
 ```
 
-Supported severities are `CRITICAL`, `MAJOR`, and `MINOR`. If known findings
-survive configured review caps, or any stage is force-skipped, the result is
-`completed_with_findings`. The controller does not claim that reviews passed.
+Supported severities are `CRITICAL`, `MAJOR`, and `MINOR`. Fusion review requests the `plan-review-v1` output contract and consumes only
+Fusion's validated top-level `callerOutput.output`. Missing, blank, malformed,
+or mismatched caller output fails closed; `run.report` is never used as a
+fallback. If the optional Fusion provider is absent or its launch response is
+unusable, the stage falls back to the pi-subagents reviewer with the same
+operation ID.
+If known findings survive configured review caps, or any stage is force-skipped,
+the result is `completed_with_findings`. The controller does not claim that
+reviews passed.
 
 ## Recovery and safety
 

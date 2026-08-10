@@ -132,11 +132,17 @@ const REQUIRED_RUNTIME_TOOLS: Record<string, string> = {
   subagent: "pi-subagents",
   TaskCreate: "@tintinweb/pi-tasks",
 };
-const SETUP_COMMANDS = [
+const REQUIRED_SETUP_COMMANDS = [
   "pi install npm:pi-subagents",
   "pi install npm:@tintinweb/pi-tasks",
   "pi install npm:@alexeiled/pi-subagents-bridge@>=0.2.2",
-  "pi install npm:@alexeiled/pi-fusion",
+];
+const OPTIONAL_SETUP_COMMANDS = [
+  "pi install 'npm:@alexeiled/pi-fusion@>=0.7.0'",
+];
+const SETUP_COMMANDS = [
+  ...REQUIRED_SETUP_COMMANDS,
+  ...OPTIONAL_SETUP_COMMANDS,
   "pi install npm:@alexeiled/pi-plan-exec",
 ];
 
@@ -309,10 +315,10 @@ export default function planExecExtension(pi: ExtensionAPI): void {
       pi.getAllTools().map((tool) => tool.name),
     );
     if (missingTools.length > 0) return [`missing: ${missingTools.join(", ")}`];
-    const [bridgeReply, fusionReply] = await Promise.all([
-      new BridgeClient(pi.events, PROVIDER_PROBE_TIMEOUT_MS).ping(),
-      new FusionClient(pi.events, PROVIDER_PROBE_TIMEOUT_MS).ping(),
-    ]);
+    const bridgeReply = await new BridgeClient(
+      pi.events,
+      PROVIDER_PROBE_TIMEOUT_MS,
+    ).ping();
     const missing: string[] = [];
     const incompatible: string[] = [];
     if (!bridgeReply.success) missing.push("@alexeiled/pi-subagents-bridge");
@@ -321,7 +327,6 @@ export default function planExecExtension(pi: ExtensionAPI): void {
       !hasBridgeWorkflowScriptSpawnCapability(bridgeReply.data)
     )
       incompatible.push("@alexeiled/pi-subagents-bridge >=0.2.2");
-    if (!fusionReply.success) missing.push("@alexeiled/pi-fusion");
     return [
       ...(missing.length > 0 ? [`missing: ${missing.join(", ")}`] : []),
       ...(incompatible.length > 0
@@ -2567,8 +2572,12 @@ function terminalMessage(run: PlanExecRun): string {
 
 export function execSetup(): string {
   return [
-    "Install the plan-exec prerequisites at compatible versions:",
-    ...SETUP_COMMANDS,
+    "Install the required plan-exec packages at compatible versions:",
+    ...REQUIRED_SETUP_COMMANDS,
+    "Optional preferred Fusion review provider:",
+    ...OPTIONAL_SETUP_COMMANDS,
+    "Install the plan-exec package:",
+    "pi install npm:@alexeiled/pi-plan-exec",
     "",
     "Then run /reload. Use /exec help for commands.",
   ].join("\n");

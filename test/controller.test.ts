@@ -1145,14 +1145,17 @@ test("ambiguous spawn timeout fails while preserving the operation identity", as
   assert.equal(deferred.activeOperation?.operationId !== undefined, true);
 });
 
-test("malformed Fusion start fails without discarding the operation identity", async () => {
+test("malformed Fusion start falls back to the pi-subagents reviewer", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
   const planPath = join(root, "plan.md");
+  const outputPath = join(root, "review.txt");
   await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
+  await writeFile(outputPath, "NO_FINDINGS\n");
   const registry = new RunRegistry(join(root, "runs"));
+  const bridge = new FakeBridge(outputPath);
   const controller = new PlanExecController(
     registry,
-    new FakeBridge(join(root, "none.json")),
+    bridge,
     new MalformedStartFusion(),
     fakeGit(root),
   );
@@ -1161,12 +1164,55 @@ test("malformed Fusion start fails without discarding the operation identity", a
     stage: "fusion_review",
   });
 
-  const deferred = await controller.advance(run);
+  const launched = await controller.advance(run);
 
-  assert.equal(deferred.status, "failed");
-  assert.match(deferred.error ?? "", /no run ID/);
-  assert.equal(deferred.activeOperation?.service, "fusion");
-  assert.equal(deferred.activeOperation?.externalRunId, undefined);
+  assert.equal(launched.status, "running");
+  assert.equal(launched.activeOperation?.service, "bridge");
+  assert.equal(launched.activeOperation?.kind, "review");
+  assert.equal(bridge.spawnCount, 1);
+
+  const completed = await controller.advance(launched);
+
+  assert.equal(completed.stage, "critical_review");
+  assert.deepEqual(completed.reviewFindings, []);
+});
+
+test("Fusion replay falls back without changing the operation identity", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
+  const planPath = join(root, "plan.md");
+  const outputPath = join(root, "review.txt");
+  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
+  await writeFile(outputPath, "NO_FINDINGS\n");
+  const registry = new RunRegistry(join(root, "runs"));
+  const bridge = new FakeBridge(outputPath);
+  const controller = new PlanExecController(
+    registry,
+    bridge,
+    new StartFailingFusion(),
+    fakeGit(root),
+  );
+  const run = await registry.create({
+    ...baseRun(root, planPath),
+    stage: "fusion_review",
+    activeOperation: {
+      operationId: "fusion-replay-operation",
+      service: "fusion",
+      kind: "fusion",
+      reviewIteration: 1,
+      launchStartedAt: 0,
+      recovery: "replay",
+      params: { prompt: "Persisted Fusion prompt" },
+    },
+  });
+
+  const launched = await controller.advance(run);
+
+  assert.equal(launched.activeOperation?.service, "bridge");
+  assert.equal(
+    launched.activeOperation?.operationId,
+    "fusion-replay-operation",
+  );
+  assert.equal(bridge.spawnCount, 1);
 });
 
 test("unknown persisted launch remains failed without a duplicate replay", async () => {
@@ -1515,6 +1561,98 @@ test("Fusion result failure becomes terminal instead of polling forever", async 
   assert.equal(terminal.updatedAt, failed.updatedAt);
   assert.equal(fusion.statusCount, 1);
   assert.equal(fusion.resultCount, 1);
+});
+
+test("Fusion review uses validated caller output instead of run.report", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
+  const planPath = join(root, "plan.md");
+  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
+  const registry = new RunRegistry(join(root, "runs"));
+  const controller = new PlanExecController(
+    registry,
+    new FakeBridge(join(root, "none.json")),
+    new ContradictoryReportFusion(),
+    fakeGit(root),
+  );
+  const run = await registry.create({
+    ...baseRun(root, planPath),
+    stage: "fusion_review",
+    activeOperation: {
+      operationId: "fusion-operation",
+      service: "fusion",
+      kind: "fusion",
+      externalRunId: "fusion-1",
+    },
+  });
+
+  const advanced = await controller.advance(run);
+
+  assert.equal(advanced.stage, "critical_review");
+  assert.deepEqual(advanced.reviewFindings, []);
+});
+
+test("Fusion done without validated caller output fails closed", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
+  const planPath = join(root, "plan.md");
+  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
+  const registry = new RunRegistry(join(root, "runs"));
+  const controller = new PlanExecController(
+    registry,
+    new FakeBridge(join(root, "none.json")),
+    new NoCallerOutputFusion(),
+    fakeGit(root),
+  );
+  const run = await registry.create({
+    ...baseRun(root, planPath),
+    stage: "fusion_review",
+    activeOperation: {
+      operationId: "fusion-operation",
+      service: "fusion",
+      kind: "fusion",
+      externalRunId: "fusion-1",
+    },
+  });
+
+  const failed = await controller.advance(run);
+
+  assert.equal(failed.status, "failed");
+  assert.match(failed.error ?? "", /validated caller output/);
+  assert.doesNotMatch(failed.error ?? "", /NO_FINDINGS/);
+});
+
+test("failed and cancelled Fusion runs preserve terminal phase errors", async () => {
+  for (const terminal of [
+    { phase: "failed" as const, error: "provider quota exhausted" },
+    { phase: "cancelled" as const, error: "operator stopped Fusion" },
+  ]) {
+    const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
+    const planPath = join(root, "plan.md");
+    await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
+    const registry = new RunRegistry(join(root, "runs"));
+    const controller = new PlanExecController(
+      registry,
+      new FakeBridge(join(root, "none.json")),
+      new TerminalFusion(terminal.phase, terminal.error),
+      fakeGit(root),
+    );
+    const run = await registry.create({
+      ...baseRun(root, planPath),
+      stage: "fusion_review",
+      activeOperation: {
+        operationId: "fusion-operation",
+        service: "fusion",
+        kind: "fusion",
+        externalRunId: "fusion-1",
+      },
+    });
+
+    const failed = await controller.advance(run);
+
+    assert.equal(failed.status, "failed", terminal.phase);
+    assert.match(failed.error ?? "", new RegExp(terminal.phase));
+    assert.match(failed.error ?? "", new RegExp(terminal.error));
+    assert.doesNotMatch(failed.error ?? "", /validated caller output/);
+  }
 });
 
 test("Fusion recovery reuses the persisted prompt and profile", async () => {
@@ -1958,6 +2096,49 @@ test("force skip recovers a Fusion launch before stopping it", async () => {
   assert.equal(pending.activeOperation?.stopRequested, true);
   assert.equal(fusion.startCount, 1);
   assert.equal(fusion.cancelCount, 1);
+});
+
+test("Fusion fallback preserves pending force-skip state", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
+  const planPath = join(root, "plan.md");
+  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
+  const registry = new RunRegistry(join(root, "runs"));
+  const bridge = new FakeBridge(join(root, "none.json"));
+  const controller = new PlanExecController(
+    registry,
+    bridge,
+    new StartFailingFusion(),
+    fakeGit(root),
+  );
+  const failed = await registry.create({
+    ...baseRun(root, planPath),
+    status: "failed",
+    stage: "fusion_review",
+    pendingStageSkip: {
+      stage: "fusion_review",
+      reason: "operator waiver",
+      requestedAt: 1,
+      requestedBy: "session-1",
+    },
+    activeOperation: {
+      operationId: "fusion-launch",
+      service: "fusion",
+      kind: "fusion",
+      params: { prompt: "Review this diff" },
+    },
+    error: "Fusion launch response was lost.",
+  });
+
+  const pending = await controller.skip(
+    failed.id,
+    "session-1",
+    "operator accepts remaining Fusion risk",
+  );
+
+  assert.equal(pending.status, "skip_pending");
+  assert.equal(pending.pendingStageSkip?.stage, "fusion_review");
+  assert.equal(pending.activeOperation?.service, "bridge");
+  assert.equal(pending.activeOperation?.externalRunId, "run-1");
 });
 
 test("resume returns a failed pending skip to skip_pending", async () => {
@@ -2820,6 +3001,10 @@ class FakeFusion {
         terminal: true,
         report: "NO_FINDINGS",
       },
+      callerOutput: {
+        contract: "plan-review-v1",
+        output: "NO_FINDINGS",
+      },
     });
   }
   async adopt(): Promise<BridgeResult> {
@@ -2877,7 +3062,7 @@ class ResultFailingFusion extends FakeFusion {
   override async status(): Promise<BridgeResult> {
     this.statusCount += 1;
     return success({
-      run: { runId: "fusion-1", phase: "failed", terminal: true },
+      run: { runId: "fusion-1", phase: "done", terminal: true },
     });
   }
 
@@ -2890,9 +3075,88 @@ class ResultFailingFusion extends FakeFusion {
   }
 }
 
+class ContradictoryReportFusion extends FakeFusion {
+  override async status(): Promise<BridgeResult> {
+    return success({
+      run: { runId: "fusion-1", phase: "done", terminal: true },
+    });
+  }
+
+  override async result(): Promise<BridgeResult> {
+    return success({
+      run: {
+        runId: "fusion-1",
+        phase: "done",
+        terminal: true,
+        report: "FINDING: CRITICAL | Contradictory unvalidated report",
+      },
+      callerOutput: { contract: "plan-review-v1", output: "NO_FINDINGS" },
+    });
+  }
+}
+
+class NoCallerOutputFusion extends FakeFusion {
+  override async status(): Promise<BridgeResult> {
+    return success({
+      run: { runId: "fusion-1", phase: "done", terminal: true },
+    });
+  }
+
+  override async result(): Promise<BridgeResult> {
+    return success({
+      run: {
+        runId: "fusion-1",
+        phase: "done",
+        terminal: true,
+        report: "NO_FINDINGS",
+      },
+    });
+  }
+}
+
+class TerminalFusion extends FakeFusion {
+  constructor(
+    private readonly phase: "failed" | "cancelled",
+    private readonly terminalError: string,
+  ) {
+    super();
+  }
+
+  override async status(): Promise<BridgeResult> {
+    return success({
+      run: {
+        runId: "fusion-1",
+        phase: this.phase,
+        terminal: true,
+        error: this.terminalError,
+      },
+    });
+  }
+
+  override async result(): Promise<BridgeResult> {
+    return success({
+      run: {
+        runId: "fusion-1",
+        phase: this.phase,
+        terminal: true,
+        error: this.terminalError,
+      },
+    });
+  }
+}
+
 class MalformedStartFusion extends FakeFusion {
   override async start(): Promise<BridgeResult> {
     return success({ accepted: true });
+  }
+}
+
+class StartFailingFusion extends FakeFusion {
+  override async start(): Promise<BridgeResult> {
+    return {
+      success: false,
+      error: { message: "Fusion extension unavailable." },
+    };
   }
 }
 
