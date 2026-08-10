@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 1.0.1 - 2026-08-10
+
+- Require and request Fusion's `plan-review-v1` contract, consume only validated
+  top-level `callerOutput.output`, and fail closed when it is absent.
+- Treat Fusion as optional and fall back to the pi-subagents reviewer when its
+  launch or replay response is unavailable or unusable.
+- Preserve review operation identity and force-skip state during fallback.
+
 ## 1.0.0 - 2026-08-09
 
 Breaking:
