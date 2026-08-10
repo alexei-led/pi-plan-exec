@@ -1,6 +1,7 @@
 import { requestRpc, type EventBus } from "./rpc.js";
 
 export const FUSION_REQUEST_EVENT = "fusion:rpc:v1:request";
+export const PLAN_REVIEW_OUTPUT_CONTRACT = "plan-review-v1" as const;
 const FUSION_REPLY_PREFIX = "fusion:rpc:v1:reply:";
 const DEFAULT_FUSION_TIMEOUT_MS = 30_000;
 
@@ -16,12 +17,18 @@ export const FUSION_PHASE = {
 export type FusionPhase = (typeof FUSION_PHASE)[keyof typeof FUSION_PHASE];
 const FUSION_PHASES = new Set<FusionPhase>(Object.values(FUSION_PHASE));
 
+export type PlanReviewOutputContract = typeof PLAN_REVIEW_OUTPUT_CONTRACT;
+
+export interface FusionCallerOutput {
+  contract: PlanReviewOutputContract;
+  output: string;
+}
+
 export interface FusionRunState {
   runId: string;
   operationId?: string;
   phase: FusionPhase;
   terminal: boolean;
-  report?: string;
   error?: string;
 }
 
@@ -45,7 +52,12 @@ export class FusionClient {
     profile?: string,
   ): Promise<FusionResult> {
     return this.request("start", {
-      params: { operationId, prompt, ...(profile ? { profile } : {}) },
+      params: {
+        operationId,
+        prompt,
+        ...(profile ? { profile } : {}),
+        outputContract: PLAN_REVIEW_OUTPUT_CONTRACT,
+      },
     });
   }
 
@@ -108,13 +120,26 @@ export class FusionClient {
   }
 }
 
+export function parseFusionCallerOutput(
+  value: unknown,
+): FusionCallerOutput | undefined {
+  if (
+    !isRecord(value) ||
+    value.contract !== PLAN_REVIEW_OUTPUT_CONTRACT ||
+    typeof value.output !== "string"
+  )
+    return undefined;
+  return value.output.trim()
+    ? { contract: PLAN_REVIEW_OUTPUT_CONTRACT, output: value.output }
+    : undefined;
+}
+
 export function fusionState(value: unknown): FusionRunState | undefined {
   if (!isRecord(value)) return undefined;
   const run = isRecord(value.run) ? value.run : value;
   const runId = text(run.runId);
   const phase = text(run.phase);
   const operationId = text(run.operationId);
-  const report = text(run.report);
   const error = text(run.error);
   if (
     !runId ||
@@ -129,7 +154,6 @@ export function fusionState(value: unknown): FusionRunState | undefined {
     phase,
     terminal: run.terminal,
     ...(operationId ? { operationId } : {}),
-    ...(report ? { report } : {}),
     ...(error ? { error } : {}),
   };
 }

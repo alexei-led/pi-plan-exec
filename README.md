@@ -18,7 +18,7 @@ It has been exercised in runs lasting a few hours; the controller keeps polling
 instead of asking one chat prompt to remember the whole job.
 
 It executes one checked-list task at a time in a Git checkout you choose, then
-runs review and fix stages with fresh Pi subagents and Fusion. A worker saying
+runs review and fix stages with fresh Pi subagents and optional Fusion. A worker saying
 “done” is not enough: the plan’s checked items are the implementation record.
 
 > Experimental. Start with disposable repositories or reviewable worktrees.
@@ -36,25 +36,29 @@ runs review and fix stages with fresh Pi subagents and Fusion. A worker saying
   it. Compare-and-set records, operation IDs, controller locks, and leases avoid
   intentionally starting another writer or losing a pause or cancellation.
 - **Reviews before it finishes.** It runs comprehensive, smells, Fusion, and
-  critical review/fix phases. Unresolved findings remain visible in the final
-  `completed_with_findings` state.
+  critical review/fix phases. Fusion `>=0.7.0` validates the strict
+  `plan-review-v1` output contract; plan-exec consumes only top-level
+  `callerOutput.output` and fails closed when validation evidence is absent. If
+  Fusion is unavailable, the Fusion review stage falls back to the pi-subagents
+  reviewer without changing the persisted operation ID. Unresolved findings
+  remain visible in the final `completed_with_findings` state.
 
 ## Install and run
 
-Install the prerequisites, then plan-exec:
+Install the required packages, then plan-exec. Fusion is optional; install it for the preferred Fusion review provider:
 
 ```bash
 pi install npm:pi-subagents
 pi install npm:@tintinweb/pi-tasks
 pi install 'npm:@alexeiled/pi-subagents-bridge@>=0.2.2'
-pi install npm:@alexeiled/pi-fusion
+pi install 'npm:@alexeiled/pi-fusion@>=0.7.0'
 pi install npm:@alexeiled/pi-plan-exec
 ```
 
 The providers remain independent Pi packages. `pi-plan-exec` requires Bridge
-`0.2.2` or later for safe operation lookup and pi-subagents workflow execution,
-probes Bridge and Fusion capabilities before it creates a run, and tells you how
-to recover if they are unavailable.
+`0.2.2` or later for safe operation lookup and pi-subagents workflow execution.
+Fusion is optional: the controller falls back to the pi-subagents reviewer when
+Fusion is absent or its launch response is unusable.
 
 Reload Pi. From an interactive session in a Git repository, run an executable
 plan:
@@ -113,7 +117,8 @@ flowchart LR
     worker --> worktree["Git worktree"]
     worktree --> checks["plan checkboxes"]
     checks --> controller
-    controller --> fusion["pi-fusion panel + judge"]
+    controller --> fusion["optional pi-fusion panel + judge"]
+    fusion -. unavailable .-> bridge
     fusion --> controller
     controller --> result["completed or completed_with_findings"]
 ```

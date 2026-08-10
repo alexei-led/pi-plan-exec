@@ -22,11 +22,15 @@ or multi-model review.
 | `pi-plan-exec`        | Plan parsing, Git safety, stages, retries, leases, recovery, prompts, findings, archival                        |
 | `pi-subagents-bridge` | Versioned execution RPC, `cwd` forwarding, spawn idempotency, run observation, result normalization, stop/adopt |
 | `pi-subagents`        | Fresh child sessions, built-in `worker`/`reviewer`, model execution, artifacts, lifecycle                       |
-| `pi-fusion`           | Panel, judge, profiles, machine-readable Fusion RPC, persistent operation identity                              |
+| `pi-fusion`           | Optional panel, judge, profiles, machine-readable Fusion RPC (`>=0.7.0`), validated caller output, persistent operation identity |
 | `pi-tasks`            | Task file format, locking, dependencies, session widget                                                         |
 
 The bridge and Fusion APIs are event-based, versioned RPC contracts. The
-controller does not import their runtime internals.
+controller does not import their runtime internals. Fusion review starts request
+`outputContract: "plan-review-v1"`; terminal approval uses only validated
+top-level `callerOutput.output` and fails closed when it is absent. If Fusion
+is unavailable before an external run is tracked, the controller uses the
+pi-subagents reviewer with the same operation ID.
 
 The exception is the pi-tasks projection adapter. Pi-tasks has no cross-extension
 CRUD RPC, so `task-projection.ts` uses the shipped `TaskStore` contract. The
@@ -43,8 +47,9 @@ flowchart LR
     controller --> projection[pi-tasks projection]
     controller --> bridge[pi-subagents-bridge RPC]
     bridge --> agents["pi-subagents worker / reviewer"]
-    controller --> fusion[pi-fusion RPC]
+    controller --> fusion[optional pi-fusion RPC]
     fusion --> panel[panel and judge]
+    fusion -. launch fallback .-> bridge
     agents --> worktree[Git execution worktree]
     panel --> controller
     worktree --> plan[plan checkboxes]
@@ -231,8 +236,9 @@ recovery reconciles the same operation ID. Bridge `0.2.2` or later reports an
 operation as `found`, `pending`, `unknown`, or `absent` and advertises compatible
 workflowScript spawning; the controller only
 attaches `found` work and refuses a blind replay for every other uncertain
-outcome. Fusion retries its persisted operation ID. Active foreign-session runs
-are observed rather than replaced.
+outcome. Fusion retries its persisted operation ID; an unavailable Fusion
+launch falls back to pi-subagents with that same operation ID. Active
+foreign-session runs are observed rather than replaced.
 
 ## Stage pipeline
 
@@ -257,7 +263,8 @@ the schema for migration and explicit transition handling.
 
 Implementation repeatedly selects the first task with unchecked boxes and runs
 one worker. Comprehensive and Fusion review can loop through findings and a sole
-fixer. Smells and critical review are single-pass review/fix stages. Known
+fixer. The Fusion review uses pi-subagents when the optional Fusion provider is
+unavailable. Smells and critical review are single-pass review/fix stages. Known
 findings that survive caps are retained and produce `completed_with_findings`.
 
 ## Cancellation, pause, and force-skip
@@ -294,6 +301,8 @@ Untrusted boundaries are validated at entry:
 - Registry run IDs must be UUID-shaped before path construction.
 - Stored run records are schema-checked and migrated.
 - Bridge/Fusion replies are parsed from `unknown`.
+- Fusion review requires validated top-level `callerOutput` for
+  `plan-review-v1`; `run.report` is not an approval fallback.
 - Reviewer output must be `NO_FINDINGS` or structured findings.
 - Git common-directory and branch checks protect writer stages.
 - `src/types.ts` owns persisted run/status/stage/operation constants. ESLint

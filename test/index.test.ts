@@ -273,7 +273,10 @@ test("help and setup explain the installed command surface", () => {
     execSetup(),
     /pi install npm:@alexeiled\/pi-subagents-bridge@>=0\.2\.2/,
   );
-  assert.match(execSetup(), /pi install npm:@alexeiled\/pi-fusion/);
+  assert.match(
+    execSetup(),
+    /pi install 'npm:@alexeiled\/pi-fusion@>=0\.7\.0'/,
+  );
   assert.match(execSetup(), /pi install npm:@alexeiled\/pi-plan-exec/);
 });
 
@@ -1785,6 +1788,7 @@ test("status reports a missing package with its install commands", async () => {
 
   assert.match(report, /Plan-exec prerequisites — missing: pi-subagents\./);
   assert.match(report, /^pi install npm:pi-subagents$/m);
+  assert.doesNotMatch(report, /pi-fusion/);
   assert.match(report, /No plan execution runs\. Start one with \/exec\./);
   assert.equal(
     await execStatus(registry),

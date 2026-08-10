@@ -123,6 +123,17 @@ checkbox markers from `[ ]` to `[x]` or `[X]`. Do not change headings, numbers,
 checkbox text, or checkbox count. A structural change requires interactive
 review before resume.
 
+## Review provider
+
+- Fusion is the preferred provider for the `fusion_review` stage, but it is
+  optional. The required pi-subagents bridge is the fallback reviewer.
+- If Fusion is absent, rejects a launch, or returns an unusable start response,
+  the controller launches the same review through pi-subagents instead.
+- Fallback keeps the persisted operation ID and review stage. Do not launch a
+  second provider manually; use `/exec resume` for recovery.
+- A Fusion run with a tracked external run ID is observed before any fallback;
+  do not duplicate an active review because a provider is slow.
+
 ## Start safely
 
 Prefer **Worktree (isolated)** unless the user explicitly requests in-place
@@ -250,7 +261,9 @@ record, worktree, active-operation evidence, and approval or runtime fix needed.
 ## Prerequisites
 
 `pi-plan-exec` requires compatible installations of `pi-subagents`,
-`@tintinweb/pi-tasks`, `@alexeiled/pi-subagents-bridge` `>=0.2.2`, and
-`@alexeiled/pi-fusion`. Run `/exec status`, install what it reports, run
-`/reload`, then return to the same run ID. Installing dependencies does not
-replace or complete the preserved run.
+`@tintinweb/pi-tasks`, and `@alexeiled/pi-subagents-bridge` `>=0.2.2`.
+`@alexeiled/pi-fusion` `>=0.7.0` is optional; install it to use the preferred
+Fusion review provider:
+`pi install 'npm:@alexeiled/pi-fusion@>=0.7.0'`. Run `/exec status`, install
+what it reports, run `/reload`, then return to the same run ID. Installing
+dependencies does not replace or complete the preserved run.
