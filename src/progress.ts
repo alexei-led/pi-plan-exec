@@ -1,4 +1,4 @@
-import { appendFile, mkdir, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import type { PlanExecRun } from "./types.js";
 
@@ -29,6 +29,25 @@ export async function appendProgress(
     `[${new Date().toISOString()}] ${message}\n`,
     "utf8",
   );
+}
+
+export async function appendProgressOnce(
+  run: PlanExecRun,
+  message: string,
+): Promise<void> {
+  if (!run.progressPath) return;
+  let existing = "";
+  try {
+    existing = await readFile(run.progressPath, "utf8");
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  const escapedMessage = message.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const timestampedMessage = new RegExp(
+    `\\[\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z\\] ${escapedMessage}(?:\\n|$)`,
+  );
+  if (timestampedMessage.test(existing)) return;
+  await appendProgress(run, message);
 }
 
 function progressPath(run: PlanExecRun): string {
