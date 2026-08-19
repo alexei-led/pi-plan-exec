@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 1.0.2 - 2026-08-19
+
+- Make archive retries idempotent after partial renames or staged commits.
+- Protect plan-derived Git paths from pathspec magic and force-stage ignored
+  progress artifacts.
+- Deduplicate terminal progress records during recovery.
+
 ## 1.0.1 - 2026-08-10
 
 - Require and request Fusion's `plan-review-v1` contract, consume only validated

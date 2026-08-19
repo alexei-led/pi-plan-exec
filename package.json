@@ -1,6 +1,6 @@
 {
   "name": "@alexeiled/pi-plan-exec",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Turn a Markdown execution plan into an isolated, resumable Pi run - durable controller state, one writer, deliberate recovery",
   "keywords": [
     "pi-package",
