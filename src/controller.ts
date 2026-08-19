@@ -1,6 +1,21 @@
 import { randomUUID } from "node:crypto";
-import { access, mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { basename, dirname, join, relative, sep } from "node:path";
+import {
+  access,
+  lstat,
+  mkdir,
+  readFile,
+  rename,
+  writeFile,
+} from "node:fs/promises";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
 import { readSubagentArtifact } from "./artifact.js";
 import {
   FUSION_PHASE,
@@ -71,6 +86,7 @@ const OPERATION_RECOVERY_DELAY_MS = 35_000;
 const RECOVERY_WORKER_MAX_TURNS = 75;
 const RECOVERY_REVIEWER_MAX_TURNS = 75;
 const MAX_TERMINAL_ERROR_LENGTH = 2_000;
+const GIT_MISSING_OBJECT_EXIT_CODE = 128;
 export const PLAN_STRUCTURE_CHANGED_ERROR =
   "Plan task structure changed outside checkbox completion.";
 
@@ -1401,8 +1417,26 @@ export class PlanExecController {
       COMPLETED_PLANS_DIRECTORY,
       basename(run.planPath),
     );
+    const sourceRelative = relative(run.worktreeCwd, run.planPath);
+    const destinationRelative = relative(run.worktreeCwd, destination);
+    const progressRelative = run.progressPath
+      ? relative(run.worktreeCwd, run.progressPath)
+      : undefined;
+    if (
+      !isInsideWorktree(sourceRelative) ||
+      !isInsideWorktree(destinationRelative) ||
+      (progressRelative !== undefined && !isInsideWorktree(progressRelative))
+    )
+      return this.fail(run, "Archive paths must stay inside the execution worktree.");
+
     const status = completionStatus(run);
+    const source = gitPath(sourceRelative);
+    const destinationPath = gitPath(destinationRelative);
     try {
+      await assertNoSymlinkPath(run.worktreeCwd, run.planPath);
+      await assertNoSymlinkPath(run.worktreeCwd, destination);
+      if (run.progressPath)
+        await assertNoSymlinkPath(run.worktreeCwd, run.progressPath);
       await mkdir(dirname(destination), { recursive: true });
       const sourceExists = await pathExists(run.planPath);
       const destinationExists = await pathExists(destination);
@@ -1410,40 +1444,78 @@ export class PlanExecController {
         throw new Error(
           `Completed plan destination already exists: ${destination}.`,
         );
-      if (sourceExists) await rename(run.planPath, destination);
-      else if (!destinationExists)
-        throw new Error(`Plan to archive is missing: ${run.planPath}.`);
-      await appendProgressOnce(run, `Archived plan to ${destination}.`);
-      await appendProgressOnce(run, `Run completed as ${status}.`);
-      const source = gitPath(relative(run.worktreeCwd, run.planPath));
-      const destinationPath = gitPath(relative(run.worktreeCwd, destination));
-      const paths = [destinationPath];
-      if (sourceExists) paths.unshift(source);
-      else {
+      let sourceTracked = false;
+      let sourceInIndex = false;
+      if (sourceExists) {
         const tracked = await this.runCommand(
           "git",
           ["ls-files", "--error-unmatch", "--", `:(literal)${source}`],
           run.worktreeCwd,
         );
-        if (tracked.code === 0) paths.unshift(source);
-        else if (tracked.code !== 1)
+        if (tracked.code === 0) {
+          sourceTracked = true;
+          sourceInIndex = true;
+        } else if (tracked.code !== 1)
           throw new Error(
             tracked.stderr.trim() || "Could not inspect archived plan state.",
           );
       }
-      if (run.progressPath) {
-        const progress = gitPath(relative(run.worktreeCwd, run.progressPath));
-        if (progress !== ".." && !progress.startsWith("../"))
-          paths.push(progress);
+      if (sourceExists) await rename(run.planPath, destination);
+      else if (!destinationExists)
+        throw new Error(`Plan to archive is missing: ${run.planPath}.`);
+      await appendProgressOnce(run, `Archived plan to ${destination}.`);
+      await appendProgressOnce(run, `Run completed as ${status}.`);
+
+      if (!sourceExists) {
+        const tracked = await this.runCommand(
+          "git",
+          ["ls-files", "--error-unmatch", "--", `:(literal)${source}`],
+          run.worktreeCwd,
+        );
+        if (tracked.code === 0) {
+          sourceTracked = true;
+          sourceInIndex = true;
+        } else if (tracked.code !== 1)
+          throw new Error(
+            tracked.stderr.trim() || "Could not inspect archived plan state.",
+          );
+        else {
+          // A previous failed attempt may already have staged the deletion, so
+          // the index no longer reports the source even though HEAD does.
+          const committed = await this.runCommand(
+            "git",
+            ["cat-file", "-e", `HEAD:${source}`],
+            run.worktreeCwd,
+          );
+          if (committed.code === 0) sourceTracked = true;
+          else if (
+            committed.code !== 1 &&
+            committed.code !== GIT_MISSING_OBJECT_EXIT_CODE
+          )
+            throw new Error(
+              committed.stderr.trim() || "Could not inspect archived plan history.",
+            );
+        }
       }
+
+      const paths = [destinationPath];
+      if (sourceTracked) paths.unshift(source);
+      if (progressRelative !== undefined) paths.push(gitPath(progressRelative));
+      const literalPaths = paths.map((path) => `:(literal)${path}`);
+      const addPaths = [
+        ...(sourceInIndex ? [`:(literal)${source}`] : []),
+        `:(literal)${destinationPath}`,
+        ...(progressRelative !== undefined
+          ? [`:(literal)${gitPath(progressRelative)}`]
+          : []),
+      ];
       const add = await this.runCommand(
         "git",
-        ["add", "-f", "-A", "--", ...paths.map((path) => `:(literal)${path}`)],
+        ["add", "-f", "-A", "--", ...addPaths],
         run.worktreeCwd,
       );
       if (add.code !== 0)
         throw new Error(add.stderr.trim() || "Could not stage archived plan.");
-      const literalPaths = paths.map((path) => `:(literal)${path}`);
       const pending = await this.runCommand(
         "git",
         ["status", "--porcelain", "--", ...literalPaths],
@@ -1456,7 +1528,14 @@ export class PlanExecController {
       if (pending.stdout.trim()) {
         const commit = await this.runCommand(
           "git",
-          ["commit", "-m", `chore: archive ${basename(destination)}`],
+          [
+            "commit",
+            "--only",
+            "-m",
+            `chore: archive ${basename(destination)}`,
+            "--",
+            ...literalPaths,
+          ],
           run.worktreeCwd,
         );
         if (commit.code !== 0)
@@ -1464,8 +1543,16 @@ export class PlanExecController {
             commit.stderr.trim() || "Could not commit archived plan.",
           );
       }
-      // The plan is already renamed and committed, and that cannot be replayed,
-      // so the terminal status must not be lost to a concurrent claim.
+    } catch (error: unknown) {
+      return this.fail(
+        run,
+        `Plan archival failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+
+    // Git has durably completed. A registry failure must not turn that fact
+    // into a new archival failure; the next resume can reconcile this state.
+    try {
       const completed = await this.registry.updateLatest(run.id, (current) => ({
         ...current,
         status,
@@ -1474,9 +1561,11 @@ export class PlanExecController {
       }));
       return this.registry.release(completed);
     } catch (error: unknown) {
-      return this.fail(
-        run,
-        `Plan archival failed: ${error instanceof Error ? error.message : String(error)}`,
+      const current = await this.registry.get(run.id);
+      if (current) return current;
+      throw new Error(
+        `Archive committed but run finalization failed: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
       );
     }
   }
@@ -2290,6 +2379,32 @@ export function isRecoverableFailure(run: PlanExecRun): boolean {
 
 function gitPath(path: string): string {
   return path.split(sep).join("/");
+}
+
+function isInsideWorktree(path: string): boolean {
+  return path !== "" && !isAbsolute(path) && path !== ".." && !path.startsWith(`..${sep}`);
+}
+
+async function assertNoSymlinkPath(
+  worktreeCwd: string,
+  target: string,
+): Promise<void> {
+  const root = resolve(worktreeCwd);
+  let current = resolve(target);
+  while (current !== root) {
+    const currentRelative = relative(root, current);
+    if (!isInsideWorktree(currentRelative))
+      throw new Error(`Archive path escapes the execution worktree: ${target}.`);
+    try {
+      if ((await lstat(current)).isSymbolicLink())
+        throw new Error(`Archive path uses a symbolic link: ${target}.`);
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    current = dirname(current);
+  }
+  if ((await lstat(root)).isSymbolicLink())
+    throw new Error(`Execution worktree is a symbolic link: ${worktreeCwd}.`);
 }
 
 async function pathExists(path: string): Promise<boolean> {

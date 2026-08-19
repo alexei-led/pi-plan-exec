@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import { execFile as execFileCallback } from "node:child_process";
-import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
+import {
+  mkdtemp,
+  mkdir,
+  readFile,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { promisify } from "node:util";
 import { join } from "node:path";
@@ -12,6 +18,7 @@ import {
 } from "../src/controller.js";
 import { execReconcile } from "../src/index.js";
 import { parsePlan } from "../src/plan.js";
+import { appendProgressOnce } from "../src/progress.js";
 import { RunRegistry } from "../src/registry.js";
 import type { BridgeResult, PlanExecRun } from "../src/types.js";
 
@@ -1777,6 +1784,47 @@ test("archive retires the run record with a persisted retiredAt", async () => {
   assert.equal(reloaded.retiredAt, completed.retiredAt);
 });
 
+test("terminal progress dedupe is strict and serialized", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-progress-"));
+  const progressPath = join(root, ".ralphex", "progress", "progress-plan.txt");
+  await mkdir(join(root, ".ralphex", "progress"), { recursive: true });
+  const run = { progressPath } as PlanExecRun;
+  await writeFile(
+    progressPath,
+    "prefix [2024-01-02T03:04:05.000Z] Run completed as completed.\n[2024-99-99T03:04:05.000Z] Run completed as completed.\n",
+  );
+
+  await appendProgressOnce(run, "Run completed as completed.");
+  await Promise.all(
+    Array.from({ length: 20 }, () =>
+      appendProgressOnce(run, "Concurrent terminal message."),
+    ),
+  );
+  await Promise.all([
+    appendProgressOnce(run, "Archived path with\na newline."),
+    appendProgressOnce(run, "Archived path with\na newline."),
+  ]);
+
+  const progress = await readFile(progressPath, "utf8");
+  assert.equal(
+    progress
+      .split("\n")
+      .filter(
+        (line) =>
+          /^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\] Run completed as completed\.$/.test(
+            line,
+          ) && !line.startsWith("[2024-99"),
+      ).length,
+    1,
+  );
+  assert.equal(
+    (progress.match(/^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\] Concurrent terminal message\.$/gm) ?? []).length,
+    1,
+  );
+  assert.equal((progress.match(/\] Archived path with\na newline\./g) ?? []).length, 1);
+  await assert.rejects(readFile(`${progressPath}.lock`), /ENOENT/);
+});
+
 test("archive commit failure remains resumable and retries idempotently", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
   const planPath = join(root, "plan.md");
@@ -1820,7 +1868,8 @@ test("archive commit failure remains resumable and retries idempotently", async 
 
 test("archive retry handles a partially staged move and ignored progress", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, ":(glob)**.md");
+  const planName = ":(glob) plan-ü\n**.md";
+  const planPath = join(root, planName);
   const progressPath = join(root, ".ralphex", "progress", "progress-plan.txt");
   const unrelatedPath = join(root, "unrelated.md");
   await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
@@ -1828,7 +1877,7 @@ test("archive retry handles a partially staged move and ignored progress", async
   await mkdir(join(root, ".ralphex", "progress"), { recursive: true });
   await writeFile(
     progressPath,
-    `started\nnot-a-timestamp] Archived plan to ${join(root, "completed", ":(glob)**.md")}.\n`,
+    `started\nnot-a-timestamp] Archived plan to ${join(root, "completed", planName)}.\n`,
   );
   await writeFile(join(root, ".gitignore"), ".ralphex/\nruns/\n");
   const git = realGit();
@@ -1850,6 +1899,8 @@ test("archive retry handles a partially staged move and ignored progress", async
   }
   assert.notEqual(branch, "");
   await writeFile(unrelatedPath, "changed\n");
+  const unrelatedStage = await git("git", ["add", "--", unrelatedPath], root);
+  assert.equal(unrelatedStage.code, 0, unrelatedStage.stderr);
   const registry = new RunRegistry(join(root, "runs"));
   let failCommit = true;
   const failingGit = async (
@@ -1881,7 +1932,7 @@ test("archive retry handles a partially staged move and ignored progress", async
   assert.equal(failed.stage, "archive");
   const staged = await git("git", ["diff", "--cached", "--name-only"], root);
   assert.equal(staged.code, 0, staged.stderr);
-  assert.doesNotMatch(staged.stdout, /unrelated\.md/);
+  assert.match(staged.stdout, /unrelated\.md/);
 
   const recovering = new PlanExecController(
     registry,
@@ -1895,15 +1946,119 @@ test("archive retry handles a partially staged move and ignored progress", async
   assert.equal(completed.stage, "complete");
   await assert.rejects(readFile(planPath));
   assert.match(
-    await readFile(join(root, "completed", ":(glob)**.md"), "utf8"),
+    await readFile(join(root, "completed", planName), "utf8"),
     /Task 1/,
   );
   const progress = await readFile(progressPath, "utf8");
   assert.equal((progress.match(/\[[^\]\n]+\] Archived plan to/g) ?? []).length, 1);
   assert.equal((progress.match(/\[[^\]\n]+\] Run completed as completed/g) ?? []).length, 1);
+  const committed = await git("git", ["show", "--format=", "--name-only", "HEAD"], root);
+  assert.equal(committed.code, 0, committed.stderr);
+  assert.doesNotMatch(committed.stdout, /unrelated\.md/);
   const clean = await git("git", ["status", "--porcelain"], root);
   assert.equal(clean.code, 0);
-  assert.equal(clean.stdout, " M unrelated.md\n");
+  assert.equal(clean.stdout, "M  unrelated.md\n");
+});
+
+test("archive stages an untracked source plan after moving it", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
+  const planPath = join(root, "untracked-plan.md");
+  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
+  await writeFile(join(root, ".gitignore"), ".ralphex/\nruns/\n");
+  const git = realGit();
+  for (const args of [
+    ["init", "--quiet"],
+    ["config", "user.email", "test@example.com"],
+    ["config", "user.name", "Plan Exec Test"],
+    ["add", ".gitignore"],
+    ["commit", "--quiet", "-m", "initial"],
+  ]) {
+    const result = await git("git", args, root);
+    assert.equal(result.code, 0, result.stderr);
+  }
+  const branchResult = await git("git", ["branch", "--show-current"], root);
+  assert.equal(branchResult.code, 0, branchResult.stderr);
+  const progressPath = join(root, ".ralphex", "progress", "progress-plan.txt");
+  const registry = new RunRegistry(join(root, "runs"));
+  const controller = new PlanExecController(
+    registry,
+    new FakeBridge(join(root, "none.json")),
+    new FakeFusion(),
+    git,
+  );
+  const run = await registry.create({
+    ...baseRun(root, planPath),
+    branch: branchResult.stdout.trim(),
+    stage: "archive",
+    progressPath,
+  });
+
+  const completed = await controller.advance(run);
+
+  assert.equal(completed.status, "completed");
+  assert.match(
+    await readFile(join(root, "completed", "untracked-plan.md"), "utf8"),
+    /Task 1/,
+  );
+  const committed = await git("git", ["show", "--format=", "--name-only", "HEAD"], root);
+  assert.equal(committed.code, 0, committed.stderr);
+  assert.match(committed.stdout, /completed\/untracked-plan\.md/);
+  assert.doesNotMatch(committed.stdout, /^untracked-plan\.md$/m);
+});
+
+test("archive does not mark a committed move failed when registry finalization retries", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
+  const planPath = join(root, "plan.md");
+  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
+  const registry = new FinalizationFailingRegistry(join(root, "runs"));
+  const controller = new PlanExecController(
+    registry,
+    new FakeBridge(join(root, "none.json")),
+    new FakeFusion(),
+    fakeGit(root),
+  );
+  const run = await registry.create({
+    ...baseRun(root, planPath),
+    stage: "archive",
+  });
+
+  const afterCommit = await controller.advance(run);
+
+  assert.equal(afterCommit.status, "running");
+  assert.equal(afterCommit.stage, "archive");
+  assert.equal((await registry.get(run.id))?.status, "running");
+  assert.match(
+    await readFile(join(root, "completed", "plan.md"), "utf8"),
+    /Task 1/,
+  );
+
+  const completed = await controller.resume(run.id, "session-1");
+  assert.equal(completed.status, "completed");
+  assert.equal(completed.stage, "complete");
+});
+
+test("archive recreates a missing progress artifact after the plan move", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
+  const planPath = join(root, "plan.md");
+  const progressPath = join(root, ".ralphex", "progress", "progress-plan.txt");
+  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
+  const registry = new RunRegistry(join(root, "runs"));
+  const controller = new PlanExecController(
+    registry,
+    new FakeBridge(join(root, "none.json")),
+    new FakeFusion(),
+    fakeGit(root),
+  );
+  const run = await registry.create({
+    ...baseRun(root, planPath),
+    stage: "archive",
+    progressPath,
+  });
+
+  const completed = await controller.advance(run);
+
+  assert.equal(completed.status, "completed");
+  assert.match(await readFile(progressPath, "utf8"), /Run completed as completed/);
 });
 
 test("archive recovery completes after a committed plan move without committing again", async () => {
@@ -2361,6 +2516,53 @@ test("a force-skipped stage makes terminal completion honest", async () => {
   assert.equal(completed.status, "completed_with_findings");
 });
 
+test("archive rejects source paths through symlinked directories", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
+  const outside = await mkdtemp(join(tmpdir(), "pi-plan-exec-outside-"));
+  await writeFile(join(outside, "plan.md"), "### Task 1: Implement\n- [x] Done\n");
+  await symlink(outside, join(root, "linked"), "dir");
+  const planPath = join(root, "linked", "plan.md");
+  const registry = new RunRegistry(join(root, "runs"));
+  const controller = new PlanExecController(
+    registry,
+    new FakeBridge(join(root, "none.json")),
+    new FakeFusion(),
+    fakeGit(root),
+  );
+  const run = await registry.create({
+    ...baseRun(root, planPath),
+    stage: "archive",
+  });
+
+  const failed = await controller.advance(run);
+
+  assert.equal(failed.status, "failed");
+  assert.match(failed.error ?? "", /symbolic link/);
+  assert.match(await readFile(join(outside, "plan.md"), "utf8"), /Task 1/);
+});
+
+test("archive fails closed when both source and destination are missing", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
+  const planPath = join(root, "plan.md");
+  const registry = new RunRegistry(join(root, "runs"));
+  const controller = new PlanExecController(
+    registry,
+    new FakeBridge(join(root, "none.json")),
+    new FakeFusion(),
+    fakeGit(root),
+  );
+  const run = await registry.create({
+    ...baseRun(root, planPath),
+    stage: "archive",
+  });
+
+  const failed = await controller.advance(run);
+
+  assert.equal(failed.status, "failed");
+  assert.match(failed.error ?? "", /Plan to archive is missing/);
+  await assert.rejects(readFile(planPath), /ENOENT/);
+});
+
 test("archive refuses to overwrite an existing completed plan", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
   const planPath = join(root, "plan.md");
@@ -2534,6 +2736,17 @@ test("archive stages the plan move and final progress entries together", async (
     "add",
     "-f",
     "-A",
+    "--",
+    ":(literal)plan.md",
+    ":(literal)completed/plan.md",
+    ":(literal).ralphex/progress/progress-plan.txt",
+  ]);
+  const commit = calls.find((args) => args[0] === "commit");
+  assert.deepEqual(commit, [
+    "commit",
+    "--only",
+    "-m",
+    "chore: archive plan.md",
     "--",
     ":(literal)plan.md",
     ":(literal)completed/plan.md",
@@ -3242,6 +3455,21 @@ class NoCallerOutputFusion extends FakeFusion {
         report: "NO_FINDINGS",
       },
     });
+  }
+}
+
+class FinalizationFailingRegistry extends RunRegistry {
+  private failNextFinalization = true;
+
+  override async updateLatest(
+    runId: string,
+    apply: (current: PlanExecRun) => PlanExecRun,
+  ): Promise<PlanExecRun> {
+    if (this.failNextFinalization) {
+      this.failNextFinalization = false;
+      throw new Error("registry temporarily unavailable");
+    }
+    return super.updateLatest(runId, apply);
   }
 }
 

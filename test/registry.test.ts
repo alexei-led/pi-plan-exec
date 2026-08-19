@@ -608,6 +608,60 @@ test("controller lock recovers an orphan from the same live Pi process", async (
   await assert.rejects(readFile(lockPath), /ENOENT/);
 });
 
+test("controller lock treats fresh empty metadata as held", async () => {
+  const { directory, registry } = await seedRegistry();
+  const run = await registry.create(runSeed());
+  const lockPath = join(directory, run.id, "run.json.controller.lock");
+  await writeFile(lockPath, "");
+
+  const result = await registry.withControllerLock(run.id, async () => "stolen");
+
+  assert.equal(result, undefined);
+  await rm(lockPath);
+});
+
+test("controller lock does not steal an old lock from a live local owner", async () => {
+  const { directory, registry } = await seedRegistry();
+  const run = await registry.create(runSeed());
+  const lockPath = join(directory, run.id, "run.json.controller.lock");
+  await writeFile(
+    lockPath,
+    `${JSON.stringify({
+      pid: process.pid,
+      hostname: hostname(),
+      createdAt: Date.now() - 180_000,
+      token: "slow-live-controller",
+    })}\n`,
+  );
+
+  const result = await registry.withControllerLock(run.id, async () => "stolen");
+
+  assert.equal(result, undefined);
+  assert.match(await readFile(lockPath, "utf8"), /slow-live-controller/);
+  await rm(lockPath);
+});
+
+test("controller lock fails closed for a foreign host", async () => {
+  const { directory, registry } = await seedRegistry();
+  const run = await registry.create(runSeed());
+  const lockPath = join(directory, run.id, "run.json.controller.lock");
+  await writeFile(
+    lockPath,
+    `${JSON.stringify({
+      pid: process.pid,
+      hostname: "other-host.example",
+      createdAt: Date.now() - 180_000,
+      token: "foreign-controller",
+    })}\n`,
+  );
+
+  const result = await registry.withControllerLock(run.id, async () => "stolen");
+
+  assert.equal(result, undefined);
+  assert.match(await readFile(lockPath, "utf8"), /foreign-controller/);
+  await rm(lockPath);
+});
+
 test("controller lock does not steal a fresh live provider request", async () => {
   const { directory, registry } = await seedRegistry();
   const run = await registry.create(runSeed());
