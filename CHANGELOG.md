@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 1.0.3 - 2026-08-19
+
+- Restrict archive commits to literal archive paths so unrelated staged work is
+  preserved.
+- Recover after staged deletions, untracked plans, missing progress artifacts,
+  and registry failures that occur after a successful archive commit.
+- Serialize terminal progress deduplication and reject unsafe archive paths or
+  concurrent controller lock takeovers.
+
 ## 1.0.2 - 2026-08-19
 
 - Make archive retries idempotent after partial renames or staged commits.
