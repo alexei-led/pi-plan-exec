@@ -28,7 +28,11 @@ import {
   nextStage,
 } from "./lifecycle.js";
 import { readPlan } from "./plan.js";
-import { appendProgress, initializeProgress } from "./progress.js";
+import {
+  appendProgress,
+  appendProgressOnce,
+  initializeProgress,
+} from "./progress.js";
 import { RunRegistry } from "./registry.js";
 import {
   formatFindings,
@@ -1409,27 +1413,40 @@ export class PlanExecController {
       if (sourceExists) await rename(run.planPath, destination);
       else if (!destinationExists)
         throw new Error(`Plan to archive is missing: ${run.planPath}.`);
-      await appendProgress(run, `Archived plan to ${destination}.`);
-      await appendProgress(run, `Run completed as ${status}.`);
-      const paths = [
-        relative(run.worktreeCwd, run.planPath),
-        relative(run.worktreeCwd, destination),
-      ];
+      await appendProgressOnce(run, `Archived plan to ${destination}.`);
+      await appendProgressOnce(run, `Run completed as ${status}.`);
+      const source = gitPath(relative(run.worktreeCwd, run.planPath));
+      const destinationPath = gitPath(relative(run.worktreeCwd, destination));
+      const paths = [destinationPath];
+      if (sourceExists) paths.unshift(source);
+      else {
+        const tracked = await this.runCommand(
+          "git",
+          ["ls-files", "--error-unmatch", "--", `:(literal)${source}`],
+          run.worktreeCwd,
+        );
+        if (tracked.code === 0) paths.unshift(source);
+        else if (tracked.code !== 1)
+          throw new Error(
+            tracked.stderr.trim() || "Could not inspect archived plan state.",
+          );
+      }
       if (run.progressPath) {
-        const progress = relative(run.worktreeCwd, run.progressPath);
-        if (progress !== ".." && !progress.startsWith(`..${sep}`))
+        const progress = gitPath(relative(run.worktreeCwd, run.progressPath));
+        if (progress !== ".." && !progress.startsWith("../"))
           paths.push(progress);
       }
       const add = await this.runCommand(
         "git",
-        ["add", "-A", "--", ...paths],
+        ["add", "-f", "-A", "--", ...paths.map((path) => `:(literal)${path}`)],
         run.worktreeCwd,
       );
       if (add.code !== 0)
         throw new Error(add.stderr.trim() || "Could not stage archived plan.");
+      const literalPaths = paths.map((path) => `:(literal)${path}`);
       const pending = await this.runCommand(
         "git",
-        ["status", "--porcelain", "--", ...paths],
+        ["status", "--porcelain", "--", ...literalPaths],
         run.worktreeCwd,
       );
       if (pending.code !== 0)
@@ -2269,6 +2286,10 @@ function recoveryEvidence(run: PlanExecRun): string {
 
 export function isRecoverableFailure(run: PlanExecRun): boolean {
   return isRecoverableRun(run);
+}
+
+function gitPath(path: string): string {
+  return path.split(sep).join("/");
 }
 
 async function pathExists(path: string): Promise<boolean> {

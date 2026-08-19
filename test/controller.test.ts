@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
+import { execFile as execFileCallback } from "node:child_process";
 import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
+import { promisify } from "node:util";
 import { join } from "node:path";
 import test from "node:test";
 import {
@@ -1816,6 +1818,94 @@ test("archive commit failure remains resumable and retries idempotently", async 
   );
 });
 
+test("archive retry handles a partially staged move and ignored progress", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
+  const planPath = join(root, ":(glob)**.md");
+  const progressPath = join(root, ".ralphex", "progress", "progress-plan.txt");
+  const unrelatedPath = join(root, "unrelated.md");
+  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
+  await writeFile(unrelatedPath, "original\n");
+  await mkdir(join(root, ".ralphex", "progress"), { recursive: true });
+  await writeFile(
+    progressPath,
+    `started\nnot-a-timestamp] Archived plan to ${join(root, "completed", ":(glob)**.md")}.\n`,
+  );
+  await writeFile(join(root, ".gitignore"), ".ralphex/\nruns/\n");
+  const git = realGit();
+  let branch = "";
+  for (const args of [
+    ["init", "--quiet"],
+    ["config", "user.email", "test@example.com"],
+    ["config", "user.name", "Plan Exec Test"],
+    ["add", "-A"],
+    ["commit", "--quiet", "-m", "initial"],
+  ]) {
+    const result = await git("git", args, root);
+    assert.equal(result.code, 0, result.stderr);
+    if (args[0] === "init") {
+      const current = await git("git", ["branch", "--show-current"], root);
+      assert.equal(current.code, 0, current.stderr);
+      branch = current.stdout.trim();
+    }
+  }
+  assert.notEqual(branch, "");
+  await writeFile(unrelatedPath, "changed\n");
+  const registry = new RunRegistry(join(root, "runs"));
+  let failCommit = true;
+  const failingGit = async (
+    command: string,
+    args: string[],
+    cwd: string,
+  ) => {
+    if (args[0] === "commit" && failCommit) {
+      failCommit = false;
+      return { stdout: "", stderr: "commit failed", code: 1 };
+    }
+    return git(command, args, cwd);
+  };
+  const failing = new PlanExecController(
+    registry,
+    new FakeBridge(join(root, "none.json")),
+    new FakeFusion(),
+    failingGit,
+  );
+  const run = await registry.create({
+    ...baseRun(root, planPath),
+    branch,
+    stage: "archive",
+    progressPath,
+  });
+
+  const failed = await failing.advance(run);
+  assert.equal(failed.status, "failed");
+  assert.equal(failed.stage, "archive");
+  const staged = await git("git", ["diff", "--cached", "--name-only"], root);
+  assert.equal(staged.code, 0, staged.stderr);
+  assert.doesNotMatch(staged.stdout, /unrelated\.md/);
+
+  const recovering = new PlanExecController(
+    registry,
+    new FakeBridge(join(root, "none.json")),
+    new FakeFusion(),
+    git,
+  );
+  const completed = await recovering.resume(failed.id, "session-1");
+
+  assert.equal(completed.status, "completed");
+  assert.equal(completed.stage, "complete");
+  await assert.rejects(readFile(planPath));
+  assert.match(
+    await readFile(join(root, "completed", ":(glob)**.md"), "utf8"),
+    /Task 1/,
+  );
+  const progress = await readFile(progressPath, "utf8");
+  assert.equal((progress.match(/\[[^\]\n]+\] Archived plan to/g) ?? []).length, 1);
+  assert.equal((progress.match(/\[[^\]\n]+\] Run completed as completed/g) ?? []).length, 1);
+  const clean = await git("git", ["status", "--porcelain"], root);
+  assert.equal(clean.code, 0);
+  assert.equal(clean.stdout, " M unrelated.md\n");
+});
+
 test("archive recovery completes after a committed plan move without committing again", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
   const planPath = join(root, "plan.md");
@@ -2430,14 +2520,24 @@ test("archive stages the plan move and final progress entries together", async (
     await readFile(progressPath, "utf8"),
     /Run completed as completed/,
   );
+  const status = calls.find((args) => args[0] === "status");
+  assert.deepEqual(status, [
+    "status",
+    "--porcelain",
+    "--",
+    ":(literal)plan.md",
+    ":(literal)completed/plan.md",
+    ":(literal).ralphex/progress/progress-plan.txt",
+  ]);
   const add = calls.find((args) => args[0] === "add");
   assert.deepEqual(add, [
     "add",
+    "-f",
     "-A",
     "--",
-    "plan.md",
-    "completed/plan.md",
-    ".ralphex/progress/progress-plan.txt",
+    ":(literal)plan.md",
+    ":(literal)completed/plan.md",
+    ":(literal).ralphex/progress/progress-plan.txt",
   ]);
 });
 
@@ -3189,6 +3289,35 @@ class StartFailingFusion extends FakeFusion {
       error: { message: "Fusion extension unavailable." },
     };
   }
+}
+
+const execFile = promisify(execFileCallback);
+
+function realGit() {
+  return async (command: string, args: string[], cwd: string) => {
+    try {
+      const result = await execFile(command, args, {
+        cwd,
+        encoding: "utf8",
+      });
+      return {
+        stdout: String(result.stdout),
+        stderr: String(result.stderr),
+        code: 0,
+      };
+    } catch (error: unknown) {
+      const result = error as {
+        code?: unknown;
+        stderr?: unknown;
+        stdout?: unknown;
+      };
+      return {
+        stdout: typeof result.stdout === "string" ? result.stdout : "",
+        stderr: typeof result.stderr === "string" ? result.stderr : "",
+        code: typeof result.code === "number" ? result.code : null,
+      };
+    }
+  };
 }
 
 function fakeGit(root: string, branch = "feature") {
