@@ -447,11 +447,22 @@ async function acquireLock(
     try {
       const handle = await open(path, "wx");
       const token = randomUUID();
-      await handle.writeFile(
-        `${JSON.stringify({ pid: process.pid, createdAt: Date.now(), token })}\n`,
-        "utf8",
-      );
-      return { handle, token };
+      try {
+        await handle.writeFile(
+          `${JSON.stringify({
+            pid: process.pid,
+            hostname: hostname(),
+            createdAt: Date.now(),
+            token,
+          })}\n`,
+          "utf8",
+        );
+        return { handle, token };
+      } catch (error: unknown) {
+        await handle.close();
+        await rm(path, { force: true });
+        throw error;
+      }
     } catch (error: unknown) {
       if (!isNodeError(error, "EEXIST")) throw error;
       await removeStaleLock(path, staleMs);
@@ -474,17 +485,26 @@ async function removeStaleLock(path: string, staleMs: number): Promise<void> {
     const pid = isRecord(parsed)
       ? numberOr(parsed.pid, 0)
       : Number.parseInt(raw, 10);
+    const ownerHostname = isRecord(parsed) ? stringOr(parsed.hostname, "") : "";
+    if (ownerHostname) {
+      // Current locks fail closed across hosts and while their local owner is
+      // alive. Age alone cannot fence a controller that is still mutating Git.
+      if (!isThisHost(ownerHostname)) return;
+      if (Number.isSafeInteger(pid) && pid > 0 && isProcessRunning(pid)) return;
+      await rm(path, { force: true });
+      return;
+    }
+
+    // Legacy locks had no hostname. Preserve their bounded recovery behavior;
+    // new locks above require positive owner-death evidence instead.
     const createdAt = isRecord(parsed)
       ? numberOr(parsed.createdAt, 0)
       : (await stat(path)).mtimeMs;
     if (
-      !Number.isSafeInteger(pid) ||
-      pid <= 0 ||
-      !isProcessRunning(pid) ||
+      (Number.isSafeInteger(pid) && pid > 0 && !isProcessRunning(pid)) ||
       (createdAt > 0 && Date.now() - createdAt > staleMs)
-    ) {
+    )
       await rm(path, { force: true });
-    }
   } catch (error: unknown) {
     if (!isNodeError(error, "ENOENT")) throw error;
   }
@@ -497,9 +517,8 @@ async function releaseLock(
   await lock.handle.close();
   try {
     const parsed: unknown = JSON.parse(await readFile(path, "utf8"));
-    if (isRecord(parsed) && parsed.token === lock.token) {
+    if (isRecord(parsed) && parsed.token === lock.token)
       await rm(path, { force: true });
-    }
   } catch (error: unknown) {
     if (!isNodeError(error, "ENOENT") && !(error instanceof SyntaxError))
       throw error;
@@ -510,8 +529,8 @@ function isProcessRunning(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
-  } catch {
-    return false;
+  } catch (error: unknown) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
   }
 }
 
