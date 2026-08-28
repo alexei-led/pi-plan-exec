@@ -3,7 +3,10 @@ import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { readSubagentArtifact } from "../src/artifact.js";
+import {
+  readSettledWorkflowCompletion,
+  readSubagentArtifact,
+} from "../src/artifact.js";
 
 test("uses pi-subagents status recentOutput when no configured result path exists", async () => {
   const asyncDir = await mkdtemp(join(tmpdir(), "pi-plan-exec-artifact-"));
@@ -112,4 +115,100 @@ test("uses an explicit output artifact before status fallback", async () => {
     }),
   );
   assert.equal(await readSubagentArtifact(result, asyncDir), "NO_FINDINGS");
+});
+
+test("recognizes a settled detached workflow from its result artifact", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-artifact-"));
+  const result = join(root, "result.json");
+  await writeFile(
+    result,
+    JSON.stringify({
+      mode: "workflow",
+      state: "failed",
+      workflowResolution: "settled-awaiting-resume",
+      results: [{ success: true, output: "NO_FINDINGS" }],
+    }),
+  );
+
+  assert.deepEqual(await readSettledWorkflowCompletion(result, undefined), {
+    output: "NO_FINDINGS",
+  });
+});
+
+test("recovers a settled detached workflow after its result was archived", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-artifact-"));
+  const runId = "workflow-1";
+  const asyncDir = join(root, "async-subagent-runs", runId);
+  const archiveDir = join(
+    root,
+    "async-subagent-results",
+    "output-archives",
+  );
+  await mkdir(asyncDir, { recursive: true });
+  await mkdir(archiveDir, { recursive: true });
+  await writeFile(
+    join(asyncDir, "status.json"),
+    JSON.stringify({
+      mode: "workflow",
+      state: "failed",
+      steps: [{ workflowKey: "main", status: "completed" }],
+    }),
+  );
+  await writeFile(
+    join(asyncDir, "workflow-receipt.json"),
+    JSON.stringify({
+      state: "failed",
+      workflowResolution: "settled-awaiting-resume",
+      entries: { main: { key: "main" } },
+    }),
+  );
+  await writeFile(
+    join(archiveDir, `${runId}.json`),
+    JSON.stringify({
+      runId,
+      entries: [{ resultIndex: 0, source: "result-tail", text: "stats" }],
+    }),
+  );
+
+  assert.deepEqual(await readSettledWorkflowCompletion(undefined, asyncDir), {
+    output: "stats",
+  });
+});
+
+test("rejects a detached workflow result with a different run identity", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-artifact-"));
+  const result = join(root, "result.json");
+  await writeFile(
+    result,
+    JSON.stringify({
+      runId: "other-workflow",
+      mode: "workflow",
+      state: "failed",
+      workflowResolution: "settled-awaiting-resume",
+      results: [{ success: true, output: "wrong result" }],
+    }),
+  );
+  assert.equal(
+    await readSettledWorkflowCompletion(result, undefined, "expected-workflow"),
+    undefined,
+  );
+});
+
+test("does not recover a detached workflow whose child failed", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-artifact-"));
+  const result = join(root, "result.json");
+  await writeFile(
+    result,
+    JSON.stringify({
+      mode: "workflow",
+      state: "failed",
+      workflowResolution: "failed-child",
+      results: [{ success: false, error: "review failed" }],
+    }),
+  );
+
+  assert.equal(
+    await readSettledWorkflowCompletion(result, undefined),
+    undefined,
+  );
 });

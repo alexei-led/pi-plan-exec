@@ -356,7 +356,11 @@ Use this sequence instead:
    per run. Add a full run ID for the stage, active operation, worktree, branch,
    progress path, and any error of that one run. It only observes.
 2. Run `/exec stop` when you want the run to end and pick pause or cancel at the
-   prompt. Run `/exec resume` when you are ready to continue a paused run.
+   prompt. Run `/exec resume` when you are ready to continue a paused run. If
+   status says the workflow needs supervisor input, answer that displayed
+   request first. A live controller keeps polling and continues automatically.
+   After a restart, resume consumes the finished child result or reattaches the
+   same workflow without launching a duplicate.
 3. Use the full run ID from `/exec status` with another command when more than
    one run matches the repository and Pi cannot choose unambiguously.
 4. After a Pi restart or a session handoff, run `/exec status` first. A matching

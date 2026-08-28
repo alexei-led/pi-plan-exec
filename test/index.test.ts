@@ -587,6 +587,50 @@ test("run status classifies recovery and gives one safe next action", () => {
   assert.match(paused, /recovery: paused, waiting for you to continue it/);
   assert.match(paused, /resume .* applies the paused stage/);
 
+  const pausedWorkflowRun = run({
+    status: "running",
+    stage: "stats",
+    activeOperation: {
+      operationId: "paused-workflow-operation",
+      service: "bridge",
+      kind: "stats",
+      externalRunId: "paused-workflow-run",
+      lastObservedState: "paused",
+      terminalError: "Run 'main' detached for intercom coordination.",
+    },
+  });
+  const pausedWorkflow = formatRunStatus(pausedWorkflowRun, {
+    leaseLive: true,
+  });
+  assert.match(
+    pausedWorkflow,
+    /recovery: workflow paused for supervisor input/,
+  );
+  assert.match(pausedWorkflow, /Reply to the displayed supervisor request/);
+  assert.match(pausedWorkflow, /continues automatically/);
+  assert.match(pausedWorkflow, /do not resume or start another run/);
+
+  const detachedWorkflowRun = run({
+    status: "failed",
+    stage: "stats",
+    error: "stats operation ended as paused.",
+    failedOperation: {
+      operationId: "detached-workflow-operation",
+      service: "bridge",
+      kind: "stats",
+      externalRunId: "detached-workflow-run",
+      terminalError: "Run 'main' detached for intercom coordination.",
+    },
+  });
+  delete detachedWorkflowRun.activeOperation;
+  const detachedWorkflow = formatRunStatus(detachedWorkflowRun);
+  assert.match(
+    detachedWorkflow,
+    /recovery: workflow detached during supervisor coordination/,
+  );
+  assert.match(detachedWorkflow, /consumes a durably completed child/);
+  assert.match(detachedWorkflow, /does not launch a replacement/);
+
   const cancellingRun = run({ status: "cancel_pending" });
   delete cancellingRun.activeOperation;
   const cancelling = formatRunStatus(cancellingRun, { leaseLive: true });

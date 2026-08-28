@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Preserve and poll workflows paused for supervisor coordination instead of
+  failing the plan run; a live controller continues automatically after the
+  reply.
+- Recover settled detached children from durable receipts and output archives;
+  `/exec resume` reattaches unresolved workflows instead of launching a
+  duplicate.
+- Report supervisor-paused and detached-workflow recovery actions explicitly in
+  `/exec status`.
+
 ## 1.0.3 - 2026-08-19
 
 - Restrict archive commits to literal archive paths so unrelated staged work is

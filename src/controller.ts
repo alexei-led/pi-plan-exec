@@ -16,7 +16,10 @@ import {
   resolve,
   sep,
 } from "node:path";
-import { readSubagentArtifact } from "./artifact.js";
+import {
+  readSettledWorkflowCompletion,
+  readSubagentArtifact,
+} from "./artifact.js";
 import {
   FUSION_PHASE,
   fusionState,
@@ -884,13 +887,14 @@ export class PlanExecController {
         operation,
         status.error.message,
       );
+    const state = text(status.data.state);
     const observed = await this.recordObservation(
       run,
       operation,
       status.data.text,
+      state,
     );
     if (!sameOperationState(run, observed, operation)) return observed;
-    const state = text(status.data.state);
     if (
       !state ||
       state === EXTERNAL_OPERATION_STATE.RUNNING ||
@@ -898,36 +902,69 @@ export class PlanExecController {
     )
       return observed;
     const terminalError = bridgeTerminalError(status.data);
-
-    if (operation.kind === OPERATION_KIND.IMPLEMENTATION)
-      return this.finishImplementation(
+    const settled =
+      state === EXTERNAL_OPERATION_STATE.PAUSED ||
+      state === EXTERNAL_OPERATION_STATE.FAILED
+        ? await readSettledWorkflowCompletion(
+            text(status.data.resultPath),
+            operation.asyncDir,
+            operation.externalRunId,
+          )
+        : undefined;
+    if (state === EXTERNAL_OPERATION_STATE.PAUSED && !settled)
+      return this.waitForExternalOperation(
         observed,
         operation,
-        state,
         terminalError,
       );
+    if (settled) {
+      await appendProgressBestEffort(
+        observed,
+        `Recovered completed ${operation.kind} child after its workflow detached for supervisor coordination.`,
+      );
+    }
+    return this.finishBridgeOperation(
+      observed,
+      operation,
+      settled ? EXTERNAL_OPERATION_STATE.COMPLETE : state,
+      settled ? undefined : terminalError,
+      settled?.output,
+    );
+  }
+
+  private async finishBridgeOperation(
+    run: PlanExecRun,
+    operation: ActiveOperation,
+    state: string,
+    terminalError?: string,
+    recoveredOutput?: string,
+  ): Promise<PlanExecRun> {
+    if (operation.kind === OPERATION_KIND.IMPLEMENTATION)
+      return this.finishImplementation(run, operation, state, terminalError);
     if (operation.kind === OPERATION_KIND.REVIEW) {
       if (!isSuccessfulOperationState(state))
-        return this.finishReview(observed, operation, state, "", terminalError);
-      let output: string;
-      try {
-        output = await this.bridgeOutput(operation);
-      } catch (error: unknown) {
-        return this.retryReviewOutput(
-          observed,
-          operation,
-          error instanceof Error ? error.message : String(error),
-        );
+        return this.finishReview(run, operation, state, "", terminalError);
+      let output = recoveredOutput;
+      if (!output) {
+        try {
+          output = await this.bridgeOutput(operation);
+        } catch (error: unknown) {
+          return this.retryReviewOutput(
+            run,
+            operation,
+            error instanceof Error ? error.message : String(error),
+          );
+        }
       }
-      const current = (await this.registry.get(run.id)) ?? observed;
-      if (!sameOperationState(observed, current, operation)) return current;
+      const current = (await this.registry.get(run.id)) ?? run;
+      if (!sameOperationState(run, current, operation)) return current;
       return this.finishReview(current, operation, state, output);
     }
     if (operation.kind === OPERATION_KIND.FIX)
-      return this.finishFix(observed, operation, state, terminalError);
+      return this.finishFix(run, operation, state, terminalError);
     if (operation.kind === OPERATION_KIND.FINALIZE)
       return this.finishBestEffort(
-        observed,
+        run,
         operation,
         state,
         RUN_STAGE.STATS,
@@ -935,7 +972,7 @@ export class PlanExecController {
       );
     if (operation.kind === OPERATION_KIND.STATS)
       return this.finishBestEffort(
-        observed,
+        run,
         operation,
         state,
         RUN_STAGE.ARCHIVE,
@@ -945,6 +982,26 @@ export class PlanExecController {
       run,
       `Unexpected bridge operation kind: ${operation.kind}.`,
     );
+  }
+
+  private async waitForExternalOperation(
+    run: PlanExecRun,
+    operation: ActiveOperation,
+    terminalError?: string,
+  ): Promise<PlanExecRun> {
+    const waiting = await this.registry.updateIfCurrent(
+      clearError({
+        ...withTerminalError(run, operation, terminalError),
+        status: RUN_STATUS.RUNNING,
+      }),
+      run.updatedAt,
+    );
+    if (!waiting.applied) return waiting.run;
+    await appendProgressOnceBestEffort(
+      waiting.run,
+      `${operation.kind} workflow is waiting for supervisor input; the controller kept its operation attached and continued polling.`,
+    );
+    return waiting.run;
   }
 
   private async observeFusion(
@@ -1017,10 +1074,12 @@ export class PlanExecController {
     run: PlanExecRun,
     operation: ActiveOperation,
     statusText?: unknown,
+    observedState?: string,
   ): Promise<PlanExecRun> {
     const observedOperation: ActiveOperation = {
       ...operation,
       lastObservedAt: Date.now(),
+      ...(observedState ? { lastObservedState: observedState } : {}),
     };
     delete observedOperation.statusFailures;
     delete observedOperation.lastStatusError;
@@ -1085,6 +1144,14 @@ export class PlanExecController {
         : await readPlan(run.planPath);
     if (plan && plan.hash !== run.planHash)
       return this.pauseForReview(run, PLAN_STRUCTURE_CHANGED_ERROR);
+    const settled = await this.settledFailedWorkflow(run);
+    if (settled) return settled;
+    if (isDetachedWorkflowFailure(run))
+      return this.registry.heartbeat({
+        ...run,
+        error:
+          "Detached workflow has no correlated durable completion artifact; refusing blind reattachment. Inspect the provider artifacts and retry only after correlation is restored.",
+      });
     if (run.pendingStageSkip) {
       const resetOperation = resetOperationFailures(run.activeOperation);
       const recovered = await this.registry.updateIfCurrent(
@@ -1177,6 +1244,46 @@ export class PlanExecController {
         formatFindings(recovered.run.reviewFindings),
       ),
     });
+  }
+
+  private async settledFailedWorkflow(
+    run: PlanExecRun,
+  ): Promise<PlanExecRun | undefined> {
+    const operation = run.failedOperation;
+    if (
+      operation?.service !== OPERATION_SERVICE.BRIDGE ||
+      !operation.externalRunId
+    )
+      return undefined;
+    const settled = await readSettledWorkflowCompletion(
+      undefined,
+      operation.asyncDir,
+      operation.externalRunId,
+    );
+    if (!settled) return undefined;
+    const restored = await this.registry.updateIfCurrent(
+      clearError({
+        ...run,
+        status: RUN_STATUS.RUNNING,
+        activeOperation: {
+          ...resetOperationFailures(operation)!,
+          recovery: OPERATION_RECOVERY.OBSERVE,
+        },
+      }),
+      run.updatedAt,
+    );
+    if (!restored.applied) return restored.run;
+    await appendProgressBestEffort(
+      restored.run,
+      `Manual recovery consumed the completed ${operation.kind} child from its detached workflow; no replacement was launched.`,
+    );
+    return this.finishBridgeOperation(
+      restored.run,
+      restored.run.activeOperation ?? operation,
+      EXTERNAL_OPERATION_STATE.COMPLETE,
+      undefined,
+      settled.output,
+    );
   }
 
   private async pauseForReview(
@@ -2074,6 +2181,17 @@ function resetOperationFailures(
   return reset;
 }
 
+async function appendProgressOnceBestEffort(
+  run: PlanExecRun,
+  message: string,
+): Promise<void> {
+  try {
+    await appendProgressOnce(run, message);
+  } catch {
+    // Observation progress is diagnostic; registry state remains authoritative.
+  }
+}
+
 async function appendProgressBestEffort(
   run: PlanExecRun,
   message: string,
@@ -2299,6 +2417,20 @@ function sameOperationState(
 }
 
 export const TASK_RETRY_OPTION = "--retry-task";
+
+export function isDetachedWorkflowFailure(run: PlanExecRun): boolean {
+  if (
+    run.status !== RUN_STATUS.FAILED ||
+    run.failedOperation?.service !== OPERATION_SERVICE.BRIDGE ||
+    !run.failedOperation.externalRunId
+  )
+    return false;
+  return [run.error, run.failedOperation.terminalError].some((value) =>
+    /\b(?:operation ended as paused|run ['"]?main['"]? detached)\b/i.test(
+      value ?? "",
+    ),
+  );
+}
 
 export function isRecoverableImplementationFailure(run: PlanExecRun): boolean {
   return (

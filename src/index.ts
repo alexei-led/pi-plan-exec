@@ -10,6 +10,7 @@ import {
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { BridgeClient } from "./bridge.js";
 import {
+  isDetachedWorkflowFailure,
   isExternalManualBlocker,
   isModelProviderFailure,
   isTaskRetryConfirmationRequired,
@@ -631,6 +632,21 @@ export function recoveryGuidance(
     // A stored `running` claim is not evidence: only a trustworthy activity
     // signal earns wording that says the worker is alive.
     if (run.activeOperation) {
+      if (
+        run.activeOperation.lastObservedState ===
+        EXTERNAL_OPERATION_STATE.PAUSED
+      )
+        return polled
+          ? {
+              classification: "workflow paused for supervisor input",
+              action: `Reply to the displayed supervisor request. This controller is still polling the same workflow and continues automatically after its child settles. Run ${status} to re-check; do not resume or start another run.`,
+              command: status,
+            }
+          : {
+              classification: "workflow paused for supervisor input",
+              action: `No live controller is polling it. Reply to any displayed supervisor request, then run ${resume}; it consumes the durable child result or reattaches the same workflow without launching a replacement.`,
+              command: resume,
+            };
       const signal = run.activeOperation.workerSignal;
       const workflow =
         signal?.mode === WORKFLOW_MODE ? " for a workflow-mode run" : "";
@@ -670,13 +686,26 @@ export function recoveryGuidance(
           command: resume,
         };
   }
-  if (run.status === RUN_STATUS.PAUSED)
+  if (run.status === RUN_STATUS.PAUSED) {
+    if (run.activeOperation)
+      return {
+        classification: "workflow paused for supervisor input",
+        action: `Reply to the displayed supervisor request first and wait for its child to finish. Then run ${resume}; it consumes the durable child result or reattaches the same workflow without launching a replacement.`,
+        command: resume,
+      };
     return {
       classification: "paused, waiting for you to continue it",
       action: `Run ${resume}; it applies the paused stage or its finished worker without starting a second one.`,
       command: resume,
     };
+  }
   if (run.status === RUN_STATUS.FAILED) {
+    if (isDetachedWorkflowFailure(run))
+      return {
+        classification: "workflow detached during supervisor coordination",
+        action: `Run ${resume}; it consumes a durably completed child or reattaches the same workflow. It does not launch a replacement while that detached operation is unresolved.`,
+        command: resume,
+      };
     if (isModelProviderFailure(run))
       return {
         classification:

@@ -27,8 +27,12 @@ recovery with a manually launched subagent.
 - Continue or recover anything stuck: `/exec resume [full-run-id]`. It takes the
   lease over from a session proven dead, resets a run whose worker is provably
   gone and then continues it, reconciles a running child, continues a paused
-  run, or safely retries a recoverable failed run. It never launches on partial
-  evidence: a run whose worker cannot be proven gone is reported, not reset.
+  run, or safely retries a recoverable failed run. A workflow paused for a
+  supervisor reply stays attached and a live controller continues automatically
+  after the reply. After a restart, resume consumes its durable child result or
+  reattaches the same operation without launching a duplicate. It never launches
+  on partial evidence: a run whose worker cannot be proven gone is reported, not
+  reset.
 - A lease whose pid is dead on this host is stale at once, so `/exec resume`
   takes that run over with no wait. A lease recorded without a hostname is
   judged by its heartbeat alone; wait out the 30-second heartbeat window before

@@ -201,6 +201,10 @@ export interface BranchRebinding {
 /** `status.mode` value the bridge spawns; its activity fields are untrustworthy. */
 export const WORKFLOW_MODE = "workflow";
 
+export const WORKFLOW_RESOLUTION = {
+  SETTLED_AWAITING_RESUME: "settled-awaiting-resume",
+} as const;
+
 /**
  * Compact digest of the provider status text. The provider renders each line
  * conditionally, so a missing field means "not reported", never "healthy".
@@ -235,6 +239,7 @@ export interface ActiveOperation {
   lastLaunchError?: string;
   statusFailures?: number;
   lastObservedAt?: number;
+  lastObservedState?: string;
   lastStatusError?: string;
   terminalError?: string;
   skipFailures?: number;

@@ -743,6 +743,145 @@ test("paused runs retain a terminal child until resume applies its completion", 
   assert.equal(resumed.activeOperation?.kind, "implementation");
 });
 
+test("detached workflow keeps polling the same operation for supervisor recovery", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
+  const planPath = join(root, "plan.md");
+  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
+  const registry = new RunRegistry(join(root, "runs"));
+  const controller = new PlanExecController(
+    registry,
+    new PausedWorkflowBridge(join(root, "none.json")),
+    new FakeFusion(),
+    fakeGit(root),
+  );
+  const run = await registry.create({
+    ...baseRun(root, planPath),
+    stage: "stats",
+    activeOperation: {
+      operationId: "operation-1",
+      service: "bridge",
+      kind: "stats",
+      externalRunId: "workflow-1",
+      asyncDir: "/tmp/workflow-1",
+    },
+  });
+
+  const waiting = await controller.advance(run);
+
+  assert.equal(waiting.status, "running");
+  assert.equal(waiting.stage, "stats");
+  assert.equal(waiting.activeOperation?.externalRunId, "workflow-1");
+  assert.match(waiting.activeOperation?.terminalError ?? "", /supervisor/i);
+  assert.equal(waiting.failedOperation, undefined);
+  assert.equal(waiting.error, undefined);
+});
+
+test("resume consumes a settled detached stats child without launching a replacement", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
+  const planPath = join(root, "plan.md");
+  const plan = "### Task 1: Implement\n- [x] Done\n";
+  await writeFile(planPath, plan);
+  const runtimeRoot = join(root, "runtime");
+  const runId = "workflow-1";
+  const asyncDir = join(runtimeRoot, "async-subagent-runs", runId);
+  const archiveDir = join(
+    runtimeRoot,
+    "async-subagent-results",
+    "output-archives",
+  );
+  await mkdir(asyncDir, { recursive: true });
+  await mkdir(archiveDir, { recursive: true });
+  await writeFile(
+    join(asyncDir, "status.json"),
+    JSON.stringify({
+      mode: "workflow",
+      runId,
+      state: "failed",
+      steps: [{ workflowKey: "main", status: "completed" }],
+    }),
+  );
+  await writeFile(
+    join(asyncDir, "workflow-receipt.json"),
+    JSON.stringify({
+      state: "failed",
+      workflowResolution: "settled-awaiting-resume",
+      entries: {
+        main: { key: "main", parentWorkflowRunId: runId },
+      },
+    }),
+  );
+  await writeFile(
+    join(archiveDir, `${runId}.json`),
+    JSON.stringify({ runId, entries: [{ text: "stats completed" }] }),
+  );
+  const registry = new RunRegistry(join(root, "runs"));
+  const bridge = new FakeBridge(join(root, "none.json"));
+  const controller = new PlanExecController(
+    registry,
+    bridge,
+    new FakeFusion(),
+    fakeGit(root),
+  );
+  const failed = await registry.create({
+    ...baseRun(root, planPath),
+    planHash: parsePlan(planPath, plan).hash,
+    status: "failed",
+    stage: "stats",
+    error: "stats operation ended as paused.",
+    failedOperation: {
+      operationId: "operation-1",
+      service: "bridge",
+      kind: "stats",
+      externalRunId: runId,
+      asyncDir,
+      terminalError: "Run 'main' detached for intercom coordination.",
+    },
+  });
+
+  const recovered = await controller.resume(failed.id, "session-1");
+
+  assert.equal(recovered.status, "completed");
+  assert.equal(recovered.stage, "complete");
+  assert.equal(bridge.spawnCount, 0);
+  assert.equal(recovered.failedOperation, undefined);
+});
+
+test("resume reattaches an unsettled detached workflow instead of duplicating it", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
+  const planPath = join(root, "plan.md");
+  const plan = "### Task 1: Implement\n- [x] Done\n";
+  await writeFile(planPath, plan);
+  const registry = new RunRegistry(join(root, "runs"));
+  const bridge = new PausedWorkflowBridge(join(root, "none.json"));
+  const controller = new PlanExecController(
+    registry,
+    bridge,
+    new FakeFusion(),
+    fakeGit(root),
+  );
+  const failed = await registry.create({
+    ...baseRun(root, planPath),
+    planHash: parsePlan(planPath, plan).hash,
+    status: "failed",
+    stage: "stats",
+    error: "stats operation ended as paused.",
+    failedOperation: {
+      operationId: "operation-1",
+      service: "bridge",
+      kind: "stats",
+      externalRunId: "workflow-1",
+      asyncDir: join(root, "missing-workflow-artifacts"),
+      terminalError: "Run 'main' detached for intercom coordination.",
+    },
+  });
+
+  const recovered = await controller.resume(failed.id, "session-1");
+
+  assert.equal(recovered.status, "failed");
+  assert.match(recovered.error ?? "", /refusing blind reattachment/);
+  assert.equal(bridge.spawnCount, 0);
+});
+
 test("controller fails after repeated status-observation errors", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
   const planPath = join(root, "plan.md");
@@ -3099,6 +3238,19 @@ class FakeBridge {
   }
   async stop(): Promise<BridgeResult> {
     return success({ state: "stopping" });
+  }
+}
+
+class PausedWorkflowBridge extends FakeBridge {
+  override async status() {
+    return success({
+      state: "paused",
+      text: [
+        "State: paused",
+        "Error: Run 'main' detached: waiting for supervisor reply",
+        "Detached for intercom coordination: reviewer.",
+      ].join("\n"),
+    });
   }
 }
 

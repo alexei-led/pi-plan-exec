@@ -232,19 +232,34 @@ instead and keep its worktree:
 
 ## Paused
 
-Status classifies this `paused, waiting for you to continue it`. Use:
+A run without an active operation is classified
+`paused, waiting for you to continue it`. Use:
 
 ```text
 /exec resume <full-run-id>
 ```
 
-A paused terminal child remains controller-owned. Resume applies its result; do
-not resume the child directly.
+A run with an active workflow is classified `workflow paused for supervisor
+input`. Answer the displayed supervisor request first. A live controller keeps
+polling the same workflow and continues automatically after the child settles;
+use `/exec status <id>` to re-check and do not resume it. If no live controller
+holds the run, use `/exec resume <id>` after the reply. Resume consumes the
+durable completed-child result, or reattaches the same workflow when it has not
+settled yet. It does not launch a replacement while that operation is
+unresolved.
+
+A paused child remains controller-owned. Do not resume it directly.
 
 ## Failed
 
 Status classifies a recoverable failure `stopped, and you can continue it`.
 Inspect the stage, error, and active-operation fields first.
+
+A run from an older plan-exec version can instead read `workflow detached during
+supervisor coordination`. `/exec resume <id>` checks the durable workflow
+receipt before it does anything else. It consumes a successfully settled child,
+or restores and observes the same external operation. It never blindly replays
+that detached stage.
 
 - No active operation: `/exec resume <id>` retries the same stage in the same
   worktree. It automatically resets a no-progress implementation retry because

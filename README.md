@@ -85,7 +85,11 @@ Four verbs cover everything after the start:
   reported, not reset. A model or provider failure is retried with the model this
   Pi session is signed in to and does not consume an implementation retry;
   `--model current` or `--model provider/model` is an advanced override for that
-  one replacement child and never pins later workers.
+  one replacement child and never pins later workers. When a child pauses for a
+  supervisor reply, the live controller preserves and polls that workflow, then
+  continues automatically after the reply. After a restart, resume consumes its
+  durable result or reattaches the same operation; it does not launch a
+  duplicate.
 - `/exec stop` asks whether to pause the run (resumable) or cancel it (final,
   worktree preserved).
 - `/exec cleanup` retires run records. It previews by default and deletes
