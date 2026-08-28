@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 1.0.5 - 2026-08-28
+
+- Correlate settled workflow receipts using the actual pi-subagents schema:
+  top-level workflow identity plus the completed status step's parent identity.
+
+## 1.0.4 - 2026-08-28
+
 - Preserve and poll workflows paused for supervisor coordination instead of
   failing the plan run; a live controller continues automatically after the
   reply.

@@ -138,6 +138,7 @@ async function hasSettledWorkflowReceipt(
     return false;
   if (
     !isRecord(receipt) ||
+    (expectedRunId && receipt.workflowRunId !== expectedRunId) ||
     receipt.state !== EXTERNAL_OPERATION_STATE.FAILED ||
     receipt.workflowResolution !==
       WORKFLOW_RESOLUTION.SETTLED_AWAITING_RESUME ||
@@ -145,12 +146,15 @@ async function hasSettledWorkflowReceipt(
   )
     return false;
   const [key, entry] = Object.entries(receipt.entries)[0] ?? [];
+  const step = status.steps[0];
   return (
     Object.keys(receipt.entries).length === 1 &&
     isRecord(entry) &&
-    (!expectedRunId || entry.parentWorkflowRunId === expectedRunId) &&
-    isRecord(status.steps[0]) &&
-    (!status.steps[0].workflowKey || status.steps[0].workflowKey === key)
+    (!expectedRunId ||
+      (step.parentWorkflowRunId === expectedRunId &&
+        (entry.parentWorkflowRunId === undefined ||
+          entry.parentWorkflowRunId === expectedRunId))) &&
+    (!step.workflowKey || step.workflowKey === key)
   );
 }
 

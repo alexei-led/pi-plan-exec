@@ -149,14 +149,22 @@ test("recovers a settled detached workflow after its result was archived", async
   await writeFile(
     join(asyncDir, "status.json"),
     JSON.stringify({
+      runId,
       mode: "workflow",
       state: "failed",
-      steps: [{ workflowKey: "main", status: "completed" }],
+      steps: [
+        {
+          workflowKey: "main",
+          parentWorkflowRunId: runId,
+          status: "completed",
+        },
+      ],
     }),
   );
   await writeFile(
     join(asyncDir, "workflow-receipt.json"),
     JSON.stringify({
+      workflowRunId: runId,
       state: "failed",
       workflowResolution: "settled-awaiting-resume",
       entries: { main: { key: "main" } },
@@ -170,9 +178,10 @@ test("recovers a settled detached workflow after its result was archived", async
     }),
   );
 
-  assert.deepEqual(await readSettledWorkflowCompletion(undefined, asyncDir), {
-    output: "stats",
-  });
+  assert.deepEqual(
+    await readSettledWorkflowCompletion(undefined, asyncDir, runId),
+    { output: "stats" },
+  );
 });
 
 test("rejects a detached workflow result with a different run identity", async () => {

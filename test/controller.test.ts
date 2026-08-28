@@ -797,12 +797,19 @@ test("resume consumes a settled detached stats child without launching a replace
       mode: "workflow",
       runId,
       state: "failed",
-      steps: [{ workflowKey: "main", status: "completed" }],
+      steps: [
+        {
+          workflowKey: "main",
+          parentWorkflowRunId: runId,
+          status: "completed",
+        },
+      ],
     }),
   );
   await writeFile(
     join(asyncDir, "workflow-receipt.json"),
     JSON.stringify({
+      workflowRunId: runId,
       state: "failed",
       workflowResolution: "settled-awaiting-resume",
       entries: {
