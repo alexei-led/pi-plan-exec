@@ -8,7 +8,11 @@ import {
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
-import { BridgeClient, processTerminalProof } from "./bridge.js";
+import {
+  BridgeClient,
+  processTerminalProof,
+  type BridgeCapabilities,
+} from "./bridge.js";
 import {
   isDetachedWorkflowFailure,
   isExternalManualBlocker,
@@ -346,20 +350,21 @@ export default function planExecExtension(pi: ExtensionAPI): void {
       pi.getAllTools().map((tool) => tool.name),
     );
     if (missingTools.length > 0) return [`missing: ${missingTools.join(", ")}`];
+    const runtimeVisibility = await runtimeIntegration;
     const bridgeReply = await bridge.ping();
     const missing: string[] = [];
     const incompatible: string[] = [];
+    const visibilityProblem = runtimeIntegrationProblem(
+      runtimeVisibility !== undefined,
+    );
+    if (visibilityProblem) incompatible.push(visibilityProblem);
     if (!bridgeReply.success) missing.push("@alexeiled/pi-subagents-bridge");
     else {
       const capabilities = await bridge.capabilities();
-      const compatible =
-        capabilities.protocolVersion === 2 &&
-        capabilities.healthy &&
-        capabilities.workflowScriptSpawn &&
-        capabilities.durableOperationLookup &&
-        capabilities.processTerminalProofVersion === 1;
-      if (!compatible)
-        incompatible.push("@alexeiled/pi-subagents-bridge (v2 capabilities required)");
+      if (!bridgeRuntimeCompatible(bridgeReply.data, capabilities))
+        incompatible.push(
+          "@alexeiled/pi-subagents-bridge (operation lookup and workflow spawn required)",
+        );
     }
     return [
       ...(missing.length > 0 ? [`missing: ${missing.join(", ")}`] : []),
@@ -463,13 +468,11 @@ export default function planExecExtension(pi: ExtensionAPI): void {
         "warning",
       );
     for (const run of contextualRuns) {
-      if (!isTerminal(run.status) && run.lease?.sessionId === sessionId) {
-        const repaired = await syncProjection(run, {
-          cwd: ctx.cwd,
-          sessionId,
-        });
+      const repaired = shouldRepairProjectionForSession(run, sessionId)
+        ? await syncProjection(run, { cwd: ctx.cwd, sessionId })
+        : run;
+      if (!isTerminal(repaired.status) && repaired.lease?.sessionId === sessionId)
         startBackgroundController(repaired, sessionId, ctx.cwd, ctx);
-      }
     }
     // Advisory only: a failed diagnosis must not take the session down with it.
     try {
@@ -490,6 +493,30 @@ export default function planExecExtension(pi: ExtensionAPI): void {
     void runtimeIntegration.then((integration) => integration?.dispose());
     // Status is session-scoped in Pi, so the next session starts clean.
   });
+}
+
+export function runtimeIntegrationProblem(
+  available: boolean,
+): string | undefined {
+  return available
+    ? undefined
+    : "pi-subagents >=0.60.0 external-runs/background-work APIs unavailable";
+}
+
+export function bridgeRuntimeCompatible(
+  pingData: unknown,
+  capabilities: BridgeCapabilities,
+): boolean {
+  if (!capabilities.healthy || !capabilities.workflowScriptSpawn) return false;
+  if (capabilities.protocolVersion === 2)
+    return (
+      capabilities.durableOperationLookup &&
+      capabilities.processTerminalProofVersion === 1
+    );
+  return (
+    hasBridgeOperationMethod(pingData) &&
+    hasBridgeWorkflowScriptSpawnCapability(pingData)
+  );
 }
 
 export function hasBridgeOperationMethod(data: unknown): boolean {
@@ -1872,6 +1899,16 @@ interface CommandDependencies {
   checkRuntime: RuntimeCheck;
   runtimeProblems: RuntimeProbe;
   doctorProbe: EvidenceProbe;
+}
+
+export function shouldRepairProjectionForSession(
+  run: PlanExecRun,
+  sessionId: string,
+): boolean {
+  return (
+    run.lease?.sessionId === sessionId ||
+    run.taskProjection?.sessionId === sessionId
+  );
 }
 
 async function repairProjectionForRead(

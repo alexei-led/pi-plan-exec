@@ -70,11 +70,7 @@ export class TaskProjector {
       const store = await openCompatibleStore(target.storeTarget);
       const plan = await readProjectionPlan(run);
       const tasks = store.list();
-      const existing = new Map(
-        tasks
-          .filter((task) => isOwnedTask(task, run))
-          .map((task) => [String(task.metadata.planExecKey), task]),
-      );
+      const existing = deduplicateOwnedTasks(store, tasks, run);
       const desiredKeys = new Set([
         ...plan.tasks.map((task) => implementationKey(task.id)),
         ...PIPELINE_STAGES,
@@ -261,13 +257,41 @@ function sameProjection(
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
+function deduplicateOwnedTasks(
+  store: TaskStore,
+  tasks: Task[],
+  run: PlanExecRun,
+): Map<string, Task> {
+  const existing = new Map<string, Task>();
+  for (const task of tasks) {
+    if (!isOwnedTask(task, run)) continue;
+    const key = task.metadata.planExecKey;
+    if (typeof key !== "string" || !key) {
+      store.delete(task.id);
+      continue;
+    }
+    const duplicate = existing.get(key);
+    if (!duplicate) {
+      existing.set(key, task);
+      continue;
+    }
+    const preferredId = run.taskProjection?.taskIds[key];
+    const keep =
+      task.id === preferredId ||
+      (duplicate.id !== preferredId && task.id < duplicate.id)
+        ? task
+        : duplicate;
+    store.delete(keep.id === task.id ? duplicate.id : task.id);
+    existing.set(key, keep);
+  }
+  return existing;
+}
+
 function isOwnedTask(task: Task, run: PlanExecRun): boolean {
-  if (
+  return (
     task.metadata.planExecOwner === TASK_PROJECTION_OWNER &&
     task.metadata.planExecRunId === run.id
-  )
-    return true;
-  return false;
+  );
 }
 
 async function readProjectionPlan(run: PlanExecRun) {

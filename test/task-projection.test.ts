@@ -280,6 +280,54 @@ test("projection degrades on unsupported pi-tasks scope", async () => {
   assert.match(projected.taskProjection?.error ?? "", /requires session scope/i);
 });
 
+test("projection repair collapses duplicate owned stable keys", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-projection-"));
+  const planPath = join(root, "plan.md");
+  await writeFile(planPath, "### Task 1: First\n- [ ] Pending\n");
+  const registry = new RunRegistry(join(root, "runs"));
+  const run = await registry.create({
+    schemaVersion: 1,
+    repositoryRoot: root,
+    planPath,
+    planHash: "ignored-by-projection",
+    worktreeCwd: root,
+    branch: "feature",
+    defaultBranch: "main",
+    status: "running",
+    stage: "implementation",
+    taskAttempts: {},
+    stageAttempts: {},
+    reviewFindings: [],
+    unresolvedFindings: [],
+    config,
+  });
+  const path = sessionTaskPath(root, "session-1");
+  const store = new TaskStore(path);
+  const metadata = {
+    planExecOwner: "pi-plan-exec",
+    planExecRunId: run.id,
+    planExecKey: "implementation:1",
+  };
+  store.create("Duplicate one", "stale", undefined, metadata);
+  store.create("Duplicate two", "stale", undefined, metadata);
+
+  await new TaskProjector(registry).sync(run, {
+    cwd: root,
+    sessionId: "session-1",
+  });
+
+  const owned = new TaskStore(path)
+    .list()
+    .filter(
+      (task) =>
+        task.metadata.planExecOwner === "pi-plan-exec" &&
+        task.metadata.planExecRunId === run.id &&
+        task.metadata.planExecKey === "implementation:1",
+    );
+  assert.equal(owned.length, 1);
+  assert.equal(owned[0]?.subject, "Implement Task 1: First");
+});
+
 test("projection repair never mutates foreign tasks", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-projection-"));
   const planPath = join(root, "plan.md");

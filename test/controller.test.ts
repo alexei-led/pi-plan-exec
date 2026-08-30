@@ -1083,6 +1083,45 @@ test("controller safely replays a v2 operation proven durably absent", async () 
   assert.equal(bridge.lastSpawnParams?.mission, false);
 });
 
+test("controller refuses v2 absence without matching digest attestation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
+  const planPath = join(root, "plan.md");
+  await writeFile(planPath, "### Task 1: Implement\n- [ ] Do the work\n");
+  const registry = new RunRegistry(join(root, "runs"));
+  const bridge = new UnattestedAbsentBridge(join(root, "none.json"));
+  const controller = new PlanExecController(
+    registry,
+    bridge,
+    new FakeFusion(),
+    fakeGit(root),
+  );
+  const params = {
+    agent: "worker",
+    task: "recover",
+    cwd: root,
+    mission: false,
+  };
+  const run = await registry.create({
+    ...baseRun(root, planPath),
+    stage: "implementation",
+    activeOperation: {
+      operationId: "operation-v2-unattested-absent",
+      service: "bridge",
+      kind: "implementation",
+      taskId: 1,
+      params,
+      requestDigest: bridgeRequestDigest(params),
+    },
+  });
+
+  const recovered = await controller.advance(run);
+
+  assert.equal(recovered.status, "failed");
+  assert.equal(recovered.activeOperation?.recovery, "recovery_required");
+  assert.equal(recovered.activeOperation?.lastObservedState, "unknown_launch");
+  assert.equal(bridge.spawnCount, 0);
+});
+
 test("concurrent controllers launch one bridge operation", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
   const planPath = join(root, "plan.md");
@@ -3317,8 +3356,14 @@ class DurableAbsentBridge extends FakeBridge {
     };
   }
 
-  override async operation() {
-    return success({ state: "absent" });
+  override async operation(
+    _operationId?: string,
+    owner?: { requestDigest?: string },
+  ) {
+    return success({
+      state: "absent",
+      ...(owner?.requestDigest ? { requestDigest: owner.requestDigest } : {}),
+    });
   }
 
   override async spawn(
@@ -3332,6 +3377,12 @@ class DurableAbsentBridge extends FakeBridge {
       requestDigest: bridgeRequestDigest(params ?? {}),
       operationId: operationId ?? "",
     });
+  }
+}
+
+class UnattestedAbsentBridge extends DurableAbsentBridge {
+  override async operation() {
+    return success({ state: "absent" });
   }
 }
 

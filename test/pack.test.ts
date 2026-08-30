@@ -37,7 +37,7 @@ test("package manifest ships only plan-exec resources and requires recovery-capa
   }
   assert.equal(
     manifest.peerDependencies["@alexeiled/pi-subagents-bridge"],
-    ">=0.2.3",
+    ">=0.3.0",
   );
   assert.equal(
     manifest.peerDependenciesMeta["@alexeiled/pi-subagents-bridge"]?.optional,

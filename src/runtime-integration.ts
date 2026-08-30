@@ -80,12 +80,14 @@ export class PlanExecRuntimeIntegration {
   private readonly rows = new Map<string, RegisteredRow>();
   private readonly activeWork = new Map<string, BackgroundWorkItem>();
   private disposeProvider: (() => void) | undefined;
+  private disposed = false;
 
   constructor(private readonly api: PlanExecRuntimeApi) {
     this.generation = nextRuntimeGeneration();
   }
 
   reconcile(runs: PlanExecRun[], sessionId: string): void {
+    if (this.disposed) return;
     this.ensureProvider();
     const desired = new Set(
       runs.filter((run) => matchesContextRun(run, sessionId)).map((run) => run.id),
@@ -115,6 +117,7 @@ export class PlanExecRuntimeIntegration {
   }
 
   sync(run: PlanExecRun, sessionId: string): void {
+    if (this.disposed) return;
     this.ensureProvider();
     const externalId = externalRunId(run.id);
     const rowKey = registrationKey(sessionId, externalId);
@@ -146,6 +149,8 @@ export class PlanExecRuntimeIntegration {
   }
 
   dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
     this.disposeProvider?.();
     this.disposeProvider = undefined;
     for (const runId of [...this.rows.keys()]) this.unregister(runId);
@@ -153,7 +158,7 @@ export class PlanExecRuntimeIntegration {
   }
 
   private ensureProvider(): void {
-    if (this.disposeProvider) return;
+    if (this.disposed || this.disposeProvider) return;
     const provider: BackgroundWorkProvider = {
       name: PROVIDER_NAME,
       listActiveWork: () => [...this.activeWork.values()],

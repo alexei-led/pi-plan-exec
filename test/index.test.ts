@@ -17,6 +17,7 @@ import { RunRegistry } from "../src/registry.js";
 import {
   abandonedRunsNotice,
   abandonmentProbe,
+  bridgeRuntimeCompatible,
   chooseStopOutcome,
   execCleanup,
   execReconcile,
@@ -47,10 +48,12 @@ import {
   runActionFor,
   sameMachineRefusal,
   settledRunLines,
+  shouldRepairProjectionForSession,
   resumeResultMessage,
   prioritizeRunCandidates,
   recoveryGuidance,
   reviewedPlanHashForResume,
+  runtimeIntegrationProblem,
 } from "../src/index.js";
 import {
   EXEC_ACTION,
@@ -257,6 +260,32 @@ const durableTerminalProbe: EvidenceProbe = async (candidate) => {
 };
 
 test("bridge runtime compatibility requires recovery and workflow spawn capabilities", () => {
+  const v1 = {
+    protocolVersion: 1 as const,
+    healthy: true,
+    workflowScriptSpawn: true,
+    durableOperationLookup: false,
+  };
+  assert.equal(
+    bridgeRuntimeCompatible(
+      {
+        methods: ["ping", "operation"],
+        capabilities: { workflowScriptSpawn: true },
+      },
+      v1,
+    ),
+    true,
+  );
+  assert.equal(
+    bridgeRuntimeCompatible(
+      {
+        methods: ["ping", "spawn"],
+        capabilities: { workflowScriptSpawn: true },
+      },
+      v1,
+    ),
+    false,
+  );
   assert.equal(
     hasBridgeOperationMethod({ methods: ["ping", "operation"] }),
     true,
@@ -301,6 +330,34 @@ test("exec command completions explain the command family", () => {
 test("runtime prerequisite check identifies missing provider extensions", () => {
   assert.deepEqual(missingRuntimeTools(["TaskCreate"]), ["pi-subagents"]);
   assert.deepEqual(missingRuntimeTools(["subagent", "TaskCreate"]), []);
+  assert.equal(runtimeIntegrationProblem(true), undefined);
+  assert.match(
+    runtimeIntegrationProblem(false) ?? "",
+    /external-runs\/background-work APIs unavailable/,
+  );
+});
+
+test("reload repairs terminal projections owned by the current session", () => {
+  const terminal = retiredRun({
+    taskProjection: {
+      version: 1,
+      state: "ready",
+      owner: "pi-plan-exec",
+      sessionId: "session-1",
+      scope: "session",
+      revision: 1,
+      taskIds: {},
+    },
+  });
+
+  assert.equal(
+    shouldRepairProjectionForSession(terminal, "session-1"),
+    true,
+  );
+  assert.equal(
+    shouldRepairProjectionForSession(terminal, "foreign-session"),
+    false,
+  );
 });
 
 test("help and setup explain the installed command surface", () => {

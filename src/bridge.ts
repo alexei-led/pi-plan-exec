@@ -13,7 +13,8 @@ const BRIDGE_REPLY_PREFIX = "plan-exec:bridge:v1:reply:";
 export const BRIDGE_V2_REQUEST_EVENT = "plan-exec:bridge:v2:request";
 const BRIDGE_V2_REPLY_PREFIX = "plan-exec:bridge:v2:reply:";
 const DEFAULT_BRIDGE_TIMEOUT_MS = 30_000;
-const MIN_V2_PROBE_TIMEOUT_MS = 1_000;
+const DEFAULT_NEGOTIATION_TIMEOUT_MS = 1_500;
+const MAX_NEGOTIATION_TIMEOUT_MS = 2_000;
 
 export interface BridgeOperationOwner {
   kind: "pi-plan-exec";
@@ -91,21 +92,33 @@ export function processTerminalProof(
 
 export class BridgeClient {
   private negotiated?: BridgeCapabilities;
+  private readonly negotiationTimeoutMs: number;
 
   constructor(
     private readonly events: EventBus,
     private readonly timeoutMs = DEFAULT_BRIDGE_TIMEOUT_MS,
-  ) {}
+    negotiationTimeoutMs = DEFAULT_NEGOTIATION_TIMEOUT_MS,
+  ) {
+    this.negotiationTimeoutMs = Math.max(
+      1,
+      Math.min(negotiationTimeoutMs, MAX_NEGOTIATION_TIMEOUT_MS),
+    );
+  }
 
   async ping(): Promise<BridgeResult> {
-    if (this.negotiated?.protocolVersion === 2)
-      return this.request(2, "ping", {});
+    if (this.negotiated)
+      return this.request(
+        this.negotiated.protocolVersion,
+        "ping",
+        {},
+        this.negotiationTimeoutMs,
+      );
 
     const v2Reply = await this.request(
       2,
       "ping",
       {},
-      Math.max(this.timeoutMs, MIN_V2_PROBE_TIMEOUT_MS),
+      this.negotiationTimeoutMs,
     );
     const capabilities = parseV2Capabilities(v2Reply);
     if (capabilities) {
@@ -113,7 +126,12 @@ export class BridgeClient {
       return v2Reply;
     }
 
-    const v1Reply = await this.request(1, "ping", {});
+    const v1Reply = await this.request(
+      1,
+      "ping",
+      {},
+      this.negotiationTimeoutMs,
+    );
     if (v1Reply.success) this.negotiated = { ...V1_CAPABILITIES, healthy: true };
     return v1Reply;
   }

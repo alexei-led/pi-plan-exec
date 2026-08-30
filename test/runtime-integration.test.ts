@@ -159,6 +159,19 @@ test("same generation reconciliation removes its own retired row", () => {
   integration.dispose();
 });
 
+test("disposed integration cannot resurrect rows or providers", () => {
+  const api = new FakeRuntimeApi();
+  const integration = new PlanExecRuntimeIntegration(api);
+  integration.reconcile([run()], "session-1");
+  integration.dispose();
+
+  integration.sync(run({ revision: 4, updatedAt: 3 }), "session-1");
+  integration.reconcile([run({ revision: 5, updatedAt: 4 })], "session-1");
+
+  assert.equal(api.rows.size, 0);
+  assert.equal(api.providers.size, 0);
+});
+
 test("terminal runs remain visible but leave background work", () => {
   const api = new FakeRuntimeApi();
   const integration = new PlanExecRuntimeIntegration(api);

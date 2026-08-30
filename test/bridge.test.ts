@@ -106,6 +106,45 @@ test("Bridge client negotiates v2 and sends durable operation identity", async (
   assert.equal((await pending).success, true);
 });
 
+test("Bridge v2 negotiation accepts a delayed local capability reply", async () => {
+  const events = new TestEvents();
+  const bridge = new BridgeClient(events, 30_000, 250);
+  const pending = bridge.ping();
+  setTimeout(() => {
+    events.replyAt(0, "plan-exec:bridge:v2:reply:", {
+      success: true,
+      data: {
+        protocol: "plan-exec-bridge",
+        version: 2,
+        capabilities: {
+          workflowScriptSpawn: true,
+          durableOperationLookup: { version: 1 },
+          processTerminalProof: { version: 1 },
+        },
+      },
+    });
+  }, 125);
+
+  assert.equal((await pending).success, true);
+  assert.equal((await bridge.capabilities()).protocolVersion, 2);
+});
+
+test("Bridge negotiation stays bounded when no bridge is installed", async () => {
+  const events = new TestEvents();
+  const bridge = new BridgeClient(events, 100, 20);
+  const startedAt = Date.now();
+
+  const reply = await bridge.ping();
+
+  assert.equal(reply.success, false);
+  assert.equal(reply.error.code, "timeout");
+  assert.ok(Date.now() - startedAt < 250);
+  assert.deepEqual(
+    events.emissions.map((entry) => entry.event),
+    [BRIDGE_V2_REQUEST_EVENT, BRIDGE_REQUEST_EVENT],
+  );
+});
+
 test("process terminal proof validates exact native identity", () => {
   assert.deepEqual(
     processTerminalProof(

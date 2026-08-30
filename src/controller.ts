@@ -771,7 +771,6 @@ export class PlanExecController {
       const lookupDigest = text(lookup.data.requestDigest);
       if (
         capabilities?.protocolVersion === 2 &&
-        lookupState !== EXTERNAL_OPERATION_STATE.ABSENT &&
         (!owner || lookupDigest !== owner.requestDigest)
       )
         return this.failUnknownLaunch(
