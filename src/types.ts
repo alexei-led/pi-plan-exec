@@ -131,6 +131,7 @@ export const OPERATION_RECOVERY = {
   OBSERVE: "observe",
   REPLAY: "replay",
   CANCEL: "cancel",
+  REQUIRED: "recovery_required",
 } as const;
 
 export type OperationRecovery =
@@ -148,6 +149,7 @@ export const EXTERNAL_OPERATION_STATE = {
   PENDING: "pending",
   FOUND: "found",
   UNKNOWN: "unknown",
+  UNKNOWN_LAUNCH: "unknown_launch",
   ABSENT: "absent",
   CHAIN: "chain",
   PANEL: "panel",
@@ -231,6 +233,7 @@ export interface ActiveOperation {
   asyncDir?: string;
   launchStartedAt?: number;
   params?: Record<string, unknown>;
+  requestDigest?: string;
   taskId?: number;
   reviewIteration?: number;
   stopRequested?: boolean;
@@ -251,6 +254,8 @@ export interface ActiveOperation {
 export interface PlanExecRun {
   schemaVersion: 1;
   id: string;
+  /** Monotonic durable-state revision. Missing only on legacy v1 records. */
+  revision?: number;
   repositoryRoot: string;
   planPath: string;
   planHash: string;
@@ -267,9 +272,16 @@ export interface PlanExecRun {
   branchRebindings: BranchRebinding[];
   progressPath?: string;
   taskProjection?: {
+    version?: 1;
+    state?: "ready" | "degraded";
+    owner?: "pi-plan-exec";
     sessionId: string;
-    listPath: string;
+    scope?: "session";
+    listPath?: string;
+    packageVersion?: string;
+    revision?: number;
     taskIds: Record<string, string>;
+    error?: string;
   };
   activeOperation?: ActiveOperation;
   failedOperation?: ActiveOperation;

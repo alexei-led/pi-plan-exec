@@ -20,8 +20,8 @@ or multi-model review.
 | Component             | Owns                                                                                                            |
 | --------------------- | --------------------------------------------------------------------------------------------------------------- |
 | `pi-plan-exec`        | Plan parsing, Git safety, stages, retries, leases, recovery, prompts, findings, archival                        |
-| `pi-subagents-bridge` | Versioned execution RPC, `cwd` forwarding, spawn idempotency, run observation, result normalization, stop/adopt |
-| `pi-subagents`        | Fresh child sessions, built-in `worker`/`reviewer`, model execution, artifacts, lifecycle                       |
+| `pi-subagents-bridge` | Versioned execution RPC, `cwd` forwarding, spawn idempotency, durable operation lookup, native process-terminal proof, run observation, result normalization, stop/adopt |
+| `pi-subagents`        | Fresh child sessions, built-in `worker`/`reviewer`, model execution, artifacts, lifecycle, external-run/background-work visibility registries |
 | `pi-fusion`           | Optional panel, judge, profiles, machine-readable Fusion RPC (`>=0.7.0`), validated caller output, persistent operation identity |
 | `pi-tasks`            | Task file format, locking, dependencies, session widget                                                         |
 
@@ -70,9 +70,9 @@ not completion evidence; checked plan items are.
 | `src/lifecycle.ts`       | Stage order and status classification predicates shared by command and controller |
 | `src/plan.ts`            | Strict Markdown plan parser and structure hash                                    |
 | `src/git.ts`             | Repository, branch, dirty-state, common-dir, and worktree safety                  |
-| `src/bridge.ts`          | Typed client for `plan-exec:bridge:v1`                                            |
+| `src/bridge.ts`          | Typed v1/v2 bridge client, capability negotiation, request digests, and proof validation |
 | `src/fusion.ts`          | Typed client for `fusion:rpc:v1`                                                  |
-| `src/task-projection.ts` | Session pi-tasks projection and rebuild                                           |
+| `src/task-projection.ts` | Rebuildable, owned pi-tasks cache with scope/version checks and degraded-state reporting |
 | `src/artifact.ts`        | Subagent output/result fallback extraction                                        |
 | `src/review.ts`          | Structured finding parsing and severity decisions                                 |
 | `src/progress.ts`        | `.ralphex/progress/` execution log                                                |
@@ -174,14 +174,15 @@ rethrown rather than answered with a recursive delete.
 ### Abandonment
 
 A run is `abandoned` only on the full conjunction: an in-flight status, a lease
-that is not live, and a tracked operation provably gone — its async directory
-absent from disk, or the bridge answering `absent` for its operation ID. Anything
-short of that is `ambiguous`: it is reported and never reset, because resetting a
-run whose worker is alive can put a second writer in one worktree, which is worse
-than the stall. Reconciliation clears the operation, records a `failed` status
-naming the evidence, stamps `reconciledAt`, appends the reason to the progress
-log, and leaves `taskAttempts` untouched — the worker never ran. Recovery is then
-the ordinary `/exec resume` path.
+that is not live, and either a v2 bridge `processTerminal` proof with
+`state: observed` for the matching native run ID, or a v2 healthy durable lookup
+that proves an unbound operation is absent. Missing bridge memory, a missing
+`asyncDir`, v1 `absent`, and `pending`/`unknown` proof are inconclusive. They are
+reported as `recovery_required`/`unknown_launch` and never trigger a duplicate
+worker. Reconciliation clears the operation only after proof, records a `failed`
+status naming the evidence, stamps `reconciledAt`, appends the reason to the
+progress log, and leaves `taskAttempts` untouched — the worker never ran.
+Recovery is then the ordinary `/exec resume` path.
 
 One function maps a run and its evidence to a verdict and exactly one next
 command. The sweep row, the settled row, the detail view, and the refusal the
@@ -226,15 +227,23 @@ single run it recovers; the registry-wide sweep behind `/exec doctor
 
 External starts follow this order:
 
-1. Generate a durable operation ID.
-2. Persist operation intent and replay parameters.
-3. Call Bridge or Fusion with that operation ID.
+1. Generate a durable operation ID and canonical request digest.
+2. Persist operation intent, replay parameters, digest, and `mission: false`.
+3. Call Bridge with the v2 owner DTO when advertised, or the v1-compatible DTO. V1 recovery fails closed when it cannot prove a launch outcome.
 4. Persist the returned external run ID.
 
+Each plan run is also exposed as exactly one `pi-subagents` external-runs row and
+one background-work provider. Reload reconciliation uses `run.json`, replaces
+only this extension's registrations, and never creates native child rows.
+Pi-tasks remains a rebuildable cache: owned tasks carry the plan owner, run ID,
+key, revision, status, and projection version. Scope, path, and the installed
+`pi-tasks` 0.9.x version are checked exactly. A failed repair records visible
+degraded projection state while the controller continues.
+
 If Pi stops between steps 2 and 4, or a start reply times out or is malformed,
-recovery reconciles the same operation ID. Bridge `0.2.2` or later reports an
-operation as `found`, `pending`, `unknown`, or `absent` and advertises compatible
-workflowScript spawning; the controller only
+recovery reconciles the same operation ID. The latest Bridge reports an
+operation as `found`, `pending`, `unknown`, or `absent`; plan-exec uses v2
+durable lookup and terminal proof when advertised. The controller only
 attaches `found` work and refuses a blind replay for every other uncertain
 outcome. Fusion retries its persisted operation ID; an unavailable Fusion
 launch falls back to pi-subagents with that same operation ID. Active

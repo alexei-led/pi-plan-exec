@@ -1,4 +1,6 @@
-import { basename, dirname, join } from "node:path";
+import { createRequire } from "node:module";
+import { homedir } from "node:os";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type { TaskStore } from "@tintinweb/pi-tasks/dist/task-store.js";
 import type { Task, TaskStatus } from "@tintinweb/pi-tasks/dist/types.js";
 import { PIPELINE_STAGES, isTerminalStatus, stageIndex } from "./lifecycle.js";
@@ -11,6 +13,10 @@ import {
   type PlanExecRun,
   type RunStage,
 } from "./types.js";
+
+const TASK_PROJECTION_VERSION = 1 as const;
+const TASK_PROJECTION_OWNER = "pi-plan-exec" as const;
+const SUPPORTED_PI_TASKS_VERSION = /^0\.9\.\d+(?:[-+].*)?$/;
 
 const STAGE_SUBJECT: Record<(typeof PIPELINE_STAGES)[number], string> = {
   [RUN_STAGE.COMPREHENSIVE_REVIEW]: "Run comprehensive review",
@@ -32,15 +38,24 @@ const TASK_PROJECTION_KIND = {
   STAGE: "stage",
 } as const;
 
+type ProjectionScope = Exclude<
+  NonNullable<PlanExecRun["taskProjection"]>["scope"],
+  undefined
+>;
+
+interface ProjectionTarget {
+  scope: ProjectionScope;
+  listPath: string;
+  storeTarget: string;
+  packageVersion: string;
+}
+
 export interface TaskProjectionOptions {
   cwd: string;
   sessionId: string;
 }
 
-/**
- * Writes the same task file format and locking protocol as pi-tasks. This is a
- * session projection only: the global PlanExecRun remains authoritative.
- */
+/** The PlanExecRun is authoritative; this only repairs pi-tasks' file cache. */
 export class TaskProjector {
   constructor(private readonly registry: RunRegistry) {}
 
@@ -50,99 +65,120 @@ export class TaskProjector {
   ): Promise<PlanExecRun> {
     const current = await this.registry.get(run.id);
     if (current && current.updatedAt > run.updatedAt) run = current;
-    const path = sessionTaskPath(options.cwd, options.sessionId);
-    const store = await openCompatibleStore(path);
-    const plan = await readProjectionPlan(run);
-    const existing = new Map(
-      store
-        .list()
-        .filter((task) => task.metadata.planExecRunId === run.id)
-        .map((task) => [String(task.metadata.planExecKey), task]),
-    );
-    const desiredKeys = new Set([
-      ...plan.tasks.map((task) => implementationKey(task.id)),
-      ...PIPELINE_STAGES,
-    ]);
-    for (const [key, task] of existing) {
-      if (!desiredKeys.has(key as RunStage)) {
-        store.delete(task.id);
-        existing.delete(key);
+    try {
+      const target = await resolveProjectionTarget(options);
+      const store = await openCompatibleStore(target.storeTarget);
+      const plan = await readProjectionPlan(run);
+      const tasks = store.list();
+      const existing = deduplicateOwnedTasks(store, tasks, run);
+      const desiredKeys = new Set([
+        ...plan.tasks.map((task) => implementationKey(task.id)),
+        ...PIPELINE_STAGES,
+      ]);
+      for (const [key, task] of existing) {
+        if (!desiredKeys.has(key as RunStage)) {
+          store.delete(task.id);
+          existing.delete(key);
+        }
       }
-    }
-    const taskIds: Record<string, string> = {};
-    const firstIncompleteTaskId = plan.tasks.find(
-      (task) => task.unchecked.length > 0,
-    )?.id;
-    let previousId: string | undefined;
 
-    for (const task of plan.tasks) {
-      const key = implementationKey(task.id);
-      const projected = ensureTask(store, existing.get(key), {
-        subject: `Implement Task ${task.id}: ${task.title}`,
-        description: implementationDescription(
-          run,
-          task.items,
-          task.id === firstIncompleteTaskId,
-        ),
-        metadata: {
-          planExecRunId: run.id,
-          planExecKey: key,
-          planExecKind: TASK_PROJECTION_KIND.IMPLEMENTATION,
-        },
-        blockedBy: previousId ? [previousId] : [],
-      });
-      taskIds[key] = projected.id;
-      previousId = projected.id;
-    }
+      const taskIds: Record<string, string> = {};
+      const firstIncompleteTaskId = plan.tasks.find(
+        (task) => task.unchecked.length > 0,
+      )?.id;
+      const commonMetadata = {
+        planExecOwner: TASK_PROJECTION_OWNER,
+        planExecRunId: run.id,
+        planExecRevision: run.revision ?? 1,
+        planStatus: run.status,
+        planExecProjectionVersion: TASK_PROJECTION_VERSION,
+      };
+      let previousId: string | undefined;
 
-    for (const entry of PIPELINE) {
-      const skipped = run.skippedStages.find(
-        (stage) => stage.stage === entry.key,
-      );
-      const projected = ensureTask(store, existing.get(entry.key), {
-        subject: skipped ? `FORCE-SKIPPED: ${entry.subject}` : entry.subject,
-        description: stageDescription(run, entry.key),
-        metadata: {
-          planExecRunId: run.id,
-          planExecKey: entry.key,
-          planExecKind: TASK_PROJECTION_KIND.STAGE,
-        },
-        blockedBy: previousId ? [previousId] : [],
-      });
-      taskIds[entry.key] = projected.id;
-      previousId = projected.id;
-    }
+      for (const task of plan.tasks) {
+        const key = implementationKey(task.id);
+        const projected = ensureTask(store, existing.get(key), {
+          subject: `Implement Task ${task.id}: ${task.title}`,
+          description: implementationDescription(
+            run,
+            task.items,
+            task.id === firstIncompleteTaskId,
+          ),
+          metadata: {
+            ...commonMetadata,
+            planExecKey: key,
+            planExecKind: TASK_PROJECTION_KIND.IMPLEMENTATION,
+          },
+          blockedBy: previousId ? [previousId] : [],
+        });
+        taskIds[key] = projected.id;
+        previousId = projected.id;
+      }
 
-    for (const task of plan.tasks) {
-      const key = implementationKey(task.id);
-      const projected = store.get(taskIds[key] ?? "");
-      if (projected)
-        updateStatus(
-          store,
-          projected,
-          implementationStatus(run, task.id, task.unchecked.length === 0),
+      for (const entry of PIPELINE) {
+        const skipped = run.skippedStages.find(
+          (stage) => stage.stage === entry.key,
         );
-    }
-    for (const entry of PIPELINE) {
-      const projected = store.get(taskIds[entry.key] ?? "");
-      if (projected)
-        updateStatus(store, projected, stageStatus(run, entry.key));
-    }
+        const projected = ensureTask(store, existing.get(entry.key), {
+          subject: skipped ? `FORCE-SKIPPED: ${entry.subject}` : entry.subject,
+          description: stageDescription(run, entry.key),
+          metadata: {
+            ...commonMetadata,
+            planExecKey: entry.key,
+            planExecKind: TASK_PROJECTION_KIND.STAGE,
+          },
+          blockedBy: previousId ? [previousId] : [],
+        });
+        taskIds[entry.key] = projected.id;
+        previousId = projected.id;
+      }
 
-    const persisted = await this.registry.updateIfCurrent(
-      {
-        ...run,
-        taskProjection: {
-          sessionId: options.sessionId,
-          listPath: path,
-          taskIds,
-        },
-      },
-      run.updatedAt,
-    );
-    if (!persisted.applied && persisted.run.updatedAt !== run.updatedAt)
-      return this.sync(persisted.run, options);
-    return persisted.run;
+      for (const task of plan.tasks) {
+        const key = implementationKey(task.id);
+        const projected = store.get(taskIds[key] ?? "");
+        if (projected)
+          updateStatus(
+            store,
+            projected,
+            implementationStatus(run, task.id, task.unchecked.length === 0),
+          );
+      }
+      for (const entry of PIPELINE) {
+        const projected = store.get(taskIds[entry.key] ?? "");
+        if (projected)
+          updateStatus(store, projected, stageStatus(run, entry.key));
+      }
+
+      return this.persistState(run, {
+        version: TASK_PROJECTION_VERSION,
+        state: "ready",
+        owner: TASK_PROJECTION_OWNER,
+        sessionId: options.sessionId,
+        scope: target.scope,
+        listPath: target.listPath,
+        packageVersion: target.packageVersion,
+        revision: run.revision ?? 1,
+        taskIds,
+      });
+    } catch (error: unknown) {
+      return this.persistState(run, {
+        version: TASK_PROJECTION_VERSION,
+        state: "degraded",
+        owner: TASK_PROJECTION_OWNER,
+        sessionId: options.sessionId,
+        revision: run.revision ?? 1,
+        taskIds: run.taskProjection?.taskIds ?? {},
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  private async persistState(
+    run: PlanExecRun,
+    taskProjection: NonNullable<PlanExecRun["taskProjection"]>,
+  ): Promise<PlanExecRun> {
+    if (sameProjection(run.taskProjection, taskProjection)) return run;
+    return this.registry.updateTaskProjection(run, taskProjection);
   }
 }
 
@@ -150,6 +186,112 @@ export function sessionTaskPath(cwd: string, sessionId: string): string {
   if (!sessionId.trim())
     throw new Error("Pi session ID is required for pi-tasks projection.");
   return join(cwd, ".pi", "tasks", `tasks-${sessionId}.json`);
+}
+
+async function resolveProjectionTarget(
+  options: TaskProjectionOptions,
+): Promise<ProjectionTarget> {
+  if (!options.sessionId.trim())
+    throw new Error("Pi session ID is required for pi-tasks projection.");
+  const packageVersion = piTasksPackageVersion();
+  if (!SUPPORTED_PI_TASKS_VERSION.test(packageVersion))
+    throw new Error(
+      `pi-tasks ${packageVersion} is unsupported; plan-exec requires 0.9.x for projection.`,
+    );
+
+  const configured = process.env.PI_TASKS;
+  const expectedPath = sessionTaskPath(options.cwd, options.sessionId);
+  if (configured === "off")
+    throw new Error("PI_TASKS=off selects memory scope; no durable projection path exists.");
+  if (configured) {
+    const configuredPath = isAbsolute(configured)
+      ? configured
+      : configured.startsWith(".")
+        ? resolve(options.cwd, configured)
+        : join(homedir(), ".pi", "tasks", `${configured}.json`);
+    if (resolve(configuredPath) !== resolve(expectedPath))
+      throw new Error(
+        `PI_TASKS selects ${configuredPath}; plan-exec requires the session path ${expectedPath}.`,
+      );
+    return {
+      scope: "session",
+      listPath: expectedPath,
+      storeTarget: expectedPath,
+      packageVersion,
+    };
+  }
+
+  const [{ loadTasksConfig }] = await Promise.all([
+    import("@tintinweb/pi-tasks/dist/tasks-config.js"),
+  ]);
+  const scope = loadTasksConfig(options.cwd).taskScope ?? "session";
+  if (scope !== "session")
+    throw new Error(
+      `pi-tasks scope ${scope} is unsupported; plan-exec requires session scope.`,
+    );
+  return {
+    scope: "session",
+    listPath: expectedPath,
+    storeTarget: expectedPath,
+    packageVersion,
+  };
+}
+
+function piTasksPackageVersion(): string {
+  const require = createRequire(import.meta.url);
+  const packageJson: unknown = require("@tintinweb/pi-tasks/package.json");
+  if (
+    typeof packageJson !== "object" ||
+    packageJson === null ||
+    !("version" in packageJson) ||
+    typeof packageJson.version !== "string"
+  )
+    throw new Error("Installed pi-tasks package has no readable version.");
+  return packageJson.version;
+}
+
+function sameProjection(
+  left: PlanExecRun["taskProjection"],
+  right: PlanExecRun["taskProjection"],
+): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function deduplicateOwnedTasks(
+  store: TaskStore,
+  tasks: Task[],
+  run: PlanExecRun,
+): Map<string, Task> {
+  const existing = new Map<string, Task>();
+  for (const task of tasks) {
+    if (!isOwnedTask(task, run)) continue;
+    const key = task.metadata.planExecKey;
+    if (typeof key !== "string" || !key) {
+      store.delete(task.id);
+      continue;
+    }
+    const duplicate = existing.get(key);
+    if (!duplicate) {
+      existing.set(key, task);
+      continue;
+    }
+    const preferredId = run.taskProjection?.taskIds[key];
+    const keep =
+      task.id === preferredId ||
+      (duplicate.id !== preferredId && task.id < duplicate.id)
+        ? task
+        : duplicate;
+    store.delete(keep.id === task.id ? duplicate.id : task.id);
+    existing.set(key, keep);
+  }
+  return existing;
+}
+
+function isOwnedTask(task: Task, run: PlanExecRun): boolean {
+  return (
+    task.metadata.planExecOwner === TASK_PROJECTION_OWNER &&
+    task.metadata.planExecRunId === run.id
+  );
 }
 
 async function readProjectionPlan(run: PlanExecRun) {
@@ -213,7 +355,7 @@ function ensureTask(
   store.update(task.id, {
     subject: desired.subject,
     description: desired.description,
-    metadata: desired.metadata,
+    metadata: { ...desired.metadata, agentType: null },
     ...(desired.blockedBy.length > 0
       ? { addBlockedBy: desired.blockedBy }
       : {}),

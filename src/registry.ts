@@ -126,7 +126,12 @@ export class RunRegistry {
   async create(
     run: Omit<
       PlanExecRun,
-      "id" | "createdAt" | "updatedAt" | "skippedStages" | "branchRebindings"
+      | "id"
+      | "revision"
+      | "createdAt"
+      | "updatedAt"
+      | "skippedStages"
+      | "branchRebindings"
     > & {
       skippedStages?: PlanExecRun["skippedStages"];
       branchRebindings?: PlanExecRun["branchRebindings"];
@@ -138,6 +143,7 @@ export class RunRegistry {
       skippedStages: run.skippedStages ?? [],
       branchRebindings: run.branchRebindings ?? [],
       id: randomUUID(),
+      revision: 1,
       createdAt: now,
       updatedAt: now,
     };
@@ -229,7 +235,9 @@ export class RunRegistry {
   async updateIfCurrent(
     run: PlanExecRun,
     expectedUpdatedAt: number,
+    preserveRevision = false,
   ): Promise<{ run: PlanExecRun; applied: boolean }> {
+    run = { ...run, revision: run.revision ?? 1 };
     assertRun(run);
     const path = this.pathFor(run.id);
     const lockPath = `${path}.lock`;
@@ -249,6 +257,9 @@ export class RunRegistry {
         return { run: current, applied: false };
       const updated: PlanExecRun = {
         ...run,
+        revision: preserveRevision
+          ? (current.revision ?? 1)
+          : (current.revision ?? 1) + 1,
         updatedAt: nextUpdatedAt(current.updatedAt),
       };
       await writeLocked(path, updated);
@@ -256,6 +267,25 @@ export class RunRegistry {
     } finally {
       await releaseLock(lockPath, lock);
     }
+  }
+
+  async updateTaskProjection(
+    run: PlanExecRun,
+    taskProjection: NonNullable<PlanExecRun["taskProjection"]>,
+  ): Promise<PlanExecRun> {
+    let current = run;
+    for (let attempt = 0; attempt < CLAIM_CAS_RETRIES; attempt += 1) {
+      const written = await this.updateIfCurrent(
+        { ...current, taskProjection },
+        current.updatedAt,
+        true,
+      );
+      if (written.applied) return written.run;
+      current = written.run;
+    }
+    throw new Error(
+      `Run ${run.id} changed repeatedly while repairing its task projection.`,
+    );
   }
 
   async claim(run: PlanExecRun, sessionId: string): Promise<PlanExecRun> {
@@ -318,6 +348,7 @@ export class RunRegistry {
         lease: { ...run.lease, heartbeatAt: Date.now() },
       },
       run.updatedAt,
+      true,
     );
     return heartbeat.run;
   }
@@ -553,6 +584,10 @@ function migrateLegacyRun(value: Record<string, unknown>): PlanExecRun {
   const config = isRecord(value.config) ? value.config : {};
   return {
     ...(value as unknown as PlanExecRun),
+    revision:
+      typeof value.revision === "number" && Number.isInteger(value.revision)
+        ? value.revision
+        : 1,
     stage: stage as RunStage,
     stageAttempts: isRecord(value.stageAttempts)
       ? (value.stageAttempts as Record<string, number>)
@@ -626,6 +661,8 @@ function assertRun(run: PlanExecRun): void {
   if (
     !RUN_STAGES.includes(run.stage) ||
     !RUN_STATUSES.includes(run.status) ||
+    !Number.isInteger(run.revision) ||
+    (run.revision ?? 0) < 1 ||
     !Number.isFinite(run.createdAt) ||
     !Number.isFinite(run.updatedAt) ||
     !isFrozenConfig(run.config) ||

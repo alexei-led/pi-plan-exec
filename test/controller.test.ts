@@ -11,6 +11,7 @@ import { hostname, tmpdir } from "node:os";
 import { promisify } from "node:util";
 import { join } from "node:path";
 import test from "node:test";
+import { bridgeRequestDigest } from "../src/bridge.js";
 import {
   parseWorkerSignal,
   PLAN_STRUCTURE_CHANGED_ERROR,
@@ -157,6 +158,7 @@ test("plain resume clears legacy recovery model pins before launching", async ()
   assert.equal(resumed.config.workerModel, undefined);
   assert.equal(resumed.activeOperation?.params?.model, undefined);
   assert.equal(bridge.spawnCount, 1);
+  assert.equal(bridge.lastSpawnParams?.mission, false);
 });
 
 test("resume refuses an exhausted worker without explicit task retry", async () => {
@@ -1032,10 +1034,91 @@ test("controller refuses an untracked persisted bridge operation rather than dup
     /refusing to launch a possible duplicate/,
   );
   assert.equal(recovered.activeOperation?.externalRunId, undefined);
+  assert.equal(recovered.activeOperation?.recovery, "recovery_required");
+  assert.equal(recovered.activeOperation?.lastObservedState, "unknown_launch");
   assert.equal(
     recovered.activeOperation?.operationId,
     "operation-crashed-before-reply",
   );
+  assert.equal(bridge.spawnCount, 0);
+});
+
+test("controller safely replays a v2 operation proven durably absent", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
+  const planPath = join(root, "plan.md");
+  await writeFile(planPath, "### Task 1: Implement\n- [ ] Do the work\n");
+  const registry = new RunRegistry(join(root, "runs"));
+  const bridge = new DurableAbsentBridge(join(root, "none.json"));
+  const controller = new PlanExecController(
+    registry,
+    bridge,
+    new FakeFusion(),
+    fakeGit(root),
+  );
+  const params = {
+    agent: "worker",
+    task: "recover",
+    cwd: root,
+    mission: false,
+  };
+  const run = await registry.create({
+    ...baseRun(root, planPath),
+    stage: "implementation",
+    activeOperation: {
+      operationId: "operation-v2-absent",
+      service: "bridge",
+      kind: "implementation",
+      taskId: 1,
+      params,
+      requestDigest: bridgeRequestDigest(params),
+    },
+  });
+
+  const recovered = await controller.advance(run);
+
+  assert.equal(recovered.status, "running");
+  assert.equal(recovered.activeOperation?.externalRunId, "run-1");
+  assert.equal(recovered.activeOperation?.recovery, "observe");
+  assert.equal(bridge.spawnCount, 1);
+  assert.equal(bridge.lastSpawnParams?.mission, false);
+});
+
+test("controller refuses v2 absence without matching digest attestation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
+  const planPath = join(root, "plan.md");
+  await writeFile(planPath, "### Task 1: Implement\n- [ ] Do the work\n");
+  const registry = new RunRegistry(join(root, "runs"));
+  const bridge = new UnattestedAbsentBridge(join(root, "none.json"));
+  const controller = new PlanExecController(
+    registry,
+    bridge,
+    new FakeFusion(),
+    fakeGit(root),
+  );
+  const params = {
+    agent: "worker",
+    task: "recover",
+    cwd: root,
+    mission: false,
+  };
+  const run = await registry.create({
+    ...baseRun(root, planPath),
+    stage: "implementation",
+    activeOperation: {
+      operationId: "operation-v2-unattested-absent",
+      service: "bridge",
+      kind: "implementation",
+      taskId: 1,
+      params,
+      requestDigest: bridgeRequestDigest(params),
+    },
+  });
+
+  const recovered = await controller.advance(run);
+
+  assert.equal(recovered.status, "failed");
+  assert.equal(recovered.activeOperation?.recovery, "recovery_required");
+  assert.equal(recovered.activeOperation?.lastObservedState, "unknown_launch");
   assert.equal(bridge.spawnCount, 0);
 });
 
@@ -3162,7 +3245,16 @@ test("a reconciled run resumes through the normal recovery path", async () => {
     },
   });
 
-  const report = await execReconcile(registry);
+  const report = await execReconcile(registry, async () => ({
+    processTerminalProof: {
+      version: 1,
+      state: "observed",
+      runId: "external-1",
+      runnerProcessInstanceId: "native-instance-1",
+      observedAt: 1,
+      instances: [],
+    },
+  }));
 
   assert.match(report, /Reset 1 abandoned run to failed\./);
   const reconciled = await registry.get(created.id);
@@ -3220,12 +3312,17 @@ function baseRun(
 
 class FakeBridge {
   protected current = 0;
+  lastSpawnParams?: Record<string, unknown>;
   constructor(protected readonly resultPath: string) {}
   get spawnCount() {
     return this.current;
   }
-  async spawn(): Promise<BridgeResult> {
+  async spawn(
+    _operationId?: string,
+    params?: Record<string, unknown>,
+  ): Promise<BridgeResult> {
     this.current += 1;
+    if (params) this.lastSpawnParams = params;
     return success({ runId: `run-${this.current}`, asyncDir: "/tmp/async" });
   }
   async operation(): Promise<BridgeResult> {
@@ -3245,6 +3342,47 @@ class FakeBridge {
   }
   async stop(): Promise<BridgeResult> {
     return success({ state: "stopping" });
+  }
+}
+
+class DurableAbsentBridge extends FakeBridge {
+  async capabilities() {
+    return {
+      protocolVersion: 2 as const,
+      healthy: true,
+      workflowScriptSpawn: true,
+      durableOperationLookup: true,
+      processTerminalProofVersion: 1,
+    };
+  }
+
+  override async operation(
+    _operationId?: string,
+    owner?: { requestDigest?: string },
+  ) {
+    return success({
+      state: "absent",
+      ...(owner?.requestDigest ? { requestDigest: owner.requestDigest } : {}),
+    });
+  }
+
+  override async spawn(
+    operationId?: string,
+    params?: Record<string, unknown>,
+  ): Promise<BridgeResult> {
+    this.current += 1;
+    if (params) this.lastSpawnParams = params;
+    return success({
+      runId: `run-${this.current}`,
+      requestDigest: bridgeRequestDigest(params ?? {}),
+      operationId: operationId ?? "",
+    });
+  }
+}
+
+class UnattestedAbsentBridge extends DurableAbsentBridge {
+  override async operation() {
+    return success({ state: "absent" });
   }
 }
 

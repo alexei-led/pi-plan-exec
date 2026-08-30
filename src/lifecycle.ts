@@ -144,13 +144,32 @@ export const ABANDONMENT = {
 
 export type Abandonment = (typeof ABANDONMENT)[keyof typeof ABANDONMENT];
 
+export const PROCESS_TERMINAL_STATE = {
+  PENDING: "pending",
+  NOT_STARTED: "not-started",
+  OBSERVED: "observed",
+  UNKNOWN: "unknown",
+} as const;
+
+export interface ProcessTerminalProof {
+  version: 1;
+  state: (typeof PROCESS_TERMINAL_STATE)[keyof typeof PROCESS_TERMINAL_STATE];
+  runId: string;
+  runnerProcessInstanceId: string;
+  observedAt?: number;
+  instances?: unknown[];
+  reason?: string;
+}
+
 /** What a sweep managed to observe about a run's claim. */
 export interface AbandonmentEvidence {
   leaseLive: boolean;
-  /** Only `false` is evidence; undefined means no directory was recorded. */
+  /** Diagnostic only. Directory absence is not native process proof. */
   asyncDirPresent?: boolean;
   /** The bridge's own answer for the operation ID, when it was asked. */
   bridgeState?: string;
+  durableOperationLookup?: boolean;
+  processTerminalProof?: ProcessTerminalProof;
 }
 
 /**
@@ -167,8 +186,15 @@ export function classifyAbandonment(
   if (evidence.leaseLive) return ABANDONMENT.LIVE;
   if (!isInFlightStatus(run.status) || !run.activeOperation)
     return ABANDONMENT.AMBIGUOUS;
-  const gone =
-    evidence.asyncDirPresent === false ||
+  const terminalObserved =
+    evidence.processTerminalProof?.version === 1 &&
+    evidence.processTerminalProof.state === "observed" &&
+    evidence.processTerminalProof.runId === run.activeOperation?.externalRunId;
+  const launchProvenAbsent =
+    !run.activeOperation.externalRunId &&
+    evidence.durableOperationLookup === true &&
     evidence.bridgeState === EXTERNAL_OPERATION_STATE.ABSENT;
-  return gone ? ABANDONMENT.ABANDONED : ABANDONMENT.AMBIGUOUS;
+  return terminalObserved || launchProvenAbsent
+    ? ABANDONMENT.ABANDONED
+    : ABANDONMENT.AMBIGUOUS;
 }

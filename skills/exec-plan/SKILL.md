@@ -265,9 +265,9 @@ record, worktree, active-operation evidence, and approval or runtime fix needed.
 ## Prerequisites
 
 `pi-plan-exec` requires compatible installations of `pi-subagents`,
-`@tintinweb/pi-tasks`, and `@alexeiled/pi-subagents-bridge` `>=0.2.2`.
-`@alexeiled/pi-fusion` `>=0.7.0` is optional; install it to use the preferred
-Fusion review provider:
-`pi install 'npm:@alexeiled/pi-fusion@>=0.7.0'`. Run `/exec status`, install
+`@tintinweb/pi-tasks`, and the latest `@alexeiled/pi-subagents-bridge`. Plan-exec uses Bridge v2 recovery proof when advertised and fails closed under v1 when proof is unavailable.
+`@alexeiled/pi-fusion` is optional; install it to use the preferred Fusion
+review provider:
+`pi install npm:@alexeiled/pi-fusion`. Run `/exec status`, install
 what it reports, run `/reload`, then return to the same run ID. Installing
 dependencies does not replace or complete the preserved run.
