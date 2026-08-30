@@ -21,6 +21,11 @@ import {
   readSubagentArtifact,
 } from "./artifact.js";
 import {
+  bridgeRequestDigest,
+  type BridgeCapabilities,
+  type BridgeOperationOwner,
+} from "./bridge.js";
+import {
   FUSION_PHASE,
   fusionState,
   parseFusionCallerOutput,
@@ -101,8 +106,13 @@ interface BridgeLike {
   spawn(
     operationId: string,
     params: Record<string, unknown>,
+    owner?: BridgeOperationOwner,
   ): Promise<ServiceReply>;
-  operation(operationId: string): Promise<ServiceReply>;
+  operation(
+    operationId: string,
+    owner?: BridgeOperationOwner,
+  ): Promise<ServiceReply>;
+  capabilities?(): Promise<BridgeCapabilities>;
   status(runId: string, asyncDir?: string): Promise<ServiceReply>;
   result(runId: string, asyncDir?: string): Promise<ServiceReply>;
   adopt(runId: string, asyncDir?: string): Promise<ServiceReply>;
@@ -678,8 +688,10 @@ export class PlanExecController {
       context: "fresh",
       turnBudget: { maxTurns: input.maxTurns },
       acceptance: false,
+      mission: false,
       ...(input.kind === OPERATION_KIND.FIX ? { completionGuard: false } : {}),
     };
+    const requestDigest = bridgeRequestDigest(params);
     const persisted = await this.registry.updateIfCurrent(
       {
         ...runWithoutRecoveryModel,
@@ -692,6 +704,7 @@ export class PlanExecController {
           service: OPERATION_SERVICE.BRIDGE,
           kind: input.kind,
           params,
+          requestDigest,
           launchStartedAt,
           recovery: OPERATION_RECOVERY.REPLAY,
           ...(input.taskId ? { taskId: input.taskId } : {}),
@@ -704,8 +717,26 @@ export class PlanExecController {
     );
     if (!persisted.applied) return persisted.run;
     const intended = persisted.run;
-    const reply = await this.bridge.spawn(operationId, params);
+    const capabilities = await this.bridgeCapabilities();
+    const owner = bridgeOperationOwner(intended, intended.activeOperation);
+    const reply = await this.bridge.spawn(operationId, params, owner);
     if (!reply.success) return this.fail(intended, reply.error.message, true);
+    const replyDigest = text(reply.data.requestDigest);
+    if (
+      capabilities?.protocolVersion === 2 &&
+      (!replyDigest || replyDigest !== requestDigest)
+    )
+      return this.failUnknownLaunch(
+        intended,
+        intended.activeOperation,
+        "Bridge spawn omitted or mismatched its request digest.",
+      );
+    if (replyDigest && replyDigest !== requestDigest)
+      return this.failUnknownLaunch(
+        intended,
+        intended.activeOperation,
+        "Bridge spawn returned a mismatched request digest.",
+      );
     const externalRunId = text(reply.data.runId);
     if (!externalRunId)
       return this.fail(intended, "Bridge spawn returned no run ID.", true);
@@ -727,46 +758,72 @@ export class PlanExecController {
     )
       return run;
     if (operation.service === OPERATION_SERVICE.BRIDGE) {
-      const lookup = await this.bridge.operation(operation.operationId);
+      const capabilities = await this.bridgeCapabilities();
+      const owner = bridgeOperationOwner(run, operation);
+      const lookup = await this.bridge.operation(operation.operationId, owner);
       if (!lookup.success)
-        return this.fail(
+        return this.failUnknownLaunch(
           run,
+          operation,
           `Unable to look up bridge operation: ${lookup.error.message}`,
-          true,
         );
       const lookupState = text(lookup.data.state);
+      const lookupDigest = text(lookup.data.requestDigest);
+      if (
+        capabilities?.protocolVersion === 2 &&
+        lookupState !== EXTERNAL_OPERATION_STATE.ABSENT &&
+        (!owner || lookupDigest !== owner.requestDigest)
+      )
+        return this.failUnknownLaunch(
+          run,
+          operation,
+          "Bridge operation lookup did not match the persisted request digest.",
+        );
       if (lookupState === EXTERNAL_OPERATION_STATE.FOUND) {
         const externalRunId = text(lookup.data.runId);
         if (!externalRunId)
-          return this.fail(
+          return this.failUnknownLaunch(
             run,
+            operation,
             "Bridge operation lookup omitted a run ID.",
-            true,
           );
         const asyncDir = text(lookup.data.asyncDir);
         return this.updateActiveOperation(run, operation.operationId, {
           externalRunId,
           recovery: OPERATION_RECOVERY.OBSERVE,
+          ...(owner ? { requestDigest: owner.requestDigest } : {}),
           ...(asyncDir ? { asyncDir } : {}),
         });
       }
       if (lookupState === EXTERNAL_OPERATION_STATE.PENDING) return run;
+      if (lookupState === EXTERNAL_OPERATION_STATE.ABSENT) {
+        if (
+          capabilities?.protocolVersion === 2 &&
+          capabilities.healthy &&
+          capabilities.durableOperationLookup &&
+          owner
+        )
+          return this.replayAbsentBridgeOperation(
+            run,
+            operation,
+            owner,
+          );
+        return this.failUnknownLaunch(
+          run,
+          operation,
+          "Bridge launch outcome is unknown; v1 absence is not terminal proof, so refusing to launch a possible duplicate worker.",
+        );
+      }
       if (lookupState === EXTERNAL_OPERATION_STATE.UNKNOWN)
-        return this.fail(
+        return this.failUnknownLaunch(
           run,
+          operation,
           "Bridge operation lookup is unresolved; retry /exec resume after the provider recovers.",
-          true,
         );
-      if (lookupState === EXTERNAL_OPERATION_STATE.ABSENT)
-        return this.fail(
-          run,
-          "Bridge has no record of this operation; refusing to launch a possible duplicate worker.",
-          true,
-        );
-      return this.fail(
+      return this.failUnknownLaunch(
         run,
+        operation,
         "Bridge operation lookup returned an invalid state.",
-        true,
       );
     }
 
@@ -796,6 +853,78 @@ export class PlanExecController {
       externalRunId: state.runId,
       recovery: OPERATION_RECOVERY.OBSERVE,
     });
+  }
+
+  private async bridgeCapabilities(): Promise<
+    BridgeCapabilities | undefined
+  > {
+    try {
+      return await this.bridge.capabilities?.();
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async replayAbsentBridgeOperation(
+    run: PlanExecRun,
+    operation: ActiveOperation,
+    owner: BridgeOperationOwner,
+  ): Promise<PlanExecRun> {
+    if (!operation.params)
+      return this.failUnknownLaunch(
+        run,
+        operation,
+        "Bridge operation parameters are missing; refusing recovery launch.",
+      );
+    if (operation.params.mission !== false)
+      return this.failUnknownLaunch(
+        run,
+        operation,
+        "Bridge recovery parameters lack mission:false; refusing recovery launch.",
+      );
+    const reply = await this.bridge.spawn(
+      operation.operationId,
+      operation.params,
+      owner,
+    );
+    if (!reply.success)
+      return this.failUnknownLaunch(run, operation, reply.error.message);
+    const replyDigest = text(reply.data.requestDigest);
+    if (!replyDigest || replyDigest !== owner.requestDigest)
+      return this.failUnknownLaunch(
+        run,
+        operation,
+        "Bridge recovery spawn omitted or mismatched its request digest.",
+      );
+    const externalRunId = text(reply.data.runId);
+    if (!externalRunId)
+      return this.failUnknownLaunch(
+        run,
+        operation,
+        "Bridge recovery spawn returned no run ID.",
+      );
+    const asyncDir = text(reply.data.asyncDir);
+    return this.updateActiveOperation(run, operation.operationId, {
+      externalRunId,
+      requestDigest: owner.requestDigest,
+      recovery: OPERATION_RECOVERY.OBSERVE,
+      ...(asyncDir ? { asyncDir } : {}),
+    });
+  }
+
+  private async failUnknownLaunch(
+    run: PlanExecRun,
+    operation: ActiveOperation | undefined,
+    message: string,
+  ): Promise<PlanExecRun> {
+    const marked = operation
+      ? await this.updateActiveOperation(run, operation.operationId, {
+          recovery: OPERATION_RECOVERY.REQUIRED,
+          lastObservedState: EXTERNAL_OPERATION_STATE.UNKNOWN_LAUNCH,
+          lastStatusError: message,
+        })
+      : run;
+    return this.fail(marked, message, true);
   }
 
   private async updateActiveOperation(
@@ -2546,6 +2675,20 @@ async function pathExists(path: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+function bridgeOperationOwner(
+  run: PlanExecRun,
+  operation: ActiveOperation | undefined,
+): BridgeOperationOwner | undefined {
+  if (!operation?.params) return undefined;
+  return {
+    kind: "pi-plan-exec",
+    runId: run.id,
+    key: operation.operationId,
+    requestDigest:
+      operation.requestDigest ?? bridgeRequestDigest(operation.params),
+  };
 }
 
 function text(value: unknown): string | undefined {

@@ -421,28 +421,28 @@ test("abandonment needs a dead lease, an in-flight claim, and a gone operation",
     expected: Abandonment;
   }> = [
     {
-      name: "dead lease, running, directory gone",
+      name: "dead lease, running, directory gone is inconclusive",
       run: subject(),
       evidence: { leaseLive: false, asyncDirPresent: false },
-      expected: "abandoned",
+      expected: "ambiguous",
     },
     {
-      name: "dead lease, running, bridge has no record",
+      name: "dead lease, v1 bridge has no record is inconclusive",
       run: subject(),
       evidence: { leaseLive: false, bridgeState: "absent" },
-      expected: "abandoned",
+      expected: "ambiguous",
     },
     {
-      name: "dead lease, starting, directory gone",
+      name: "dead lease, starting, directory gone is inconclusive",
       run: subject({ status: "starting" }),
       evidence: { leaseLive: false, asyncDirPresent: false },
-      expected: "abandoned",
+      expected: "ambiguous",
     },
     {
-      name: "dead lease, cancel_pending, directory gone",
+      name: "dead lease, cancel_pending, directory gone is inconclusive",
       run: subject({ status: "cancel_pending" }),
       evidence: { leaseLive: false, asyncDirPresent: false },
-      expected: "abandoned",
+      expected: "ambiguous",
     },
     {
       name: "dead lease, skip_pending, directory gone",
@@ -463,6 +463,45 @@ test("abandonment needs a dead lease, an in-flight claim, and a gone operation",
         },
       }),
       evidence: { leaseLive: false, asyncDirPresent: false },
+      expected: "ambiguous",
+    },
+    {
+      name: "native process terminal observation proves abandonment",
+      run: subject({
+        activeOperation: {
+          operationId: "operation-1",
+          service: "bridge",
+          kind: "implementation",
+          externalRunId: "external-1",
+        },
+      }),
+      evidence: {
+        leaseLive: false,
+        processTerminalProof: {
+          version: 1,
+          state: "observed",
+          runId: "external-1",
+          runnerProcessInstanceId: "native-instance-1",
+          observedAt: 1,
+          instances: [],
+        },
+      },
+      expected: "abandoned",
+    },
+    {
+      name: "healthy durable operation absence proves an unbound launch safe",
+      run: subject({
+        activeOperation: {
+          operationId: "operation-1",
+          service: "bridge",
+          kind: "implementation",
+        },
+      }),
+      evidence: {
+        leaseLive: false,
+        bridgeState: "absent",
+        durableOperationLookup: true,
+      },
       expected: "abandoned",
     },
     {

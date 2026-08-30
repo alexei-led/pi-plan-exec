@@ -8,7 +8,7 @@ import {
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
-import { BridgeClient } from "./bridge.js";
+import { BridgeClient, processTerminalProof } from "./bridge.js";
 import {
   isDetachedWorkflowFailure,
   isExternalManualBlocker,
@@ -31,6 +31,7 @@ import {
   longRunningOperation,
   type Abandonment,
   type AbandonmentEvidence,
+  type ProcessTerminalProof,
 } from "./lifecycle.js";
 import {
   asLocalRun,
@@ -43,12 +44,14 @@ import {
 } from "./registry.js";
 import { readPlan } from "./plan.js";
 import { appendProgress } from "./progress.js";
+import { loadPlanExecRuntimeIntegration } from "./runtime-integration.js";
 import { TaskProjector } from "./task-projection.js";
 import {
   COMPLETED_PLANS_DIRECTORY,
   EXEC_ACTION,
   EXEC_ALIAS_ACTIONS,
   EXTERNAL_OPERATION_STATE,
+  OPERATION_RECOVERY,
   OPERATION_SERVICE,
   RUN_STATUS,
   WORKFLOW_MODE,
@@ -136,10 +139,10 @@ const REQUIRED_RUNTIME_TOOLS: Record<string, string> = {
 const REQUIRED_SETUP_COMMANDS = [
   "pi install npm:pi-subagents",
   "pi install npm:@tintinweb/pi-tasks",
-  "pi install npm:@alexeiled/pi-subagents-bridge@>=0.2.2",
+  "pi install npm:@alexeiled/pi-subagents-bridge",
 ];
 const OPTIONAL_SETUP_COMMANDS = [
-  "pi install 'npm:@alexeiled/pi-fusion@>=0.7.0'",
+  "pi install npm:@alexeiled/pi-fusion",
 ];
 
 /** Primary verbs only: a retired name still dispatches, but is never taught. */
@@ -199,12 +202,23 @@ type SyncProjection = (
 
 export default function planExecExtension(pi: ExtensionAPI): void {
   const projector = new TaskProjector(defaultRegistry);
+  const runtimeIntegration = loadPlanExecRuntimeIntegration().catch(
+    () => undefined,
+  );
   const projectionQueues = new Map<string, Promise<PlanExecRun>>();
   const syncProjection: SyncProjection = (run, options) => {
     const previous = projectionQueues.get(run.id) ?? Promise.resolve(run);
     const next = previous
       .catch(() => run)
-      .then(() => projector.sync(run, options));
+      .then(() => projector.sync(run, options))
+      .then(async (projected) => {
+        try {
+          (await runtimeIntegration)?.sync(projected, options.sessionId);
+        } catch {
+          // Fleet visibility is a cache too; the durable run still proceeds.
+        }
+        return projected;
+      });
     projectionQueues.set(run.id, next);
     void next.finally(() => {
       if (projectionQueues.get(run.id) === next)
@@ -230,13 +244,34 @@ export default function planExecExtension(pi: ExtensionAPI): void {
 
   // Bounded: a diagnosis runs right after a restart, when the bridge may not be
   // up yet. No answer within the budget is simply no evidence.
-  const doctorProbe = abandonmentProbe(async (operationId) => {
-    const lookup = await new BridgeClient(
-      pi.events,
-      PROVIDER_PROBE_TIMEOUT_MS,
-    ).operation(operationId);
-    return lookup.success ? bridgeOperationState(lookup.data) : undefined;
-  });
+  const probeBridge = new BridgeClient(pi.events, PROVIDER_PROBE_TIMEOUT_MS);
+  const doctorProbe = abandonmentProbe(
+    async (operationId) => {
+      await probeBridge.capabilities();
+      const lookup = await probeBridge.operation(operationId);
+      return lookup.success ? bridgeOperationState(lookup.data) : undefined;
+    },
+    async (operation) => {
+      const capabilities = await probeBridge.capabilities();
+      if (capabilities.protocolVersion !== 2 || !capabilities.healthy) return {};
+      const proof = operation.externalRunId
+        ? await probeBridge
+            .status(operation.externalRunId, operation.asyncDir)
+            .then((reply) =>
+              reply.success
+                ? processTerminalProof(
+                    processTerminalFromStatus(reply.data),
+                    operation.externalRunId ?? "",
+                  )
+                : undefined,
+            )
+        : undefined;
+      return {
+        durableOperationLookup: capabilities.durableOperationLookup,
+        ...(proof ? { processTerminalProof: proof } : {}),
+      };
+    },
+  );
 
   const activeControllers = new Map<string, ReturnType<typeof setInterval>>();
   const inFlightControllers = new Set<string>();
@@ -311,18 +346,21 @@ export default function planExecExtension(pi: ExtensionAPI): void {
       pi.getAllTools().map((tool) => tool.name),
     );
     if (missingTools.length > 0) return [`missing: ${missingTools.join(", ")}`];
-    const bridgeReply = await new BridgeClient(
-      pi.events,
-      PROVIDER_PROBE_TIMEOUT_MS,
-    ).ping();
+    const bridgeReply = await bridge.ping();
     const missing: string[] = [];
     const incompatible: string[] = [];
     if (!bridgeReply.success) missing.push("@alexeiled/pi-subagents-bridge");
-    else if (
-      !hasBridgeOperationMethod(bridgeReply.data) ||
-      !hasBridgeWorkflowScriptSpawnCapability(bridgeReply.data)
-    )
-      incompatible.push("@alexeiled/pi-subagents-bridge >=0.2.2");
+    else {
+      const capabilities = await bridge.capabilities();
+      const compatible =
+        capabilities.protocolVersion === 2 &&
+        capabilities.healthy &&
+        capabilities.workflowScriptSpawn &&
+        capabilities.durableOperationLookup &&
+        capabilities.processTerminalProofVersion === 1;
+      if (!compatible)
+        incompatible.push("@alexeiled/pi-subagents-bridge (v2 capabilities required)");
+    }
     return [
       ...(missing.length > 0 ? [`missing: ${missing.join(", ")}`] : []),
       ...(incompatible.length > 0
@@ -412,23 +450,28 @@ export default function planExecExtension(pi: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId();
     const { runs, errors } = await defaultRegistry.listWithErrors();
+    const contextualRuns = runs.filter((run) => matchesContext(run, ctx.cwd));
+    try {
+      (await runtimeIntegration)?.reconcile(contextualRuns, sessionId);
+    } catch {
+      // Runtime visibility is advisory; run.json remains authoritative.
+    }
     if (errors.length > 0)
       notify(
         ctx,
         `Ignored ${errors.length} corrupt plan-exec run record${errors.length === 1 ? "" : "s"}: ${errors.map((error) => shortRunId(error.runId)).join(", ")}.`,
         "warning",
       );
-    for (const run of runs) {
-      if (
-        !isTerminal(run.status) &&
-        run.lease?.sessionId === sessionId &&
-        matchesContext(run, ctx.cwd)
-      ) {
-        startBackgroundController(run, sessionId, ctx.cwd, ctx);
+    for (const run of contextualRuns) {
+      if (!isTerminal(run.status) && run.lease?.sessionId === sessionId) {
+        const repaired = await syncProjection(run, {
+          cwd: ctx.cwd,
+          sessionId,
+        });
+        startBackgroundController(repaired, sessionId, ctx.cwd, ctx);
       }
     }
-    // Advisory only: startup never writes, and a failed diagnosis must not take
-    // the session down with it.
+    // Advisory only: a failed diagnosis must not take the session down with it.
     try {
       const notice = abandonedRunsNotice(
         await sweepAbandonment(defaultRegistry),
@@ -444,6 +487,7 @@ export default function planExecExtension(pi: ExtensionAPI): void {
     activeControllers.clear();
     inFlightControllers.clear();
     lastStates.clear();
+    void runtimeIntegration.then((integration) => integration?.dispose());
     // Status is session-scoped in Pi, so the next session starts clean.
   });
 }
@@ -607,6 +651,16 @@ export function recoveryGuidance(
       classification: "its lease names a machine that is not this one",
       action: `The lease was stamped on ${run.lease?.hostname} and this machine answers to ${hostname()}, so nothing here can observe its worker. If that name was this machine before it was renamed, run ${resume} ${SAME_MACHINE_OPTION}; it checks the worker here and still refuses while one is running. If it was a different machine, recover the run there.`,
       command: `${resume} ${SAME_MACHINE_OPTION}`,
+    };
+  if (
+    run.activeOperation?.recovery === OPERATION_RECOVERY.REQUIRED ||
+    run.activeOperation?.lastObservedState ===
+      EXTERNAL_OPERATION_STATE.UNKNOWN_LAUNCH
+  )
+    return {
+      classification: "recovery required: worker launch outcome is unknown",
+      action: `Run ${resume} only to re-check the same durable operation identity. Plan-exec will not launch replacement work without v2 durable absence proof. Use ${stop} if you must stop recovery.`,
+      command: resume,
     };
   // In-flight only. A settled run's own record says the controller stopped, and
   // its resume looks the operation up by ID rather than launching a second one.
@@ -881,6 +935,14 @@ export function formatRunStatus(
       );
   }
   if (run.progressPath) lines.push(`progress: ${run.progressPath}`);
+  if (run.taskProjection?.state === "degraded")
+    lines.push(
+      `task projection: degraded — ${run.taskProjection.error ?? "unknown error"}`,
+    );
+  else if (run.taskProjection?.state === "ready")
+    lines.push(
+      `task projection: ready (${run.taskProjection.scope ?? "unknown scope"}${run.taskProjection.listPath ? `, ${run.taskProjection.listPath}` : ""})`,
+    );
   if (operation?.lastObservedAt)
     lines.push(
       `last observation: ${new Date(operation.lastObservedAt).toISOString()}`,
@@ -1275,13 +1337,19 @@ export interface AbandonmentSweep {
 }
 
 /**
- * Filesystem evidence always; the bridge only when a lookup is wired in and the
- * cheap check was not decisive. A lookup that cannot answer yields no evidence
- * rather than a false verdict, and a run whose lease names another host yields
- * none at all — see `isLocalRun`.
+ * Filesystem evidence is diagnostic only. A wired bridge is still asked for
+ * durable lookup and native process proof. A lookup that cannot answer yields
+ * no evidence rather than a false verdict, and a run whose lease names another
+ * host yields none at all — see `isLocalRun`.
  */
 export function abandonmentProbe(
   lookupOperationState?: (operationId: string) => Promise<string | undefined>,
+  lookupBridgeProof?: (
+    operation: ActiveOperation,
+  ) => Promise<{
+    durableOperationLookup?: boolean;
+    processTerminalProof?: ProcessTerminalProof;
+  }>,
 ): EvidenceProbe {
   return async (run) => {
     const operation = run.activeOperation;
@@ -1289,16 +1357,20 @@ export function abandonmentProbe(
     const asyncDirPresent = operation.asyncDir
       ? await pathExists(operation.asyncDir)
       : undefined;
-    if (asyncDirPresent === false) return { asyncDirPresent };
     const bridgeState =
       lookupOperationState && operation.service === OPERATION_SERVICE.BRIDGE
         ? await lookupOperationState(operation.operationId).catch(
             () => undefined,
           )
         : undefined;
+    const bridgeProof =
+      lookupBridgeProof && operation.service === OPERATION_SERVICE.BRIDGE
+        ? await lookupBridgeProof(operation).catch(() => ({}))
+        : {};
     return {
       ...(asyncDirPresent === undefined ? {} : { asyncDirPresent }),
       ...(bridgeState ? { bridgeState } : {}),
+      ...bridgeProof,
     };
   };
 }
@@ -1755,6 +1827,21 @@ function nextCommand(diagnosis: RunDiagnosis): string {
   return recoveryGuidance(diagnosis.run, diagnosis.evidence).command;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function processTerminalFromStatus(
+  data: Record<string, unknown>,
+): unknown {
+  if (isRecord(data.processTerminal)) return data.processTerminal;
+  const details = data.details;
+  if (!isRecord(details)) return undefined;
+  const lifecycleStatus = details.lifecycleStatus;
+  if (!isRecord(lifecycleStatus)) return undefined;
+  return lifecycleStatus.processTerminal;
+}
+
 function bridgeOperationState(
   data: Record<string, unknown>,
 ): string | undefined {
@@ -1787,6 +1874,34 @@ interface CommandDependencies {
   doctorProbe: EvidenceProbe;
 }
 
+async function repairProjectionForRead(
+  args: string[],
+  ctx: ExtensionCommandContext,
+  syncProjection: SyncProjection,
+): Promise<void> {
+  const sessionId = ctx.sessionManager.getSessionId();
+  const selector = args.find((arg) => !arg.startsWith("--"));
+  const selected = selector ? await defaultRegistry.get(selector) : undefined;
+  const runs = selected
+    ? selected.lease?.sessionId === sessionId ||
+      selected.taskProjection?.sessionId === sessionId
+      ? [selected]
+      : []
+    : (await defaultRegistry.list()).filter(
+        (run) =>
+          matchesContext(run, ctx.cwd) &&
+          (run.lease?.sessionId === sessionId ||
+            run.taskProjection?.sessionId === sessionId),
+      );
+  for (const run of runs) {
+    try {
+      await syncProjection(run, { cwd: ctx.cwd, sessionId });
+    } catch {
+      // The read still reports registry truth when a cache repair cannot land.
+    }
+  }
+}
+
 async function handleCommand(
   args: string,
   ctx: ExtensionCommandContext,
@@ -1804,6 +1919,12 @@ async function handleCommand(
   if (subcommand === EXEC_ACTION.HELP) return execHelp();
   if (subcommand === EXEC_ACTION.CLEANUP)
     return execCleanup(defaultRegistry, rest);
+  if (
+    subcommand === EXEC_ACTION.STATUS ||
+    subcommand === EXEC_ACTION.RUNS ||
+    subcommand === EXEC_ACTION.DOCTOR
+  )
+    await repairProjectionForRead(rest, ctx, syncProjection);
   const read = await execRead(defaultRegistry, subcommand, rest, {
     probe: doctorProbe,
     problems: runtimeProblems,
@@ -2581,7 +2702,9 @@ function observationLabel(run: PlanExecRun): string {
 }
 
 function compactRunStatus(run: PlanExecRun): string {
-  return `exec ${run.status} · ${run.stage} · ${activeOperationLabel(run)} · ${observationLabel(run)}`;
+  const projection =
+    run.taskProjection?.state === "degraded" ? " · projection degraded" : "";
+  return `exec ${run.status} · ${run.stage} · ${activeOperationLabel(run)} · ${observationLabel(run)}${projection}`;
 }
 
 function terminalMessage(run: PlanExecRun): string {

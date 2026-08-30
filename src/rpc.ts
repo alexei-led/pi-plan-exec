@@ -10,6 +10,7 @@ export function requestRpc<T>(options: {
   requestEvent: string;
   replyPrefix: string;
   timeoutMs: number;
+  version?: number;
   method: string;
   label?: string;
   body: Record<string, unknown>;
@@ -49,7 +50,7 @@ export function requestRpc<T>(options: {
         return;
       }
       options.events.emit(options.requestEvent, {
-        version: 1,
+        version: options.version ?? 1,
         requestId,
         method: options.method,
         ...options.body,

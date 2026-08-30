@@ -27,13 +27,17 @@ test("package manifest ships only plan-exec resources and requires recovery-capa
   ]) {
     assert.equal(
       manifest.peerDependencies[packageName],
-      packageName === "@alexeiled/pi-fusion" ? ">=0.7.0" : "*",
+      packageName === "@alexeiled/pi-fusion"
+        ? ">=0.7.0"
+        : packageName === "@tintinweb/pi-tasks"
+          ? ">=0.9.0"
+          : ">=0.60.0",
     );
     assert.equal(manifest.peerDependenciesMeta[packageName]?.optional, true);
   }
   assert.equal(
     manifest.peerDependencies["@alexeiled/pi-subagents-bridge"],
-    ">=0.2.2",
+    ">=0.2.3",
   );
   assert.equal(
     manifest.peerDependenciesMeta["@alexeiled/pi-subagents-bridge"]?.optional,
