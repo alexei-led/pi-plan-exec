@@ -1,17 +1,12 @@
 # Changelog
 
-## Unreleased
+## 1.1.0 - 2026-08-30
 
-- Integrate with pi-subagents 0.60 external-runs/background-work registries using
-  one owned PlanExec row and provider; reload reconciliation is idempotent and
-  never duplicates native child rows.
-- Pass `mission: false` to every pi-subagents workflow launch and persist a
-  canonical request digest with the durable operation identity.
-- Add bridge v2 capability negotiation and process-terminal proof handling;
-  missing memory, async directories, or v1 absence now fail closed as
-  `recovery_required`/`unknown_launch` instead of launching duplicates.
-- Keep pi-tasks 0.9 as a rebuildable cache with ownership, revision, and plan
-  status metadata, exact scope/path/version checks, and visible degraded state.
+- Integrate with pi-subagents 0.60 external-runs/background-work registries using one owned PlanExec row and provider.
+- Add durable bridge v2 capability negotiation, request identity, process-terminal proof, and fail-closed unknown-launch recovery.
+- Make reload reconciliation idempotent and keep pi-tasks 0.9 projection as a rebuildable cache with visible degraded state.
+
+## Unreleased
 ## 1.0.5 - 2026-08-28
 
 - Correlate settled workflow receipts using the actual pi-subagents schema:
