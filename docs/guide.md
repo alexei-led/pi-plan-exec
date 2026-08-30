@@ -11,8 +11,10 @@ contracts and component ownership.
 - Pi in an **interactive** session. `/exec` asks whether to use a worktree.
 - A Git repository with a non-detached `HEAD`.
 - A plan file inside that repository.
-- These independently installed Pi packages, at compatible versions. In
-  particular, `@alexeiled/pi-subagents-bridge` must be `0.2.2` or later:
+- These independently installed Pi packages, at compatible versions. Use
+  `pi-subagents` 0.60.x and `@tintinweb/pi-tasks` 0.9.x. Use the latest Bridge;
+  v2 durable-operation and process-terminal capabilities enable automatic proof,
+  while v1 remains safe but cannot prove a missing launch is gone:
   - `pi-subagents`;
   - `@tintinweb/pi-tasks`;
   - `@alexeiled/pi-subagents-bridge`;
@@ -27,8 +29,8 @@ does not require cc-thingz agents.
 ```bash
 pi install npm:pi-subagents
 pi install npm:@tintinweb/pi-tasks
-pi install 'npm:@alexeiled/pi-subagents-bridge@>=0.2.2'
-pi install 'npm:@alexeiled/pi-fusion@>=0.7.0'
+pi install npm:@alexeiled/pi-subagents-bridge
+pi install npm:@alexeiled/pi-fusion
 pi install npm:@alexeiled/pi-plan-exec
 ```
 
@@ -434,13 +436,21 @@ Authoritative records live at:
 ```
 
 They store stage, attempts, active Bridge/Fusion operation, worktree, branch,
-findings, force-skip audit records, and lease. Durable operation IDs let the controller replay an
+findings, force-skip audit records, and lease. Durable operation IDs and request digests let the controller reconcile an
 ambiguous or interrupted start without intentionally launching a second writer.
-Registry compare-and-set updates and controller locks keep stale reload instances
-from overwriting cancellation, pause, or operation state.
+A v2 `processTerminal` proof with `state: observed` is the only terminal process
+proof. Missing bridge memory, missing `asyncDir`, v1 `absent`, and unknown proof
+stay `recovery_required`/`unknown_launch`; they never start a duplicate. Registry
+compare-and-set updates and controller locks keep stale reload instances from
+overwriting cancellation, pause, or operation state.
 
-Pi-tasks is a session-scoped UI projection. On adoption, the projection is
-rebuilt from the global record and plan.
+Pi-subagents receives one top-level PlanExec external-run row and one
+background-work provider. Reload reads `run.json` and safely re-registers those
+owned records; native child rows are not duplicated. Pi-tasks is a session-scoped,
+rebuildable UI cache. Owned tasks carry owner, run, key, revision, status, and
+projection version metadata. Scope, path, and the installed 0.9.x version are
+checked. A cache repair failure is visible as degraded projection state while
+plan execution continues.
 
 Pause, cancellation, failure, and completion preserve the worktree for review.
 Cancellation retries transient provider failures without dropping the active

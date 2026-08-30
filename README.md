@@ -50,13 +50,12 @@ Install the required packages, then plan-exec. Fusion is optional; install it fo
 ```bash
 pi install npm:pi-subagents
 pi install npm:@tintinweb/pi-tasks
-pi install 'npm:@alexeiled/pi-subagents-bridge@>=0.2.2'
-pi install 'npm:@alexeiled/pi-fusion@>=0.7.0'
+pi install npm:@alexeiled/pi-subagents-bridge
+pi install npm:@alexeiled/pi-fusion
 pi install npm:@alexeiled/pi-plan-exec
 ```
 
-The providers remain independent Pi packages. `pi-plan-exec` requires Bridge
-`0.2.2` or later for safe operation lookup and pi-subagents workflow execution.
+The providers remain independent Pi packages. Install the latest Bridge release. `pi-plan-exec` uses v2 durable lookup and terminal proof when advertised; v1 remains compatible but fails closed when recovery cannot prove a launch outcome.
 Fusion is optional: the controller falls back to the pi-subagents reviewer when
 Fusion is absent or its launch response is unusable.
 
@@ -72,7 +71,8 @@ plan:
 While it runs, Pi shows the execution-worktree path, branch, stage, and worker.
 Four verbs cover everything after the start:
 
-- `/exec status` only observes; it never interrupts or restarts a run. With no
+- `/exec status` never interrupts or restarts a run. It may idempotently repair
+  the advisory pi-tasks and Fleet visibility caches from `run.json`. With no
   run ID it lists every run, groups the ones that claim a worker by the evidence
   for that claim, reports any missing package with its install command, and ends
   every row in one next command. Add a full run ID for one run in detail, or
@@ -89,7 +89,9 @@ Four verbs cover everything after the start:
   supervisor reply, the live controller preserves and polls that workflow, then
   continues automatically after the reply. After a restart, resume consumes its
   durable result or reattaches the same operation; it does not launch a
-  duplicate.
+  duplicate. Missing bridge memory, a missing async directory, and v1 absence
+  are inconclusive; only matching v2 durable absence or native process-terminal
+  proof permits recovery to launch again.
 - `/exec stop` asks whether to pause the run (resumable) or cancel it (final,
   worktree preserved).
 - `/exec cleanup` retires run records. It previews by default and deletes
