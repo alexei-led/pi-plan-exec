@@ -13,7 +13,7 @@ const BRIDGE_REPLY_PREFIX = "plan-exec:bridge:v1:reply:";
 export const BRIDGE_V2_REQUEST_EVENT = "plan-exec:bridge:v2:request";
 const BRIDGE_V2_REPLY_PREFIX = "plan-exec:bridge:v2:reply:";
 const DEFAULT_BRIDGE_TIMEOUT_MS = 30_000;
-const V2_PROBE_TIMEOUT_MS = 100;
+const MIN_V2_PROBE_TIMEOUT_MS = 1_000;
 
 export interface BridgeOperationOwner {
   kind: "pi-plan-exec";
@@ -101,7 +101,12 @@ export class BridgeClient {
     if (this.negotiated?.protocolVersion === 2)
       return this.request(2, "ping", {});
 
-    const v2Reply = await this.request(2, "ping", {}, V2_PROBE_TIMEOUT_MS);
+    const v2Reply = await this.request(
+      2,
+      "ping",
+      {},
+      Math.max(this.timeoutMs, MIN_V2_PROBE_TIMEOUT_MS),
+    );
     const capabilities = parseV2Capabilities(v2Reply);
     if (capabilities) {
       this.negotiated = capabilities;

@@ -1883,8 +1883,9 @@ async function repairProjectionForRead(
   const selector = args.find((arg) => !arg.startsWith("--"));
   const selected = selector ? await defaultRegistry.get(selector) : undefined;
   const runs = selected
-    ? selected.lease?.sessionId === sessionId ||
-      selected.taskProjection?.sessionId === sessionId
+    ? matchesContext(selected, ctx.cwd) &&
+      (selected.lease?.sessionId === sessionId ||
+        selected.taskProjection?.sessionId === sessionId)
       ? [selected]
       : []
     : (await defaultRegistry.list()).filter(
