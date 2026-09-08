@@ -159,6 +159,58 @@ test("failed runs are visible without leaving projected work in progress", async
   assert.throws(() => sessionTaskPath("/repo", ""), /session ID/);
 });
 
+test("projection follows a recovered lifecycle without retaining a stale failed task", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-projection-"));
+  const planPath = join(root, "plan.md");
+  await writeFile(planPath, "### Task 1: First\n- [ ] Pending\n");
+  const registry = new RunRegistry(join(root, "runs"));
+  const failed = await registry.create({
+    schemaVersion: 1,
+    repositoryRoot: root,
+    planPath,
+    planHash: "ignored-by-projection",
+    worktreeCwd: root,
+    branch: "feature",
+    defaultBranch: "main",
+    status: "failed",
+    stage: "implementation",
+    taskAttempts: {},
+    stageAttempts: {},
+    reviewFindings: [],
+    unresolvedFindings: [],
+    config,
+    error: "Worker was proven gone during recovery.",
+  });
+  const projector = new TaskProjector(registry);
+  const projectedFailure = await projector.sync(failed, {
+    cwd: root,
+    sessionId: "session-1",
+  });
+
+  const recoveryCandidate = {
+    ...projectedFailure,
+    status: "running" as const,
+    activeOperation: {
+      operationId: "replacement-operation",
+      service: "bridge" as const,
+      kind: "implementation" as const,
+      taskId: 1,
+    },
+  };
+  delete recoveryCandidate.error;
+  const recovered = await registry.update(recoveryCandidate);
+  assert.equal(recovered.status, "running");
+  assert.equal(recovered.activeOperation?.taskId, 1);
+  await projector.sync(recovered, { cwd: root, sessionId: "session-1" });
+
+  const task = new TaskStore(sessionTaskPath(root, "session-1"))
+    .list()
+    .find((candidate) => candidate.metadata.planExecKey === "implementation:1");
+  assert.equal(task?.status, "in_progress");
+  assert.equal(task?.metadata.planStatus, "running");
+  assert.doesNotMatch(task?.description ?? "", /proven gone/);
+});
+
 test("projection removes stale tasks and their blockers", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-projection-"));
   const planPath = join(root, "plan.md");

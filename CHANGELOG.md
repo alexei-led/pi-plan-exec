@@ -1,12 +1,18 @@
 # Changelog
 
+## 1.2.0 - 2026-09-08
+
+- Add preparation-only `/goal`: inspect the repository in a restricted planning turn and save a validated plan with one explicit `/exec` next action.
+- Preserve goal identity and plan hashes, reuse unchanged prepared plans, and refuse to overwrite edited plans.
+- Keep planning read-only after invalid finalization or rejected concurrent commands; restore tools at safe lifecycle boundaries.
+- Clarify fail-closed recovery evidence and add lifecycle and task-projection regression coverage.
+
 ## 1.1.0 - 2026-08-30
 
 - Integrate with pi-subagents 0.60 external-runs/background-work registries using one owned PlanExec row and provider.
 - Add durable bridge v2 capability negotiation, request identity, process-terminal proof, and fail-closed unknown-launch recovery.
 - Make reload reconciliation idempotent and keep pi-tasks 0.9 projection as a rebuildable cache with visible degraded state.
 
-## Unreleased
 ## 1.0.5 - 2026-08-28
 
 - Correlate settled workflow receipts using the actual pi-subagents schema:

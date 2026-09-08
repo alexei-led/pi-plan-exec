@@ -40,6 +40,35 @@ Reload Pi after installing:
 /reload
 ```
 
+## Prepare a goal
+
+Use `/goal <short goal>` in a Git repository to prepare, but not start, a
+single executable plan. For example:
+
+```text
+/goal Add a greeting endpoint
+```
+
+`/goal` starts a bounded planning turn in the **current Pi session**. During that
+turn it enables only `read`, `grep`, `find`, and `ls` plus the extension-owned
+`finalize_goal_plan` tool; Pi rejects the thirteenth `read` call. The model must
+inspect repository files and cite them
+under `## Repository evidence`; it cannot write files, call execution tools, or
+launch a child. The finalizer is the only writer: it validates the same
+executable-plan parser contract used by `/exec`, the exact `Goal:` text, cited
+repository evidence, and `goal_id`, `goal_hash`, `plan_hash`, and
+`document_hash` metadata before atomically creating `docs/plans/goal-<hash>.md`
+without replacement. It creates no run, worktree, task projection, or child.
+
+A retry with equivalent whitespace reuses a ready validated file. A file with an
+invalid metadata/content binding is treated as a user edit or incomplete file
+and is never overwritten. A finalizer validation error retains the restricted
+tool set so the same planning turn may correct its Markdown; Pi restores the
+previous tools only when that turn settles or its session shuts down. If planning
+settles without calling the finalizer, Pi reports an interrupted preparation and
+no plan exists. A ready result prints
+exactly one next action: `/exec <path>`.
+
 ## Executable plan format
 
 An executable plan is a Markdown file with a sequence of numbered task or
@@ -156,6 +185,7 @@ runs match, Pi opens a picker; headless mode asks for the full ID. Bare
 full ID is always in front of you.
 
 ```text
+/goal <short goal>      Prepare a repository-grounded validated plan; does not start it
 /exec [plan]            Start a run; bare /exec opens the plan picker
 /exec status [run-id]   No run ID: every run grouped by what it needs, any missing package, and one next command per run. With a run ID: that run in detail
 /exec resume [run-id] [--model current|provider/model]

@@ -3,6 +3,7 @@ import { hostname } from "node:os";
 import { basename, relative, resolve, sep } from "node:path";
 import {
   SessionManager,
+  withFileMutationQueue,
   type ExtensionAPI,
   type ExtensionCommandContext,
   type ExtensionContext,
@@ -25,6 +26,14 @@ import {
   taskRetryRequiredMessage,
 } from "./controller.js";
 import { FusionClient } from "./fusion.js";
+import {
+  beginGoalPreparation,
+  finalizeGoalPlan,
+  goalPreparationMessage,
+  type PendingGoalPlan,
+} from "./goal.js";
+import { Type } from "typebox";
+import { requireGitRepository } from "./git.js";
 import {
   ABANDONMENT,
   classifyAbandonment,
@@ -82,6 +91,15 @@ const CLEANUP_RETENTION_DAYS = 7;
 const MILLISECONDS_PER_DAY = 86_400_000;
 const CLEANUP_RETENTION_MS = CLEANUP_RETENTION_DAYS * MILLISECONDS_PER_DAY;
 const RUNS_ALL_OPTION = "--all";
+const GOAL_FINALIZATION_TOOL = "finalize_goal_plan";
+const GOAL_MAX_READ_CALLS = 12;
+const GOAL_EXPLORATION_TOOLS = [
+  "read",
+  "grep",
+  "find",
+  "ls",
+  GOAL_FINALIZATION_TOOL,
+];
 /** Keyed by `ExecAliasAction`, so retiring another name forces a note with it. */
 const ALIAS_NOTES: Record<ExecAliasAction, string> = {
   [EXEC_ACTION.RUNS]:
@@ -204,6 +222,28 @@ type SyncProjection = (
   options: { cwd: string; sessionId: string },
 ) => Promise<PlanExecRun>;
 
+function goalPreparationPrompt(prepared: PendingGoalPlan): string {
+  return [
+    "Prepare a meaningful executable Markdown plan for this repository. This is preparation only: do not execute work, create a run, launch a child, or change any repository file.",
+    `Requested goal: ${prepared.goal}`,
+    `Use only the enabled read-only tools. Pi enforces at most ${GOAL_MAX_READ_CALLS} read-tool calls for this turn; use them on the most relevant files, then produce 2 to 6 ordered tasks that name the concrete modules, tests, interfaces, and verification commands discovered in this repository.`,
+    "Before finalizing, make every claim traceable to the repository. Do not invent paths or generic Implement/Verify steps.",
+    "Call finalize_goal_plan exactly once with the plan body and no frontmatter. Its required shape is:",
+    "# <specific plan title>",
+    "",
+    `Goal: ${prepared.goal}`,
+    "",
+    "## Repository evidence",
+    "- `actual/path.ts`: what this file establishes for the plan.",
+    "",
+    "### Task 1: <concrete repository change>",
+    "- [ ] <specific implementation and test work>",
+    "",
+    "### Task 2: <next concrete change>",
+    "- [ ] <specific verification work>",
+  ].join("\n");
+}
+
 export default function planExecExtension(pi: ExtensionAPI): void {
   const projector = new TaskProjector(defaultRegistry);
   const runtimeIntegration = loadPlanExecRuntimeIntegration().catch(
@@ -232,18 +272,19 @@ export default function planExecExtension(pi: ExtensionAPI): void {
   };
   const bridge = new BridgeClient(pi.events);
   const fusion = new FusionClient(pi.events);
+  const runCommand = async (command: string, args: string[], cwd: string) => {
+    const result = await pi.exec(command, args, { cwd });
+    return {
+      stdout: result.stdout,
+      stderr: result.stderr,
+      code: result.code,
+    };
+  };
   const controller = new PlanExecController(
     defaultRegistry,
     bridge,
     fusion,
-    async (command, args, cwd) => {
-      const result = await pi.exec(command, args, { cwd });
-      return {
-        stdout: result.stdout,
-        stderr: result.stderr,
-        code: result.code,
-      };
-    },
+    runCommand,
   );
 
   // Bounded: a diagnosis runs right after a restart, when the bridge may not be
@@ -444,6 +485,142 @@ export default function planExecExtension(pi: ExtensionAPI): void {
         });
         if (message) ctx.ui.notify(message, "info");
       } catch (error: unknown) {
+        ctx.ui.notify(
+          error instanceof Error ? error.message : String(error),
+          "error",
+        );
+      }
+    },
+  });
+
+  let activeGoalPreparation:
+    | (PendingGoalPlan & {
+        previousTools: string[];
+        repositoryRoot: string;
+        sessionId: string;
+        readCalls: number;
+      })
+    | undefined;
+  const restoreGoalTools = (sessionId: string): boolean => {
+    const active = activeGoalPreparation;
+    if (!active || active.sessionId !== sessionId) return false;
+    pi.setActiveTools(active.previousTools);
+    activeGoalPreparation = undefined;
+    return true;
+  };
+
+  pi.registerTool({
+    name: GOAL_FINALIZATION_TOOL,
+    label: "Finalize Goal Plan",
+    description:
+      "Validate and atomically publish the repository-grounded goal plan prepared for the active /goal request.",
+    promptSnippet: "Publish the active researched goal plan after read-only exploration",
+    promptGuidelines: [
+      "Use finalize_goal_plan exactly once after inspecting the repository and drafting a repository-grounded Markdown plan. Do not use edit, write, bash, subagents, or execution tools during /goal preparation.",
+    ],
+    parameters: Type.Object({
+      markdown: Type.String({
+        description:
+          "Plan body only: exact Goal line, repository evidence, and numbered checkbox tasks; no frontmatter.",
+      }),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const active = activeGoalPreparation;
+      if (!active || active.sessionId !== ctx.sessionManager.getSessionId())
+        throw new Error(
+          "No active /goal preparation owns this finalization request.",
+        );
+      const prepared = await withFileMutationQueue(active.path, () =>
+        finalizeGoalPlan({
+          repositoryRoot: active.repositoryRoot,
+          goal: active.goal,
+          markdown: params.markdown,
+        }),
+      );
+      const path = relative(ctx.cwd, prepared.path) || prepared.path;
+      restoreGoalTools(active.sessionId);
+      return {
+        content: [{ type: "text", text: goalPreparationMessage(prepared, path) }],
+        details: {
+          goalId: prepared.goalId,
+          goalHash: prepared.goalHash,
+          planHash: prepared.planHash,
+          path: prepared.path,
+        },
+        terminate: true,
+      };
+    },
+  });
+
+  pi.on("tool_call", async (event, ctx) => {
+    const active = activeGoalPreparation;
+    if (!active || active.sessionId !== ctx.sessionManager.getSessionId())
+      return undefined;
+    if (!GOAL_EXPLORATION_TOOLS.includes(event.toolName))
+      return {
+        block: true,
+        reason:
+          "/goal preparation permits only bounded read-only exploration and its extension-owned finalizer.",
+      };
+    if (event.toolName === "read") {
+      if (active.readCalls >= GOAL_MAX_READ_CALLS)
+        return {
+          block: true,
+          reason: `/goal preparation permits at most ${GOAL_MAX_READ_CALLS} read-tool calls.`,
+        };
+      active.readCalls += 1;
+    }
+    return undefined;
+  });
+
+  pi.on("agent_settled", async (_event, ctx) => {
+    if (!restoreGoalTools(ctx.sessionManager.getSessionId())) return;
+    ctx.ui.notify(
+      "Goal preparation ended without a validated ready plan; no file was published. Retry /goal <short goal>.",
+      "warning",
+    );
+  });
+  pi.on("session_shutdown", async (_event, ctx) => {
+    restoreGoalTools(ctx.sessionManager.getSessionId());
+  });
+
+  pi.registerCommand("goal", {
+    description:
+      "Research and prepare a validated plan from a short goal without starting execution",
+    handler: async (args, ctx) => {
+      let acquiredGoalSessionId: string | undefined;
+      try {
+        if (!ctx.isIdle())
+          throw new Error("Goal preparation requires an idle Pi session.");
+        if (activeGoalPreparation)
+          throw new Error("Another goal preparation is already active.");
+        const repositoryRoot = await requireGitRepository(runCommand, ctx.cwd);
+        const prepared = await beginGoalPreparation({
+          repositoryRoot,
+          goal: args,
+        });
+        if (prepared.state === "ready") {
+          const path = relative(ctx.cwd, prepared.path) || prepared.path;
+          ctx.ui.notify(goalPreparationMessage(prepared, path), "info");
+          return;
+        }
+        activeGoalPreparation = {
+          ...prepared,
+          repositoryRoot,
+          previousTools: pi.getActiveTools(),
+          sessionId: ctx.sessionManager.getSessionId(),
+          readCalls: 0,
+        };
+        acquiredGoalSessionId = activeGoalPreparation.sessionId;
+        pi.setActiveTools(GOAL_EXPLORATION_TOOLS);
+        pi.sendUserMessage(goalPreparationPrompt(prepared));
+        ctx.ui.notify(
+          "Preparing a repository-grounded plan in this Pi session with read-only tools. No run or child was started.",
+          "info",
+        );
+      } catch (error: unknown) {
+        if (acquiredGoalSessionId)
+          restoreGoalTools(acquiredGoalSessionId);
         ctx.ui.notify(
           error instanceof Error ? error.message : String(error),
           "error",

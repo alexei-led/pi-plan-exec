@@ -39,8 +39,18 @@ controller's authoritative state.
 
 ## Data flow
 
+`/goal` is deliberately outside the execution controller. It temporarily narrows
+the main Pi session to read-only repository tools (with at most 12 `read` calls)
+and one extension-owned finalization tool. The tool alone validates and atomically publishes the ready
+plan; it never creates a run record or talks to Bridge, Fusion, the projector,
+or pi-subagents.
+
 ```mermaid
 flowchart LR
+    goal["/goal short goal"] --> explore["main Pi read-only exploration"]
+    explore --> finalizer["extension-owned finalizer"]
+    finalizer --> prepared["validated docs/plans/goal-*.md"]
+    prepared --> command
     user["/exec plan.md"] --> command[Pi command]
     command --> controller[plan-exec controller]
     controller --> registry["global run registry"]
@@ -63,7 +73,8 @@ not completion evidence; checked plan items are.
 
 | Module                   | Responsibility                                                                    |
 | ------------------------ | --------------------------------------------------------------------------------- |
-| `src/index.ts`           | `/exec` command surface, interactive selection, background controller loop        |
+| `src/index.ts`           | `/exec` and preparation-only `/goal` command surfaces, interactive selection, background controller loop |
+| `src/goal.ts`            | Goal-plan finalization, semantic metadata validation, atomic no-replace publication, safe retry/reuse |
 | `src/controller.ts`      | State transitions, operation launch/observation, retries, cancellation, recovery  |
 | `src/types.ts`           | Run, stage, operation, finding, and frozen configuration contracts                |
 | `src/registry.ts`        | Locked atomic run persistence, migration, leases, liveness, removal               |

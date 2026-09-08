@@ -59,16 +59,28 @@ The providers remain independent Pi packages. Install the latest Bridge release.
 Fusion is optional: the controller falls back to the pi-subagents reviewer when
 Fusion is absent or its launch response is unusable.
 
-Reload Pi. From an interactive session in a Git repository, run an executable
-plan:
+Reload Pi. From an interactive session in a Git repository, prepare a short goal
+or run an existing executable plan:
 
 ```text
 /reload
-/exec help
+/goal Add a greeting endpoint
 /exec docs/plans/20260713-add-greeting.md
 ```
 
-While it runs, Pi shows the execution-worktree path, branch, stage, and worker.
+`/goal <short goal>` uses the current Pi session for read-only repository
+exploration (with an enforced maximum of 12 `read` tool calls), then permits
+only the extension-owned `finalize_goal_plan` tool to
+publish a researched Markdown plan under `docs/plans/`. The finalizer validates
+the executable-plan parser contract, repository evidence, exact goal binding,
+and stable `goal_id`, `goal_hash`, `plan_hash`, and `document_hash` metadata.
+It atomically creates a complete file without overwriting an existing one. It
+never creates a run, worktree, task projection, or child. A ready retry reuses
+an unchanged validated file; an edited or incomplete file is refused. A turn
+that ends before finalization is reported as interrupted and publishes no plan.
+The ready result has exactly one next action: `/exec <path>`.
+
+While an execution runs, Pi shows the execution-worktree path, branch, stage, and worker.
 Four verbs cover everything after the start:
 
 - `/exec status` never interrupts or restarts a run. It may idempotently repair

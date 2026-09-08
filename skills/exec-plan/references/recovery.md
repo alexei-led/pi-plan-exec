@@ -103,9 +103,12 @@ Never start a second run for the same plan.
 
 ### `the worker is gone, so nothing is running`
 
-Checked live at the moment status ran: the operation's async directory is absent
-from disk, or the bridge has no record of its operation. Either way no worker is
-writing. Reset this one run and continue it:
+Checked live at the moment status ran: a v2 bridge supplied a matching native
+process-terminal proof for the tracked external run, **or** its durable
+operation lookup answered `absent` for an unbound launch. Only either proof says
+no worker is writing. A missing async directory and a v1 bridge's missing record
+are diagnostics, not death proof; those runs remain ambiguous and must not be
+reset. With decisive proof, reset this one run and continue it:
 
 ```text
 /exec resume <full-run-id>
@@ -184,9 +187,10 @@ upstream and temporary: `nicobailon/pi-subagents#920`.
 
 A run is **abandoned** only when all three hold at once: it claims `running`,
 `starting`, `skip_pending`, or `cancel_pending`; its lease is not live; and its
-operation is provably gone, because its async directory is absent from disk or
-the bridge answers `absent` for its operation ID. Anything less is `ambiguous`
-and is never reset.
+operation is provably gone by a matching native process-terminal proof or (for
+an unbound launch only) v2 durable lookup with `absent`. A missing async
+directory, a v1 absence response, or `absent` for an already-bound external run
+is incomplete evidence. Anything less is `ambiguous` and is never reset.
 
 Recover one named run — the usual case, and the smaller blast radius:
 
