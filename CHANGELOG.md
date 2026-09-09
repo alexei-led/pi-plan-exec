@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.0 - 2026-09-09
+
+- Add explicit `/exec --worktree <path> <plan-path>` to execute in an existing registered worktree without creating a branch or copying the plan.
+- Resolve plan paths relative to the selected worktree, support quoted paths, and validate canonical Git and filesystem boundaries.
+- Preserve in-place session cwd and keep background polling independent of unrelated registry records.
+- Prevent conflicting starts and failed-run recovery, including symlink aliases and deleted nested worktrees.
+- Document the new workflow and add real Git, concurrency, and recovery regression tests.
+
 ## 1.2.0 - 2026-09-08
 
 - Add preparation-only `/goal`: inspect the repository in a restricted planning turn and save a validated plan with one explicit `/exec` next action.
