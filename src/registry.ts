@@ -9,7 +9,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { homedir, hostname } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { isSkippableStage, isTerminalStatus } from "./lifecycle.js";
 import {
   DEFAULT_FROZEN_RUN_CONFIG,
@@ -137,18 +137,39 @@ export class RunRegistry {
       branchRebindings?: PlanExecRun["branchRebindings"];
     },
   ): Promise<PlanExecRun> {
-    const now = Date.now();
-    const created: PlanExecRun = {
-      ...run,
-      skippedStages: run.skippedStages ?? [],
-      branchRebindings: run.branchRebindings ?? [],
-      id: randomUUID(),
-      revision: 1,
-      createdAt: now,
-      updatedAt: now,
-    };
-    await this.write(created);
-    return created;
+    await mkdir(this.directory, { recursive: true });
+    const registryLockPath = join(this.directory, "registry.lock");
+    const registryLock = await acquireLock(registryLockPath);
+    try {
+      const conflict = (await this.list()).find(
+        (existing) =>
+          !isTerminalStatus(existing.status) &&
+          (resolve(existing.worktreeCwd) === resolve(run.worktreeCwd) ||
+            resolve(existing.planPath) === resolve(run.planPath)),
+      );
+      if (conflict)
+        throw new Error(
+          `Plan execution already exists for ${
+            resolve(conflict.worktreeCwd) === resolve(run.worktreeCwd)
+              ? "worktree"
+              : "plan"
+          }: ${conflict.id}. Use /exec status ${conflict.id} or /exec resume ${conflict.id}.`,
+        );
+      const now = Date.now();
+      const created: PlanExecRun = {
+        ...run,
+        skippedStages: run.skippedStages ?? [],
+        branchRebindings: run.branchRebindings ?? [],
+        id: randomUUID(),
+        revision: 1,
+        createdAt: now,
+        updatedAt: now,
+      };
+      await this.write(created);
+      return created;
+    } finally {
+      await releaseLock(registryLockPath, registryLock);
+    }
   }
 
   async get(runId: string): Promise<PlanExecRun | undefined> {

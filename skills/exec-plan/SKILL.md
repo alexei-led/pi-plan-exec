@@ -16,6 +16,9 @@ recovery with a manually launched subagent.
 - Create a plan: write a strict Markdown plan under `docs/plans/`. Do not start
   it unless asked.
 - Start a named plan: `/exec <path/to/plan.md>`.
+- Start a plan in an existing linked worktree: `/exec --worktree <worktree-path> <path/to/plan.md>`.
+  The worktree must belong to the same Git repository; the existing branch is
+  preserved and the plan path is resolved relative to that worktree.
 - Pick a plan interactively: `/exec`.
 - See what is going on: `/exec status`. It is read-only, and it is the first
   step after a Pi restart or a session handoff. With no run ID it lists every
@@ -141,8 +144,10 @@ review before resume.
 ## Start safely
 
 Prefer **Worktree (isolated)** unless the user explicitly requests in-place
-execution. Pi forks the session into the execution worktree. Continue there; do
-not switch to the source checkout and run another worker against the same plan.
+execution. When a plan already exists in a linked worktree, use the explicit
+`--worktree` form instead. Pi forks the session into the execution worktree.
+Continue there; do not switch to the source checkout and run another worker
+against the same plan or worktree.
 
 Before starting, use `/exec status` to ensure the same plan is not already
 active.
@@ -224,6 +229,7 @@ second writer.
   live lease, or one a controller is recovering.
 - Do not use `subagent resume` for a child owned by plan-exec.
 - Do not start a new run as a substitute for `/exec resume`.
+- Do not start a second non-terminal run for the same plan or worktree.
 - Do not hand-edit `~/.pi/plan-exec/runs/<id>/run.json`.
 - Do not edit the worktree until status evidence rules out a live writer.
 - `/exec resume` on a run another session owns is an active takeover that may

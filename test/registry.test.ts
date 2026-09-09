@@ -90,6 +90,28 @@ function thisHost(): string {
   return hostname().split(".")[0]!;
 }
 
+test("registry rejects a second nonterminal run in the same worktree or plan", async () => {
+  const { registry } = await seedRegistry();
+  const first = await registry.create(runSeed({ status: "paused" }));
+
+  await assert.rejects(
+    registry.create(
+      runSeed({ planPath: "/repo/other.md", worktreeCwd: "/repo" }),
+    ),
+    new RegExp(`same worktree.*${first.id}|worktree.*${first.id}`),
+  );
+  await assert.rejects(
+    registry.create(
+      runSeed({ planPath: "/repo/plan.md", worktreeCwd: "/other" }),
+    ),
+    new RegExp(`same plan.*${first.id}|plan.*${first.id}`),
+  );
+
+  await registry.update({ ...first, status: "completed" });
+  const replacement = await registry.create(runSeed());
+  assert.notEqual(replacement.id, first.id);
+});
+
 test("registry persists runs, protects path traversal, and reclaims stale leases", async () => {
   const { registry } = await seedRegistry();
   const run = await registry.create(

@@ -37,7 +37,9 @@ import {
   currentBranch,
   defaultBranch,
   ensureCleanForWorktree,
+  isPathWithin,
   requireGitRepository,
+  verifyExistingWorktree,
   verifyExecutionRepository,
   verifyExecutionTree,
   worktreePlanPath,
@@ -135,6 +137,8 @@ export interface StartRunOptions {
   cwd: string;
   planPath: string;
   useWorktree: boolean;
+  /** Use this already-registered linked worktree instead of creating one. */
+  existingWorktree?: string;
   sessionId: string;
 }
 
@@ -153,32 +157,51 @@ export class PlanExecController {
       this.runCommand,
       options.cwd,
     );
-    if (!plan.path.startsWith(repositoryRoot)) {
-      throw new Error("Plan must be stored inside the Git repository.");
-    }
     const baseBranch = await defaultBranch(this.runCommand, repositoryRoot);
-    const current = await currentBranch(this.runCommand, options.cwd);
-    const planBranch = branchNameFromPlan(plan.path);
-    const branch = options.useWorktree
-      ? current === baseBranch
-        ? planBranch
-        : `${current}-${planBranch}`
-      : current;
-    const worktreeCwd = options.useWorktree
-      ? await this.createExecutionWorktree(repositoryRoot, plan.path, branch)
-      : options.cwd;
-    const executionPlanPath = options.useWorktree
-      ? worktreePlanPath(worktreeCwd, repositoryRoot, plan.path)
-      : plan.path;
-    if (options.useWorktree)
-      await copyPlanIntoWorktree(plan.path, executionPlanPath);
+    let branch: string;
+    let executionWorktreeCwd: string;
+    let executionPlanPath = plan.path;
+
+    if (options.existingWorktree !== undefined) {
+      const targetWorktree = resolve(options.existingWorktree);
+      await verifyExistingWorktree(
+        this.runCommand,
+        repositoryRoot,
+        targetWorktree,
+      );
+      if (!isPathWithin(targetWorktree, plan.path))
+        throw new Error("Plan must be inside the selected Git worktree.");
+      branch = await currentBranch(this.runCommand, targetWorktree);
+      executionWorktreeCwd = targetWorktree;
+    } else {
+      if (!isPathWithin(repositoryRoot, plan.path))
+        throw new Error("Plan must be stored inside the Git repository.");
+      const current = await currentBranch(this.runCommand, options.cwd);
+      const planBranch = branchNameFromPlan(plan.path);
+      branch = options.useWorktree
+        ? current === baseBranch
+          ? planBranch
+          : `${current}-${planBranch}`
+        : current;
+      executionWorktreeCwd = options.useWorktree
+        ? await this.createExecutionWorktree(repositoryRoot, plan.path, branch)
+        : resolve(options.cwd);
+      if (options.useWorktree) {
+        executionPlanPath = worktreePlanPath(
+          executionWorktreeCwd,
+          repositoryRoot,
+          plan.path,
+        );
+        await copyPlanIntoWorktree(plan.path, executionPlanPath);
+      }
+    }
 
     const run = await this.registry.create({
       schemaVersion: 1,
       repositoryRoot,
       planPath: executionPlanPath,
       planHash: plan.hash,
-      worktreeCwd,
+      worktreeCwd: executionWorktreeCwd,
       branch,
       defaultBranch: baseBranch,
       status: RUN_STATUS.STARTING,

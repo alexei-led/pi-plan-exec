@@ -10,7 +10,8 @@ contracts and component ownership.
 
 - Pi in an **interactive** session. `/exec` asks whether to use a worktree.
 - A Git repository with a non-detached `HEAD`.
-- A plan file inside that repository.
+- A plan file inside that repository. When using an existing linked worktree,
+  the plan must be inside that selected worktree.
 - These independently installed Pi packages, at compatible versions. Use
   `pi-subagents` 0.60.x and `@tintinweb/pi-tasks` 0.9.x. Use the latest Bridge;
   v2 durable-operation and process-terminal capabilities enable automatic proof,
@@ -163,16 +164,32 @@ To choose a Markdown plan beneath `docs/plans/`, excluding directories named
 /exec
 ```
 
-The extension always asks whether to use the current checkout or an isolated
-Git worktree. Prefer the worktree. On selection, Pi forks the current session
-into the worktree; its tools, footer, and task projection then use the execution
-branch. Worktrees live outside the source repository:
+The extension asks whether to use the current checkout or an isolated Git
+worktree when no explicit target is supplied. Prefer the worktree for a new
+execution branch. On selection, Pi forks the current session into the worktree;
+its tools, footer, and task projection then use the execution branch. Worktrees
+created by plan-exec live outside the source repository:
 
 ```text
 ~/.pi/plan-exec/worktrees/
 ```
 
 No stage pushes or merges a branch.
+
+To continue a plan that already lives in a linked worktree, run this from any
+checkout of the same repository:
+
+```text
+/exec --worktree ../reflex.worktrees/feature docs/plans/20260713-add-greeting.md
+```
+
+The worktree path may be absolute or relative to the current Pi session. The
+plan path is resolved relative to the selected worktree. The target must be a
+registered linked worktree from the same Git repository and must have a named
+branch. Plan-exec keeps the existing branch and does not create or copy a plan.
+It also does not clean unrelated changes in the selected worktree; review them
+before starting. Only one non-terminal execution run may use a worktree or plan
+at a time.
 
 ## Commands
 

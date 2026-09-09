@@ -42,6 +42,7 @@ import {
   needsPlanStructureReview,
   parseResumeArguments,
   parseResumeOptions,
+  parseStartArguments,
   parseSkipReason,
   parseStatusArguments,
   reconcileForResume,
@@ -357,6 +358,31 @@ test("reload repairs terminal projections owned by the current session", () => {
   assert.equal(
     shouldRepairProjectionForSession(terminal, "foreign-session"),
     false,
+  );
+});
+
+test("start arguments accept an explicit existing worktree", () => {
+  assert.deepEqual(
+    parseStartArguments(
+      "--worktree /repo.worktrees/feature docs/plans/example.md",
+    ),
+    {
+      worktreePath: "/repo.worktrees/feature",
+      planPath: "docs/plans/example.md",
+    },
+  );
+  assert.deepEqual(
+    parseStartArguments(
+      "--worktree=/repo.worktrees/feature /tmp/plan.md",
+    ),
+    {
+      worktreePath: "/repo.worktrees/feature",
+      planPath: "/tmp/plan.md",
+    },
+  );
+  assert.throws(
+    () => parseStartArguments("--worktree /repo.worktrees/feature"),
+    /Usage: \/exec --worktree/,
   );
 });
 

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
-import { basename, dirname, resolve } from "node:path";
+import { basename, dirname, relative, resolve, sep } from "node:path";
 
 const PLAN_BRANCH_HASH_LENGTH = 8;
 const REPOSITORY_HASH_LENGTH = 12;
@@ -137,6 +137,31 @@ export async function createWorktree(
   return target;
 }
 
+export async function verifyExistingWorktree(
+  run: RunCommand,
+  repositoryRoot: string,
+  worktreeCwd: string,
+): Promise<void> {
+  const listed = await run(
+    "git",
+    ["worktree", "list", "--porcelain"],
+    repositoryRoot,
+  );
+  if (listed.code !== 0)
+    throw new Error("Unable to inspect Git worktrees.");
+  const normalizedTarget = resolve(worktreeCwd);
+  const registered = listed.stdout
+    .split("\n")
+    .filter((line) => line.startsWith("worktree "))
+    .map((line) => resolve(line.slice("worktree ".length).trim()))
+    .some((path) => path === normalizedTarget);
+  if (!registered)
+    throw new Error(
+      `Execution worktree is not registered with Git: ${worktreeCwd}`,
+    );
+  await verifyExecutionRepository(run, worktreeCwd, repositoryRoot);
+}
+
 export async function verifyExecutionRepository(
   run: RunCommand,
   cwd: string,
@@ -184,15 +209,19 @@ async function gitCommonDirectory(
   return resolve(result.stdout.trim());
 }
 
+export function isPathWithin(root: string, path: string): boolean {
+  const child = relative(resolve(root), resolve(path));
+  return child === "" || (!child.startsWith(`..${sep}`) && child !== "..");
+}
+
 export function worktreePlanPath(
   worktreeCwd: string,
   repositoryRoot: string,
   planPath: string,
 ): string {
-  const relative = resolve(planPath).slice(resolve(repositoryRoot).length + 1);
-  if (relative.startsWith(".."))
+  if (!isPathWithin(repositoryRoot, planPath))
     throw new Error("Plan must be inside the Git repository.");
-  return resolve(worktreeCwd, relative);
+  return resolve(worktreeCwd, relative(resolve(repositoryRoot), resolve(planPath)));
 }
 
 export function planDirectory(planPath: string): string {
