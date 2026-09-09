@@ -213,7 +213,7 @@ export class PlanExecController {
       unresolvedFindings: [],
       skippedStages: [],
       branchRebindings: [],
-    });
+    }, { exclusive: true });
     return this.advance(await this.registry.claim(run, options.sessionId));
   }
 

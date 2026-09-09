@@ -136,17 +136,20 @@ export class RunRegistry {
       skippedStages?: PlanExecRun["skippedStages"];
       branchRebindings?: PlanExecRun["branchRebindings"];
     },
+    options: { exclusive?: boolean } = {},
   ): Promise<PlanExecRun> {
     await mkdir(this.directory, { recursive: true });
     const registryLockPath = join(this.directory, "registry.lock");
     const registryLock = await acquireLock(registryLockPath);
     try {
-      const conflict = (await this.list()).find(
-        (existing) =>
-          !isTerminalStatus(existing.status) &&
-          (resolve(existing.worktreeCwd) === resolve(run.worktreeCwd) ||
-            resolve(existing.planPath) === resolve(run.planPath)),
-      );
+      const conflict = options.exclusive
+        ? (await this.list()).find(
+            (existing) =>
+              !isTerminalStatus(existing.status) &&
+              (resolve(existing.worktreeCwd) === resolve(run.worktreeCwd) ||
+                resolve(existing.planPath) === resolve(run.planPath)),
+          )
+        : undefined;
       if (conflict)
         throw new Error(
           `Plan execution already exists for ${

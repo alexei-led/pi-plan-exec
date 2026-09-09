@@ -92,17 +92,21 @@ function thisHost(): string {
 
 test("registry rejects a second nonterminal run in the same worktree or plan", async () => {
   const { registry } = await seedRegistry();
-  const first = await registry.create(runSeed({ status: "paused" }));
+  const first = await registry.create(runSeed({ status: "paused" }), {
+    exclusive: true,
+  });
 
   await assert.rejects(
     registry.create(
       runSeed({ planPath: "/repo/other.md", worktreeCwd: "/repo" }),
+      { exclusive: true },
     ),
     new RegExp(`same worktree.*${first.id}|worktree.*${first.id}`),
   );
   await assert.rejects(
     registry.create(
       runSeed({ planPath: "/repo/plan.md", worktreeCwd: "/other" }),
+      { exclusive: true },
     ),
     new RegExp(`same plan.*${first.id}|plan.*${first.id}`),
   );
