@@ -10,7 +10,7 @@ import {
 } from "node:fs/promises";
 import { homedir, hostname } from "node:os";
 import { dirname, join } from "node:path";
-import { canonicalPath } from "./git.js";
+import { canonicalPath, worktreeIdentity } from "./git.js";
 import { isSkippableStage, isTerminalStatus } from "./lifecycle.js";
 import {
   DEFAULT_FROZEN_RUN_CONFIG,
@@ -168,7 +168,7 @@ export class RunRegistry {
     const { runs, errors } = await this.listWithErrors();
     if (errors.length)
       throw new Error(`Cannot verify execution ownership: unreadable run ${errors[0]!.runId}. Use /exec status.`);
-    const worktree = await canonicalPath(run.worktreeCwd);
+    const worktree = await worktreeIdentity(run.worktreeCwd);
     const plan = await canonicalPath(run.planPath);
     for (const existing of runs) {
       if (existing.id === run.id) continue;
@@ -176,7 +176,7 @@ export class RunRegistry {
           existing.status !== RUN_STATUS.FAILED &&
           !existing.activeOperation &&
           !(existing.lease && isLeaseLive(existing.lease))) continue;
-      const sameWorktree = await canonicalPath(existing.worktreeCwd) === worktree;
+      const sameWorktree = await worktreeIdentity(existing.worktreeCwd) === worktree;
       const samePlan = await canonicalPath(existing.planPath) === plan;
       if (sameWorktree || samePlan)
         throw new Error(

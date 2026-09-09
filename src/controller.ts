@@ -193,7 +193,7 @@ export class PlanExecController {
         : current;
       executionWorktreeCwd = options.useWorktree
         ? await this.createExecutionWorktree(repositoryRoot, plan.path, branch)
-        : repositoryRoot;
+        : resolve(options.cwd);
       if (options.useWorktree) {
         executionPlanPath = worktreePlanPath(
           executionWorktreeCwd,
@@ -272,7 +272,7 @@ export class PlanExecController {
   ): Promise<PlanExecRun> {
     const existing = await this.registry.get(runId);
     if (!existing) throw new Error(`Plan execution run not found: ${runId}`);
-    await this.registry.assertExclusive(existing);
+    if (explicit) await this.registry.assertExclusive(existing);
     const claimed = await this.registry.claim(existing, sessionId);
     let prepared = claimed;
     if (explicit) {

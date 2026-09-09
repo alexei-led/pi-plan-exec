@@ -9,6 +9,7 @@ import {
   createWorktree,
   isPathWithin,
   verifyExistingWorktree,
+  worktreeIdentity,
 } from "../src/git.js";
 
 test("plan-derived branches include a stable path hash to avoid collisions", () => {
@@ -35,7 +36,12 @@ test("accepts a symlink alias of a registered worktree with a newline in its pat
   const target = resolve(root, "feature tree\nλ");
   const alias = resolve(root, "alias");
   await mkdir(target);
+  await mkdir(resolve(root, ".git"));
+  await mkdir(resolve(target, ".git"));
+  await mkdir(resolve(target, "nested"));
   await symlink(target, alias);
+  assert.equal(await worktreeIdentity(resolve(alias, "nested")), target);
+  assert.equal(await worktreeIdentity(root), root);
   const calls: Array<{ args: string[]; cwd: string }> = [];
   const run = async (_command: string, args: string[], cwd: string) => {
     calls.push({ args, cwd });
