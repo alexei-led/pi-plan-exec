@@ -4,6 +4,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  realpath,
   rm,
   stat,
   symlink,
@@ -144,6 +145,24 @@ test("concurrent starts through different path aliases admit exactly one run", a
   assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
   assert.equal(results.filter((result) => result.status === "rejected").length, 1);
   assert.equal((await registry.list()).length, 1);
+});
+
+test("deleted nested worktrees retain separate ownership from the enclosing checkout", async (t) => {
+  const { registry, directory } = await seedRegistry();
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const checkout = join(await realpath(directory), "checkout");
+  const removed = join(checkout, ".worktrees", "feature");
+  await mkdir(join(checkout, ".git"), { recursive: true });
+  await mkdir(join(removed, ".git"), { recursive: true });
+  const old = await registry.create(runSeed({ status: "failed", worktreeCwd: removed,
+    planPath: join(removed, "plan.md") }), { exclusive: true });
+  await rm(removed, { recursive: true, force: true });
+  const replacement = await registry.create(runSeed({ worktreeCwd: checkout,
+    planPath: join(checkout, "plan.md") }), { exclusive: true });
+  assert.notEqual(replacement.id, old.id);
+  await registry.assertExclusive(old);
+  await assert.rejects(registry.create(runSeed({ worktreeCwd: removed,
+    planPath: join(removed, "other.md") }), { exclusive: true }), new RegExp(old.id));
 });
 
 test("unreadable ownership records fail closed during exclusive creation", async () => {

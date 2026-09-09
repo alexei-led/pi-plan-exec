@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { access, realpath } from "node:fs/promises";
+import { access, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 
@@ -226,6 +226,12 @@ export async function canonicalPath(path: string): Promise<string> {
 /** Compare checkout ownership without changing a session's execution cwd. */
 export async function worktreeIdentity(cwd: string): Promise<string> {
   const canonical = await canonicalPath(cwd);
+  try {
+    if (!(await stat(canonical)).isDirectory()) return canonical;
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return canonical;
+    throw error;
+  }
   for (let directory = canonical; ; directory = dirname(directory)) {
     try {
       await access(resolve(directory, ".git"));
