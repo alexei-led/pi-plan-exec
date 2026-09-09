@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { homedir } from "node:os";
+import { mkdtemp, mkdir, realpath, rm, symlink } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { basename, resolve } from "node:path";
 import test from "node:test";
 import {
@@ -28,32 +29,40 @@ test("path containment does not confuse sibling repository names", () => {
   assert.equal(isPathWithin("/repo", "/other/example.md"), false);
 });
 
-test("accepts an existing linked worktree from the same repository", async () => {
+test("accepts a symlink alias of a registered worktree with a newline in its path", async (t) => {
+  const root = await realpath(await mkdtemp(resolve(tmpdir(), "exec-git-")));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const target = resolve(root, "feature tree\nλ");
+  const alias = resolve(root, "alias");
+  await mkdir(target);
+  await symlink(target, alias);
   const calls: Array<{ args: string[]; cwd: string }> = [];
   const run = async (_command: string, args: string[], cwd: string) => {
     calls.push({ args, cwd });
     if (args[0] === "worktree")
-      return { stdout: "worktree /repo\nworktree /repo.worktrees/feature\n", stderr: "", code: 0 };
+      return { stdout: `worktree ${root}\0\0worktree ${target}\0\0`, stderr: "", code: 0 };
     if (args.includes("--git-common-dir"))
       return { stdout: "/repo/.git\n", stderr: "", code: 0 };
     return { stdout: "", stderr: "", code: 0 };
   };
 
-  await verifyExistingWorktree(run, "/repo", "/repo.worktrees/feature");
+  assert.equal(await verifyExistingWorktree(run, root, alias), target);
   assert.deepEqual(calls[0], {
-    args: ["worktree", "list", "--porcelain"],
-    cwd: "/repo",
+    args: ["worktree", "list", "--porcelain", "-z"],
+    cwd: root,
   });
 });
 
-test("rejects a directory that is not a registered linked worktree", async () => {
+test("rejects a directory that is not a registered worktree", async (t) => {
+  const target = await mkdtemp(resolve(tmpdir(), "exec-git-"));
+  t.after(() => rm(target, { recursive: true, force: true }));
   const run = async () => ({
-    stdout: "worktree /repo\n",
+    stdout: "worktree /repo\0\0",
     stderr: "",
     code: 0,
   });
   await assert.rejects(
-    verifyExistingWorktree(run, "/repo", "/repo.worktrees/missing"),
+    verifyExistingWorktree(run, "/repo", target),
     /not registered with Git/,
   );
 });

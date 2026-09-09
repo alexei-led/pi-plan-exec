@@ -1,6 +1,6 @@
 import { access, readdir } from "node:fs/promises";
 import { hostname } from "node:os";
-import { basename, relative, resolve, sep } from "node:path";
+import { basename, relative, resolve } from "node:path";
 import {
   SessionManager,
   withFileMutationQueue,
@@ -33,7 +33,7 @@ import {
   type PendingGoalPlan,
 } from "./goal.js";
 import { Type } from "typebox";
-import { requireGitRepository } from "./git.js";
+import { isPathWithin, requireGitRepository } from "./git.js";
 import {
   ABANDONMENT,
   classifyAbandonment,
@@ -1350,33 +1350,29 @@ export function parseStartArguments(args: string): {
   planPath?: string;
   worktreePath?: string;
 } {
-  const tokens = args.split(/\s+/).filter(Boolean);
-  let planPath: string | undefined;
-  let worktreePath: string | undefined;
-  for (let index = 0; index < tokens.length; index += 1) {
-    const token = tokens[index]!;
-    if (token === EXISTING_WORKTREE_OPTION) {
-      worktreePath = tokens[++index];
-      if (!worktreePath)
-        throw new Error(`Usage: /exec ${EXISTING_WORKTREE_OPTION} <path> <plan-path>`);
-    } else if (token.startsWith(`${EXISTING_WORKTREE_OPTION}=`)) {
-      worktreePath = token.slice(`${EXISTING_WORKTREE_OPTION}=`.length);
-      if (!worktreePath)
-        throw new Error(`Usage: /exec ${EXISTING_WORKTREE_OPTION} <path> <plan-path>`);
-    } else if (token.startsWith("--")) {
-      throw new Error(`Unknown /exec start option: ${token}`);
-    } else if (planPath === undefined) {
-      planPath = token;
-    } else {
-      throw new Error(`Usage: /exec [${EXISTING_WORKTREE_OPTION} <path>] [plan-path]`);
-    }
-  }
-  if (worktreePath !== undefined && planPath === undefined)
+  const input = args.trim();
+  if (!input) return {};
+  // The remaining text is one plan path, preserving the original space syntax.
+  if (!input.startsWith("--")) return { planPath: unquoteStartPath(input) };
+  const match = /^--worktree(?:=|\s+)(?:"([^"]*)"|'([^']*)'|([^\s"']+))(?:\s+|$)/.exec(
+    input,
+  );
+  const worktreePath = match?.[1] ?? match?.[2] ?? match?.[3];
+  const planPath = match ? input.slice(match[0].length).trim() : "";
+  if (
+    !worktreePath || worktreePath.startsWith("--") ||
+    !planPath || planPath.startsWith("--")
+  )
     throw new Error(`Usage: /exec ${EXISTING_WORKTREE_OPTION} <path> <plan-path>`);
-  return {
-    ...(planPath === undefined ? {} : { planPath }),
-    ...(worktreePath === undefined ? {} : { worktreePath }),
-  };
+  return { worktreePath, planPath: unquoteStartPath(planPath) };
+}
+
+function unquoteStartPath(path: string): string {
+  const quote = path[0];
+  if (quote !== '"' && quote !== "'") return path;
+  if (path.length <= 2 || !path.endsWith(quote))
+    throw new Error("Plan path needs matching quotes and must not be empty.");
+  return path.slice(1, -1);
 }
 
 export function parseCleanupArguments(args: string[]): {
@@ -2990,7 +2986,7 @@ export function execHelp(): string {
   return [
     "Plan execution commands:",
     "/exec [plan-path]       Start a plan (bare /exec opens the plan picker).",
-    "/exec --worktree <path> <plan-path>  Execute a plan in an existing linked worktree.",
+    "/exec --worktree <path> <plan-path>  Execute a plan in an existing registered worktree.",
     "/exec status [run-id]   No run ID: every run grouped by what it needs, with any missing package and one next command per run. With a run ID: that run in detail.",
     `/exec resume [run-id] [${RECOVERY_MODEL_OPTION} current|provider/model]`,
     "                        Continue a stuck run: it takes the lease over from a dead session, resets a run whose worker is provably gone, and asks before retrying a blocked task or rebinding the current branch. Model/provider failures use the current Pi model.",
@@ -3003,7 +2999,7 @@ export function execHelp(): string {
     "",
     "Hints:",
     "- Prefer Worktree (isolated) when asked.",
-    "- Use --worktree when the plan and branch already exist in a linked worktree; the existing branch and unrelated changes are preserved.",
+    "- Use --worktree when the plan and branch already exist in a registered worktree; the existing branch and unrelated changes are preserved.",
     "- /exec status reports a missing package with the exact install commands, and diagnoses every run that claims a worker.",
     "- The footer shows live stage and worker progress.",
     "- /exec resume preserves the stage and worktree, and reconciles a known Bridge operation before retrying it.",
@@ -3042,11 +3038,6 @@ function minutesLabel(milliseconds: number): string {
 
 function relativeTime(timestamp: number): string {
   return `${elapsedLabel(Date.now() - timestamp)} ago`;
-}
-
-function isPathWithin(root: string, path: string): boolean {
-  const child = relative(resolve(root), resolve(path));
-  return child === "" || (!child.startsWith(`..${sep}`) && child !== "..");
 }
 
 async function chooseIsolation(ctx: ExtensionContext): Promise<boolean> {

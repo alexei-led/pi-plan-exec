@@ -26,7 +26,7 @@ runs review and fix stages with fresh Pi subagents and optional Fusion. A worker
 ## What it does
 
 - **Keeps one writer in one checkout.** `/exec` can create an isolated Git
-  worktree, work in place, or use an explicitly selected existing linked
+  worktree, work in place, or use an explicitly selected existing
   worktree. Existing-worktree runs keep that worktree and branch, and move the
   interactive Pi session there.
 - **Executes plans deterministically.** It selects the first incomplete task,
@@ -67,8 +67,7 @@ or run an existing executable plan:
 /reload
 /goal Add a greeting endpoint
 /exec docs/plans/20260713-add-greeting.md
-# Or execute a plan already stored in a linked worktree:
-/exec --worktree ../reflex.worktrees/feature docs/plans/20260713-add-greeting.md
+/exec --worktree ../project-feature docs/plans/20260713-add-greeting.md
 ```
 
 `/goal <short goal>` uses the current Pi session for read-only repository

@@ -8,7 +8,8 @@ contracts and component ownership.
 
 ## Requirements
 
-- Pi in an **interactive** session. `/exec` asks whether to use a worktree.
+- Pi in an **interactive** session for the plan/isolation pickers; an explicit
+  `--worktree` and plan path skip both pickers.
 - A Git repository with a non-detached `HEAD`.
 - A plan file inside that repository. When using an existing linked worktree,
   the plan must be inside that selected worktree.
@@ -184,12 +185,27 @@ checkout of the same repository:
 ```
 
 The worktree path may be absolute or relative to the current Pi session. The
-plan path is resolved relative to the selected worktree. The target must be a
-registered linked worktree from the same Git repository and must have a named
-branch. Plan-exec keeps the existing branch and does not create or copy a plan.
-It also does not clean unrelated changes in the selected worktree; review them
-before starting. Only one non-terminal execution run may use a worktree or plan
-at a time.
+plan path is resolved relative to the selected worktree; absolute plan paths
+must also remain inside it. The target must be a registered worktree of the
+same Git repository with a named branch. The main checkout is also accepted:
+`--worktree .` explicitly selects in-place execution from its root.
+Symlink aliases are resolved before validation. No worktrees are auto-detected.
+
+Put `--worktree` first. Use single or double quotes around a worktree path with
+spaces; the remaining text is one plan path, optionally quoted. Quotes group
+paths only: there is no shell expansion or backslash escaping.
+
+```text
+/exec --worktree "../feature tree" "docs/plans/my plan.md"
+```
+
+Plan-exec keeps the existing branch and does not create or copy a plan. It does
+not clean unrelated changes in the selected worktree; review them before
+starting and stop any other agent writing there. A non-terminal or failed run
+reserves its worktree and plan, even without a live lease. Use `/exec resume`
+for that run rather than starting another. Only settled completed or cancelled
+runs permit reuse. These checks cover plan-exec runs, not arbitrary editors or
+other agent processes.
 
 ## Commands
 
@@ -204,6 +220,7 @@ full ID is always in front of you.
 ```text
 /goal <short goal>      Prepare a repository-grounded validated plan; does not start it
 /exec [plan]            Start a run; bare /exec opens the plan picker
+/exec --worktree <path> <plan>  Use an existing worktree and its current branch
 /exec status [run-id]   No run ID: every run grouped by what it needs, any missing package, and one next command per run. With a run ID: that run in detail
 /exec resume [run-id] [--model current|provider/model]
                         Continue a stuck run: take the lease over from a dead session, reset a run whose worker is provably gone, retry a failure in the same stage and worktree

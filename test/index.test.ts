@@ -361,6 +361,16 @@ test("reload repairs terminal projections owned by the current session", () => {
   );
 });
 
+test("start paths preserve spaces and accept quoted explicit worktree paths", () => {
+  for (const input of ["docs/plans/my  plan.md", '"docs/plans/my  plan.md"', "'docs/plans/my  plan.md'"])
+    assert.deepEqual(parseStartArguments(input), { planPath: "docs/plans/my  plan.md" });
+  for (const input of ['--worktree "../feature tree" docs/plans/my  plan.md', "--worktree='../feature tree' 'docs/plans/my  plan.md'"])
+    assert.deepEqual(parseStartArguments(input), { worktreePath: "../feature tree", planPath: "docs/plans/my  plan.md" });
+  assert.deepEqual(parseStartArguments(""), {});
+  for (const input of ["--worktree", "--worktree=", '--worktree "" plan.md', "--worktree --unknown plan.md", '--worktree "broken plan.md', "--worktree target --worktree other plan.md", "--unknown plan.md", '"unterminated', '--worktree target ""'])
+    assert.throws(() => parseStartArguments(input), /Usage:|matching quotes/, input);
+});
+
 test("start arguments accept an explicit existing worktree", () => {
   assert.deepEqual(
     parseStartArguments(

@@ -9,7 +9,8 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { homedir, hostname } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join } from "node:path";
+import { canonicalPath } from "./git.js";
 import { isSkippableStage, isTerminalStatus } from "./lifecycle.js";
 import {
   DEFAULT_FROZEN_RUN_CONFIG,
@@ -142,22 +143,7 @@ export class RunRegistry {
     const registryLockPath = join(this.directory, "registry.lock");
     const registryLock = await acquireLock(registryLockPath);
     try {
-      const conflict = options.exclusive
-        ? (await this.list()).find(
-            (existing) =>
-              !isTerminalStatus(existing.status) &&
-              (resolve(existing.worktreeCwd) === resolve(run.worktreeCwd) ||
-                resolve(existing.planPath) === resolve(run.planPath)),
-          )
-        : undefined;
-      if (conflict)
-        throw new Error(
-          `Plan execution already exists for ${
-            resolve(conflict.worktreeCwd) === resolve(run.worktreeCwd)
-              ? "worktree"
-              : "plan"
-          }: ${conflict.id}. Use /exec status ${conflict.id} or /exec resume ${conflict.id}.`,
-        );
+      if (options.exclusive) await this.assertExclusive(run);
       const now = Date.now();
       const created: PlanExecRun = {
         ...run,
@@ -172,6 +158,30 @@ export class RunRegistry {
       return created;
     } finally {
       await releaseLock(registryLockPath, registryLock);
+    }
+  }
+
+  /** Create holds the registry lock; resume already owns a reserved run. */
+  async assertExclusive(
+    run: Pick<PlanExecRun, "worktreeCwd" | "planPath"> & { id?: string },
+  ): Promise<void> {
+    const { runs, errors } = await this.listWithErrors();
+    if (errors.length)
+      throw new Error(`Cannot verify execution ownership: unreadable run ${errors[0]!.runId}. Use /exec status.`);
+    const worktree = await canonicalPath(run.worktreeCwd);
+    const plan = await canonicalPath(run.planPath);
+    for (const existing of runs) {
+      if (existing.id === run.id) continue;
+      if (isTerminalStatus(existing.status) &&
+          existing.status !== RUN_STATUS.FAILED &&
+          !existing.activeOperation &&
+          !(existing.lease && isLeaseLive(existing.lease))) continue;
+      const sameWorktree = await canonicalPath(existing.worktreeCwd) === worktree;
+      const samePlan = await canonicalPath(existing.planPath) === plan;
+      if (sameWorktree || samePlan)
+        throw new Error(
+          `Plan execution already exists for ${sameWorktree ? "worktree" : "plan"}: ${existing.id}. Use /exec status ${existing.id} or /exec resume ${existing.id}.`,
+        );
     }
   }
 

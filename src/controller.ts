@@ -4,6 +4,7 @@ import {
   lstat,
   mkdir,
   readFile,
+  realpath,
   rename,
   writeFile,
 } from "node:fs/promises";
@@ -152,7 +153,15 @@ export class PlanExecController {
   ) {}
 
   async start(options: StartRunOptions): Promise<PlanExecRun> {
-    const plan = await readPlan(options.planPath);
+    if (options.existingWorktree !== undefined && options.useWorktree)
+      throw new Error("Choose either an existing worktree or a new worktree.");
+    const targetPath = options.existingWorktree === undefined
+      ? options.cwd
+      : resolve(options.cwd, options.existingWorktree);
+    const requestedPlan = resolve(targetPath, options.planPath);
+    const plan = await readPlan(options.existingWorktree === undefined
+      ? requestedPlan
+      : await realpath(requestedPlan));
     const repositoryRoot = await requireGitRepository(
       this.runCommand,
       options.cwd,
@@ -163,11 +172,10 @@ export class PlanExecController {
     let executionPlanPath = plan.path;
 
     if (options.existingWorktree !== undefined) {
-      const targetWorktree = resolve(options.existingWorktree);
-      await verifyExistingWorktree(
+      const targetWorktree = await verifyExistingWorktree(
         this.runCommand,
         repositoryRoot,
-        targetWorktree,
+        targetPath,
       );
       if (!isPathWithin(targetWorktree, plan.path))
         throw new Error("Plan must be inside the selected Git worktree.");
@@ -185,7 +193,7 @@ export class PlanExecController {
         : current;
       executionWorktreeCwd = options.useWorktree
         ? await this.createExecutionWorktree(repositoryRoot, plan.path, branch)
-        : resolve(options.cwd);
+        : repositoryRoot;
       if (options.useWorktree) {
         executionPlanPath = worktreePlanPath(
           executionWorktreeCwd,
@@ -264,6 +272,7 @@ export class PlanExecController {
   ): Promise<PlanExecRun> {
     const existing = await this.registry.get(runId);
     if (!existing) throw new Error(`Plan execution run not found: ${runId}`);
+    await this.registry.assertExclusive(existing);
     const claimed = await this.registry.claim(existing, sessionId);
     let prepared = claimed;
     if (explicit) {
@@ -335,6 +344,7 @@ export class PlanExecController {
   ): Promise<PlanExecRun> {
     const existing = await this.registry.get(runId);
     if (!existing) throw new Error(`Plan execution run not found: ${runId}`);
+    await this.registry.assertExclusive(existing);
     const claimed = await this.registry.claim(existing, sessionId);
     if (
       isTerminalStatus(claimed.status) &&
