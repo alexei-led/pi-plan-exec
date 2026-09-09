@@ -4,8 +4,10 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  realpath,
   rm,
   stat,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
@@ -89,6 +91,86 @@ async function seedRegistry(): Promise<{
 function thisHost(): string {
   return hostname().split(".")[0]!;
 }
+
+test("registry rejects a second nonterminal run in the same worktree or plan", async () => {
+  const { registry } = await seedRegistry();
+  const first = await registry.create(runSeed({ status: "paused" }), {
+    exclusive: true,
+  });
+
+  await assert.rejects(
+    registry.create(
+      runSeed({ planPath: "/repo/other.md", worktreeCwd: "/repo" }),
+      { exclusive: true },
+    ),
+    new RegExp(`same worktree.*${first.id}|worktree.*${first.id}`),
+  );
+  await assert.rejects(
+    registry.create(
+      runSeed({ planPath: "/repo/plan.md", worktreeCwd: "/other" }),
+      { exclusive: true },
+    ),
+    new RegExp(`same plan.*${first.id}|plan.*${first.id}`),
+  );
+
+  await registry.update({ ...first, status: "completed" });
+  const replacement = await registry.create(runSeed(), { exclusive: true });
+  assert.notEqual(replacement.id, first.id);
+});
+
+test("exclusive creation blocks all resumable statuses and permits only settled terminal runs", async () => {
+  for (const status of ["starting", "running", "paused", "failed", "skip_pending", "cancel_pending", "completed", "completed_with_findings", "cancelled"] as const) {
+    const { registry } = await seedRegistry();
+    const old = await registry.create(runSeed({ status }));
+    const create = () => registry.create(runSeed(), { exclusive: true });
+    if (["completed", "completed_with_findings", "cancelled"].includes(status)) {
+      assert.ok((await create()).id !== old.id, status);
+    } else {
+      await assert.rejects(create(), new RegExp(old.id), status);
+    }
+  }
+});
+
+test("concurrent starts through different path aliases admit exactly one run", async (t) => {
+  const { registry, directory } = await seedRegistry();
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const target = join(directory, "target");
+  const alias = join(directory, "alias");
+  await mkdir(target);
+  await symlink(target, alias);
+  const results = await Promise.allSettled([
+    registry.create(runSeed({ worktreeCwd: target, planPath: join(target, "a.md") }), { exclusive: true }),
+    new RunRegistry(directory).create(runSeed({ worktreeCwd: alias, planPath: join(alias, "b.md") }), { exclusive: true }),
+  ]);
+  assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
+  assert.equal(results.filter((result) => result.status === "rejected").length, 1);
+  assert.equal((await registry.list()).length, 1);
+});
+
+test("deleted nested worktrees retain separate ownership from the enclosing checkout", async (t) => {
+  const { registry, directory } = await seedRegistry();
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const checkout = join(await realpath(directory), "checkout");
+  const removed = join(checkout, ".worktrees", "feature");
+  await mkdir(join(checkout, ".git"), { recursive: true });
+  await mkdir(join(removed, ".git"), { recursive: true });
+  const old = await registry.create(runSeed({ status: "failed", worktreeCwd: removed,
+    planPath: join(removed, "plan.md") }), { exclusive: true });
+  await rm(removed, { recursive: true, force: true });
+  const replacement = await registry.create(runSeed({ worktreeCwd: checkout,
+    planPath: join(checkout, "plan.md") }), { exclusive: true });
+  assert.notEqual(replacement.id, old.id);
+  await registry.assertExclusive(old);
+  await assert.rejects(registry.create(runSeed({ worktreeCwd: removed,
+    planPath: join(removed, "other.md") }), { exclusive: true }), new RegExp(old.id));
+});
+
+test("unreadable ownership records fail closed during exclusive creation", async () => {
+  const { registry, directory } = await seedRegistry();
+  const old = await registry.create(runSeed());
+  await writeFile(join(directory, old.id, "run.json"), "not JSON");
+  await assert.rejects(registry.create(runSeed(), { exclusive: true }), /unreadable run/);
+});
 
 test("registry persists runs, protects path traversal, and reclaims stale leases", async () => {
   const { registry } = await seedRegistry();

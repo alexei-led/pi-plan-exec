@@ -4,6 +4,8 @@ import {
   mkdtemp,
   mkdir,
   readFile,
+  realpath,
+  rm,
   symlink,
   writeFile,
 } from "node:fs/promises";
@@ -27,6 +29,188 @@ const success = (data: Record<string, unknown>) => ({
   success: true as const,
   data,
 });
+
+test("existing linked worktree execution keeps its branch and plan", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-")));
+  const target = join(root, "feature-worktree");
+  const planPath = join(target, "docs", "plans", "example.md");
+  await mkdir(join(target, "docs", "plans"), { recursive: true });
+  await writeFile(planPath, "### Task 1: Implement\n- [ ] Do the work\n");
+  const calls: string[][] = [];
+  const runCommand = async (_command: string, args: string[], cwd: string) => {
+    calls.push([cwd, ...args]);
+    if (args[0] === "symbolic-ref")
+      return { stdout: "origin/main\n", stderr: "", code: 0 };
+    if (args[0] === "branch")
+      return { stdout: cwd === target ? "feature/existing\n" : "main\n", stderr: "", code: 0 };
+    if (args[0] === "worktree")
+      return {
+        stdout: `worktree ${root}\0\0worktree ${target}\0\0`,
+        stderr: "",
+        code: 0,
+      };
+    if (args.includes("--git-common-dir"))
+      return { stdout: `${root}/.git\n`, stderr: "", code: 0 };
+    return { stdout: `${root}\n`, stderr: "", code: 0 };
+  };
+  const controller = new PlanExecController(
+    new RunRegistry(join(root, "runs")),
+    new FakeBridge(join(root, "none.json")),
+    new FakeFusion(),
+    runCommand,
+  );
+
+  const run = await controller.start({
+    cwd: root,
+    planPath,
+    useWorktree: false,
+    existingWorktree: target,
+    sessionId: "session-1",
+  });
+
+  assert.equal(run.branch, "feature/existing");
+  assert.equal(run.worktreeCwd, target);
+  assert.equal(run.planPath, planPath);
+  assert.equal(calls.some((call) => call.includes("add")), false);
+});
+
+test("existing linked worktree rejects a plan outside the selected worktree", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
+  const target = join(root, "feature-worktree");
+  const planPath = join(root, "plan.md");
+  await mkdir(target, { recursive: true });
+  await writeFile(planPath, "### Task 1: Implement\n- [ ] Do the work\n");
+  const controller = new PlanExecController(
+    new RunRegistry(join(root, "runs")),
+    new FakeBridge(join(root, "none.json")),
+    new FakeFusion(),
+    async (_command, args) => {
+      if (args[0] === "worktree")
+        return { stdout: `worktree ${target}\0\0`, stderr: "", code: 0 };
+      if (args.includes("--git-common-dir"))
+        return { stdout: `${root}/.git\n`, stderr: "", code: 0 };
+      if (args[0] === "branch")
+        return { stdout: "feature/existing\n", stderr: "", code: 0 };
+      return { stdout: `${root}\n`, stderr: "", code: 0 };
+    },
+  );
+
+  await assert.rejects(
+    controller.start({
+      cwd: root,
+      planPath,
+      useWorktree: false,
+      existingWorktree: target,
+      sessionId: "session-1",
+    }),
+    /inside the selected Git worktree/,
+  );
+});
+
+test("real Git existing-worktree start validates paths and retains dirty branch state", async (t) => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "exec-real-worktree-")));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const source = join(root, "source");
+  const target = join(root, "feature tree\nλ");
+  const alias = join(root, "alias");
+  await mkdir(source);
+  const command = realGit();
+  const git = async (cwd: string, args: string[]) => {
+    const result = await command("git", args, cwd);
+    assert.equal(result.code, 0, result.stderr);
+    return result.stdout;
+  };
+  await git(source, ["init", "-b", "main"]);
+  await git(source, ["-c", "user.name=Test", "-c", "user.email=test@example.org",
+    "-c", "commit.gpgSign=false", "-c", "core.hooksPath=/dev/null",
+    "commit", "--allow-empty", "-m", "initial"]);
+  await git(source, ["worktree", "add", "-b", "feature/existing", target]);
+  await symlink(target, alias);
+  const planPath = join(target, "plan with spaces.md");
+  const plan = "### Task 1: Implement\n- [ ] Do the work\n";
+  await writeFile(planPath, plan);
+  await writeFile(join(source, "source-dirty.txt"), "untouched source");
+  await writeFile(join(target, "target-dirty.txt"), "untouched target");
+  const before = await git(target, ["status", "--porcelain", "-z"]);
+  const registry = new RunRegistry(join(root, "runs"));
+  const controller = new PlanExecController(registry,
+    new FakeBridge(join(root, "none.json")), new FakeFusion(), command);
+  const options = { cwd: source, existingWorktree: alias,
+    planPath: "plan with spaces.md", useWorktree: false, sessionId: "session-1" };
+  const run = await controller.start(options);
+  assert.equal(run.repositoryRoot, source);
+  assert.equal(run.worktreeCwd, target);
+  assert.equal(run.planPath, planPath);
+  assert.equal(run.branch, "feature/existing");
+  assert.equal(run.stage, "project_tasks");
+  assert.equal(await git(source, ["branch", "--show-current"]), "main\n");
+  assert.equal(await readFile(planPath, "utf8"), plan);
+  assert.equal(await git(target, ["status", "--porcelain", "-z"]), before);
+  await assert.rejects(controller.start(options), /already exists for worktree/);
+  await assert.rejects(controller.start({ ...options, planPath: "../source/plan.md" }), /ENOENT/);
+  const outsidePlan = join(source, "outside.md");
+  await writeFile(outsidePlan, plan);
+  await symlink(outsidePlan, join(target, "escape.md"));
+  await assert.rejects(controller.start({ ...options, planPath: "escape.md" }), /inside the selected Git worktree/);
+  await git(target, ["checkout", "--detach"]);
+  await assert.rejects(controller.start(options), /Detached HEAD/);
+  const foreign = join(root, "foreign");
+  await mkdir(foreign);
+  await git(foreign, ["init", "-b", "main"]);
+  await writeFile(join(foreign, "plan.md"), plan);
+  await assert.rejects(controller.start({ ...options, existingWorktree: foreign, planPath: "plan.md" }), /not registered/);
+  await assert.rejects(controller.start({ ...options, existingWorktree: source, planPath: "outside.md", useWorktree: true }), /either an existing/);
+  const mainRun = await controller.start({ ...options, existingWorktree: source, planPath: "outside.md" });
+  assert.equal(mainRun.branch, "main");
+  assert.equal(mainRun.worktreeCwd, source);
+  await registry.release(await registry.update({ ...mainRun, status: "completed" }));
+  const subdir = join(source, "packages", "api");
+  await mkdir(subdir, { recursive: true });
+  const inPlace = await controller.start({ cwd: subdir, planPath: outsidePlan,
+    useWorktree: false, sessionId: "session-1" });
+  assert.equal(inPlace.worktreeCwd, subdir);
+  assert.equal(inPlace.repositoryRoot, source);
+  const otherPlan = join(source, "other.md");
+  await writeFile(otherPlan, plan);
+  await assert.rejects(controller.start({ ...options, existingWorktree: source, planPath: otherPlan }), /already exists for worktree/);
+});
+
+test("resume refuses a legacy failed run when another run owns its worktree", async () => {
+  const root = await mkdtemp(join(tmpdir(), "exec-resume-conflict-"));
+  const registry = new RunRegistry(join(root, "runs"));
+  const bridge = new FakeBridge(join(root, "none.json"));
+  const controller = new PlanExecController(registry, bridge, new FakeFusion(), fakeGit(root));
+  const failed = await registry.create({ ...baseRun(root, join(root, "plan.md")), status: "failed" });
+  const active = await registry.create(baseRun(root, join(root, "other.md")));
+  await assert.rejects(controller.resume(failed.id, "session-1"), new RegExp(active.id));
+  await assert.rejects(controller.rebindBranchAndResume(failed.id, "session-1"), new RegExp(active.id));
+  assert.equal(bridge.spawnCount, 0);
+  assert.equal((await registry.get(failed.id))?.lease, undefined);
+});
+
+for (const blocker of ["unreadable", "legacy-conflict"] as const) {
+  test(`background advance ignores ${blocker} while explicit resume refuses it`, async (t) => {
+    const root = await mkdtemp(join(tmpdir(), "exec-background-ownership-"));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const registry = new RunRegistry(join(root, "runs"));
+    const planPath = join(root, "plan.md");
+    await writeFile(planPath, "### Task 1: Implement\n- [ ] Do the work\n");
+    const controller = new PlanExecController(registry,
+      new FakeBridge(join(root, "none.json")), new FakeFusion(), fakeGit(root));
+    const started = await controller.start({ cwd: root, planPath,
+      useWorktree: false, sessionId: "session-1" });
+    const unrelated = await registry.create({
+      ...baseRun(root, join(root, "other.md")), status: "failed",
+    });
+    if (blocker === "unreadable")
+      await writeFile(join(root, "runs", unrelated.id, "run.json"), "not JSON");
+    const advanced = await controller.resume(started.id, "session-1", false);
+    assert.equal(advanced.status, "running");
+    await assert.rejects(controller.resume(started.id, "session-1"),
+      /unreadable run|already exists for worktree/);
+    assert.equal((await registry.get(started.id))?.status, "running");
+  });
+}
 
 test("in-place execution on the default branch keeps that branch", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));

@@ -8,9 +8,11 @@ contracts and component ownership.
 
 ## Requirements
 
-- Pi in an **interactive** session. `/exec` asks whether to use a worktree.
+- Pi in an **interactive** session for the plan/isolation pickers; an explicit
+  `--worktree` and plan path skip both pickers.
 - A Git repository with a non-detached `HEAD`.
-- A plan file inside that repository.
+- A plan file inside that repository. When using an existing linked worktree,
+  the plan must be inside that selected worktree.
 - These independently installed Pi packages, at compatible versions. Use
   `pi-subagents` 0.60.x and `@tintinweb/pi-tasks` 0.9.x. Use the latest Bridge;
   v2 durable-operation and process-terminal capabilities enable automatic proof,
@@ -163,16 +165,47 @@ To choose a Markdown plan beneath `docs/plans/`, excluding directories named
 /exec
 ```
 
-The extension always asks whether to use the current checkout or an isolated
-Git worktree. Prefer the worktree. On selection, Pi forks the current session
-into the worktree; its tools, footer, and task projection then use the execution
-branch. Worktrees live outside the source repository:
+The extension asks whether to use the current checkout or an isolated Git
+worktree when no explicit target is supplied. Prefer the worktree for a new
+execution branch. On selection, Pi forks the current session into the worktree;
+its tools, footer, and task projection then use the execution branch. Worktrees
+created by plan-exec live outside the source repository:
 
 ```text
 ~/.pi/plan-exec/worktrees/
 ```
 
 No stage pushes or merges a branch.
+
+To continue a plan that already lives in a linked worktree, run this from any
+checkout of the same repository:
+
+```text
+/exec --worktree ../reflex.worktrees/feature docs/plans/20260713-add-greeting.md
+```
+
+The worktree path may be absolute or relative to the current Pi session. The
+plan path is resolved relative to the selected worktree; absolute plan paths
+must also remain inside it. The target must be a registered worktree of the
+same Git repository with a named branch. The main checkout is also accepted:
+`--worktree .` explicitly selects in-place execution from its root.
+Symlink aliases are resolved before validation. No worktrees are auto-detected.
+
+Put `--worktree` first. Use single or double quotes around a worktree path with
+spaces; the remaining text is one plan path, optionally quoted. Quotes group
+paths only: there is no shell expansion or backslash escaping.
+
+```text
+/exec --worktree "../feature tree" "docs/plans/my plan.md"
+```
+
+Plan-exec keeps the existing branch and does not create or copy a plan. It does
+not clean unrelated changes in the selected worktree; review them before
+starting and stop any other agent writing there. A non-terminal or failed run
+reserves its worktree and plan, even without a live lease. Use `/exec resume`
+for that run rather than starting another. Only settled completed or cancelled
+runs permit reuse. These checks cover plan-exec runs, not arbitrary editors or
+other agent processes.
 
 ## Commands
 
@@ -187,6 +220,7 @@ full ID is always in front of you.
 ```text
 /goal <short goal>      Prepare a repository-grounded validated plan; does not start it
 /exec [plan]            Start a run; bare /exec opens the plan picker
+/exec --worktree <path> <plan>  Use an existing worktree and its current branch
 /exec status [run-id]   No run ID: every run grouped by what it needs, any missing package, and one next command per run. With a run ID: that run in detail
 /exec resume [run-id] [--model current|provider/model]
                         Continue a stuck run: take the lease over from a dead session, reset a run whose worker is provably gone, retry a failure in the same stage and worktree

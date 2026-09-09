@@ -10,6 +10,7 @@ import {
 } from "node:fs/promises";
 import { homedir, hostname } from "node:os";
 import { dirname, join } from "node:path";
+import { canonicalPath, worktreeIdentity } from "./git.js";
 import { isSkippableStage, isTerminalStatus } from "./lifecycle.js";
 import {
   DEFAULT_FROZEN_RUN_CONFIG,
@@ -136,19 +137,52 @@ export class RunRegistry {
       skippedStages?: PlanExecRun["skippedStages"];
       branchRebindings?: PlanExecRun["branchRebindings"];
     },
+    options: { exclusive?: boolean } = {},
   ): Promise<PlanExecRun> {
-    const now = Date.now();
-    const created: PlanExecRun = {
-      ...run,
-      skippedStages: run.skippedStages ?? [],
-      branchRebindings: run.branchRebindings ?? [],
-      id: randomUUID(),
-      revision: 1,
-      createdAt: now,
-      updatedAt: now,
-    };
-    await this.write(created);
-    return created;
+    await mkdir(this.directory, { recursive: true });
+    const registryLockPath = join(this.directory, "registry.lock");
+    const registryLock = await acquireLock(registryLockPath);
+    try {
+      if (options.exclusive) await this.assertExclusive(run);
+      const now = Date.now();
+      const created: PlanExecRun = {
+        ...run,
+        skippedStages: run.skippedStages ?? [],
+        branchRebindings: run.branchRebindings ?? [],
+        id: randomUUID(),
+        revision: 1,
+        createdAt: now,
+        updatedAt: now,
+      };
+      await this.write(created);
+      return created;
+    } finally {
+      await releaseLock(registryLockPath, registryLock);
+    }
+  }
+
+  /** Create holds the registry lock; resume already owns a reserved run. */
+  async assertExclusive(
+    run: Pick<PlanExecRun, "worktreeCwd" | "planPath"> & { id?: string },
+  ): Promise<void> {
+    const { runs, errors } = await this.listWithErrors();
+    if (errors.length)
+      throw new Error(`Cannot verify execution ownership: unreadable run ${errors[0]!.runId}. Use /exec status.`);
+    const worktree = await worktreeIdentity(run.worktreeCwd);
+    const plan = await canonicalPath(run.planPath);
+    for (const existing of runs) {
+      if (existing.id === run.id) continue;
+      if (isTerminalStatus(existing.status) &&
+          existing.status !== RUN_STATUS.FAILED &&
+          !existing.activeOperation &&
+          !(existing.lease && isLeaseLive(existing.lease))) continue;
+      const sameWorktree = await worktreeIdentity(existing.worktreeCwd) === worktree;
+      const samePlan = await canonicalPath(existing.planPath) === plan;
+      if (sameWorktree || samePlan)
+        throw new Error(
+          `Plan execution already exists for ${sameWorktree ? "worktree" : "plan"}: ${existing.id}. Use /exec status ${existing.id} or /exec resume ${existing.id}.`,
+        );
+    }
   }
 
   async get(runId: string): Promise<PlanExecRun | undefined> {

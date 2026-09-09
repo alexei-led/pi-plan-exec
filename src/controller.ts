@@ -4,6 +4,7 @@ import {
   lstat,
   mkdir,
   readFile,
+  realpath,
   rename,
   writeFile,
 } from "node:fs/promises";
@@ -37,7 +38,9 @@ import {
   currentBranch,
   defaultBranch,
   ensureCleanForWorktree,
+  isPathWithin,
   requireGitRepository,
+  verifyExistingWorktree,
   verifyExecutionRepository,
   verifyExecutionTree,
   worktreePlanPath,
@@ -135,6 +138,8 @@ export interface StartRunOptions {
   cwd: string;
   planPath: string;
   useWorktree: boolean;
+  /** Use this already-registered linked worktree instead of creating one. */
+  existingWorktree?: string;
   sessionId: string;
 }
 
@@ -148,37 +153,63 @@ export class PlanExecController {
   ) {}
 
   async start(options: StartRunOptions): Promise<PlanExecRun> {
-    const plan = await readPlan(options.planPath);
+    if (options.existingWorktree !== undefined && options.useWorktree)
+      throw new Error("Choose either an existing worktree or a new worktree.");
+    const targetPath = options.existingWorktree === undefined
+      ? options.cwd
+      : resolve(options.cwd, options.existingWorktree);
+    const requestedPlan = resolve(targetPath, options.planPath);
+    const plan = await readPlan(options.existingWorktree === undefined
+      ? requestedPlan
+      : await realpath(requestedPlan));
     const repositoryRoot = await requireGitRepository(
       this.runCommand,
       options.cwd,
     );
-    if (!plan.path.startsWith(repositoryRoot)) {
-      throw new Error("Plan must be stored inside the Git repository.");
-    }
     const baseBranch = await defaultBranch(this.runCommand, repositoryRoot);
-    const current = await currentBranch(this.runCommand, options.cwd);
-    const planBranch = branchNameFromPlan(plan.path);
-    const branch = options.useWorktree
-      ? current === baseBranch
-        ? planBranch
-        : `${current}-${planBranch}`
-      : current;
-    const worktreeCwd = options.useWorktree
-      ? await this.createExecutionWorktree(repositoryRoot, plan.path, branch)
-      : options.cwd;
-    const executionPlanPath = options.useWorktree
-      ? worktreePlanPath(worktreeCwd, repositoryRoot, plan.path)
-      : plan.path;
-    if (options.useWorktree)
-      await copyPlanIntoWorktree(plan.path, executionPlanPath);
+    let branch: string;
+    let executionWorktreeCwd: string;
+    let executionPlanPath = plan.path;
+
+    if (options.existingWorktree !== undefined) {
+      const targetWorktree = await verifyExistingWorktree(
+        this.runCommand,
+        repositoryRoot,
+        targetPath,
+      );
+      if (!isPathWithin(targetWorktree, plan.path))
+        throw new Error("Plan must be inside the selected Git worktree.");
+      branch = await currentBranch(this.runCommand, targetWorktree);
+      executionWorktreeCwd = targetWorktree;
+    } else {
+      if (!isPathWithin(repositoryRoot, plan.path))
+        throw new Error("Plan must be stored inside the Git repository.");
+      const current = await currentBranch(this.runCommand, options.cwd);
+      const planBranch = branchNameFromPlan(plan.path);
+      branch = options.useWorktree
+        ? current === baseBranch
+          ? planBranch
+          : `${current}-${planBranch}`
+        : current;
+      executionWorktreeCwd = options.useWorktree
+        ? await this.createExecutionWorktree(repositoryRoot, plan.path, branch)
+        : resolve(options.cwd);
+      if (options.useWorktree) {
+        executionPlanPath = worktreePlanPath(
+          executionWorktreeCwd,
+          repositoryRoot,
+          plan.path,
+        );
+        await copyPlanIntoWorktree(plan.path, executionPlanPath);
+      }
+    }
 
     const run = await this.registry.create({
       schemaVersion: 1,
       repositoryRoot,
       planPath: executionPlanPath,
       planHash: plan.hash,
-      worktreeCwd,
+      worktreeCwd: executionWorktreeCwd,
       branch,
       defaultBranch: baseBranch,
       status: RUN_STATUS.STARTING,
@@ -190,7 +221,7 @@ export class PlanExecController {
       unresolvedFindings: [],
       skippedStages: [],
       branchRebindings: [],
-    });
+    }, { exclusive: true });
     return this.advance(await this.registry.claim(run, options.sessionId));
   }
 
@@ -241,6 +272,7 @@ export class PlanExecController {
   ): Promise<PlanExecRun> {
     const existing = await this.registry.get(runId);
     if (!existing) throw new Error(`Plan execution run not found: ${runId}`);
+    if (explicit) await this.registry.assertExclusive(existing);
     const claimed = await this.registry.claim(existing, sessionId);
     let prepared = claimed;
     if (explicit) {
@@ -312,6 +344,7 @@ export class PlanExecController {
   ): Promise<PlanExecRun> {
     const existing = await this.registry.get(runId);
     if (!existing) throw new Error(`Plan execution run not found: ${runId}`);
+    await this.registry.assertExclusive(existing);
     const claimed = await this.registry.claim(existing, sessionId);
     if (
       isTerminalStatus(claimed.status) &&

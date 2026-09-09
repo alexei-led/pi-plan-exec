@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
+import { access, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, resolve } from "node:path";
+import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 
 const PLAN_BRANCH_HASH_LENGTH = 8;
 const REPOSITORY_HASH_LENGTH = 12;
@@ -137,6 +138,34 @@ export async function createWorktree(
   return target;
 }
 
+export async function verifyExistingWorktree(
+  run: RunCommand,
+  repositoryRoot: string,
+  worktreeCwd: string,
+): Promise<string> {
+  const normalizedTarget = await realpath(worktreeCwd);
+  const listed = await run(
+    "git",
+    ["worktree", "list", "--porcelain", "-z"],
+    repositoryRoot,
+  );
+  if (listed.code !== 0)
+    throw new Error("Unable to inspect Git worktrees.");
+  const registeredPaths = await Promise.all(
+    listed.stdout
+      .split("\0")
+      .filter((field) => field.startsWith("worktree "))
+      .map((field) => canonicalPath(field.slice("worktree ".length))),
+  );
+  const registered = registeredPaths.includes(normalizedTarget);
+  if (!registered)
+    throw new Error(
+      `Execution worktree is not registered with Git: ${worktreeCwd}`,
+    );
+  await verifyExecutionRepository(run, normalizedTarget, repositoryRoot);
+  return normalizedTarget;
+}
+
 export async function verifyExecutionRepository(
   run: RunCommand,
   cwd: string,
@@ -181,7 +210,43 @@ async function gitCommonDirectory(
   if (result.code !== 0 || !result.stdout.trim()) {
     throw new Error("Unable to identify the Git common directory.");
   }
-  return resolve(result.stdout.trim());
+  return canonicalPath(result.stdout.trim());
+}
+
+/** Missing archived paths retain a comparable absolute identity. */
+export async function canonicalPath(path: string): Promise<string> {
+  try {
+    return await realpath(path);
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return resolve(path);
+    throw error;
+  }
+}
+
+/** Compare checkout ownership without changing a session's execution cwd. */
+export async function worktreeIdentity(cwd: string): Promise<string> {
+  const canonical = await canonicalPath(cwd);
+  try {
+    if (!(await stat(canonical)).isDirectory()) return canonical;
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return canonical;
+    throw error;
+  }
+  for (let directory = canonical; ; directory = dirname(directory)) {
+    try {
+      await access(resolve(directory, ".git"));
+      return directory;
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    if (dirname(directory) === directory) return canonical;
+  }
+}
+
+export function isPathWithin(root: string, path: string): boolean {
+  const child = relative(resolve(root), resolve(path));
+  return child === "" ||
+    (!isAbsolute(child) && !child.startsWith(`..${sep}`) && child !== "..");
 }
 
 export function worktreePlanPath(
@@ -189,10 +254,12 @@ export function worktreePlanPath(
   repositoryRoot: string,
   planPath: string,
 ): string {
-  const relative = resolve(planPath).slice(resolve(repositoryRoot).length + 1);
-  if (relative.startsWith(".."))
+  if (!isPathWithin(repositoryRoot, planPath))
     throw new Error("Plan must be inside the Git repository.");
-  return resolve(worktreeCwd, relative);
+  return resolve(
+    worktreeCwd,
+    relative(resolve(repositoryRoot), resolve(planPath)),
+  );
 }
 
 export function planDirectory(planPath: string): string {

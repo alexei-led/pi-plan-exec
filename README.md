@@ -25,9 +25,10 @@ runs review and fix stages with fresh Pi subagents and optional Fusion. A worker
 
 ## What it does
 
-- **Keeps one writer in one checkout.** `/exec` always asks whether to use an
-  isolated Git worktree or work in place. Isolated runs move the interactive Pi
-  session into that worktree, so its tools and footer use the execution branch.
+- **Keeps one writer in one checkout.** `/exec` can create an isolated Git
+  worktree, work in place, or use an explicitly selected existing
+  worktree. Existing-worktree runs keep that worktree and branch, and move the
+  interactive Pi session there.
 - **Executes plans deterministically.** It selects the first incomplete task,
   starts a fresh worker, and verifies completion from the plan checkboxes.
 - **Recovers deliberately.** A reload reattaches a matching run owned by the
@@ -66,6 +67,7 @@ or run an existing executable plan:
 /reload
 /goal Add a greeting endpoint
 /exec docs/plans/20260713-add-greeting.md
+/exec --worktree ../project-feature docs/plans/20260713-add-greeting.md
 ```
 
 `/goal <short goal>` uses the current Pi session for read-only repository
