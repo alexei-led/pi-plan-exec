@@ -1800,8 +1800,8 @@ test("the bridge is asked even when the operation directory is missing", async (
   );
 
   assert.deepEqual(
-    asked,
-    ["operation-surviving", "operation-1"],
+    asked.toSorted(),
+    ["operation-1", "operation-surviving"],
     "directory absence is diagnostic; every bridge operation is still asked",
   );
   assert.match(report, /Reset 2 abandoned runs to failed\./);
