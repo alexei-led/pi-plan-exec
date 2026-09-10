@@ -123,9 +123,9 @@ The installed `exec-plan` skill is also available as `/skill:exec-plan` for the
 plan format, the recovery rules, and the retired names and flags a scripted agent
 uses instead of a prompt.
 
-The **[Guide](docs/guide.md#executable-plan-format)** defines the accepted plan
-format, including the exact heading and checkbox rules. Omit the path to select
-an eligible Markdown plan below `docs/plans/`.
+The **[Guide](docs/guide.md#executable-plan-format)** defines the accepted
+heading-based formats and checkbox rules. Omit the path to select an eligible
+Markdown plan below `docs/plans/`.
 
 ## Runtime model
 

@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.0 - 2026-09-10
+
+- Accept lightweight heading-based Markdown plans such as `P0 — ...`, `Phase 1: ...`, `Step 1: ...`, and `T001: ...` while keeping canonical Task/Iteration numbering compatible.
+- Accept `*`, `+`, and ordered list markers for checkbox items and ignore fenced code examples.
+- Document the supported executable-plan formats and parser limits.
+
 ## 1.3.0 - 2026-09-09
 
 - Add explicit `/exec --worktree <path> <plan-path>` to execute in an existing registered worktree without creating a branch or copying the plan.

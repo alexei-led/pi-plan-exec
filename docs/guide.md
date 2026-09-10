@@ -92,28 +92,46 @@ Optional context is allowed before, between, and inside task sections.
 - [ ] Run the relevant documentation checks.
 ```
 
-The parser accepts these heading forms:
+The parser accepts a small set of heading-based formats. The original format
+remains supported:
 
 ```text
 ### Task 1: Short task title
-### Iteration 1: Short task title
+### Iteration 2: Another task
 ```
 
-The plan contract is strict:
+Lightweight variants are also accepted:
 
-| Rule          | Required behavior                                                                                        |
-| ------------- | -------------------------------------------------------------------------------------------------------- |
-| Heading level | Use exactly `###`.                                                                                       |
-| Heading kind  | Use `Task` or `Iteration`, followed by a positive integer and `:`.                                       |
-| Numbering     | Start at `1`; use each number exactly once; do not skip numbers.                                         |
-| Title         | Put non-empty text after `:`.                                                                            |
-| Checkbox      | Each task needs at least one `- [ ] item` or `- [x] item`. `[X]` also means checked.                     |
-| Location      | Keep the plan inside the Git repository.                                                                 |
-| Active run    | Do not change task numbers, titles, checkbox text, or add/remove task items. Only change checkbox state. |
+```text
+### P0 — Prepare the change
+### P1: Implement the change
+## Phase 2: Verify it
+### Step 3: Document it
+### T004: Follow-up work
+```
+
+`Task` and `Iteration` headings keep their existing numbering rule. They must
+start at `1` and be consecutive. Other supported labels are normalized to
+execution order, so `P0` becomes the first runtime task and `P1` the second.
+Each task needs one or more ordinary GFM-style checkbox items. These list
+markers are accepted:
+
+```text
+- [ ] Unchecked item
+* [x] Checked item
++ [ ] Another item
+1. [ ] Ordered item
+```
+
+`[x]` and `[X]` mean checked. Nested checkbox items are treated as additional
+items in the same task. Checkboxes inside fenced code blocks are ignored.
 
 Text that is not a matching checkbox is context only. It does not create work or
-complete a task. All matching checkboxes between one task heading and the next
-belong to that task.
+complete a task. The parser does not infer tasks from prose, tables, dependencies,
+parallelism, approvals, or special statuses. Keep the plan inside the Git
+repository. During an active run, change only checkbox markers; do not change
+headings, checkbox text, or add/remove items. A structure change pauses the run
+for review.
 
 ### Completion semantics
 
@@ -137,13 +155,13 @@ combine unrelated behavior and checks.
 These plans are rejected before the controller starts work:
 
 ```markdown
-## Task 1: Wrong heading level
+## Design notes
 
-- [ ] This is ignored because the heading is not `###`.
+- [ ] This heading is not a supported task label.
 
 ### Task 2: Wrong first task number
 
-- [ ] Numbering must start at 1.
+- [ ] Canonical Task numbering must start at 1.
 
 ### Task 1: Missing checkboxes
 

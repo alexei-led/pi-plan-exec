@@ -13,8 +13,8 @@ recovery with a manually launched subagent.
 
 ## Choose the job
 
-- Create a plan: write a strict Markdown plan under `docs/plans/`. Do not start
-  it unless asked.
+- Create a plan: write a Markdown plan under `docs/plans/` using the supported
+  heading-and-checkbox format. Do not start it unless asked.
 - Start a named plan: `/exec <path/to/plan.md>`.
 - Start a plan in an existing worktree: `/exec --worktree <worktree-path> <path/to/plan.md>`.
   The target must be registered in the same Git repository; its current branch
@@ -109,9 +109,11 @@ that it ran. Never replace it with a manual subagent launch.
 
 ## Write an executable plan
 
-Use contiguous `### Task N:` or `### Iteration N:` headings. Start at `1`; do
-not skip or duplicate numbers. Every task needs a non-empty title and at least
-one concrete, verifiable checkbox.
+Use heading-based task sections. The canonical forms are `Task N:` and
+`Iteration N:`. Lightweight `P0 —`, `P1:`, `Phase N:`, `Step N:`, and `T001:`
+forms are also accepted. Every section needs a non-empty title and at least one
+concrete, verifiable checkbox. Canonical Task/Iteration numbers start at `1`
+and are consecutive; lightweight labels are normalized to document order.
 
 ```markdown
 # Add greeting
@@ -127,8 +129,10 @@ one concrete, verifiable checkbox.
 - [ ] Run the relevant docs check.
 ```
 
-Keep the plan inside the Git repository. Once a run exists, change only
-checkbox markers from `[ ]` to `[x]` or `[X]`. Do not change headings, numbers,
+Keep the plan inside the Git repository. The parser accepts `-`, `*`, `+`, or
+ordered list markers before `[ ]`, `[x]`, or `[X]`; it ignores fenced code blocks.
+It does not infer tasks from prose or tables. Once a run exists, change only
+checkbox markers from `[ ]` to `[x]` or `[X]`. Do not change headings, labels,
 checkbox text, or checkbox count. A structural change requires interactive
 review before resume.
 

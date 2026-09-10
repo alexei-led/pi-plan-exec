@@ -317,7 +317,8 @@ execution queue.
 
 Untrusted boundaries are validated at entry:
 
-- Markdown plans use strict headings, numbering, and checkbox rules.
+- Markdown plans use a small heading-and-checkbox grammar; unsupported prose and
+  table content is not inferred as executable work.
 - Registry run IDs must be UUID-shaped before path construction.
 - Stored run records are schema-checked and migrated.
 - Bridge/Fusion replies are parsed from `unknown`.
