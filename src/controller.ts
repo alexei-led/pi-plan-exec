@@ -299,9 +299,9 @@ export class PlanExecController {
       prepared = adopted.run;
     }
     const preservedOperationId = prepared.activeOperation?.operationId;
+    if (explicit && isTaskRetryConfirmationRequired(prepared) && !retryTask)
+      throw new Error(taskRetryRequiredMessage(prepared));
     if (explicit && isRecoverableFailure(prepared)) {
-      if (isTaskRetryConfirmationRequired(prepared) && !retryTask)
-        throw new Error(taskRetryRequiredMessage(prepared));
       prepared = await this.recoverFailedRun(
         prepared,
         retryTask,
@@ -722,7 +722,9 @@ export class PlanExecController {
       turnBudget: { maxTurns: input.maxTurns },
       acceptance: false,
       mission: false,
-      ...(input.kind === OPERATION_KIND.FIX ? { completionGuard: false } : {}),
+      // The plan's checkboxes prove implementation; legitimate blockers need no edits.
+      ...(input.kind === OPERATION_KIND.FIX || input.kind === OPERATION_KIND.IMPLEMENTATION
+        ? { completionGuard: false } : {}),
     };
     const requestDigest = bridgeRequestDigest(params);
     const persisted = await this.registry.updateIfCurrent(
@@ -1100,8 +1102,20 @@ export class PlanExecController {
     terminalError?: string,
     recoveredOutput?: string,
   ): Promise<PlanExecRun> {
-    if (operation.kind === OPERATION_KIND.IMPLEMENTATION)
-      return this.finishImplementation(run, operation, state, terminalError);
+    if (operation.kind === OPERATION_KIND.IMPLEMENTATION) {
+      let output = recoveredOutput;
+      if (!output) {
+        try {
+          output = await this.bridgeOutput(operation);
+        } catch {
+          // Legacy providers may retain only terminal diagnostics. Checkboxes
+          // still prove completion; missing output alone is not a task blocker.
+        }
+      }
+      const current = (await this.registry.get(run.id)) ?? run;
+      if (!sameOperationState(run, current, operation)) return current;
+      return this.finishImplementation(current, operation, state, terminalError, output);
+    }
     if (operation.kind === OPERATION_KIND.REVIEW) {
       if (!isSuccessfulOperationState(state))
         return this.finishReview(run, operation, state, "", terminalError);
@@ -1469,6 +1483,7 @@ export class PlanExecController {
     operation: ActiveOperation,
     state: string,
     terminalError?: string,
+    output?: string,
   ): Promise<PlanExecRun> {
     const taskId = operation.taskId;
     if (!taskId)
@@ -1487,6 +1502,23 @@ export class PlanExecController {
         withTerminalError(run, operation, terminalError),
         `Worker ${operation.externalRunId} hit a model/provider failure before task ${taskId} completed; its task retry budget was not consumed: ${terminalError}`,
       );
+    }
+    const blocker = taskFailureReason(output);
+    if (task.unchecked.length > 0 && blocker) {
+      const paused = await this.registry.updateIfCurrent(
+        withoutOperation({
+          ...run,
+          status: RUN_STATUS.PAUSED,
+          blockedTask: { taskId, reason: blocker },
+          failedOperation: { ...operation, terminalError: blocker },
+          error: `Task ${taskId} is blocked: ${blocker}`,
+        }),
+        run.updatedAt,
+      );
+      if (paused.applied)
+        await appendProgressBestEffort(paused.run,
+          `Task ${taskId} paused without an automatic retry: ${blocker}\nAfter resolving it, use /exec resume ${run.id}.`);
+      return paused.run;
     }
     const attempts = (run.taskAttempts[String(taskId)] ?? 0) + 1;
     const cleared = withoutOperation({
@@ -2209,11 +2241,15 @@ export class PlanExecController {
       operation.externalRunId!,
       operation.asyncDir,
     );
-    if (!result.success) throw new Error(result.error.message);
-    return readSubagentArtifact(
-      text(result.data.resultPath),
-      operation.asyncDir,
-    );
+    try {
+      return await readSubagentArtifact(
+        result.success ? text(result.data.resultPath) : undefined,
+        operation.asyncDir,
+      );
+    } catch (error) {
+      if (!result.success) throw new Error(result.error.message, { cause: error });
+      throw error;
+    }
   }
 
   private async transition(
@@ -2470,6 +2506,8 @@ function workerPrompt(
     "Change only checkbox markers from [ ] to [x]. Do not change checkbox text, headings, task numbers, or add/remove plan items.",
     "Record verification in your response and progress artifacts, not by rewriting plan item text.",
     "Do not start later tasks. Do not report success until the checkboxes are updated and verification is complete.",
+    `If a required approval, external prerequisite, or verification cannot be satisfied, do not invent evidence, skip it, or make dummy edits. Leave incomplete checkboxes open and start your final response with ${TASK_FAILED_MARKER} on its own line, followed by Blocker: <exact reason> and Next step: <what is needed>. The controller will pause this same run without automatically retrying.`,
+    "A supervisor stop decision is final for this attempt. Return the blocker; do not ask repeatedly or launch another worker.",
     "Remaining checkbox items:",
     ...unchecked.map((item) => `- [ ] ${item}`),
   ].join("\n");
@@ -2563,6 +2601,7 @@ function clearError(run: PlanExecRun): PlanExecRun {
   const next = { ...run };
   delete next.error;
   delete next.failedOperation;
+  delete next.blockedTask;
   return next;
 }
 
@@ -2578,6 +2617,15 @@ function sameOperationState(
 }
 
 export const TASK_RETRY_OPTION = "--retry-task";
+const TASK_FAILED_MARKER = "<<<RALPHEX:TASK_FAILED>>>";
+
+function taskFailureReason(output: string | undefined): string | undefined {
+  const lines = output?.trim().split(/\r?\n/);
+  if (lines?.[0]?.trim() !== TASK_FAILED_MARKER) return undefined;
+  const report = lines.slice(1).join("\n").trim();
+  return (report || "Worker reported TASK_FAILED without a reason; inspect its output before retrying.")
+    .slice(0, MAX_TERMINAL_ERROR_LENGTH);
+}
 
 export function isDetachedWorkflowFailure(run: PlanExecRun): boolean {
   if (
@@ -2608,14 +2656,16 @@ export function isRecoverableImplementationFailure(run: PlanExecRun): boolean {
 export function isExternalManualBlocker(run: PlanExecRun): boolean {
   if (run.stage !== RUN_STAGE.IMPLEMENTATION || run.activeOperation)
     return false;
-  return /\b(billing|payment|quota|rate[- ]limit|provider|credential|authentication|authorization|permission|unavailable|outage|network|manual|external)\b/i.test(
-    recoveryEvidence(run),
-  );
+  return Boolean(run.blockedTask) || recoveryEvidence(run).includes(TASK_FAILED_MARKER) ||
+    /\b(billing|payment|quota|rate[- ]limit|provider|credential|authentication|authorization|permission|unavailable|outage|network|manual|external|checkpoint)\b/i.test(
+      recoveryEvidence(run),
+    );
 }
 
 export function isTaskRetryConfirmationRequired(run: PlanExecRun): boolean {
   return (
-    run.status === RUN_STATUS.FAILED &&
+    (run.status === RUN_STATUS.FAILED ||
+      (run.status === RUN_STATUS.PAUSED && run.blockedTask !== undefined)) &&
     run.stage === RUN_STAGE.IMPLEMENTATION &&
     run.activeOperation === undefined &&
     !isModelProviderFailure(run) &&
@@ -2624,7 +2674,7 @@ export function isTaskRetryConfirmationRequired(run: PlanExecRun): boolean {
 }
 
 export function isModelProviderFailure(run: PlanExecRun): boolean {
-  return isModelProviderFailureText(recoveryEvidence(run));
+  return !run.blockedTask && isModelProviderFailureText(recoveryEvidence(run));
 }
 
 function isModelProviderFailureText(value: string | undefined): boolean {
@@ -2642,13 +2692,15 @@ function isModelProviderFailureText(value: string | undefined): boolean {
 
 export function taskRetryRequiredMessage(run: PlanExecRun): string {
   const taskId =
+    run.blockedTask?.taskId ??
     run.failedOperation?.taskId ??
     run.error?.match(/Task (\d+)/)?.[1] ??
     run.error?.match(/task (\d+)/i)?.[1] ??
     "the incomplete task";
   return [
-    `Task ${taskId} is retry-exhausted or made no progress; refusing to retry this stage implicitly.`,
-    "Fix or verify the external/manual blocker first.",
+    `Task ${taskId} is blocked; no automatic retry will be started.`,
+    run.blockedTask?.reason ?? run.failedOperation?.terminalError ?? run.error ?? "Inspect the worker output for the blocker.",
+    "Resolve the reported prerequisite or record the required operator decision first. Retrying does not waive plan requirements.",
     `Implementation checkboxes are sequential; the controller cannot bypass an incomplete implementation task. Re-run the same task only with /exec resume ${run.id} ${TASK_RETRY_OPTION}.`,
   ].join(" ");
 }

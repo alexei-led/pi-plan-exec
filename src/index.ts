@@ -451,7 +451,7 @@ export default function planExecExtension(pi: ExtensionAPI): void {
             stopBackgroundController(runId);
             notify(
               ctx,
-              `Plan execution ${shortRunId(run.id)} is paused. Use /exec resume ${run.id} to continue.`,
+              pausedMessage(run),
               "warning",
             );
           } else {
@@ -946,6 +946,12 @@ export function recoveryGuidance(
         };
   }
   if (run.status === RUN_STATUS.PAUSED) {
+    if (run.blockedTask)
+      return {
+        classification: "paused for a task blocker",
+        action: `Task ${run.blockedTask.taskId}: ${run.blockedTask.reason} Resolve the blocker, then run interactive ${resume}; it asks before retrying the same task. No task was skipped and no automatic retry is scheduled.`,
+        command: resume,
+      };
     if (run.activeOperation)
       return {
         classification: "workflow paused for supervisor input",
@@ -977,7 +983,7 @@ export function recoveryGuidance(
     if (isExternalManualBlocker(run))
       return {
         classification: "a task is blocked by something outside this run",
-        action: `Fix the outside cause first — billing, credentials, quota, network, or a manual step — then run interactive ${resume}; it asks before retrying that task. Implementation work cannot be waived, so there is no way past it.`,
+        action: `Resolve the reported prerequisite first — for example an approval, release checkpoint, credentials, or network access — then run interactive ${resume}; it asks before retrying the same task in the preserved worktree. Implementation work cannot be waived. Retrying does not waive plan requirements.`,
         command: resume,
       };
     if (run.activeOperation?.externalRunId)
@@ -2957,6 +2963,12 @@ function compactRunStatus(run: PlanExecRun): string {
   const projection =
     run.taskProjection?.state === "degraded" ? " · projection degraded" : "";
   return `exec ${run.status} · ${run.stage} · ${activeOperationLabel(run)} · ${observationLabel(run)}${projection}`;
+}
+
+export function pausedMessage(run: PlanExecRun): string {
+  return run.blockedTask
+    ? `Plan execution ${shortRunId(run.id)} paused at Task ${run.blockedTask.taskId}: ${run.blockedTask.reason}\nNo automatic retries. Worktree and checkboxes preserved. Resolve the blocker, then use /exec resume ${run.id}; it asks before retrying the same task.`
+    : `Plan execution ${shortRunId(run.id)} is paused. Use /exec resume ${run.id} to continue.`;
 }
 
 function terminalMessage(run: PlanExecRun): string {

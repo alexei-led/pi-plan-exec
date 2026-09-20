@@ -43,7 +43,7 @@ recovery with a manually launched subagent.
   judged by its heartbeat alone; wait out the 30-second heartbeat window before
   treating it as stale.
 - Recover a run `stopped because the model or provider could not be used`: `/exec resume [full-run-id]` uses the active authenticated Pi model.
-- A normal resume retries a no-progress implementation task. A run `a task is blocked by something outside this run` prompts for confirmation; implementation cannot be skipped.
+- A normal resume retries a no-progress implementation task. `paused for a task blocker` means the worker explicitly stopped with `TASK_FAILED`; it preserves the reason and does not automatically retry. Resolve the blocker before confirming resume. Both this state and `a task is blocked by something outside this run` require retry confirmation; implementation cannot be skipped.
 - Stop a run and choose the outcome: `/exec stop <full-run-id>`. It asks whether
   to pause (resumable) or cancel (final, worktree preserved). It needs a human
   to answer, so an agent uses the scripted path below.
@@ -249,7 +249,12 @@ second writer.
 ## Completion truth
 
 Plan checkboxes are implementation truth. Worker prose alone does not complete
-a task. Review output is either `NO_FINDINGS` or structured
+a task. A worker whose prerequisite cannot be satisfied leaves its checkboxes
+open and starts its final response with `<<<RALPHEX:TASK_FAILED>>>` on its own
+line, followed by `Blocker: <reason>` and `Next step: <required action>`. The
+controller pauses the same run; workflow `ok: true` is not task completion.
+Do not request repeated retries without new prerequisite evidence.
+Review output is either `NO_FINDINGS` or structured
 `FINDING: CRITICAL|MAJOR|MINOR | ...` records.
 
 Do not report success until `/exec status <id>` is terminal and the worktree is

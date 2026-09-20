@@ -25,6 +25,7 @@ import {
   execSetup,
   isRemovableRun,
   parseCleanupArguments,
+  pausedMessage,
   parseDoctorArguments,
   runEvidence,
   sweepAbandonment,
@@ -81,6 +82,37 @@ const config = {
   statsAgent: "reviewer",
   statsMaxTurns: 20,
 };
+
+test("task blocker status and pause notification explain recovery without a crash", () => {
+  const blocked = run({
+    status: "paused", stage: "implementation",
+    blockedTask: { taskId: 4, reason: "Constructor merge and readiness evidence missing." },
+  });
+  delete blocked.activeOperation;
+  const status = formatRunStatus(blocked);
+  const notification = pausedMessage(blocked);
+  assert.match(status, /paused for a task blocker/);
+  for (const message of [status, notification]) {
+    assert.match(message, /Task 4/);
+    assert.match(message, /Constructor merge and readiness evidence missing/);
+    assert.match(message, new RegExp(`/exec resume ${blocked.id}`));
+    assert.match(message, /asks before retrying/);
+    assert.match(message, /[Nn]o automatic retr/);
+    assert.doesNotMatch(message, /failed at|no way past/);
+  }
+});
+
+test("legacy TASK_FAILED diagnostics show a resumable outside blocker", () => {
+  const legacy = run({
+    status: "failed", stage: "implementation",
+    error: 'Worker workflow-1 ended as complete and left task 4 checkboxes unchecked. Return: {"output":"<<<RALPHEX:TASK_FAILED>>>\\nBlocker: Constructor merge missing."}',
+  });
+  delete legacy.activeOperation;
+  const status = formatRunStatus(legacy);
+  assert.match(status, /a task is blocked by something outside this run/);
+  assert.match(status, /asks before retrying/);
+  assert.doesNotMatch(status, /no way past/);
+});
 
 function run(overrides: Partial<PlanExecRun> = {}): PlanExecRun {
   return {

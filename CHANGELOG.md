@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.4.1 - 2026-09-20
+
+- Consume implementation worker output before retrying unchecked tasks. An explicit `TASK_FAILED` pauses the plan with its reason instead of relaunching workers and ending in a generic failure.
+- Persist task blockers across reloads and require confirmation before retrying the same task; preserve completed work, operation identity, and retry budget.
+- Recover single-worker output from retained workflow status after temporary result files disappear, and recognize legacy blocked-run diagnostics.
+- Let the controller's checkbox contract own implementation completion instead of rejecting legitimate no-edit blockers in the subagent mutation guard.
+- Explain blocker recovery in status, notifications, worker instructions, and the execution skill; never treat retry permission as a waiver of plan prerequisites.
+
 ## 1.4.0 - 2026-09-10
 
 - Accept lightweight heading-based Markdown plans such as `P0 — ...`, `Phase 1: ...`, `Step 1: ...`, and `T001: ...` while keeping canonical Task/Iteration numbering compatible.

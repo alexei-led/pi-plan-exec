@@ -22,6 +22,27 @@ test("uses pi-subagents status recentOutput when no configured result path exist
   );
 });
 
+test("recovers the sole workflow return after the result file was archived", async () => {
+  const asyncDir = await mkdtemp(join(tmpdir(), "pi-plan-exec-artifact-"));
+  const output = "<<<RALPHEX:TASK_FAILED>>>\nBlocker: Operator release checkpoint is missing.";
+  await writeFile(join(asyncDir, "status.json"), JSON.stringify({
+    mode: "workflow", state: "complete",
+    steps: [{ runId: "child-1", workflowKey: "main", status: "completed" }],
+    workflow: { value: { key: "main", runId: "child-1", ok: true, output } },
+  }));
+  assert.equal(await readSubagentArtifact(join(asyncDir, "expired.json"), asyncDir), output);
+});
+
+test("does not adopt a workflow return with a different child identity", async () => {
+  const asyncDir = await mkdtemp(join(tmpdir(), "pi-plan-exec-artifact-"));
+  await writeFile(join(asyncDir, "status.json"), JSON.stringify({
+    mode: "workflow", state: "complete",
+    steps: [{ runId: "child-1", workflowKey: "main", status: "completed" }],
+    workflow: { value: { key: "main", runId: "unrelated-child", output: "unrelated output" } },
+  }));
+  await assert.rejects(readSubagentArtifact(undefined, asyncDir), /Subagent result output was unavailable/);
+});
+
 test("uses the durable async output before truncated status recentOutput", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-artifact-"));
   const asyncDir = join(root, "async");

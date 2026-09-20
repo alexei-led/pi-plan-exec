@@ -345,6 +345,123 @@ test("plain resume clears legacy recovery model pins before launching", async ()
   assert.equal(bridge.lastSpawnParams?.mission, false);
 });
 
+for (const [state, retainedStatusOnly] of [["complete", false], ["failed", false], ["complete", true]] as const) {
+  test(`explicit task blocker pauses a ${state} workflow (status only: ${retainedStatusOnly}) and resumes once after confirmation`, async (t) => {
+    const root = await mkdtemp(join(tmpdir(), "exec-task-blocked-"));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const planPath = join(root, "plan.md");
+    const plan = "### Task 1: Implement\n- [ ] Do the work\n";
+    await writeFile(planPath, plan);
+    const resultPath = join(root, "result.json");
+    const reason = "Constructor merge and operator readiness checkpoint is missing.";
+    await writeFile(resultPath, JSON.stringify({
+      mode: "workflow", results: [{ output: `<<<RALPHEX:TASK_FAILED>>>\n\nBlocker: ${reason}` }],
+    }));
+    if (retainedStatusOnly) {
+      await rm(resultPath);
+      await writeFile(join(root, "status.json"), JSON.stringify({
+        mode: "workflow", state: "complete",
+        steps: [{ runId: "child-1", workflowKey: "main", status: "completed" }],
+        workflow: { value: { key: "main", runId: "child-1", ok: true,
+          output: `<<<RALPHEX:TASK_FAILED>>>\n\nBlocker: ${reason}` } },
+      }));
+    }
+    const registry = new RunRegistry(join(root, "runs"));
+    const bridge = new FakeBridge(resultPath);
+    bridge.status = async () => success({ state, text: "Workflow transport diagnostics" });
+    if (retainedStatusOnly)
+      bridge.result = async () => ({ success: false, error: { message: "Bridge memory expired" } });
+    let controller = new PlanExecController(registry, bridge, new FakeFusion(), fakeGit(root));
+    const running = await registry.create({
+      ...baseRun(root, planPath), planHash: parsePlan(planPath, plan).hash,
+      stage: "implementation", taskAttempts: { "1": 0 },
+      activeOperation: {
+        operationId: "blocked-operation", externalRunId: "blocked-worker", service: "bridge",
+        kind: "implementation", taskId: 1, asyncDir: root,
+      },
+    });
+
+    const blocked = await controller.advance(running);
+
+    assert.equal(blocked.status, "paused");
+    assert.equal(blocked.stage, "implementation");
+    assert.equal(blocked.activeOperation, undefined);
+    assert.equal(blocked.failedOperation?.externalRunId, "blocked-worker");
+    assert.equal(blocked.taskAttempts["1"], 0);
+    assert.match(blocked.error ?? "", /Constructor merge/);
+    assert.doesNotMatch(blocked.error ?? "", /transport diagnostics/);
+    assert.equal(bridge.spawnCount, 0);
+    assert.equal(await readFile(planPath, "utf8"), plan);
+
+    controller = new PlanExecController(new RunRegistry(join(root, "runs")), bridge, new FakeFusion(), fakeGit(root));
+    assert.equal((await controller.resume(blocked.id, "session-1", false)).status, "paused");
+    await assert.rejects(controller.resume(blocked.id, "session-1"), /--retry-task/);
+    assert.equal(bridge.spawnCount, 0);
+    const resumed = await controller.resume(blocked.id, "session-1", true, undefined, true);
+    assert.equal(resumed.status, "running");
+    assert.equal(resumed.error, undefined);
+    assert.equal(resumed.activeOperation?.taskId, 1);
+    assert.equal(bridge.spawnCount, 1);
+    assert.match(String(bridge.lastSpawnParams?.task), /TASK_FAILED/);
+    assert.equal(bridge.lastSpawnParams?.completionGuard, false);
+    await writeFile(planPath, plan.replace("[ ]", "[x]"));
+    await writeFile(resultPath, JSON.stringify({ output: "Verified and complete." }));
+    bridge.result = async () => success({ resultPath });
+    const completed = await controller.advance(resumed);
+    assert.equal(completed.stage, "comprehensive_review");
+    assert.equal(bridge.spawnCount, 1);
+  });
+}
+
+test("legacy unchecked-checkbox failure with TASK_FAILED requires explicit same-run recovery", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "exec-legacy-blocked-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const planPath = join(root, "plan.md");
+  const plan = "### Task 1: Implement\n- [ ] Do the work\n";
+  await writeFile(planPath, plan);
+  const registry = new RunRegistry(join(root, "runs"));
+  const bridge = new FakeBridge(join(root, "expired.json"));
+  const controller = new PlanExecController(registry, bridge, new FakeFusion(), fakeGit(root));
+  const run = await registry.create({
+    ...baseRun(root, planPath), planHash: parsePlan(planPath, plan).hash,
+    status: "failed", stage: "implementation", taskAttempts: { "1": 100 },
+    error: 'Worker old-workflow ended as complete and left task 1 checkboxes unchecked. Return: {"output":"<<<RALPHEX:TASK_FAILED>>>\\nBlocker: Constructor merge missing."}',
+    failedOperation: { operationId: "old-operation", externalRunId: "old-workflow", service: "bridge", kind: "implementation", taskId: 1 },
+  });
+  await assert.rejects(controller.resume(run.id, "session-1"), /--retry-task/);
+  assert.equal(bridge.spawnCount, 0);
+  const resumed = await controller.resume(run.id, "session-1", true, undefined, true);
+  assert.equal(resumed.id, run.id);
+  assert.equal(resumed.worktreeCwd, run.worktreeCwd);
+  assert.equal(resumed.taskAttempts["1"], 0);
+  assert.equal(resumed.activeOperation?.taskId, 1);
+  assert.equal(bridge.spawnCount, 1);
+});
+
+test("implementation output lookup cannot overwrite a concurrent cancellation", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "exec-blocked-cancel-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const planPath = join(root, "plan.md");
+  const plan = "### Task 1: Implement\n- [ ] Do the work\n";
+  await writeFile(planPath, plan);
+  const resultPath = join(root, "result.json");
+  await writeFile(resultPath, JSON.stringify({ output: "<<<RALPHEX:TASK_FAILED>>>\nBlocker: Approval missing." }));
+  const registry = new RunRegistry(join(root, "runs"));
+  const bridge = new DeferredResultBridge(resultPath);
+  const controller = new PlanExecController(registry, bridge, new FakeFusion(), fakeGit(root));
+  const running = await registry.create({
+    ...baseRun(root, planPath), planHash: parsePlan(planPath, plan).hash, stage: "implementation",
+    activeOperation: { operationId: "blocked-operation", externalRunId: "blocked-worker", service: "bridge", kind: "implementation", taskId: 1 },
+  });
+  const advancing = controller.advance(running);
+  await bridge.resultRequested;
+  await registry.updateLatest(running.id, (current) => ({ ...current, status: "cancel_pending" }));
+  bridge.completeResult();
+  assert.equal((await advancing).status, "cancel_pending");
+  assert.equal((await registry.get(running.id))?.status, "cancel_pending");
+  assert.equal(bridge.spawnCount, 0);
+});
+
 test("resume refuses an exhausted worker without explicit task retry", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
   const planPath = join(root, "plan.md");

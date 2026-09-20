@@ -236,7 +236,23 @@ instead and keep its worktree:
 
 ## Paused
 
-A run without an active operation is classified
+`paused for a task blocker` means the worker explicitly returned
+`<<<RALPHEX:TASK_FAILED>>>` while the task still has unchecked items. The
+controller records the reason and stopped operation, preserves the worktree,
+and stops polling without consuming a retry or starting another worker.
+
+Resolve the displayed prerequisite or obtain the required operator decision,
+then use `/exec resume <full-run-id>` and confirm retrying that task. A scripted
+caller may use `--retry-task` only with that confirmation. Do not loop on this
+flag, create another run, or manually resume the child. Retrying does not waive
+the plan's approvals, release checkpoints, or verification requirements.
+
+Older releases may have stored the same `TASK_FAILED` output as a generic
+unchecked-checkbox failure. They remain recoverable through the same plan run's
+`/exec resume`; status identifies the external blocker rather than recommending
+an unconfirmed retry.
+
+A run without an active operation or task blocker is classified
 `paused, waiting for you to continue it`. Use:
 
 ```text

@@ -185,6 +185,16 @@ async function readAsyncOutput(path: string): Promise<string | undefined> {
   try {
     const value: unknown = JSON.parse(await readFile(path, "utf8"));
     if (!isRecord(value)) return undefined;
+    if (value.mode === WORKFLOW_MODE && isRecord(value.workflow) &&
+      isRecord(value.workflow.value) && Array.isArray(value.steps) && value.steps.length === 1) {
+      const step = value.steps[0];
+      const result = value.workflow.value;
+      if (isRecord(step) && typeof step.runId === "string" &&
+        result.runId === step.runId && result.key === step.workflowKey) {
+        const output = text(result.output);
+        if (output) return output;
+      }
+    }
     const durable = await readDurableOutput(value);
     if (durable) return durable;
     if (!Array.isArray(value.steps)) return undefined;

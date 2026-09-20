@@ -402,9 +402,17 @@ and creating a duplicate worker. Legacy runs stopped by a plan structure mismatc
 can be resumed interactively after confirming the current structure. The first
 resume may only transition a legacy mismatch to `paused`; status explains that a
 second interactive resume is required after review. An explicit `/exec resume`
-retries a no-progress implementation task in the preserved worktree. Only a run
-reading `a task is blocked by something outside this run` asks for confirmation
-before retrying; implementation still cannot be skipped.
+retries a no-progress implementation task in the preserved worktree. A run
+reading `a task is blocked by something outside this run` or `paused for a task
+blocker` asks for confirmation before retrying; implementation still cannot be skipped.
+
+When a worker returns `<<<RALPHEX:TASK_FAILED>>>` with incomplete checkboxes,
+the controller pauses with the reported reason and stops automatic retries.
+The same run, worktree, completed tasks, and failed operation identity survive
+reload. Resolve the prerequisite, then use `/exec resume <full-run-id>` and
+confirm. Scripted callers use `--retry-task` after operator confirmation, not
+in a retry loop. A completed workflow receipt is not evidence that the task
+succeeded, and retrying does not waive required approvals or checks.
 
 A run reading `stopped because the model or provider could not be used` is
 recorded separately from task progress. The controller keeps the failed child ID

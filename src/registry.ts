@@ -717,6 +717,12 @@ function assertRun(run: PlanExecRun): void {
           run.status !== RUN_STATUS.PAUSED))) ||
     (run.status === RUN_STATUS.SKIP_PENDING &&
       run.pendingStageSkip === undefined) ||
+    (run.blockedTask !== undefined &&
+      (!isRecord(run.blockedTask) ||
+        !Number.isInteger(run.blockedTask.taskId) ||
+        run.blockedTask.taskId < 1 ||
+        typeof run.blockedTask.reason !== "string" ||
+        !run.blockedTask.reason.trim())) ||
     !isValidOperationForStage(run.activeOperation, run.stage) ||
     !isValidOperationForStage(run.failedOperation, run.stage)
   ) {

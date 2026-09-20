@@ -113,6 +113,12 @@ Four verbs cover everything after the start:
   progress file — for terminal runs that finished more than 7 days ago.
   `failed` runs are excluded, because their record is what `/exec resume` needs.
 
+A worker that reports `<<<RALPHEX:TASK_FAILED>>>` with incomplete checkboxes
+pauses the plan with its blocker reason, without spending retries or launching
+another worker. Resolve the prerequisite, then use `/exec resume <full-run-id>`
+and confirm retrying the same task. The worktree and completed tasks are preserved;
+a successful workflow transport result does not mean the task succeeded.
+
 Implementation checkboxes remain sequential and cannot be force-skipped. When a
 provider operation may still exist, plan-exec keeps its recorded operation ID and
 reconciles it before any retry. If a review, finalization, or statistics stage

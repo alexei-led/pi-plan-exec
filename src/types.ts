@@ -285,6 +285,8 @@ export interface PlanExecRun {
   };
   activeOperation?: ActiveOperation;
   failedOperation?: ActiveOperation;
+  /** Explicit worker stop: incomplete task, no automatic retry, resumable after confirmation. */
+  blockedTask?: { taskId: number; reason: string };
   /** One recovery launch only; consumed when the replacement child is recorded. */
   recoveryModel?: string;
   config: FrozenRunConfig;

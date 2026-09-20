@@ -67,7 +67,13 @@ flowchart LR
 ```
 
 The controller re-reads the plan after implementation. A child saying “done” is
-not completion evidence; checked plan items are.
+not completion evidence; checked plan items are. For an incomplete task, a leading
+`<<<RALPHEX:TASK_FAILED>>>` in the worker's retained output records a durable
+`blockedTask` reason and pauses the run without increasing `taskAttempts`.
+The implementation child has no separate mutation guard: an explicit blocker
+needs no source edit, and the controller still enforces checkbox completion.
+Confirmed resume clears that blocker and launches the same task. Concurrent
+stop/cancel changes take precedence over a late output lookup.
 
 ## Source modules
 
