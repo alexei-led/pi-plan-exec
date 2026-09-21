@@ -93,7 +93,7 @@ treated as equivalent to the structured panel-plus-judge path. Fusion start,
 lookup, result, and cancellation preserve the caller digest and operation ID.
 
 Revmux must support the explicit `--execution-lifetime=unbounded|bounded`
-selection from [Revmux commit 398d8f1](https://github.com/umputun/revmux/pull/35/commits/398d8f11c13737cb26354fa963e0b347abcc916d),
+selection from [Revmux commit 988904f](https://github.com/umputun/revmux/pull/35/commits/988904f30da351e76c29d5779c6833a6bf890b51),
 and the plan-exec adapter must wrap it in the outer kernel-owned process
 boundary. Revmux's internal process-group proof is narrower and cannot satisfy
 the full ownership contract by itself. Its report remains invalid unless source
@@ -126,7 +126,7 @@ ownership decisions.
 model turns are scripted; a passing smoke run is not a live-LLM guarantee. A
 Darwin host with the native GUI/compiler prerequisites is required for the
 supported path. The full pipeline passed on the final dependency pins. The
-main full gate passed all 506 tests, lint, TypeScript and package validation,
+main full gate passed all 511 tests, lint, TypeScript and package validation,
 including the plan-publication follow-through. The cumulative Revmux
 confirmation remains pending.
 
@@ -142,17 +142,19 @@ The source pins currently under review are:
 
 - native `pi-subagents`: `798b70d8c94befd7ae96fc40d4ae9198a71810ef`;
 - Bridge: `c7ab396b2ab3f5354790c974abce41e04fea41a1`;
-- Fusion: `5b41a651b25c86e6164b1484f4371702b63faa34`;
-- Revmux: `398d8f11c13737cb26354fa963e0b347abcc916d`;
+- Fusion: `a29934f32376f799235a6a00ec3ddcebf7cb0108`;
+- Revmux: `988904f30da351e76c29d5779c6833a6bf890b51`;
 - Pi SDK: `0.86.1`.
 
 Reported dependency checks are native 3337 unit and 1090 integration tests,
 Bridge 72 tests plus delayed-admission/restart/cancel smoke, Fusion 251 unit,
-115 integration, and one E2E, and the Revmux full Go gates. These are dependency
+121 integration, and one E2E, and the Revmux full Go gates. These are dependency
 evidence, not a claim that the main product gate or full production pipeline is
 complete.
 
-The main and dependency scopes have passed their checks. The
+Local project checks have passed. Revmux's upstream Ubuntu CI requires
+maintainer approval and has executed no jobs; its Linux path is
+compile-verified, while Darwin runtime tests passed. The
 cumulative Revmux confirmation is still pending. The
 implementation remains draft; no release or production support claim follows
 from host smoke checks or dependency test results alone.
