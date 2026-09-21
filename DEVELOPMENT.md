@@ -3,7 +3,7 @@
 ## Local setup
 
 ```bash
-npm install
+npm exec --yes --package=npm@12.0.2 -- npm ci
 npm run test:all
 pi install /absolute/path/to/pi-plan-exec
 ```
@@ -13,6 +13,13 @@ Reload Pi after changing the extension:
 ```text
 /reload
 ```
+
+The draft runtime contracts are pinned to immutable Git commits in the lockfile.
+Use npm 12.0.2: the project permits only directly declared Git dependencies via
+`allow-git=root`; npm 11.12.1 misclassifies their normalized URLs during a clean
+install. No global npm configuration change is required. The current ownership
+limitation still blocks strict autonomous execution; see
+[runtime contracts](docs/runtime-contracts.md) before attempting an execution.
 
 ## Validation
 

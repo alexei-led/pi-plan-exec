@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { classifyAbandonment } from "../src/lifecycle.js";
-import type { PlanExecRun } from "../src/types.js";
+import { DEFAULT_FROZEN_RUN_CONFIG, type PlanExecRun } from "../src/types.js";
 
 function inFlight(overrides: Partial<PlanExecRun> = {}): PlanExecRun {
   return {
@@ -29,6 +29,7 @@ function inFlight(overrides: Partial<PlanExecRun> = {}): PlanExecRun {
       asyncDir: "/tmp/missing-async-directory",
     },
     config: {
+      ...DEFAULT_FROZEN_RUN_CONFIG,
       taskRetries: 1,
       maxTaskIterations: 1,
       reviewIterations: 1,

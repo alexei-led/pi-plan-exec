@@ -10,7 +10,9 @@ import {
   COMPLETED_PLANS_DIRECTORY,
   RUN_STAGE,
   RUN_STATUS,
+  type TaskExecution,
   type PlanExecRun,
+  type PlanTask,
   type RunStage,
 } from "./types.js";
 
@@ -38,6 +40,16 @@ const TASK_PROJECTION_KIND = {
   STAGE: "stage",
 } as const;
 
+export const TASK_EXECUTION_STATE = {
+  READY: "ready",
+  RUNNING: "running",
+  VERIFYING: "verifying",
+  RETRY_WAIT: "retry_wait",
+  WAITING_DEPENDENCY: "waiting_dependency",
+  WAITING_EXTERNAL: "waiting_external",
+  ACCEPTED: "accepted",
+} as const;
+
 type ProjectionScope = Exclude<
   NonNullable<PlanExecRun["taskProjection"]>["scope"],
   undefined
@@ -53,6 +65,49 @@ interface ProjectionTarget {
 export interface TaskProjectionOptions {
   cwd: string;
   sessionId: string;
+}
+
+export interface TaskProjectionSummary {
+  total: number;
+  accepted: number;
+  ready: number;
+  running: number;
+  retry: number;
+  dependency: number;
+  external: number;
+  attention: number;
+}
+
+/** Summarise durable task state without reading the optional pi-tasks cache. */
+export function taskProjectionSummary(run: PlanExecRun): TaskProjectionSummary {
+  const tasks = Object.values(run.tasks ?? {});
+  const summary: TaskProjectionSummary = {
+    total: tasks.length,
+    accepted: 0,
+    ready: 0,
+    running: 0,
+    retry: 0,
+    dependency: 0,
+    external: 0,
+    attention: 0,
+  };
+  for (const task of tasks) {
+    if (task.state === TASK_EXECUTION_STATE.ACCEPTED) summary.accepted += 1;
+    else if (task.state === TASK_EXECUTION_STATE.READY) summary.ready += 1;
+    else if (
+      task.state === TASK_EXECUTION_STATE.RUNNING ||
+      task.state === TASK_EXECUTION_STATE.VERIFYING
+    )
+      summary.running += 1;
+    else if (task.state === TASK_EXECUTION_STATE.RETRY_WAIT) summary.retry += 1;
+    else if (task.state === TASK_EXECUTION_STATE.WAITING_DEPENDENCY)
+      summary.dependency += 1;
+    else if (task.state === TASK_EXECUTION_STATE.WAITING_EXTERNAL)
+      summary.external += 1;
+    if (task.reason || task.state === TASK_EXECUTION_STATE.WAITING_EXTERNAL)
+      summary.attention += 1;
+  }
+  return summary;
 }
 
 /** The PlanExecRun is authoritative; this only repairs pi-tasks' file cache. */
@@ -93,28 +148,37 @@ export class TaskProjector {
         planStatus: run.status,
         planExecProjectionVersion: TASK_PROJECTION_VERSION,
       };
-      let previousId: string | undefined;
-
       for (const task of plan.tasks) {
         const key = implementationKey(task.id);
+        const execution = taskExecution(run, task.id);
+        const dependencies = task.dependsOn
+          .map((dependency) => taskIds[implementationKey(dependency)])
+          .filter((id): id is string => id !== undefined);
         const projected = ensureTask(store, existing.get(key), {
           subject: `Implement Task ${task.id}: ${task.title}`,
           description: implementationDescription(
             run,
             task.items,
             task.id === firstIncompleteTaskId,
+            execution,
           ),
           metadata: {
             ...commonMetadata,
             planExecKey: key,
             planExecKind: TASK_PROJECTION_KIND.IMPLEMENTATION,
+            planExecTaskId: task.id,
+            planExecDependsOn: task.dependsOn,
+            ...(execution ? taskExecutionMetadata(execution) : {}),
           },
-          blockedBy: previousId ? [previousId] : [],
+          blockedBy: dependencies,
         });
         taskIds[key] = projected.id;
-        previousId = projected.id;
       }
 
+      const implementationIds = plan.tasks
+        .map((task) => taskIds[implementationKey(task.id)])
+        .filter((id): id is string => id !== undefined);
+      let previousId: string | undefined;
       for (const entry of PIPELINE) {
         const skipped = run.skippedStages.find(
           (stage) => stage.stage === entry.key,
@@ -127,7 +191,12 @@ export class TaskProjector {
             planExecKey: entry.key,
             planExecKind: TASK_PROJECTION_KIND.STAGE,
           },
-          blockedBy: previousId ? [previousId] : [],
+          blockedBy:
+            entry === PIPELINE[0]
+              ? implementationIds
+              : previousId
+                ? [previousId]
+                : [],
         });
         taskIds[entry.key] = projected.id;
         previousId = projected.id;
@@ -140,7 +209,11 @@ export class TaskProjector {
           updateStatus(
             store,
             projected,
-            implementationStatus(run, task.id, task.unchecked.length === 0),
+            implementationStatus(
+              run,
+              task,
+              task.unchecked.length === 0,
+            ),
           );
       }
       for (const entry of PIPELINE) {
@@ -380,14 +453,17 @@ function implementationKey(id: number): string {
 
 function implementationStatus(
   run: PlanExecRun,
-  taskId: number,
+  task: PlanTask,
   complete: boolean,
 ): TaskStatus {
-  if (complete) return "completed";
+  const execution = taskExecution(run, task.id);
+  if (execution?.state === TASK_EXECUTION_STATE.ACCEPTED)
+    return complete ? "completed" : "pending";
+  if (!execution && complete) return "completed";
   if (run.status !== RUN_STATUS.STARTING && run.status !== RUN_STATUS.RUNNING)
     return "pending";
   const current = run.activeOperation?.taskId;
-  return run.stage === RUN_STAGE.IMPLEMENTATION && current === taskId
+  return run.stage === RUN_STAGE.IMPLEMENTATION && current === task.id
     ? "in_progress"
     : "pending";
 }
@@ -422,13 +498,49 @@ function implementationDescription(
   run: PlanExecRun,
   items: string[],
   isCurrent: boolean,
+  execution?: TaskExecution,
 ): string {
   const description = items.map((item) => `- [ ] ${item}`).join("\n");
+  const details = execution ? taskExecutionDescription(execution) : undefined;
   if (isCurrent && run.status === RUN_STATUS.FAILED && run.error)
-    return `${description}\n\nPlan-exec failed: ${run.error}`;
+    return `${description}\n\nPlan-exec failed: ${run.error}${details ? `\n${details}` : ""}`;
   if (isCurrent && run.status === RUN_STATUS.CANCELLED)
-    return `${description}\n\nPlan-exec cancelled; its worktree is preserved.`;
-  return description;
+    return `${description}\n\nPlan-exec cancelled; its worktree is preserved.${details ? `\n${details}` : ""}`;
+  return details ? `${description}\n\n${details}` : description;
+}
+
+function taskExecution(run: PlanExecRun, taskId: number): TaskExecution | undefined {
+  return run.tasks?.[String(taskId)];
+}
+
+function taskExecutionMetadata(execution: TaskExecution): Record<string, unknown> {
+  return {
+    planExecTaskState: execution.state,
+    planExecAttempts: execution.attempts,
+    ...(execution.reason ? { planExecReason: execution.reason } : {}),
+    ...(execution.nextAttemptAt !== undefined
+      ? { planExecNextAttemptAt: execution.nextAttemptAt }
+      : {}),
+    ...(execution.lastVerifiedActivityAt !== undefined
+      ? { planExecLastVerifiedActivityAt: execution.lastVerifiedActivityAt }
+      : {}),
+    ...(execution.usage ? { planExecUsage: execution.usage } : {}),
+  };
+}
+
+function taskExecutionDescription(execution: TaskExecution): string {
+  const details = [
+    `Task state: ${execution.state}`,
+    `Attempts: ${execution.attempts}`,
+    ...(execution.reason ? [`Reason: ${execution.reason}`] : []),
+    ...(execution.nextAttemptAt !== undefined
+      ? [`Next automatic attempt: ${new Date(execution.nextAttemptAt).toISOString()}`]
+      : []),
+    ...(execution.lastVerifiedActivityAt !== undefined
+      ? [`Last verified activity: ${new Date(execution.lastVerifiedActivityAt).toISOString()}`]
+      : []),
+  ];
+  return details.join("\n");
 }
 
 function stageDescription(run: PlanExecRun, stage: RunStage): string {

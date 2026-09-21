@@ -27,7 +27,7 @@ import {
   RunRegistry,
   takeoverRefusal,
 } from "../src/registry.js";
-import type { PlanExecRun } from "../src/types.js";
+import { DEFAULT_FROZEN_RUN_CONFIG, type PlanExecRun } from "../src/types.js";
 
 type RunLease = NonNullable<PlanExecRun["lease"]>;
 
@@ -43,6 +43,7 @@ function reapedPid(): number {
 }
 
 const config = {
+  ...DEFAULT_FROZEN_RUN_CONFIG,
   taskRetries: 1,
   maxTaskIterations: 50,
   reviewIterations: 5,
@@ -238,14 +239,14 @@ test("lease liveness weighs session, heartbeat, hostname, and pid", () => {
       live: false,
     },
     {
-      name: "a stale heartbeat outranks a running pid",
+      name: "a stale heartbeat cannot fence a running local owner",
       lease: {
         sessionId: "s1",
         pid: process.pid,
         heartbeatAt: stale,
         hostname: here,
       },
-      live: false,
+      live: true,
     },
     {
       // A foreign pid is not ours to check, so only the heartbeat can speak.
@@ -282,7 +283,7 @@ test("lease liveness weighs session, heartbeat, hostname, and pid", () => {
       live: true,
     },
     {
-      name: "another host falls back to heartbeat freshness",
+      name: "another host remains owned while unreachable",
       lease: {
         sessionId: "s1",
         pid: gone,
@@ -292,14 +293,14 @@ test("lease liveness weighs session, heartbeat, hostname, and pid", () => {
       live: true,
     },
     {
-      name: "another host with a stale heartbeat is dead",
+      name: "another host with a stale heartbeat remains uncertain",
       lease: {
         sessionId: "s1",
         pid: process.pid,
         heartbeatAt: stale,
         hostname: "other-host",
       },
-      live: false,
+      live: true,
     },
     {
       name: "an absent hostname falls back to heartbeat freshness",
@@ -1149,13 +1150,49 @@ test("a live lease survives the release-then-claim of a worktree handoff", async
     "the holder may still drop its own lease",
   );
   assert.equal(
-    takeoverRefusal(lease({ heartbeatAt: Date.now() - LEASE_STALE_MS }), "b"),
+    takeoverRefusal(lease({ pid: reapedPid(), heartbeatAt: Date.now() - LEASE_STALE_MS }), "b"),
     undefined,
-    "a dead lease holds nothing",
+    "a confirmed dead local owner releases the lease",
   );
   const unheld: PlanExecRun = { ...held };
   delete unheld.lease;
   assert.equal(takeoverRefusal(unheld, "session-b"), undefined);
+});
+
+test("matching session text does not authorize takeover from a live remote owner", async () => {
+  const { registry } = await seedRegistry();
+  const held = await registry.create(runSeed({
+    lease: { sessionId: "shared-session", pid: process.pid, heartbeatAt: 0, hostname: "another-machine" },
+  }));
+  await assert.rejects(() => registry.claim(held, "shared-session"), /another active Pi session/);
+  assert.equal((await registry.get(held.id))?.lease?.hostname, "another-machine");
+});
+
+test("durable autonomous task state and retry schedule survive reload", async () => {
+  const { directory, registry } = await seedRegistry();
+  const nextAttemptAt = Date.now() + 60_000;
+  const created = await registry.create(runSeed({
+    tasks: { "1": { taskId: 1, dependsOn: [], state: "retry_wait", attempts: 8, nextAttemptAt, reason: "provider unavailable", laneCwd: "/repo/lane-a" } },
+    nextAttemptAt,
+    wakeReason: "Reconcile the same durable operation",
+    stopGeneration: 3,
+  }));
+  const restored = await new RunRegistry(directory).get(created.id);
+  assert.deepEqual(restored?.tasks, created.tasks);
+  assert.equal(restored?.nextAttemptAt, nextAttemptAt);
+  assert.deepEqual(restored?.config.executionLifetime, { mode: "unbounded" });
+});
+
+test("malformed persisted dependencies or lifetime cannot be resumed", async () => {
+  const { directory, registry } = await seedRegistry();
+  const run = await registry.create(runSeed());
+  const path = join(directory, run.id, "run.json");
+  await writeFile(path, JSON.stringify({ ...run, tasks: { "1": { taskId: 1, dependsOn: [1], state: "ready", attempts: 0 } } }));
+  await assert.rejects(() => registry.get(run.id), /Invalid plan-exec/);
+  await writeFile(path, JSON.stringify({ ...run, config: { ...run.config, executionLifetime: { mode: "bounded", timeoutMs: 0 } } }));
+  await assert.rejects(() => registry.get(run.id), /Invalid plan-exec/);
+  await writeFile(path, JSON.stringify({ ...run, usage: { cost: -1 } }));
+  await assert.rejects(() => registry.get(run.id), /Invalid plan-exec/);
 });
 
 test("--same-machine asserts the host and touches nothing else", () => {

@@ -92,3 +92,42 @@ test("rejects malformed task numbering and missing checkboxes", () => {
     /no checkbox/,
   );
 });
+
+test("explicit dependencies allow independent work while omitted dependencies remain sequential", () => {
+  const plan = parsePlan("plan.md", `### Task 1: A
+- [ ] A
+### Task 2: B
+dependsOn: []
+- [ ] B
+### Task 3: C
+dependsOn: [1]
+- [ ] C
+### Task 4: D
+- [ ] D
+`);
+  assert.deepEqual(plan.tasks.map((task) => task.dependsOn), [[], [], [1], [3]]);
+});
+
+test("dependency edits change plan identity while checkbox edits do not", () => {
+  const source = "### Task 1: A\n- [ ] A\n### Task 2: B\ndependsOn: []\n- [ ] B\n";
+  const independent = parsePlan("plan.md", source);
+  assert.notEqual(independent.hash, parsePlan("plan.md", source.replace("[]", "[1]")).hash);
+  assert.equal(independent.hash, parsePlan("plan.md", source.replaceAll("[ ]", "[x]")).hash);
+});
+
+for (const dependencies of ["[2]", "[3]", "[0]", "[-1]", "[1, 1]", '["1"]', "null", "{}", "[1.5]", "1", "[1,]"]) {
+  test(`rejects invalid dependencies ${dependencies} before execution`, () => {
+    assert.throws(() => parsePlan("plan.md", `### Task 1: A
+- [ ] A
+### Task 2: B
+dependsOn: ${dependencies}
+- [ ] B
+`), /dependsOn/);
+  });
+}
+
+test("rejects duplicate dependency declarations and ignores fenced examples", () => {
+  assert.throws(() => parsePlan("plan.md", "### Task 1: A\ndependsOn: []\ndependsOn: []\n- [ ] A"), /duplicate dependsOn/);
+  const plan = parsePlan("plan.md", "### Task 1: A\n```yaml\ndependsOn: [99]\n```\n- [ ] A");
+  assert.deepEqual(plan.tasks[0]?.dependsOn, []);
+});

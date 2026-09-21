@@ -6,8 +6,10 @@ import test from "node:test";
 import { TaskStore } from "@tintinweb/pi-tasks/dist/task-store.js";
 import { RunRegistry } from "../src/registry.js";
 import { sessionTaskPath, TaskProjector } from "../src/task-projection.js";
+import { DEFAULT_FROZEN_RUN_CONFIG } from "../src/types.js";
 
 const config = {
+  ...DEFAULT_FROZEN_RUN_CONFIG,
   taskRetries: 1,
   maxTaskIterations: 50,
   reviewIterations: 5,
@@ -80,7 +82,7 @@ test("projects plan tasks and pipeline stages into the pi-tasks session file", a
     ],
   );
   assert.deepEqual(tasks[1]?.blockedBy, [tasks[0]?.id]);
-  assert.deepEqual(tasks[2]?.blockedBy, [tasks[1]?.id]);
+  assert.deepEqual(tasks[2]?.blockedBy, [tasks[0]?.id, tasks[1]?.id]);
 });
 
 test("completed runs can project after the plan is archived", async () => {

@@ -14,6 +14,8 @@ import { canonicalPath, worktreeIdentity } from "./git.js";
 import { isSkippableStage, isTerminalStatus } from "./lifecycle.js";
 import {
   DEFAULT_FROZEN_RUN_CONFIG,
+  MAX_EXECUTION_TIMEOUT_MS,
+  OPERATION_SERVICE,
   OPERATION_KIND,
   RUN_STAGE,
   RUN_STATUS,
@@ -53,15 +55,15 @@ function isThisHost(name: string): boolean {
 }
 
 /**
- * A stored lease is a claim, not evidence. It is live only when the caller owns
- * it, or its heartbeat is fresh and — on this host, where the pid means
- * something — the process still exists. A lease with no hostname predates the
- * field, so its pid is not ours to check: the heartbeat is the only evidence.
+ * Elapsed heartbeat time cannot fence a living owner. Remote owners remain
+ * uncertain until explicitly reconciled; a local dead PID permits takeover.
+ * Legacy records without a hostname retain their old heartbeat semantics.
  */
 export function isLeaseLive(lease: RunLease, sessionId?: string): boolean {
   if (sessionId !== undefined && lease.sessionId === sessionId) return true;
-  if (Date.now() - lease.heartbeatAt >= LEASE_STALE_MS) return false;
-  if (lease.hostname === undefined || !isThisHost(lease.hostname)) return true;
+  if (lease.hostname === undefined)
+    return Date.now() - lease.heartbeatAt < LEASE_STALE_MS;
+  if (!isThisHost(lease.hostname)) return true;
   return isProcessRunning(lease.pid);
 }
 
@@ -99,7 +101,9 @@ export function takeoverRefusal(
   sessionId: string,
 ): string | undefined {
   const lease = run.lease;
-  return lease && lease.sessionId !== sessionId && isLeaseLive(lease, sessionId)
+  const sameLocalOwner = lease?.sessionId === sessionId && lease.pid === process.pid &&
+    (lease.hostname === undefined || isThisHost(lease.hostname));
+  return lease && !sameLocalOwner && isLeaseLive(lease)
     ? `Run ${run.id} is controlled by another active Pi session.`
     : undefined;
 }
@@ -123,6 +127,11 @@ export function removalRefusal(run: PlanExecRun): string | undefined {
  */
 export class RunRegistry {
   constructor(private readonly directory = RUNS_DIRECTORY) {}
+
+  /** Read-only authorization source for a durable local command monitor. */
+  authorizationPath(runId: string): string {
+    return this.pathFor(runId);
+  }
 
   async create(
     run: Omit<
@@ -642,6 +651,15 @@ function migrateLegacyRun(value: Record<string, unknown>): PlanExecRun {
         : (value.branchRebindings as PlanExecRun["branchRebindings"]),
     config: {
       ...config,
+      executionLifetime: config.executionLifetime ?? DEFAULT_FROZEN_RUN_CONFIG.executionLifetime,
+      retryDelayMs: config.retryDelayMs ?? DEFAULT_FROZEN_RUN_CONFIG.retryDelayMs,
+      requiredChecks: config.requiredChecks ?? [],
+      bootstrapCommands: config.bootstrapCommands ?? [],
+      reviewEnabled: config.reviewEnabled ?? true,
+      reviewRequired: config.reviewRequired ?? true,
+      reviewBackend: config.reviewBackend ?? "subagent",
+      reviewFallback: config.reviewFallback ?? [],
+      statsEnabled: config.statsEnabled ?? false,
       taskRetries: numberOr(
         config.taskRetries,
         DEFAULT_FROZEN_RUN_CONFIG.taskRetries,
@@ -700,6 +718,7 @@ function assertRun(run: PlanExecRun): void {
     !Number.isFinite(run.createdAt) ||
     !Number.isFinite(run.updatedAt) ||
     !isFrozenConfig(run.config) ||
+    !isAutonomousState(run) ||
     !Array.isArray(run.skippedStages) ||
     !run.skippedStages.every(
       (skip) =>
@@ -733,6 +752,13 @@ function assertRun(run: PlanExecRun): void {
 function isFrozenConfig(value: unknown): boolean {
   if (!isRecord(value)) return false;
   return (
+    isExecutionLifetime(value.executionLifetime) &&
+    typeof value.retryDelayMs === "number" && Number.isFinite(value.retryDelayMs) && value.retryDelayMs > 0 &&
+    isCommands(value.requiredChecks) && isCommands(value.bootstrapCommands) &&
+    typeof value.reviewEnabled === "boolean" && typeof value.reviewRequired === "boolean" &&
+    typeof value.statsEnabled === "boolean" &&
+    !(value.reviewRequired && !value.reviewEnabled) &&
+    isReviewBackend(value.reviewBackend) && Array.isArray(value.reviewFallback) && value.reviewFallback.every(isReviewBackend) &&
     typeof value.taskRetries === "number" &&
     typeof value.maxTaskIterations === "number" &&
     typeof value.reviewIterations === "number" &&
@@ -745,6 +771,62 @@ function isFrozenConfig(value: unknown): boolean {
     typeof value.statsAgent === "string" &&
     typeof value.statsMaxTurns === "number"
   );
+}
+
+function isExecutionLifetime(value: unknown): boolean {
+  return isRecord(value) && (value.mode === "unbounded" ||
+    (value.mode === "bounded" && typeof value.timeoutMs === "number" &&
+      Number.isSafeInteger(value.timeoutMs) && value.timeoutMs > 0 && value.timeoutMs <= MAX_EXECUTION_TIMEOUT_MS));
+}
+
+function isReviewBackend(value: unknown): boolean {
+  return value === "subagent" || value === OPERATION_SERVICE.FUSION || value === "revmux";
+}
+
+function isCommands(value: unknown): boolean {
+  return Array.isArray(value) && value.every((command: unknown) =>
+    Array.isArray(command) && command.length > 0 && command.every((part: unknown) => typeof part === "string" && part.length > 0));
+}
+
+function isAutonomousState(run: PlanExecRun): boolean {
+  const timestamp = (value: unknown) => value === undefined || (typeof value === "number" && Number.isFinite(value) && value >= 0);
+  for (const commit of [run.acceptedHead, run.reviewedCommit, run.verifiedCommit])
+    if (commit !== undefined && (typeof commit !== "string" || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(commit))) return false;
+  for (const operation of [run.activeOperation, run.failedOperation]) {
+    const commit = operation?.reviewedCommit;
+    if (commit !== undefined && (typeof commit !== "string" || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(commit))) return false;
+    if (!isUsage(operation?.reportedUsage)) return false;
+  }
+  if (!isUsage(run.usage)) return false;
+  if (run.statsReport !== undefined &&
+    (!isRecord(run.statsReport) || !["summary", "reported", "unavailable"].includes(run.statsReport.state) ||
+      typeof run.statsReport.summary !== "string" ||
+      (run.statsReport.error !== undefined && typeof run.statsReport.error !== "string"))) return false;
+  if (!timestamp(run.nextAttemptAt) || !timestamp(run.stopGeneration)) return false;
+  if (run.recoveryAttempts !== undefined &&
+    (!Number.isSafeInteger(run.recoveryAttempts) || run.recoveryAttempts < 0)) return false;
+  if (run.userStopped !== undefined && typeof run.userStopped !== "boolean") return false;
+  if (run.tasks === undefined) return true;
+  if (!isRecord(run.tasks)) return false;
+  const states = new Set(["ready", "running", "verifying", "retry_wait", "waiting_dependency", "waiting_external", "accepted"]);
+  return Object.entries(run.tasks).every(([id, task]) =>
+    isRecord(task) && String(task.taskId) === id && Number.isSafeInteger(task.taskId) &&
+    typeof task.taskId === "number" && task.taskId > 0 &&
+    typeof task.state === "string" && states.has(task.state) &&
+    typeof task.attempts === "number" && Number.isSafeInteger(task.attempts) && task.attempts >= 0 &&
+    Array.isArray(task.dependsOn) && task.dependsOn.every((dependency: unknown) =>
+      typeof dependency === "number" && Number.isSafeInteger(dependency) && dependency > 0 && dependency < Number(task.taskId)) &&
+    new Set(task.dependsOn).size === task.dependsOn.length && timestamp(task.nextAttemptAt) && isUsage(task.usage));
+}
+
+function isUsage(value: unknown): boolean {
+  if (value === undefined) return true;
+  if (!isRecord(value)) return false;
+  return ["inputTokens", "outputTokens", "cost"].every((key) => {
+    const amount = value[key];
+    return amount === undefined || (typeof amount === "number" && Number.isFinite(amount) && amount >= 0 &&
+      (key === "cost" || Number.isSafeInteger(amount)));
+  });
 }
 
 function isValidBranchRebinding(value: unknown): boolean {
@@ -797,7 +879,12 @@ function isValidOperationForStage(
       RUN_STAGE.FUSION_REVIEW,
       RUN_STAGE.CRITICAL_REVIEW,
     ],
-    [OPERATION_KIND.FUSION]: [RUN_STAGE.FUSION_REVIEW],
+    [OPERATION_KIND.FUSION]: [
+      RUN_STAGE.COMPREHENSIVE_REVIEW,
+      RUN_STAGE.SMELLS_REVIEW,
+      RUN_STAGE.FUSION_REVIEW,
+      RUN_STAGE.CRITICAL_REVIEW,
+    ],
     [OPERATION_KIND.FINALIZE]: [RUN_STAGE.FINALIZE],
     [OPERATION_KIND.STATS]: [RUN_STAGE.STATS],
   };

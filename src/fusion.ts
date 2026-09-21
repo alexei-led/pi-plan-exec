@@ -1,4 +1,6 @@
 import { requestRpc, type EventBus } from "./rpc.js";
+import { executionLifetimeCapabilities, processTreeOwnershipCapabilities, supportsOwnedProcessTree, type ProcessTreeOwnership } from "./bridge.js";
+import type { ExecutionLifetime } from "./types.js";
 
 export const FUSION_REQUEST_EVENT = "fusion:rpc:v1:request";
 export const PLAN_REVIEW_OUTPUT_CONTRACT = "plan-review-v1" as const;
@@ -36,7 +38,18 @@ export type FusionResult =
   | { success: true; data: Record<string, unknown> }
   | { success: false; error: { code?: string; message: string } };
 
+export interface FusionCapabilities {
+  healthy: boolean;
+  durableOperationLookup: boolean;
+  processTerminalProofVersion?: number;
+  workflowTerminalProofVersion?: 1;
+  executionLifetimeVersion?: 1;
+  executionLifetimeModes?: readonly ExecutionLifetime["mode"][];
+  processTreeOwnership?: ProcessTreeOwnership;
+}
+
 export class FusionClient {
+  private negotiated?: FusionCapabilities;
   constructor(
     private readonly events: EventBus,
     private readonly timeoutMs = DEFAULT_FUSION_TIMEOUT_MS,
@@ -46,16 +59,43 @@ export class FusionClient {
     return this.request("ping", {});
   }
 
+  async capabilities(): Promise<FusionCapabilities> {
+    const reply = await this.ping();
+    if (!reply.success || !isRecord(reply.data.capabilities)) {
+      this.negotiated = { healthy: reply.success, durableOperationLookup: false };
+      return this.negotiated;
+    }
+    const capabilities = reply.data.capabilities;
+    this.negotiated = {
+      healthy: true,
+      durableOperationLookup: capabilities.durableOperationLookup === true ||
+        (isRecord(capabilities.durableOperationLookup) && capabilities.durableOperationLookup.version === 1),
+      ...(isRecord(capabilities.processTerminalProof) && capabilities.processTerminalProof.version === 1
+        ? { processTerminalProofVersion: 1 } : {}),
+      ...(isRecord(capabilities.workflowTerminalProof) && capabilities.workflowTerminalProof.version === 1
+        ? { workflowTerminalProofVersion: 1 as const } : {}),
+      ...executionLifetimeCapabilities(capabilities.executionLifetime),
+      ...processTreeOwnershipCapabilities(capabilities.processTreeOwnership),
+    };
+    return this.negotiated;
+  }
+
   start(
     operationId: string,
     prompt: string,
     profile?: string,
+    executionLifetime?: ExecutionLifetime,
   ): Promise<FusionResult> {
+    if (executionLifetime && (!supportsOwnedProcessTree(this.negotiated) ||
+      !this.negotiated?.executionLifetimeModes?.includes(executionLifetime.mode)))
+      return Promise.resolve({ success: false, error: { code: "unsupported",
+        message: "Fusion has not advertised the requested explicit execution lifetime and full owned-process-tree containment." } });
     return this.request("start", {
       params: {
         operationId,
         prompt,
         ...(profile ? { profile } : {}),
+        ...(executionLifetime ? { executionLifetime } : {}),
         outputContract: PLAN_REVIEW_OUTPUT_CONTRACT,
       },
     });

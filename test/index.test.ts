@@ -55,11 +55,14 @@ import {
   prioritizeRunCandidates,
   recoveryGuidance,
   reviewedPlanHashForResume,
+  requestStatus,
   runtimeIntegrationProblem,
+  shouldStopBackgroundController,
 } from "../src/index.js";
 import {
   EXEC_ACTION,
   EXEC_ALIAS_ACTIONS,
+  DEFAULT_FROZEN_RUN_CONFIG,
   type PlanExecRun,
 } from "../src/types.js";
 import {
@@ -70,6 +73,7 @@ import {
 // Three distinct turn budgets on purpose: with reviewer and stats equal, a
 // stats operation routed to the reviewer budget would be invisible.
 const config = {
+  ...DEFAULT_FROZEN_RUN_CONFIG,
   taskRetries: 1,
   maxTaskIterations: 50,
   reviewIterations: 5,
@@ -201,12 +205,41 @@ function thisHost(): string {
   return hostname().split(".")[0]!;
 }
 
+/** Return a local PID whose process has actually exited. A stale heartbeat is
+ * not enough proof now that a local live PID fences the lease. */
+function reapedPid(): number {
+  const child = spawnSync(process.execPath, ["-e", ""], { stdio: "ignore" });
+  if (child.pid === undefined)
+    throw new Error("Could not create a reaped process for the lease fixture.");
+  return child.pid;
+}
+
 const DEAD_LEASE = {
   sessionId: "session-gone",
-  pid: process.pid,
+  pid: reapedPid(),
   heartbeatAt: Date.now() - 10 * 60_000,
   hostname: hostname(),
 };
+
+const OWNED_PROCESS_TREE = {
+  version: 1 as const,
+  scope: "owned-process-tree" as const,
+  escapedDescendants: "contained" as const,
+};
+
+function observedTerminalProof(
+  runId: string,
+): NonNullable<AbandonmentEvidence["processTerminalProof"]> {
+  return {
+    version: 1,
+    state: "observed",
+    runId,
+    runnerProcessInstanceId: "native-instance-1",
+    observedAt: 1,
+    instances: [],
+    processTreeOwnership: OWNED_PROCESS_TREE,
+  } as NonNullable<AbandonmentEvidence["processTerminalProof"]>;
+}
 
 const LIVE_SESSION_ID = "session-live";
 
@@ -251,14 +284,7 @@ function terminalEvidence(runId = "external-1"): AbandonmentEvidence {
   return {
     leaseLive: false,
     asyncDirPresent: false,
-    processTerminalProof: {
-      version: 1,
-      state: "observed",
-      runId,
-      runnerProcessInstanceId: "native-instance-1",
-      observedAt: 1,
-      instances: [],
-    },
+    processTerminalProof: observedTerminalProof(runId),
   };
 }
 
@@ -268,14 +294,7 @@ const nativeTerminalProbe: EvidenceProbe = async (candidate) => {
     asyncDirPresent: false,
     ...(runId
       ? {
-          processTerminalProof: {
-            version: 1 as const,
-            state: "observed" as const,
-            runId,
-            runnerProcessInstanceId: "native-instance-1",
-            observedAt: 1,
-            instances: [],
-          },
+          processTerminalProof: observedTerminalProof(runId),
         }
       : {}),
   };
@@ -1312,7 +1331,7 @@ test("run status distinguishes unavailable observation from normal polling", () 
       },
     }),
   );
-  assert.match(status, /observation: unavailable \(2\/3\)/);
+  assert.match(status, /observation: unavailable \(2 failed probes\)/);
   assert.match(status, /bridge unavailable/);
 });
 
@@ -1385,7 +1404,7 @@ test("removable runs are terminal, past retention, and unheld", () => {
   };
   const staleLease = {
     sessionId: "session-1",
-    pid: process.pid,
+    pid: reapedPid(),
     heartbeatAt: 0,
     hostname: hostname(),
   };
@@ -1730,14 +1749,9 @@ test("doctor --reconcile skips a run reclaimed while the sweep ran", async () =>
     }
     return {
       asyncDirPresent: false,
-      processTerminalProof: {
-        version: 1,
-        state: "observed",
-        runId: candidate.activeOperation?.externalRunId ?? "external-unknown",
-        runnerProcessInstanceId: "native-instance-1",
-        observedAt: 1,
-        instances: [],
-      },
+      processTerminalProof: observedTerminalProof(
+        candidate.activeOperation?.externalRunId ?? "external-unknown",
+      ),
     };
   };
 
@@ -1819,14 +1833,9 @@ test("the bridge is asked even when the operation directory is missing", async (
         return "absent";
       },
       async (operation) => ({
-        processTerminalProof: {
-          version: 1,
-          state: "observed",
-          runId: operation.externalRunId ?? "external-unknown",
-          runnerProcessInstanceId: "native-instance-1",
-          observedAt: 1,
-          instances: [],
-        },
+        processTerminalProof: observedTerminalProof(
+          operation.externalRunId ?? "external-unknown",
+        ),
       }),
     ),
   );
@@ -2344,14 +2353,9 @@ test("resume skips a run reclaimed while it was being diagnosed", async () => {
     await registry.update({ ...current!, lease: liveLease() });
     return {
       asyncDirPresent: false,
-      processTerminalProof: {
-        version: 1,
-        state: "observed",
-        runId: abandoned.activeOperation?.externalRunId ?? "external-unknown",
-        runnerProcessInstanceId: "native-instance-1",
-        observedAt: 1,
-        instances: [],
-      },
+      processTerminalProof: observedTerminalProof(
+        abandoned.activeOperation?.externalRunId ?? "external-unknown",
+      ),
     };
   };
 
@@ -2709,6 +2713,64 @@ test("stop reaches both outcomes and asks for the one it takes", async () => {
   );
 });
 
+test("pause and cancel persist a stop fence before later recovery can run", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-stop-fence-"));
+  const registry = new RunRegistry(join(root, "runs"));
+  const stored = await registry.create(
+    run({ status: "running", stopGeneration: 4 }),
+  );
+
+  const paused = await requestStatus(stored, EXEC_ACTION.PAUSE, registry);
+  assert.equal(paused.status, "paused");
+  assert.equal(paused.userStopped, true);
+  assert.equal(paused.stopGeneration, 5);
+
+  const cancelled = await requestStatus(
+    paused,
+    EXEC_ACTION.CANCEL,
+    registry,
+  );
+  assert.equal(cancelled.status, "cancel_pending");
+  assert.equal(cancelled.userStopped, true);
+  assert.equal(cancelled.stopGeneration, 6);
+  const persisted = await registry.get(stored.id);
+  assert.deepEqual(
+    persisted && {
+      status: persisted.status,
+      userStopped: persisted.userStopped,
+      stopGeneration: persisted.stopGeneration,
+    },
+    { status: "cancel_pending", userStopped: true, stopGeneration: 6 },
+  );
+});
+
+test("paused runs keep the background probe while a child exit is unconfirmed", () => {
+  const settledPause = run({ status: "paused" });
+  delete settledPause.activeOperation;
+  assert.equal(
+    shouldStopBackgroundController(settledPause),
+    true,
+  );
+  assert.equal(
+    shouldStopBackgroundController(
+      run({
+        status: "paused",
+        activeOperation: {
+          operationId: "pause-child",
+          service: "bridge",
+          kind: "implementation",
+          externalRunId: "child-1",
+        },
+      }),
+    ),
+    false,
+  );
+  assert.equal(
+    shouldStopBackgroundController(run({ status: "completed", stage: "complete" })),
+    true,
+  );
+});
+
 test("stop offers only the outcomes a run can still take, and still asks", async () => {
   const paused = run({ status: "paused", stage: "comprehensive_review" });
   let offered: string[] = [];
@@ -3048,7 +3110,7 @@ test("nothing claims a poll loop that no live lease was observed for", async () 
   // The count is a stored fact and stays; "retrying" does not.
   assert.match(
     dead,
-    /observation: unavailable \(2\/3\) — bridge status failed/,
+    /observation: unavailable \(2 failed probes\) — bridge status failed/,
   );
   assert.doesNotMatch(dead, /retrying/);
   assert.doesNotMatch(dead, /polling continues/);
@@ -3056,7 +3118,7 @@ test("nothing claims a poll loop that no live lease was observed for", async () 
   const held = { ...stalled, lease: liveLease() };
   assert.match(
     formatRunStatus(held, await runEvidence(held, abandonmentProbe())),
-    /observation: unavailable \(2\/3\); retrying/,
+    /observation: unavailable \(2 failed probes\); retrying/,
   );
   const polling = abandonedRun({ lease: liveLease() });
   assert.match(
@@ -3117,7 +3179,7 @@ test("the sweep reports how far past its budget a run has gone", async () => {
   assert.match(report, /past the 100m allowed for its 50-turn budget/);
 });
 
-test("evidence gathered here says nothing about a run on another host", async () => {
+test("a run on another host stays live until its owner releases it", async () => {
   const remote = abandonedRun({
     lease: { ...DEAD_LEASE, hostname: "another-host" },
   });
@@ -3141,13 +3203,12 @@ test("evidence gathered here says nothing about a run on another host", async ()
   );
   assert.equal((await registry.get(remote.id))?.status, "running");
   assert.deepEqual(asked, [], "no local bridge lookup for a remote worker");
-  await assert.rejects(
-    reconcileForResume(registry, remote, probe),
-    /evidence is incomplete[\s\S]*lease names another-host, not this machine/,
-  );
+  const kept = await reconcileForResume(registry, remote, probe);
+  assert.equal(kept.run.status, "running");
+  assert.equal(kept.note, undefined);
 });
 
-test("a renamed machine can still diagnose and resume its own run", async () => {
+test("a renamed machine keeps the remote lease protected", async () => {
   // A DHCP rename: the lease names something no probe can connect back here.
   const renamed = abandonedRun({
     lease: { ...DEAD_LEASE, hostname: `${thisHost()}-corp-dhcp` },
@@ -3157,40 +3218,30 @@ test("a renamed machine can still diagnose and resume its own run", async () => 
 
   const guidance = recoveryGuidance(renamed, await runEvidence(renamed));
 
-  assert.equal(
-    guidance.classification,
-    "its lease names a machine that is not this one",
-  );
-  assert.match(
-    guidance.action,
-    new RegExp(`/exec resume ${renamed.id} --same-machine`),
-    "status names the one command that can move this run",
-  );
-  await assert.rejects(
-    reconcileForResume(registry, renamed),
-    new RegExp(`/exec resume ${renamed.id} --same-machine`),
-  );
+  assert.match(guidance.classification, /running/);
+  assert.doesNotMatch(guidance.action, /--same-machine/);
+  const stillOwned = await reconcileForResume(registry, renamed);
+  assert.equal(stillOwned.run.status, "running");
+  assert.equal(stillOwned.note, undefined);
   assert.deepEqual(
     await snapshotRuns(directory),
     before,
     "a refused resume writes nothing",
   );
 
-  const recovered = await reconcileForResume(
+  const stillOwnedAfterOverride = await reconcileForResume(
     registry,
     renamed,
     nativeTerminalProbe,
     true,
   );
 
-  assert.equal(recovered.run.status, "failed");
-  assert.equal(recovered.run.activeOperation, undefined);
-  assert.match(recovered.note ?? "", /was abandoned/);
-  assert.equal(isActionAllowed("resume", recovered.run), true);
+  assert.equal(stillOwnedAfterOverride.run.status, "running");
+  assert.equal(stillOwnedAfterOverride.note, undefined);
   assert.equal(
     (await registry.get(renamed.id))?.lease?.hostname,
     `${thisHost()}-corp-dhcp`,
-    "the assertion is not written back; the next claim re-stamps the host",
+    "the local assertion is not written back while the remote lease is live",
   );
 });
 
@@ -3236,51 +3287,49 @@ test("a machine that shares this one's first label keeps its live worker", async
   );
 });
 
-test("a stale lease from a colliding name stays ambiguous, never abandoned", async () => {
+test("a stale lease from a colliding name stays live, never abandoned", async () => {
   const collided = abandonedRun({
     lease: { ...DEAD_LEASE, hostname: `${thisHost()}.b.corp.example` },
   });
   const { registry, directory } = await seedDirectory([collided]);
   const before = await snapshotRuns(directory);
 
-  // A silent heartbeat proves the lease is stale, never that the worker is
-  // gone: that worker's disk is on the other machine.
-  await assert.rejects(
-    reconcileForResume(registry, collided),
-    /evidence is incomplete[\s\S]*not this machine/,
-  );
+  // A silent heartbeat proves nothing about a remote worker. The remote lease
+  // remains live until its owner releases it or supplies a durable handoff.
+  const kept = await reconcileForResume(registry, collided);
+  assert.equal(kept.run.status, "running");
+  assert.equal(kept.note, undefined);
   assert.deepEqual(await snapshotRuns(directory), before);
 });
 
-test("a network rename of this machine is one documented flag from recovery", async () => {
+test("a network rename cannot override a live remote lease", async () => {
   const churned = abandonedRun({
     lease: { ...DEAD_LEASE, hostname: `${thisHost()}.lan` },
   });
   const { registry, directory } = await seedDirectory([churned]);
   const before = await snapshotRuns(directory);
 
-  // Indistinguishable by name from the colliding machine above, so it is
-  // refused the same way.
-  await assert.rejects(
-    reconcileForResume(registry, churned),
-    new RegExp(`/exec resume ${churned.id} --same-machine`),
-  );
+  // Indistinguishable by name from the colliding machine above, so it remains
+  // protected by the same live remote lease.
+  const kept = await reconcileForResume(registry, churned);
+  assert.equal(kept.run.status, "running");
+  assert.equal(kept.note, undefined);
   assert.deepEqual(await snapshotRuns(directory), before);
   assert.equal(
-    sameMachineRefusal(churned),
-    undefined,
-    "the override applies here, because there is something to override",
+    sameMachineRefusal(churned)?.includes("beating lease"),
+    true,
+    "the override cannot outrank a live remote lease",
   );
 
-  const recovered = await reconcileForResume(
+  const stillOwned = await reconcileForResume(
     registry,
     churned,
     nativeTerminalProbe,
     true,
   );
 
-  assert.equal(recovered.run.status, "failed");
-  assert.equal(isActionAllowed("resume", recovered.run), true);
+  assert.equal(stillOwned.run.status, "running");
+  assert.equal(stillOwned.note, undefined);
 });
 
 test("--same-machine supplies a machine, never a verdict", async () => {
@@ -3299,11 +3348,16 @@ test("--same-machine supplies a machine, never a verdict", async () => {
   const { registry, directory } = await seedDirectory([stillWriting]);
   const before = await snapshotRuns(directory);
 
-  // The assertion only unblocks the evidence; what it then says is unchanged.
-  await assert.rejects(
-    reconcileForResume(registry, stillWriting, abandonmentProbe(), true),
-    /evidence is incomplete[\s\S]*operation directory is still on disk/,
+  // The assertion only changes where evidence may be gathered; it cannot
+  // override the live remote lease or prove ownership of the child.
+  const kept = await reconcileForResume(
+    registry,
+    stillWriting,
+    abandonmentProbe(),
+    true,
   );
+  assert.equal(kept.run.status, "running");
+  assert.equal(kept.note, undefined);
   assert.deepEqual(await snapshotRuns(directory), before);
 
   // The other half of the conjunction: a bridge that still knows the operation.
@@ -3318,15 +3372,14 @@ test("--same-machine supplies a machine, never a verdict", async () => {
   });
   const seeded = await seedDirectory([bridgeKnowsIt]);
 
-  await assert.rejects(
-    reconcileForResume(
-      seeded.registry,
-      bridgeKnowsIt,
-      abandonmentProbe(async () => "running"),
-      true,
-    ),
-    /evidence is incomplete/,
+  const bridgeKept = await reconcileForResume(
+    seeded.registry,
+    bridgeKnowsIt,
+    abandonmentProbe(async () => "running"),
+    true,
   );
+  assert.equal(bridgeKept.run.status, "running");
+  assert.equal(bridgeKept.note, undefined);
   assert.equal(
     (await seeded.registry.get(bridgeKnowsIt.id))?.status,
     "running",
@@ -3335,9 +3388,9 @@ test("--same-machine supplies a machine, never a verdict", async () => {
     sameMachineRefusal(abandonedRun()) ?? "",
     /only applies to a run whose lease names another host/,
   );
-  assert.equal(
-    sameMachineRefusal(abandonedRun({ lease: foreignLease })),
-    undefined,
+  assert.match(
+    sameMachineRefusal(abandonedRun({ lease: foreignLease })) ?? "",
+    /still has a beating lease/,
   );
 });
 
