@@ -126,7 +126,7 @@ ownership decisions.
 model turns are scripted; a passing smoke run is not a live-LLM guarantee. A
 Darwin host with the native GUI/compiler prerequisites is required for the
 supported path. The full pipeline passed on the final dependency pins. The
-main full gate passed all 491 tests, lint, TypeScript and package validation,
+main full gate passed all 506 tests, lint, TypeScript and package validation,
 including the plan-publication follow-through. The cumulative Revmux
 confirmation remains pending.
 
@@ -140,15 +140,15 @@ confirmation remains pending.
 
 The source pins currently under review are:
 
-- native `pi-subagents`: `e5f66f9f8811a7af8fae05f892253eba2f0b6fa5`;
-- Bridge: `5719a27e133db7e06408eb9da1e713a05a77173c`;
-- Fusion: `eb8ab54d01c9f089c8baa1bb85e322c380603b62`;
+- native `pi-subagents`: `798b70d8c94befd7ae96fc40d4ae9198a71810ef`;
+- Bridge: `c7ab396b2ab3f5354790c974abce41e04fea41a1`;
+- Fusion: `5b41a651b25c86e6164b1484f4371702b63faa34`;
 - Revmux: `398d8f11c13737cb26354fa963e0b347abcc916d`;
 - Pi SDK: `0.86.1`.
 
-Reported dependency checks are native 3329 unit and 1090 integration tests,
+Reported dependency checks are native 3337 unit and 1090 integration tests,
 Bridge 72 tests plus delayed-admission/restart/cancel smoke, Fusion 251 unit,
-112 integration, and one E2E, and the Revmux full Go gates. These are dependency
+115 integration, and one E2E, and the Revmux full Go gates. These are dependency
 evidence, not a claim that the main product gate or full production pipeline is
 complete.
 

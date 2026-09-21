@@ -216,6 +216,12 @@ leave a clean worktree with no uncommitted or untracked non-ignored files, and
 contain the completed plan checkboxes. The worker's response alone never
 accepts a task.
 
+Adopting a changed plan does not accept new completion claims. New or renamed
+items without matching accepted facts become pending, even when the edited
+plan marks them checked. New worktrees receive the authorized plan structure
+and accepted completion facts through a recoverable atomic publication. A
+failed attempt's checkbox changes never become another task's starting facts.
+
 Write concrete, verifiable items. Each item should name an outcome and, where
 possible, its verification. Avoid broad items such as “finish feature” that
 combine unrelated behavior and checks.
