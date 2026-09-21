@@ -19,8 +19,10 @@ import { fileURLToPath } from "node:url";
 import { RunRegistry } from "../src/registry.js";
 import { PlanExecController } from "../src/controller.js";
 import { LocalOperationFailedError } from "../src/local-operation.js";
-import { SessionManager, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import {
+import { TaskProjector } from "../src/task-projection.js";
+import { createControllerLocalExecutor } from "./fixtures/controller-local-executor.js";
+import { SessionManager, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import planExecExtension, {
   abandonedRunsNotice,
   abandonmentProbe,
   bridgeRuntimeCompatible,
@@ -94,6 +96,16 @@ const config = {
   statsAgent: "reviewer",
   statsMaxTurns: 20,
 };
+
+function persistedSession(cwd: string, directory: string): SessionManager {
+  const session = SessionManager.create(cwd, directory);
+  session.appendMessage({ role: "user", content: "Execute the saved plan.", timestamp: Date.now() });
+  session.appendMessage({ role: "assistant", content: [{ type: "text", text: "Ready to execute." }],
+    api: "openai-responses", provider: "openai", model: "test-fixture", stopReason: "stop", timestamp: Date.now(),
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } });
+  return session;
+}
 
 test("task blocker status and pause notification explain recovery without a crash", () => {
   const blocked = run({
@@ -3560,12 +3572,7 @@ test("a saved session waits for durable Git lane creation and recovers creation 
     assert.equal(result.code, 0, result.stderr);
   }
   await writeFile(join(source, "plan.md"), "### Task 1: Implement\n- [ ] Do the work\n");
-  const sourceSession = SessionManager.create(source, join(root, "sessions", "source"));
-  sourceSession.appendMessage({ role: "user", content: "Execute the saved plan.", timestamp: Date.now() });
-  sourceSession.appendMessage({ role: "assistant", content: [{ type: "text", text: "Ready to execute." }],
-    api: "openai-responses", provider: "openai", model: "test-fixture", stopReason: "stop", timestamp: Date.now(),
-    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } });
+  const sourceSession = persistedSession(source, join(root, "sessions", "source"));
   const sourceSessionFile = sourceSession.getSessionFile();
   assert.ok(sourceSessionFile);
   await access(sourceSessionFile);
@@ -3575,20 +3582,25 @@ test("a saved session waits for durable Git lane creation and recovers creation 
   let releaseCreation!: () => void;
   const creationBarrier = new Promise<void>((resolve) => { releaseCreation = resolve; });
   let attempted = 0;
+  const localExecutor = createControllerLocalExecutor();
+  const creationOperations = new Set<string>();
+  const createdPaths = new Set<string>();
+  t.after(() => Promise.all([...createdPaths].map((path) => rm(path, { recursive: true, force: true }))));
   const controller = new PlanExecController(registry,
     { spawn: unavailable, operation: unavailable, status: unavailable, result: unavailable, adopt: unavailable, stop: unavailable },
     { start: unavailable, status: unavailable, result: unavailable, adopt: unavailable, cancel: unavailable }, command,
     async (cwd, commands, options) => {
       assert.equal(await options.isAuthorized(), true);
-      attempted++;
-      if (attempted === 1) {
-        await creationBarrier;
-        throw new LocalOperationFailedError("temporary checkout failure");
+      if (options.operationId.startsWith("git:worktree:") && !creationOperations.has(options.operationId)) {
+        creationOperations.add(options.operationId);
+        createdPaths.add(options.operationId.slice("git:worktree:".length));
+        attempted++;
+        if (attempted === 1) {
+          await creationBarrier;
+          throw new LocalOperationFailedError("temporary checkout failure");
+        }
       }
-      for (const [program, ...args] of commands) {
-        const result = await command(program!, args, cwd);
-        assert.equal(result.code, 0, result.stderr);
-      }
+      await localExecutor(cwd, commands, options);
     });
   const ctx = { cwd: source, hasUI: true,
     ui: { select: async () => "Worktree (isolated)" },
@@ -3637,8 +3649,11 @@ test("a saved session waits for durable Git lane creation and recovers creation 
   assert.equal(current.lanePreparation?.state, "create");
   assert.equal(await afterTick(current), false);
   current = await registry.update({ ...current, nextAttemptAt: 0 });
-  current = await controller.tick(current.id, sourceSession.getSessionId());
-  assert.equal(current.lanePreparation?.state, "bootstrap");
+  for (let tick = 0; tick < 5 && current.lanePreparation?.state === "create"; tick++) {
+    assert.equal(await afterTick(current), false);
+    current = await controller.tick(current.id, sourceSession.getSessionId());
+  }
+  assert.equal(current.lanePreparation?.state, "bootstrap", current.error ?? current.wakeReason ?? "The lane must finish creation.");
   assert.equal(await afterTick({ ...current, status: "paused", userStopped: true }), false);
   assert.equal(await afterTick({ ...current, status: "cancel_pending", userStopped: true }), false);
   assert.equal(await afterTick(current), true);
@@ -3747,6 +3762,236 @@ test("explicit pause from an unrelated session polls a dead owner's worker until
   assert.equal(current.activeOperation?.processTreeExited, true);
   assert.deepEqual(current.taskAttempts, held.taskAttempts);
 });
+
+for (const interruption of ["shutdown", "new-owner", "own-switch"] as const) {
+  test(`worktree handoff fences ${interruption} without waiting for projection or reclaiming another lease`, { timeout: 5_000 }, async (t) => {
+    const initialCwd = process.cwd();
+    const root = await mkdtemp(join(tmpdir(), "exec-handoff-retirement-"));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const target = join(root, "worktree");
+    await mkdir(target);
+    const source = persistedSession(root, join(root, "sessions", "source"));
+    const fork = SessionManager.forkFrom.bind(SessionManager);
+    t.mock.method(SessionManager, "forkFrom", (file: string, cwd: string) => fork(file, cwd, join(root, "sessions", "target")));
+    const registry = new RunRegistry(join(root, "runs"));
+    const held = await registry.create(run({ repositoryRoot: root, worktreeCwd: target,
+      planPath: join(target, "plan.md"), lease: { ...liveLease(), sessionId: source.getSessionId() } }));
+    t.mock.method(RunRegistry.prototype, "get", registry.get.bind(registry));
+    t.mock.method(RunRegistry.prototype, "updateIfCurrent", registry.updateIfCurrent.bind(registry));
+    const claim = registry.claim.bind(registry);
+    let targetClaimed!: () => void;
+    const claimedTarget = new Promise<void>((resolve) => { targetClaimed = resolve; });
+    let releaseClaim!: () => void;
+    const pendingClaim = new Promise<void>((resolve) => { releaseClaim = resolve; });
+    t.after(releaseClaim);
+    t.mock.method(RunRegistry.prototype, "claim", async (candidate: PlanExecRun, sessionId: string) => {
+      const claimed = await claim(candidate, sessionId);
+      if (sessionId !== source.getSessionId()) { targetClaimed(); await pendingClaim; }
+      return claimed;
+    });
+    t.mock.method(PlanExecController.prototype, "start", async () => held);
+    t.mock.method(PlanExecController.prototype, "tick", async () => { assert.fail("The source must not restart after handoff shutdown."); });
+    let projectionCalls = 0;
+    let releaseProjection!: () => void;
+    const projection = new Promise<void>((resolve) => { releaseProjection = resolve; });
+    t.after(releaseProjection);
+    t.mock.method(TaskProjector.prototype, "sync", async (current: PlanExecRun) => {
+      projectionCalls++;
+      await projection;
+      return current;
+    });
+    type Handler = (event: unknown, ctx: ExtensionCommandContext) => Promise<unknown>;
+    const events = new Map<string, Handler[]>();
+    const commands = new Map<string, { handler(args: string, ctx: ExtensionCommandContext): Promise<void> }>();
+    const errors: string[] = [];
+    const pi = { events: { on() {}, emit() {} },
+      on(name: string, handler: Handler) { events.set(name, [...events.get(name) ?? [], handler]); },
+      registerCommand(name: string, command: { handler(args: string, ctx: ExtensionCommandContext): Promise<void> }) { commands.set(name, command); },
+      registerTool() {}, getAllTools() { return []; }, getActiveTools() { return []; }, setActiveTools() {},
+    } as unknown as ExtensionAPI;
+    const shutdown = async (reason: string, targetSessionFile?: string) => {
+      for (const handler of events.get("session_shutdown") ?? [])
+        await handler({ type: "session_shutdown", reason, targetSessionFile }, ctx);
+    };
+    let switchCalls = 0;
+    const ctx = { cwd: root, hasUI: true, sessionManager: source,
+      ui: { select: async () => "Worktree (isolated)",
+        notify(message: string, level: string) { if (level === "error") errors.push(message); },
+        setStatus() {}, setWidget() {},
+      },
+      switchSession: async (sessionFile: string) => {
+        switchCalls++;
+        await shutdown("resume", sessionFile);
+        return { cancelled: false };
+      },
+    } as unknown as ExtensionCommandContext;
+    t.mock.timers.enable({ apis: ["setInterval", "setTimeout"] });
+    planExecExtension(pi);
+    const command = commands.get("exec")!.handler("plan.md", ctx);
+    await claimedTarget;
+    const targetOwner = (await registry.get(held.id))?.lease;
+    assert.ok(targetOwner);
+    assert.notEqual(targetOwner.sessionId, source.getSessionId());
+    if (interruption !== "own-switch") {
+      const closing = shutdown("new");
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      t.mock.timers.tick(1_500);
+      await closing;
+    }
+    if (interruption === "new-owner") {
+      const current = (await registry.get(held.id))!;
+      await registry.update({ ...current, lease: { ...liveLease(), sessionId: "replacement-owner" } });
+    }
+    releaseClaim();
+    await command;
+    const current = await registry.get(held.id);
+    assert.equal(current?.lease?.sessionId, interruption === "shutdown" ? undefined
+      : interruption === "new-owner" ? "replacement-owner" : targetOwner.sessionId);
+    assert.equal(switchCalls, interruption === "own-switch" ? 1 : 0);
+    assert.equal(projectionCalls, interruption === "own-switch" ? 1 : 0);
+    assert.deepEqual(errors, []);
+    assert.equal(process.cwd(), initialCwd);
+  });
+}
+
+for (const reason of ["new", "reload"] as const) {
+  test(`${reason} retires only its drained controller and restores the next extension instance`, { timeout: 10_000 }, async (t) => {
+    const root = await mkdtemp(join(tmpdir(), "exec-session-retirement-"));
+    const registry = new RunRegistry(join(root, "runs"));
+    const sessionA = "outgoing-session";
+    const sessionB = reason === "reload" ? sessionA : "replacement-session";
+    const held = await registry.create(run({ repositoryRoot: root, worktreeCwd: root,
+      planPath: join(root, "plan.md"), lease: { ...liveLease(), sessionId: sessionA },
+      activeOperation: { operationId: "preserved-operation", service: "bridge", kind: "implementation", externalRunId: "preserved-worker" } }));
+    const other = await registry.create(run({ repositoryRoot: join(root, "other"), worktreeCwd: join(root, "other"),
+      lease: { ...liveLease(), sessionId: "another-live-controller" } }));
+    const lookup = registry.get.bind(registry);
+    let restorationReadFailures = reason === "new" ? 2 : 1;
+    t.mock.method(RunRegistry.prototype, "get", async (runId: string) => {
+      const current = await lookup(runId);
+      if (runId === held.id && current && !current.lease && restorationReadFailures > 0) {
+        restorationReadFailures--;
+        throw new Error("Temporary restoration read failure.");
+      }
+      return current;
+    });
+    t.mock.method(RunRegistry.prototype, "listWithErrors", registry.listWithErrors.bind(registry));
+    t.mock.method(RunRegistry.prototype, "claim", registry.claim.bind(registry));
+    const update = registry.updateIfCurrent.bind(registry);
+    let rejectRetirement = true;
+    let retirementFailed!: () => void;
+    const failedRetirement = new Promise<void>((resolve) => { retirementFailed = resolve; });
+    t.mock.method(RunRegistry.prototype, "updateIfCurrent", async (candidate: PlanExecRun, revision: number, preserveRevision?: boolean) => {
+      if (candidate.id === held.id && !candidate.lease && rejectRetirement) {
+        rejectRetirement = false;
+        retirementFailed();
+        throw new Error("Temporary registry write failure.");
+      }
+      return update(candidate, revision, preserveRevision);
+    });
+    t.mock.method(TaskProjector.prototype, "sync", async (current: PlanExecRun) => current);
+    let releaseTick!: () => void;
+    const pendingTick = new Promise<void>((resolve) => { releaseTick = resolve; });
+    let tickStarted!: () => void;
+    const startedTick = new Promise<void>((resolve) => { tickStarted = resolve; });
+    let replacementTicked!: () => void;
+    const replacementTick = new Promise<void>((resolve) => { replacementTicked = resolve; });
+    const ticks: string[] = [];
+    let activeTicks = 0;
+    t.mock.method(PlanExecController.prototype, "tick", async (runId: string, owner: string) => {
+      assert.equal(activeTicks++, 0, "Session replacement must never overlap controller ticks.");
+      try {
+        const current = await registry.get(runId);
+        assert.ok(current);
+        const claimed = await registry.claim(current, owner);
+        ticks.push(owner);
+        if (ticks.length === 1) {
+          tickStarted();
+          await pendingTick;
+          return (await update({ ...claimed, wakeReason: "late outgoing observation" }, claimed.updatedAt)).run;
+        }
+        const next = reason === "new" && claimed.activeOperation
+          ? (await update({ ...claimed, activeOperation: { ...claimed.activeOperation, processTreeExited: true } }, claimed.updatedAt)).run
+          : claimed;
+        replacementTicked();
+        return next;
+      } finally {
+        activeTicks--;
+      }
+    });
+    type Handler = (event: unknown, ctx: ExtensionCommandContext) => Promise<unknown>;
+    const harness = (sessionId: string) => {
+      const events = new Map<string, Handler[]>();
+      const commands = new Map<string, { handler(args: string, ctx: ExtensionCommandContext): Promise<void> }>();
+      let uiCalls = 0;
+      const pi = { events: { on() {}, emit() {} },
+        on(name: string, handler: Handler) { events.set(name, [...events.get(name) ?? [], handler]); },
+        registerCommand(name: string, command: { handler(args: string, ctx: ExtensionCommandContext): Promise<void> }) { commands.set(name, command); },
+        registerTool() {}, getAllTools() { return []; }, getActiveTools() { return []; }, setActiveTools() {},
+      } as unknown as ExtensionAPI;
+      const ctx = { cwd: root, hasUI: true, sessionManager: { getSessionId: () => sessionId },
+        ui: { setStatus() { uiCalls++; }, setWidget() { uiCalls++; }, notify() { uiCalls++; } },
+      } as unknown as ExtensionCommandContext;
+      planExecExtension(pi);
+      return { commands, ctx, uiCalls: () => uiCalls,
+        emit: async (name: string) => { for (const handler of events.get(name) ?? []) await handler({ type: name, reason }, ctx); } };
+    };
+    t.mock.timers.enable({ apis: ["setInterval", "setTimeout"] });
+    const first = harness(sessionA);
+    const replacements: Array<ReturnType<typeof harness>> = [];
+    t.after(async () => {
+      releaseTick();
+      for (const replacement of replacements) await replacement.emit("session_shutdown");
+      await rm(root, { recursive: true, force: true });
+    });
+    await first.emit("session_start");
+    t.mock.timers.tick(1_000);
+    await startedTick;
+    const shutdown = first.emit("session_shutdown");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    t.mock.timers.tick(1_500);
+    await shutdown;
+    const outgoingUICalls = first.uiCalls();
+    assert.equal((await registry.get(held.id))?.lease?.sessionId, sessionA);
+    assert.equal(activeTicks, 1);
+    const second = harness(sessionB);
+    replacements.push(second);
+    await second.emit("session_start");
+    t.mock.timers.tick(1_000);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(ticks, [sessionA]);
+    if (reason === "new") {
+      await second.commands.get("exec")!.handler(`pause ${held.id}`, second.ctx);
+      const paused = await registry.get(held.id);
+      assert.equal(paused?.userStopped, true);
+      assert.equal(paused?.status, "paused");
+      assert.equal(paused?.stopGeneration, 1);
+      assert.equal(paused?.lease?.sessionId, sessionA);
+    }
+    releaseTick();
+    await failedRetirement;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal((await registry.get(held.id))?.lease?.sessionId, sessionA);
+    assert.deepEqual(ticks, [sessionA]);
+    t.mock.timers.tick(1_000);
+    const restorationDeadline = Date.now() + 2_000;
+    while (ticks.length < 2 && Date.now() < restorationDeadline) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      t.mock.timers.tick(1_000);
+    }
+    assert.equal(ticks.length, 2, "The replacement must automatically restore after retirement succeeds.");
+    await replacementTick;
+    const recovered = await registry.get(held.id);
+    assert.equal(recovered?.lease?.sessionId, sessionB);
+    assert.equal(recovered?.activeOperation?.operationId, "preserved-operation");
+    assert.equal(recovered?.status, reason === "new" ? "paused" : "running");
+    if (reason === "new") assert.equal(recovered?.userStopped, true);
+    assert.deepEqual(ticks, [sessionA, sessionB]);
+    assert.equal(restorationReadFailures, 0);
+    assert.equal(first.uiCalls(), outgoingUICalls);
+    assert.deepEqual((await registry.get(other.id))?.lease, other.lease);
+  });
+}
 
 test("cleanup reports every outcome instead of stopping at the first refusal", async () => {
   const first = retiredRun({ id: "33333333-3333-4333-8333-333333333333" });
