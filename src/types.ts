@@ -363,6 +363,7 @@ export interface PlanExecRun {
   repositoryRoot: string;
   planPath: string;
   planHash: string;
+  initialPlan?: { hash: string; content: string };
   approvedPlan?: { hash: string; content: string };
   worktreeCwd: string;
   branch: string;

@@ -7,7 +7,6 @@ import {
   readFile,
   realpath,
   rename,
-  writeFile,
 } from "node:fs/promises";
 import {
   basename,
@@ -195,9 +194,11 @@ export class PlanExecController {
       ? options.cwd
       : resolve(options.cwd, options.existingWorktree);
     const requestedPlan = resolve(targetPath, options.planPath);
-    const plan = await readPlan(options.existingWorktree === undefined
+    const sourcePlanPath = options.existingWorktree === undefined
       ? requestedPlan
-      : await realpath(requestedPlan));
+      : await realpath(requestedPlan);
+    const initialContent = await readFile(sourcePlanPath, "utf8");
+    const plan = parsePlan(sourcePlanPath, initialContent);
     const repositoryRoot = await requireGitRepository(
       this.runCommand,
       options.cwd,
@@ -253,6 +254,7 @@ export class PlanExecController {
       repositoryRoot,
       planPath: executionPlanPath,
       planHash: plan.hash,
+      initialPlan: { hash: plan.hash, content: initialContent },
       worktreeCwd: executionWorktreeCwd,
       branch,
       defaultBranch: baseBranch,
@@ -363,18 +365,17 @@ export class PlanExecController {
       const content = await readFile(prepared.planPath, "utf8");
       const approved = parsePlan(prepared.planPath, content);
       if (approved.hash !== reviewedPlanHash) return this.pauseForReview(prepared, PLAN_STRUCTURE_CHANGED_ERROR);
-      const tasks = reconcileTasks(approved.tasks, prepared.tasks);
-      for (const task of approved.tasks) {
-        const execution = tasks[String(task.id)]!;
-        if (execution.state === "accepted" && task.unchecked.length > 0)
-          tasks[String(task.id)] = { ...execution, state: "ready" };
-      }
+      const acceptedHead = prepared.acceptedHead ?? prepared.outputTarget?.initialHead ??
+        await gitValue(this.runCommand, prepared.worktreeCwd, ["rev-parse", "HEAD"]);
+      const { facts } = await this.planBaseline(prepared, prepared.worktreeCwd, acceptedHead, prepared.planPath);
+      const materialized = parsePlan(prepared.planPath, materializeApprovedPlan(prepared.planPath, content, facts));
+      const tasks = reconcileTaskFacts(materialized, prepared.tasks);
       const adopted = await this.registry.updateIfCurrent(
         {
           ...prepared,
           planHash: reviewedPlanHash,
           approvedPlan: { hash: reviewedPlanHash, content },
-          tasks: reconcileTasks(approved.tasks, tasks),
+          tasks,
           status: RUN_STATUS.PAUSED,
         },
         prepared.updatedAt,
@@ -643,9 +644,21 @@ export class PlanExecController {
   }
 
   private async advanceImplementation(run: PlanExecRun): Promise<PlanExecRun> {
-    const plan = await readPlan(run.planPath);
+    const content = await readFile(run.planPath, "utf8");
+    const plan = parsePlan(run.planPath, content);
     if (plan.hash !== run.planHash) {
       return this.pauseForReview(run, PLAN_STRUCTURE_CHANGED_ERROR);
+    }
+    if (!run.initialPlan && !run.approvedPlan && run.tasks) {
+      const head = run.acceptedHead ?? run.outputTarget?.initialHead ?? await gitValue(this.runCommand, run.worktreeCwd, ["rev-parse", "HEAD"]);
+      const { facts } = await this.planBaseline(run, run.worktreeCwd, head, run.planPath);
+      const materialized = materializeApprovedPlan(run.planPath, content, facts);
+      const captured = await this.registry.updateIfCurrent({ ...run,
+        initialPlan: { hash: run.planHash, content: materialized },
+        tasks: reconcileTaskFacts(parsePlan(run.planPath, materialized), run.tasks),
+      }, run.updatedAt);
+      if (!captured.applied) return captured.run;
+      run = captured.run;
     }
     const checkoutRoot = await gitCheckoutRoot(this.runCommand, run.worktreeCwd);
     const tasks = reconcileTasks(plan.tasks, run.tasks);
@@ -710,7 +723,15 @@ export class PlanExecController {
       return laneRun.run;
     }
     const occupied = Object.values(tasks).some((other) => other.taskId !== task.id && other.state !== "accepted" && other.laneCwd === run.worktreeCwd);
-    if (occupied && !selected.laneCwd) {
+    let needsPublication = false;
+    const authorized = run.approvedPlan ?? run.initialPlan;
+    if (authorized && !selected.laneCwd) {
+      const { facts } = await this.planBaseline(run, run.worktreeCwd, acceptedHead, run.planPath);
+      const materialized = parsePlan(run.planPath, materializeApprovedPlan(run.planPath, authorized.content, facts));
+      needsPublication = JSON.stringify(plan.tasks.map((entry) => entry.unchecked)) !==
+        JSON.stringify(materialized.tasks.map((entry) => entry.unchecked));
+    }
+    if ((occupied || needsPublication) && !selected.laneCwd) {
       const token = randomUUID().slice(0, LANE_TOKEN_LENGTH);
       return (await this.registry.updateIfCurrent({ ...run, tasks, acceptedHead,
         lanePreparation: { taskId: task.id, cwd: join(dirname(checkoutRoot), `plan-exec-${run.id}-${token}`),
@@ -808,12 +829,10 @@ export class PlanExecController {
         await verifyExecutionTree(this.runCommand, preparation.cwd, run.repositoryRoot, preparation.branch);
         const head = await gitValue(this.runCommand, preparation.cwd, ["rev-parse", "HEAD"]);
         if (head !== preparation.baselineCommit) throw new Error("Lane creation found an unexpected HEAD; refusing to reuse it.");
-        if (preparation.publication || (run.approvedPlan && preparation.taskId !== 0)) {
-          const pending = await this.publishApprovedPlan(run, preparation.cwd, preparation.baselineCommit, planPath);
-          if (pending) return pending;
-          if (preparation.publication?.planHash !== run.planHash)
-            throw new LocalOperationFailedError("Plan publication retired under an earlier approval; a fresh lane is required.");
-        } else if (!await pathExists(planPath)) await copyPlanIntoWorktree(preparation.sourcePlanPath ?? run.planPath, planPath);
+        const pending = await this.publishLanePlan(run, preparation.cwd, preparation.baselineCommit, planPath);
+        if (pending) return pending;
+        if (preparation.publication?.planHash !== run.planHash)
+          throw new LocalOperationFailedError("Plan publication retired under an earlier approval; a fresh lane is required.");
         return (await this.registry.updateIfCurrent({ ...run, lanePreparation: { ...preparation, state: "bootstrap" } }, run.updatedAt)).run;
       }
       await this.executeLocalCommands(workerCwd, await bootstrapCommands(workerCwd, run.config.bootstrapCommands),
@@ -849,7 +868,22 @@ export class PlanExecController {
     }
   }
 
-  private async publishApprovedPlan(run: PlanExecRun, cwd: string, baselineCommit: string, planPath: string): Promise<PlanExecRun | undefined> {
+  private async planBaseline(run: PlanExecRun, cwd: string, commit: string, planPath: string) {
+    const checkoutRoot = await gitCheckoutRoot(this.runCommand, cwd);
+    const relativePlanPath = gitPath(relative(checkoutRoot, planPath));
+    const tracked = await gitValue(this.runCommand, checkoutRoot, ["ls-tree", "--name-only", commit, "--", relativePlanPath]);
+    let committed: string | undefined;
+    if (tracked) {
+      const result = await this.runCommand("git", ["show", `${commit}:${relativePlanPath}`], checkoutRoot);
+      if (result.code !== 0) throw new Error(result.stderr.trim() || "Unable to read the committed baseline plan.");
+      committed = result.stdout;
+    }
+    const facts = commit === run.outputTarget?.initialHead && run.initialPlan
+      ? run.initialPlan.content : committed;
+    return { committed, facts };
+  }
+
+  private async publishLanePlan(run: PlanExecRun, cwd: string, baselineCommit: string, planPath: string): Promise<PlanExecRun | undefined> {
     const options = await this.localOptions(run, `plan:publish:${cwd}`, baselineCommit);
     const directory = join(options.journalRoot, "plan-payloads", run.id);
     const publication = run.lanePreparation!.publication;
@@ -859,15 +893,22 @@ export class PlanExecController {
           join(directory, `${publication.digest}.json`), publication.digest]], options);
       return undefined;
     }
-    const approved = run.approvedPlan!;
-    if (approved.hash !== run.planHash || parsePlan(planPath, approved.content).hash !== run.planHash)
-      throw new Error("Approved plan snapshot does not match the authorized structure.");
-    const relativePlanPath = gitPath(relative(cwd, planPath));
-    const tracked = await gitValue(this.runCommand, cwd, ["ls-tree", "--name-only", baselineCommit, "--", relativePlanPath]);
-    const baseline = tracked ? await this.runCommand("git", ["show", `${baselineCommit}:${relativePlanPath}`], cwd) : undefined;
-    if (baseline && baseline.code !== 0) throw new Error(baseline.stderr.trim() || "Unable to read the committed baseline plan.");
-    const payload = { cwd, path: planPath, expectedContent: baseline?.stdout ?? null,
-      content: materializeApprovedPlan(planPath, approved.content, baseline?.stdout) };
+    const authorized = run.approvedPlan ?? run.initialPlan;
+    if (!authorized) {
+      const content = await readFile(run.lanePreparation!.sourcePlanPath ?? run.planPath, "utf8");
+      if (parsePlan(planPath, content).hash !== run.planHash) return this.pauseForReview(run, PLAN_STRUCTURE_CHANGED_ERROR);
+      const { facts } = await this.planBaseline(run, cwd, baselineCommit, planPath);
+      const materialized = materializeApprovedPlan(planPath, content, facts);
+      return (await this.registry.updateIfCurrent({ ...run,
+        initialPlan: { hash: run.planHash, content: materialized },
+        tasks: reconcileTaskFacts(parsePlan(planPath, materialized), run.tasks),
+      }, run.updatedAt)).run;
+    }
+    if (authorized.hash !== run.planHash) return this.pauseForReview(run, PLAN_STRUCTURE_CHANGED_ERROR);
+    const { committed, facts } = await this.planBaseline(run, cwd, baselineCommit, planPath);
+    const payload = { cwd, path: planPath, expectedContent: committed ?? null,
+      content: run.lanePreparation!.taskId === 0 && !run.approvedPlan ? authorized.content
+        : materializeApprovedPlan(planPath, authorized.content, facts) };
     const serialized = JSON.stringify(payload);
     const digest = createHash("sha256").update(serialized).digest("hex");
     await mkdir(directory, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
@@ -879,7 +920,7 @@ export class PlanExecController {
       await durableJson(payloadPath, payload);
     }
     return (await this.registry.updateIfCurrent({ ...run,
-      lanePreparation: { ...run.lanePreparation!, publication: { planHash: approved.hash, digest } },
+      lanePreparation: { ...run.lanePreparation!, publication: { planHash: authorized.hash, digest } },
     }, run.updatedAt)).run;
   }
 
@@ -3359,6 +3400,22 @@ function normalizedSummary(summary: string): string {
   return summary.trim().replace(/\s+/g, " ").toLowerCase();
 }
 
+function reconcileTaskFacts(plan: ParsedPlan, existing: PlanExecRun["tasks"]) {
+  const tasks = reconcileTasks(plan.tasks, existing);
+  for (const task of plan.tasks) {
+    const execution = tasks[String(task.id)]!;
+    if (execution.state !== "accepted" || task.unchecked.length === 0) continue;
+    const reopened = { ...execution, state: "ready" as const };
+    delete reopened.laneCwd;
+    delete reopened.laneBranch;
+    delete reopened.baselineCommit;
+    delete reopened.candidateCommit;
+    delete reopened.operationId;
+    tasks[String(task.id)] = reopened;
+  }
+  return reconcileTasks(plan.tasks, tasks);
+}
+
 function assertAcceptedCheckboxes(run: PlanExecRun, plan: ParsedPlan): void {
   if (plan.hash !== run.planHash) throw new Error(PLAN_STRUCTURE_CHANGED_ERROR);
   for (const task of Object.values(run.tasks ?? {})) {
@@ -3375,14 +3432,6 @@ function statsPrompt(run: PlanExecRun): string {
     `Worktree: ${run.worktreeCwd}`,
     "Use git churn and available artifacts. Return concise Markdown with changed files, commits, verification, and residual findings.",
   ].join("\n");
-}
-
-async function copyPlanIntoWorktree(
-  source: string,
-  destination: string,
-): Promise<void> {
-  await mkdir(dirname(destination), { recursive: true });
-  await writeFile(destination, await readFile(source));
 }
 
 function withoutOperation(run: PlanExecRun): PlanExecRun {
