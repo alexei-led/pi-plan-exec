@@ -62,6 +62,11 @@ Control RPC deadlines remain finite. A lost reply does not establish whether a
 child started or stopped. Lookup, replay, adoption, and cancellation retain the
 same operation ID and immutable digest across restart.
 
+Recovery records preserve ownership as well as lifetime. Ordinary native resume
+cannot downgrade an owned run to the legacy launcher. Continuation uses a fresh
+correlated owned operation after predecessor retirement. Owner-bound Bridge
+lookup and cancellation use v2 even before a new client negotiates capabilities.
+
 ## Caller, native, and kernel identities
 
 These identity namespaces are separate and must never be equated:
@@ -91,6 +96,9 @@ Fusion uses a structured panel graph with one judge and the
 currently unsupported and must be rejected before dispatch; they cannot be
 treated as equivalent to the structured panel-plus-judge path. Fusion start,
 lookup, result, and cancellation preserve the caller digest and operation ID.
+Shared project admission serializes concurrent starts across Pi processes.
+Writers must use the updated protocol; conflicting unknown legacy snapshots
+remain visible and fenced rather than being discarded or replaced by age.
 
 Revmux must support the explicit `--execution-lifetime=unbounded|bounded`
 selection from [Revmux commit 988904f](https://github.com/umputun/revmux/pull/35/commits/988904f30da351e76c29d5779c6833a6bf890b51),
@@ -126,7 +134,7 @@ ownership decisions.
 model turns are scripted; a passing smoke run is not a live-LLM guarantee. A
 Darwin host with the native GUI/compiler prerequisites is required for the
 supported path. The full pipeline passed on the final dependency pins. The
-main full gate passed all 511 tests, lint, TypeScript and package validation,
+main full gate passed all 514 tests, lint, TypeScript and package validation,
 including the plan-publication follow-through. The cumulative Revmux
 confirmation remains pending.
 
@@ -140,15 +148,15 @@ confirmation remains pending.
 
 The source pins currently under review are:
 
-- native `pi-subagents`: `798b70d8c94befd7ae96fc40d4ae9198a71810ef`;
-- Bridge: `c7ab396b2ab3f5354790c974abce41e04fea41a1`;
-- Fusion: `a29934f32376f799235a6a00ec3ddcebf7cb0108`;
+- native `pi-subagents`: `0fde758ad54a245935b432e14447c02b03f2b052`;
+- Bridge: `1ef889db7ac6a6fa67618a711fbb60b9eb161f9d`;
+- Fusion: `a80ac608b2af5d357a59a96a6f78ea44b78e40fb`;
 - Revmux: `988904f30da351e76c29d5779c6833a6bf890b51`;
 - Pi SDK: `0.86.1`.
 
-Reported dependency checks are native 3337 unit and 1090 integration tests,
-Bridge 72 tests plus delayed-admission/restart/cancel smoke, Fusion 251 unit,
-121 integration, and one E2E, and the Revmux full Go gates. These are dependency
+Reported dependency checks are native 3339 unit and 1091 integration tests,
+Bridge 72 tests plus delayed-admission/restart/cancel smoke, Fusion 255 unit,
+125 integration, and one E2E, and the Revmux full Go gates. These are dependency
 evidence, not a claim that the main product gate or full production pipeline is
 complete.
 
