@@ -14,21 +14,46 @@ import {
 } from "../src/bridge.js";
 
 const FULL_OWNERSHIP = { version: 1, scope: "owned-process-tree", escapedDescendants: "contained" } as const;
+const CALLER_BINDING = { operationId: "caller-op", requestDigest: "caller-digest" };
+
+function observedProof(runId: string) {
+  const binding = { operationId: "kernel-op", requestDigest: "kernel-digest",
+    hostId: "00000000-0000-0000-0000-000000000001", bootId: "00000000-0000-0000-0000-000000000002" };
+  const identity = { ...binding, version: 1, backend: "darwin-resource-coalition-v1", coalitionId: "42",
+    leader: { pid: 23, uniqueId: "123456", pidVersion: 1 } };
+  const proof = { ...binding, kind: "darwin-coalition-retired", identity, observedAt: "2026-09-21T12:00:00.000Z" };
+  return { version: 1, state: "observed", runId, runnerProcessInstanceId: "kernel-instance",
+    observedAt: Date.parse(proof.observedAt), processTreeOwnership: FULL_OWNERSHIP,
+    callerBinding: CALLER_BINDING, nativeOperation: { operationId: "native-op", digest: "native-digest" },
+    kernelBinding: binding, kernelProof: { status: "retired", binding, identity, proof } };
+}
+
+test("kernel retirement proof needs exact prepared binding and no fabricated process instances", () => {
+  const proof = observedProof("native-run");
+  assert.ok(processTerminalProof(proof, "native-run", CALLER_BINDING));
+  assert.equal(processTerminalProof(proof, "native-run"), undefined);
+  for (const invalid of [
+    { ...proof, kernelBinding: { ...proof.kernelBinding, requestDigest: "other" } },
+    { ...proof, kernelProof: { ...proof.kernelProof, status: "never-started" } },
+    { ...proof, kernelProof: { ...proof.kernelProof, identity: { ...proof.kernelProof.identity, bootId: "other" } } },
+    { ...proof, nativeOperation: undefined }, { ...proof, callerBinding: { ...CALLER_BINDING, requestDigest: "other" } },
+  ]) assert.equal(processTerminalProof(invalid, "native-run", CALLER_BINDING), undefined);
+});
 
 test("workflow proof requires closed dispatch and recursively observed child exit", () => {
-  const child = { version: 1, state: "observed", runId: "child", runnerProcessInstanceId: "instance",
-    observedAt: 1, instances: [], processTreeOwnership: FULL_OWNERSHIP };
+  const child = observedProof("child");
   const workflow = { version: 1, kind: "workflow", state: "observed", runId: "flow",
-    dispatchClosed: true, observedAt: 2, children: [child] };
-  assert.equal(hasTerminalOwnershipProof({ workflowTerminalProof: workflow }, "flow"), true);
-  assert.equal(hasTerminalOwnershipProof({ workflowTerminalProof: { ...workflow, children: [{ ...workflow, runId: "nested" }] } }, "flow"), true);
+    dispatchClosed: true, observedAt: 2, children: [child], callerBinding: CALLER_BINDING };
+  assert.equal(hasTerminalOwnershipProof({ workflowTerminalProof: workflow }, "flow", CALLER_BINDING), true);
+  assert.equal(hasTerminalOwnershipProof({ workflowTerminalProof: workflow }, "flow"), false);
+  assert.equal(hasTerminalOwnershipProof({ workflowTerminalProof: { ...workflow, children: [{ ...workflow, runId: "nested" }] } }, "flow", CALLER_BINDING), true);
   for (const invalid of [
     { ...workflow, dispatchClosed: false }, { ...workflow, children: [{ ...child, state: "pending" }] },
     { ...workflow, children: [{ ...child, scope: "process-groups" }] },
     { ...workflow, children: [{ ...child, processTreeOwnership: undefined }] },
     { ...workflow, children: [{ ...child, instances: [{ processTree: { mechanism: "posix-process-group", containment: "unverified" } }] }] },
     { ...workflow, children: [{}] }, { ...workflow, runId: "different" },
-  ]) assert.equal(hasTerminalOwnershipProof({ workflowTerminalProof: invalid }, "flow"), false);
+  ]) assert.equal(hasTerminalOwnershipProof({ workflowTerminalProof: invalid }, "flow", CALLER_BINDING), false);
 });
 
 test("explicit lifetime capabilities never infer unbounded support", () => {
@@ -100,6 +125,32 @@ test("Bridge refuses explicit lifetime dispatch without a verified capability", 
   assert.ok(!result.success);
   assert.equal(result.error.code, "unsupported");
   assert.equal(events.emissions.length, 0);
+});
+
+test("diagnostic guidance stays bound to confirmed failure and durable operation identity", async () => {
+  const events = new TestEvents();
+  const bridge = new BridgeClient(events, 50);
+  const owner = { kind: "pi-plan-exec" as const, runId: "plan", key: "op", requestDigest: "caller-digest" };
+  const guidance = { diagnosticId: "stable-failure-key", toolCallId: "failed-tool-call", message: "Inspect the reported tool failure." };
+  assert.equal((await bridge.diagnoseOperation("op", owner, guidance)).success, false);
+  assert.equal(events.emissions.length, 0);
+  const preflight = bridge.capabilities();
+  events.reply("plan-exec:bridge:v2:reply:", { success: true, data: {
+    protocol: "plan-exec-bridge", version: 2, capabilities: {
+      singleAgentSpawn: true, durableOperationLookup: { version: 1 }, processTerminalProof: { version: 1 },
+      diagnosticGuidance: { version: 1, idempotent: true, mode: "follow_up", confirmedToolFailure: true },
+    },
+  } });
+  assert.equal((await preflight).diagnosticGuidance?.confirmedToolFailure, true);
+  const pending = bridge.diagnoseOperation("op", owner, guidance);
+  assert.equal(events.emitted?.payload.method, "diagnoseOperation");
+  assert.deepEqual(events.emitted?.payload.owner, owner);
+  assert.deepEqual(events.emitted?.payload.params, guidance);
+  events.reply("plan-exec:bridge:v2:reply:", { success: true, data: { state: "queued", guidanceOnly: true } });
+  assert.deepEqual(await pending, { success: true, data: { state: "queued", guidanceOnly: true } });
+  const count = events.emissions.length;
+  assert.equal((await bridge.diagnoseOperation("op", owner, { ...guidance, toolCallId: "" })).success, false);
+  assert.equal(events.emissions.length, count);
 });
 
 test("Bridge keeps lifetime support distinct and blocks group-only ownership before dispatch", async () => {
@@ -214,7 +265,7 @@ test("Bridge preflight upgrades and recovers without downgrading tracked v2 oper
       }
       this.reply(prefix, { success: true, data: {
         protocol: "plan-exec-bridge", version: 2, capabilities: {
-          workflowScriptSpawn: true, durableOperationLookup: { version: 1 }, processTerminalProof: { version: 1 },
+          workflowScriptSpawn: false, singleAgentSpawn: true, durableOperationLookup: { version: 1 }, processTerminalProof: { version: 1 },
           executionLifetime: { version: 1, modes: ["unbounded"] },
           processTreeOwnership: this.mode === "full" ? FULL_OWNERSHIP : {
             version: 1, scope: "posix-process-group", escapedDescendants: "unverified",
@@ -242,6 +293,8 @@ test("Bridge preflight upgrades and recovers without downgrading tracked v2 oper
   events.mode = "full";
   const recovered = await bridge.capabilities();
   assert.equal(recovered.healthy, true);
+  assert.equal(recovered.workflowScriptSpawn, false);
+  assert.equal(recovered.singleAgentSpawn, true);
   assert.equal(supportsOwnedProcessTree(recovered), true);
   assert.equal((await bridge.spawn("new", { executionLifetime: { mode: "unbounded" } })).success, true);
 });
@@ -263,29 +316,8 @@ test("Bridge negotiation stays bounded when no bridge is installed", async () =>
 });
 
 test("process terminal proof validates exact native identity", () => {
-  assert.deepEqual(
-    processTerminalProof(
-      {
-        version: 1,
-        state: "observed",
-        runId: "native-run-1",
-        runnerProcessInstanceId: "instance-1",
-        observedAt: 42,
-        instances: [],
-        processTreeOwnership: FULL_OWNERSHIP,
-      },
-      "native-run-1",
-    ),
-    {
-      version: 1,
-      state: "observed",
-      runId: "native-run-1",
-      runnerProcessInstanceId: "instance-1",
-      observedAt: 42,
-      instances: [],
-      processTreeOwnership: FULL_OWNERSHIP,
-    },
-  );
+  const proof = observedProof("native-run-1");
+  assert.deepEqual(processTerminalProof(proof, "native-run-1", CALLER_BINDING), proof);
   assert.equal(
     processTerminalProof(
       {
@@ -297,6 +329,7 @@ test("process terminal proof validates exact native identity", () => {
         instances: [],
       },
       "native-run-1",
+      CALLER_BINDING,
     ),
     undefined,
   );

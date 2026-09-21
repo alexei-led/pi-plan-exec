@@ -18,20 +18,21 @@ test("package manifest ships only plan-exec resources and requires recovery-capa
   };
   assert.deepEqual(manifest.pi.extensions, ["./src/index.ts"]);
   assert.deepEqual(manifest.pi.skills, ["./skills"]);
-  assert.equal(manifest.dependencies, undefined);
+  assert.match(
+    manifest.dependencies?.["pi-subagents"] ?? "",
+    /^git\+https:\/\/github\.com\/alexei-led\/pi-subagents-codex-fix\.git#[a-f0-9]{40}$/,
+  );
+  assert.equal(manifest.peerDependencies["pi-subagents"], undefined);
   assert.equal(manifest.bundledDependencies, undefined);
   for (const packageName of [
     "@alexeiled/pi-fusion",
     "@tintinweb/pi-tasks",
-    "pi-subagents",
   ]) {
     assert.equal(
       manifest.peerDependencies[packageName],
       packageName === "@alexeiled/pi-fusion"
         ? ">=0.7.0"
-        : packageName === "@tintinweb/pi-tasks"
-          ? ">=0.9.0"
-          : ">=0.60.0",
+        : ">=0.9.0",
     );
     assert.equal(manifest.peerDependenciesMeta[packageName]?.optional, true);
   }

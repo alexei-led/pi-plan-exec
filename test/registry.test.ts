@@ -479,6 +479,18 @@ test("remove deletes an unreadable record instead of throwing on it", async () =
   assert.deepEqual((await registry.listWithErrors()).errors, []);
 });
 
+test("corrupt run cleanup preserves the independent local ownership fence", async () => {
+  const { directory, registry } = await seedRegistry();
+  const id = "22222222-2222-4222-8222-222222222222";
+  const active = registry.localOperationsPath(id);
+  await mkdir(active, { recursive: true });
+  await writeFile(join(directory, id, "run.json"), "{not-json\n");
+  const entry = join(active, `${"a".repeat(64)}.json`);
+  await writeFile(entry, "{unresolved-ownership\n");
+  await assert.rejects(registry.remove(id), /unconfirmed local command ownership/);
+  assert.equal(await readFile(entry, "utf8"), "{unresolved-ownership\n");
+});
+
 test("abandonment needs a dead lease, an in-flight claim, and a gone operation", () => {
   const subject = (overrides: Partial<PlanExecRun> = {}): PlanExecRun => ({
     ...runSeed(),
@@ -572,7 +584,7 @@ test("abandonment needs a dead lease, an in-flight claim, and a gone operation",
       expected: "abandoned",
     },
     {
-      name: "healthy durable operation absence proves an unbound launch safe",
+      name: "durable operation absence alone leaves an unbound launch ambiguous",
       run: subject({
         activeOperation: {
           operationId: "operation-1",
@@ -585,7 +597,24 @@ test("abandonment needs a dead lease, an in-flight claim, and a gone operation",
         bridgeState: "absent",
         durableOperationLookup: true,
       },
-      expected: "abandoned",
+      expected: "ambiguous",
+    },
+    {
+      name: "explicit replay safety permits reconciliation without proving exit",
+      run: subject({
+        activeOperation: {
+          operationId: "operation-1",
+          service: "bridge",
+          kind: "implementation",
+        },
+      }),
+      evidence: {
+        leaseLive: false,
+        bridgeState: "absent",
+        durableOperationLookup: true,
+        replaySafe: true,
+      },
+      expected: "reconcilable",
     },
     {
       name: "live lease outranks every other signal",

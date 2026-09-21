@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -7,6 +7,86 @@ import {
   readSettledWorkflowCompletion,
   readSubagentArtifact,
 } from "../src/artifact.js";
+import { parseReviewFindings } from "../src/review.js";
+
+function nativeSingleResult() {
+  return { lifecycleArtifactVersion: 3, id: "native-review", agent: "reviewer", mode: "single",
+    success: true, state: "complete", summary: "reviewer:\nNO_FINDINGS", truncated: false,
+    launchContractDigest: "launch-contract", results: [{ agent: "reviewer", success: true,
+      output: "NO_FINDINGS", outputState: "present", launchContractDigest: "launch-contract" }] };
+}
+
+test("extracts the authoritative sole native reviewer output instead of decorated summary", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-artifact-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const result = join(root, "result.json");
+  await writeFile(result, JSON.stringify(nativeSingleResult()));
+  const output = await readSubagentArtifact(result, undefined, { runId: "native-review", agent: "reviewer", successful: true });
+  assert.equal(output, "NO_FINDINGS");
+  assert.deepEqual(parseReviewFindings(output), []);
+});
+
+test("invalid native reviewer envelopes cannot fall back to clean status text", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-artifact-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const result = join(root, "result.json");
+  await writeFile(join(root, "status.json"), JSON.stringify({ runId: "native-review", mode: "single", state: "complete",
+    steps: [{ agent: "reviewer", status: "complete", recentOutput: ["NO_FINDINGS"] }] }));
+  const valid = nativeSingleResult();
+  const child = valid.results[0];
+  for (const invalid of [
+    { ...valid, results: [] }, { ...valid, results: [child, child] },
+    { ...valid, id: "other-run" }, { ...valid, agent: "worker" },
+    { ...valid, results: [{ ...child, agent: "other-reviewer" }] },
+    { ...valid, results: [{ ...child, launchContractDigest: "other-launch" }] },
+    { ...valid, results: [{ ...child, output: "" }] },
+    { ...valid, results: [{ ...child, outputState: "missing" }] },
+    { ...valid, state: "running" }, { ...valid, truncated: true },
+    { ...valid, state: "failed", success: false, results: [{ ...child, success: false }] },
+  ]) {
+    await writeFile(result, JSON.stringify(invalid));
+    await assert.rejects(readSubagentArtifact(result, root, { runId: "native-review", agent: "reviewer", successful: true }), /Single-agent/);
+  }
+});
+
+test("failed task diagnostics use actual child output rather than a launch summary", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-artifact-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const result = join(root, "result.json");
+  const output = "<<<RALPHEX:TASK_FAILED>>>\nBlocker: AssertEqual failed at test/input.test.ts:9.";
+  await writeFile(result, JSON.stringify({ ...nativeSingleResult(), id: "native-task", agent: "worker", state: "failed",
+    success: false, summary: "Subagent was scheduled with task instructions.", results: [{ agent: "worker", success: false,
+      outputState: "present", output, launchContractDigest: "launch-contract" }] }));
+  assert.equal(await readSubagentArtifact(result, undefined, { runId: "native-task", agent: "worker" }), output);
+});
+
+test("launch receipts and metadata are never interpreted as worker outcomes", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-artifact-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const result = join(root, "result.json");
+  for (const receipt of [
+    { details: { runId: "native-task", asyncDir: root }, content: [{ text: "<<<RALPHEX:TASK_FAILED>>>\nInstruction: report this marker on failure." }] },
+    { summary: "NO_FINDINGS", instructions: "Return NO_FINDINGS only after review." },
+  ]) {
+    await writeFile(result, JSON.stringify(receipt));
+    await assert.rejects(readSubagentArtifact(result, undefined, { runId: "native-task", agent: "worker" }));
+  }
+});
+
+test("bound single-agent recovery requires full output rather than a potentially truncated status tail", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-artifact-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const status = { runId: "native-review", mode: "single", state: "complete",
+    steps: [{ agent: "reviewer", status: "complete", recentOutput: ["NO_FINDINGS"] }] };
+  await writeFile(join(root, "status.json"), JSON.stringify(status));
+  const expected = { runId: "native-review", agent: "reviewer", successful: true };
+  await assert.rejects(readSubagentArtifact(undefined, root, expected));
+  const outputFile = join(root, "output-0.log");
+  const output = "FINDING: MAJOR | Assertion fails\nEvidence: test/input.ts:9 fails\nFix: Check the empty input case.";
+  await writeFile(outputFile, output);
+  await writeFile(join(root, "status.json"), JSON.stringify({ ...status, outputFile }));
+  assert.equal(await readSubagentArtifact(undefined, root, expected), output);
+});
 
 test("uses pi-subagents status recentOutput when no configured result path exists", async () => {
   const asyncDir = await mkdtemp(join(tmpdir(), "pi-plan-exec-artifact-"));

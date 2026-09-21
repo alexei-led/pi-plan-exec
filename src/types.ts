@@ -1,4 +1,7 @@
+import type { OperationDiagnostics } from "./diagnostics.js";
+
 export const COMPLETED_PLANS_DIRECTORY = "completed";
+export const CONTROLLER_POLL_INTERVAL_MS = 1_000;
 
 export const EXEC_ACTION = {
   HELP: "help",
@@ -267,6 +270,8 @@ export interface ActiveOperation {
   reviewIteration?: number;
   reviewedCommit?: string;
   stopRequested?: boolean;
+  stopAcknowledged?: boolean;
+  launchFenced?: boolean;
   recovery?: OperationRecovery;
   launchFailures?: number;
   lastLaunchError?: string;
@@ -283,7 +288,26 @@ export interface ActiveOperation {
   stopGeneration?: number;
   nextAttemptAt?: number;
   effectiveLifetime?: ExecutionLifetime;
+  expectedLifetime?: ExecutionLifetime;
+  terminationReason?: "execution_lifetime_expired";
+  budgetExpiryRecorded?: boolean;
+  budgetGrowthGranted?: boolean;
+  externalPrerequisite?: ExternalPrerequisite;
+  diagnostics?: OperationDiagnostics;
+  diagnosticActions?: Record<string, DiagnosticAction>;
   reportedUsage?: { inputTokens?: number; outputTokens?: number; cost?: number };
+}
+
+export interface DiagnosticAction {
+  diagnosticId: string;
+  toolCallId: string;
+  message: string;
+  state: "pending" | "queued" | "cancelled" | "rejected";
+  stopGeneration: number;
+  requestedAt: number;
+  nextAttemptAt: number;
+  lastReplyAt?: number;
+  error?: string;
 }
 
 export type TaskExecutionState =
@@ -295,6 +319,12 @@ export type TaskExecutionState =
   | "waiting_external"
   | "accepted";
 
+export interface ExternalPrerequisite {
+  kind: "credentials" | "permission" | "missing_executable" | "runtime";
+  source: "provider" | "worker";
+  evidence: string;
+}
+
 export interface TaskExecution {
   taskId: number;
   dependsOn: number[];
@@ -302,8 +332,11 @@ export interface TaskExecution {
   attempts: number;
   nextAttemptAt?: number;
   reason?: string;
+  externalPrerequisite?: ExternalPrerequisite;
   laneCwd?: string;
   laneBranch?: string;
+  recoverySource?: TaskRecoverySource;
+  recoveryHistory?: TaskRecoverySource[];
   baselineCommit?: string;
   candidateCommit?: string;
   acceptedCommit?: string;
@@ -311,6 +344,15 @@ export interface TaskExecution {
   lastScheduledAt?: number;
   lastVerifiedActivityAt?: number;
   usage?: { inputTokens?: number; outputTokens?: number; cost?: number };
+}
+
+export interface TaskRecoverySource {
+  cwd: string;
+  branch: string;
+  baselineCommit: string;
+  headCommit: string;
+  checkpointRef: string;
+  checkpointCommit?: string;
 }
 
 export interface PlanExecRun {
@@ -325,8 +367,12 @@ export interface PlanExecRun {
   branch: string;
   defaultBranch: string;
   status: RunStatus;
+  /** Derived from the private local-operation index on registry reads. */
+  localOperationActive?: boolean;
   stage: RunStage;
   taskAttempts: Record<string, number>;
+  budgetExhaustions?: Record<string, number>;
+  budgetGrowths?: Record<string, number>;
   tasks?: Record<string, TaskExecution>;
   acceptedHead?: string;
   reviewedCommit?: string;
@@ -337,6 +383,16 @@ export interface PlanExecRun {
   usage?: { inputTokens?: number; outputTokens?: number; cost?: number };
   statsReport?: { state: "summary" | "reported" | "unavailable"; summary: string; error?: string };
   reviewRecovery?: { fingerprint: string; repeats: number; pendingFix: boolean; lastReviewedCommit?: string };
+  outputTarget?: { cwd: string; branch: string; initialHead: string; planRelativePath: string; progressRelativePath?: string };
+  outputPromotion?: { candidate: string; state: "pending" | "complete"; attempt?: number; commandStarted?: boolean };
+  archiveOperation?: {
+    phase: "stage" | "commit" | "retired";
+    operationId: string;
+    commands: string[][];
+    paths: string[];
+    destination: string;
+    attempt: number;
+  };
   needsAttention?: boolean;
   stopGeneration?: number;
   userStopped?: boolean;
@@ -348,6 +404,7 @@ export interface PlanExecRun {
     state: "create" | "bootstrap";
     nextAttemptAt?: number;
     error?: string;
+    sourcePlanPath?: string;
   };
   stageAttempts: Partial<Record<RunStage, number>>;
   reviewFindings: ReviewFinding[];

@@ -18,6 +18,34 @@ export type RunCommand = (
   cwd: string,
 ) => Promise<CommandResult>;
 
+export function parsePorcelainPaths(output: string): string[] {
+  if (!output) return [];
+  if (!output.endsWith("\0")) throw new Error("Git status omitted its NUL record terminator.");
+  const entries = output.slice(0, -1).split("\0");
+  const paths: string[] = [];
+  for (let index = 0; index < entries.length; index++) {
+    const entry = entries[index]!;
+    if (entry.length < PORCELAIN_PATH_OFFSET + 1 || entry[PORCELAIN_PATH_OFFSET - 1] !== " ")
+      throw new Error("Git status returned a malformed path record.");
+    paths.push(entry.slice(PORCELAIN_PATH_OFFSET));
+    const status = entry.slice(0, PORCELAIN_PATH_OFFSET - 1);
+    if (status.includes("R") || status.includes("C")) {
+      const source = entries[++index];
+      if (!source) throw new Error("Git status omitted a rename or copy source path.");
+      paths.push(source);
+    }
+  }
+  return paths;
+}
+
+const PORCELAIN_PATH_OFFSET = 3;
+
+export async function worktreeChanges(run: RunCommand, cwd: string): Promise<string[]> {
+  const result = await run("git", ["status", "--porcelain", "-z", "--untracked-files=all"], cwd);
+  if (result.code !== 0) throw new Error(result.stderr.trim() || "Cannot inspect the worktree state.");
+  return parsePorcelainPaths(result.stdout);
+}
+
 export async function requireGitRepository(
   run: RunCommand,
   cwd: string,
@@ -101,41 +129,21 @@ export function branchNameFromPlan(planPath: string): string {
   return `${branch}-${identity}`;
 }
 
-export async function createWorktree(
-  run: RunCommand,
+export function executionWorktreePath(
   repositoryRoot: string,
-  planPath: string,
   branch: string,
-): Promise<string> {
+): string {
   const repositoryId = createHash("sha256")
     .update(resolve(repositoryRoot))
     .digest("hex")
     .slice(0, REPOSITORY_HASH_LENGTH);
-  const target = resolve(
+  return resolve(
     homedir(),
     ".pi",
     "plan-exec",
     "worktrees",
     `${basename(repositoryRoot)}-${repositoryId}-${branch}`,
   );
-  const exists = await run(
-    "git",
-    ["worktree", "list", "--porcelain"],
-    repositoryRoot,
-  );
-  if (exists.stdout.includes(`worktree ${target}\n`)) {
-    throw new Error(`Worktree already exists: ${target}`);
-  }
-  const created = await run(
-    "git",
-    ["worktree", "add", "-b", branch, target],
-    repositoryRoot,
-  );
-  if (created.code !== 0)
-    throw new Error(
-      created.stderr.trim() || "Could not create execution worktree.",
-    );
-  return target;
 }
 
 export async function verifyExistingWorktree(

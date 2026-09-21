@@ -1,22 +1,13 @@
 import {
   EXTERNAL_OPERATION_STATE,
-  OPERATION_KIND,
   RUN_STAGE,
   RUN_STATUS,
-  type FrozenRunConfig,
-  type OperationKind,
+  MAX_EXECUTION_TIMEOUT_MS,
+  type ExecutionLifetime,
   type PlanExecRun,
   type RunStage,
   type RunStatus,
 } from "./types.js";
-
-/**
- * Wall-clock allowance per turn, so each stage is bounded by its own turn
- * budget. PLACEHOLDER, deliberately generous: a false "long-running" banner on
- * a healthy worker is worse than a late one. Tighten it once a real per-turn
- * activity signal exists (nicobailon/pi-subagents#920).
- */
-const OPERATION_TURN_ALLOWANCE_MS = 120_000;
 
 export const PIPELINE_STAGES = [
   RUN_STAGE.COMPREHENSIVE_REVIEW,
@@ -109,36 +100,46 @@ export function isRecoverableRun(run: PlanExecRun): boolean {
   );
 }
 
-/** Turn budget each launch path passes; fusion carries none of its own. */
-function operationMaxTurns(
-  config: FrozenRunConfig,
-  kind: OperationKind,
-): number {
-  if (kind === OPERATION_KIND.STATS) return config.statsMaxTurns;
-  if (kind === OPERATION_KIND.REVIEW) return config.reviewerMaxTurns;
-  return config.workerMaxTurns;
-}
-
 /**
- * Report an operation past its stage's turn budget. Classification only:
- * nothing here fails or kills a run. An operation with no `launchStartedAt`
- * predates the field, cannot be bounded, and is never reported.
+ * Report an operation past an explicitly selected bounded compatibility
+ * lifetime. Unbounded workers have no synthetic wall-clock verdict; activity,
+ * phase, and process evidence remain diagnostic only.
  */
 export function longRunningOperation(
   run: PlanExecRun,
   now = Date.now(),
-): { elapsedMs: number; boundMs: number; maxTurns: number } | undefined {
+): { elapsedMs: number; boundMs: number; maxTurns?: never } | undefined {
   const operation = run.activeOperation;
-  if (!operation?.launchStartedAt) return undefined;
-  const maxTurns = operationMaxTurns(run.config, operation.kind);
-  const boundMs = maxTurns * OPERATION_TURN_ALLOWANCE_MS;
+  const lifetime = activeExecutionLifetime(run);
+  if (
+    !operation?.launchStartedAt ||
+    lifetime?.mode !== "bounded"
+  )
+    return undefined;
+  const boundMs = lifetime.timeoutMs;
   const elapsedMs = now - operation.launchStartedAt;
-  return elapsedMs > boundMs ? { elapsedMs, boundMs, maxTurns } : undefined;
+  return elapsedMs > boundMs ? { elapsedMs, boundMs } : undefined;
+}
+
+/** Existing operations use their persisted request or attestation, never a new base policy. */
+export function activeExecutionLifetime(run: PlanExecRun): ExecutionLifetime | undefined {
+  const operation = run.activeOperation;
+  if (!operation) return run.config.executionLifetime;
+  if (operation.effectiveLifetime) return operation.effectiveLifetime;
+  if (operation.expectedLifetime) return operation.expectedLifetime;
+  const params = operation.params?.executionLifetime;
+  if (!params || typeof params !== "object" || !("mode" in params)) return undefined;
+  if (params.mode === "unbounded") return { mode: "unbounded" };
+  if (params.mode === "bounded" && "timeoutMs" in params && typeof params.timeoutMs === "number" &&
+    Number.isSafeInteger(params.timeoutMs) && params.timeoutMs > 0 && params.timeoutMs <= MAX_EXECUTION_TIMEOUT_MS)
+    return { mode: "bounded", timeoutMs: params.timeoutMs };
+  return undefined;
 }
 
 export const ABANDONMENT = {
   LIVE: "live",
   ABANDONED: "abandoned",
+  RECONCILABLE: "reconcilable",
   AMBIGUOUS: "ambiguous",
 } as const;
 
@@ -169,16 +170,12 @@ export interface AbandonmentEvidence {
   /** The bridge's own answer for the operation ID, when it was asked. */
   bridgeState?: string;
   durableOperationLookup?: boolean;
+  replaySafe?: boolean;
+  neverStarted?: boolean;
   processTerminalProof?: ProcessTerminalProof;
 }
 
-/**
- * `abandoned` is the full conjunction: an in-flight claim, a dead lease, and a
- * tracked operation provably gone. Anything short of that is `ambiguous`,
- * reported and never reset — resetting a run whose worker is alive can
- * double-write a worktree, which is worse than the stall. The sweep, the resume
- * gate, and the detail view all read this one answer.
- */
+/** Exit proof permits result recovery; replay-safe absence permits only the same launch identity. */
 export function classifyAbandonment(
   run: PlanExecRun,
   evidence: AbandonmentEvidence,
@@ -190,11 +187,12 @@ export function classifyAbandonment(
     evidence.processTerminalProof?.version === 1 &&
     evidence.processTerminalProof.state === "observed" &&
     evidence.processTerminalProof.runId === run.activeOperation?.externalRunId;
-  const launchProvenAbsent =
+  const replaySafeAbsence =
     !run.activeOperation.externalRunId &&
     evidence.durableOperationLookup === true &&
+    evidence.replaySafe === true &&
     evidence.bridgeState === EXTERNAL_OPERATION_STATE.ABSENT;
-  return terminalObserved || launchProvenAbsent
+  return terminalObserved || (evidence.durableOperationLookup === true && evidence.neverStarted === true)
     ? ABANDONMENT.ABANDONED
-    : ABANDONMENT.AMBIGUOUS;
+    : replaySafeAbsence ? ABANDONMENT.RECONCILABLE : ABANDONMENT.AMBIGUOUS;
 }

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { classifyAbandonment } from "../src/lifecycle.js";
+import { activeExecutionLifetime, classifyAbandonment, longRunningOperation } from "../src/lifecycle.js";
 import { DEFAULT_FROZEN_RUN_CONFIG, type PlanExecRun } from "../src/types.js";
 
 function inFlight(overrides: Partial<PlanExecRun> = {}): PlanExecRun {
@@ -76,7 +76,7 @@ test("recovery fails closed when a bound worker has only missing-directory or ab
   );
 });
 
-test("durable absence resets only an unbound launch", () => {
+test("durable absence is ambiguous unless it explicitly permits same-identity reconciliation", () => {
   const run = inFlight({
     activeOperation: {
       operationId: "operation-1",
@@ -91,6 +91,62 @@ test("durable absence resets only an unbound launch", () => {
       bridgeState: "absent",
       durableOperationLookup: true,
     }),
-    "abandoned",
+    "ambiguous",
   );
+  assert.equal(classifyAbandonment(run, { leaseLive: false, bridgeState: "absent", durableOperationLookup: true, replaySafe: true }), "reconcilable");
+});
+
+test("only explicitly bounded compatibility runs receive an elapsed deadline", () => {
+  const unbounded = inFlight({
+    activeOperation: {
+      operationId: "operation-1",
+      service: "bridge",
+      kind: "implementation",
+      externalRunId: "external-1",
+      launchStartedAt: 1,
+    },
+  });
+  assert.equal(longRunningOperation(unbounded, 10_000_000), undefined);
+
+  const bounded = inFlight({
+    config: {
+      ...DEFAULT_FROZEN_RUN_CONFIG,
+      executionLifetime: { mode: "bounded", timeoutMs: 5_000 },
+    },
+    activeOperation: {
+      operationId: "operation-1",
+      service: "bridge",
+      kind: "implementation",
+      externalRunId: "external-1",
+      launchStartedAt: 1,
+      expectedLifetime: { mode: "bounded", timeoutMs: 5_000 },
+    },
+  });
+  assert.equal(longRunningOperation(bounded, 5_001), undefined);
+  assert.deepEqual(longRunningOperation(bounded, 5_002), {
+    elapsedMs: 5_001,
+    boundMs: 5_000,
+  });
+  assert.deepEqual(longRunningOperation(bounded, 5_003), {
+    elapsedMs: 5_002,
+    boundMs: 5_000,
+  });
+});
+
+test("compatibility deadline display follows the persisted attempt rather than the frozen base", () => {
+  const run = inFlight({ config: { ...DEFAULT_FROZEN_RUN_CONFIG, executionLifetime: { mode: "bounded", timeoutMs: 5_000 } },
+    activeOperation: { operationId: "grown", service: "bridge", kind: "implementation", launchStartedAt: 1,
+      expectedLifetime: { mode: "bounded", timeoutMs: 20_000 }, effectiveLifetime: { mode: "bounded", timeoutMs: 20_000 } },
+  });
+  assert.deepEqual(activeExecutionLifetime(run), { mode: "bounded", timeoutMs: 20_000 });
+  assert.equal(longRunningOperation(run, 10_001), undefined);
+  assert.deepEqual(longRunningOperation(run, 20_002), { elapsedMs: 20_001, boundMs: 20_000 });
+});
+
+test("legacy unknown operation lifetime is not synthesized from a changed frozen base", () => {
+  const run = inFlight({ config: { ...DEFAULT_FROZEN_RUN_CONFIG, executionLifetime: { mode: "bounded", timeoutMs: 5_000 } } });
+  assert.equal(activeExecutionLifetime(run), undefined);
+  assert.equal(longRunningOperation(run, 100_000), undefined);
+  run.activeOperation!.params = { executionLifetime: { mode: "bounded", timeoutMs: 10_000 } };
+  assert.deepEqual(activeExecutionLifetime(run), { mode: "bounded", timeoutMs: 10_000 });
 });

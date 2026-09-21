@@ -4,7 +4,7 @@ const FINDING = /^FINDING:[ \t]*(CRITICAL|MAJOR|MINOR)[ \t]*\|[ \t]*(.+)$/i;
 
 export function parseReviewFindings(output: string): ReviewFinding[] {
   if (output.trim() === "NO_FINDINGS") return [];
-  if (/\bNO_FINDINGS\b/i.test(output))
+  if (/^[\t ]*NO_FINDINGS[\t ]*$/im.test(output))
     throw new Error("Reviewer output contradicts NO_FINDINGS.");
   const findings: ReviewFinding[] = [];
   for (const rawLine of output.split(/\r?\n/)) {

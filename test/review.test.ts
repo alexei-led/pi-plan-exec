@@ -35,3 +35,9 @@ test("contradictory and incomplete review envelopes never mean clean", () => {
     "FINDING: MAJOR | Defect\nEvidence:\nFix: repair",
   ]) assert.throws(() => parseReviewFindings(output));
 });
+
+test("a finding may discuss the NO_FINDINGS sentinel without claiming a clean review", () => {
+  const findings = parseReviewFindings("FINDING: MAJOR | Mixed NO_FINDINGS output bypasses review\nEvidence: src/review.ts accepts NO_FINDINGS mixed with defects.\nFix: Validate the whole envelope.");
+  assert.equal(findings.length, 1);
+  assert.equal(hasBlockingFindings(findings), true);
+});

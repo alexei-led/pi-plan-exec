@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { TaskStore } from "@tintinweb/pi-tasks/dist/task-store.js";
-import { formatRunWidget, shouldAutoRestoreRun } from "../src/index.js";
+import { formatRunWidget, shouldAutoRestoreRun, shouldStopBackgroundController } from "../src/index.js";
 import { sessionTaskPath, TaskProjector } from "../src/task-projection.js";
 import { RunRegistry } from "../src/registry.js";
 import {
@@ -106,7 +106,7 @@ test("widget reports waits, verified activity, usage, and explicit unbounded lif
   assert.match(widget.join("\n"), /after task 1 is accepted/);
   assert.match(widget.join("\n"), /Needs attention/);
   assert.match(widget.join("\n"), /Usage: tokens 4800, cost 0.4/);
-  assert.match(widget.join("\n"), /Lifetime: unbounded end-to-end verified/);
+  assert.match(widget.join("\n"), /Lifetime: unbounded requested/);
   assert.match(widget.join("\n"), /Last verified progress/);
 });
 
@@ -136,4 +136,14 @@ test("startup restores stale or unleased runs without stealing live leases or pa
     ),
     true,
   );
+});
+
+test("restart restores paused local cleanup without resuming plan execution", () => {
+  const paused = { ...runFixture("/repo"), id: "paused-cleanup", createdAt: 1, updatedAt: 1,
+    status: RUN_STATUS.PAUSED, userStopped: true, localOperationActive: true } satisfies PlanExecRun;
+  assert.equal(shouldAutoRestoreRun(paused, "new-session"), true);
+  assert.equal(shouldStopBackgroundController(paused), false);
+  const retired = { ...paused, localOperationActive: false };
+  assert.equal(shouldAutoRestoreRun(retired, "new-session"), false);
+  assert.equal(shouldStopBackgroundController(retired), true);
 });

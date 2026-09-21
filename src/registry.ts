@@ -12,6 +12,8 @@ import { homedir, hostname } from "node:os";
 import { dirname, join } from "node:path";
 import { canonicalPath, worktreeIdentity } from "./git.js";
 import { isSkippableStage, isTerminalStatus } from "./lifecycle.js";
+import { parseOperationActivity } from "./diagnostics.js";
+import { hasActiveLocalOperations } from "./local-operation.js";
 import {
   DEFAULT_FROZEN_RUN_CONFIG,
   MAX_EXECUTION_TIMEOUT_MS,
@@ -114,6 +116,7 @@ export function takeoverRefusal(
  * would refuse.
  */
 export function removalRefusal(run: PlanExecRun): string | undefined {
+  if (run.localOperationActive) return `Run ${run.id} still has unconfirmed local command ownership.`;
   if (!isTerminalStatus(run.status))
     return `Run ${run.id} is ${run.status}; only a terminal run can be removed.`;
   if (run.lease && isLeaseLive(run.lease))
@@ -131,6 +134,10 @@ export class RunRegistry {
   /** Read-only authorization source for a durable local command monitor. */
   authorizationPath(runId: string): string {
     return this.pathFor(runId);
+  }
+
+  localOperationsPath(runId: string): string {
+    return join(dirname(this.pathFor(runId)), "local-operations");
   }
 
   async create(
@@ -184,6 +191,7 @@ export class RunRegistry {
       if (isTerminalStatus(existing.status) &&
           existing.status !== RUN_STATUS.FAILED &&
           !existing.activeOperation &&
+          !existing.localOperationActive &&
           !(existing.lease && isLeaseLive(existing.lease))) continue;
       const sameWorktree = await worktreeIdentity(existing.worktreeCwd) === worktree;
       const samePlan = await canonicalPath(existing.planPath) === plan;
@@ -197,7 +205,10 @@ export class RunRegistry {
   async get(runId: string): Promise<PlanExecRun | undefined> {
     assertRunId(runId);
     try {
-      return parseRun(await readFile(this.pathFor(runId), "utf8"), runId);
+      const run = parseRun(await readFile(this.pathFor(runId), "utf8"), runId);
+      if (await hasActiveLocalOperations(this.localOperationsPath(runId))) return { ...run, localOperationActive: true };
+      delete run.localOperationActive;
+      return run;
     } catch (error: unknown) {
       if (isNodeError(error, "ENOENT")) return undefined;
       throw error;
@@ -448,6 +459,8 @@ export class RunRegistry {
       throw error;
     }
     try {
+      if (await hasActiveLocalOperations(this.localOperationsPath(runId)))
+        throw new Error(`Run ${runId} still has unconfirmed local command ownership.`);
       const run = await this.readForRemoval(runId);
       if (run === undefined) return false;
       const refusal = run === null ? undefined : removalRefusal(run);
@@ -719,6 +732,7 @@ function assertRun(run: PlanExecRun): void {
     !Number.isFinite(run.updatedAt) ||
     !isFrozenConfig(run.config) ||
     !isAutonomousState(run) ||
+    (run.localOperationActive !== undefined && typeof run.localOperationActive !== "boolean") ||
     !Array.isArray(run.skippedStages) ||
     !run.skippedStages.every(
       (skip) =>
@@ -796,8 +810,57 @@ function isAutonomousState(run: PlanExecRun): boolean {
     const commit = operation?.reviewedCommit;
     if (commit !== undefined && (typeof commit !== "string" || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(commit))) return false;
     if (!isUsage(operation?.reportedUsage)) return false;
+    if (operation?.expectedLifetime !== undefined && !isExecutionLifetime(operation.expectedLifetime)) return false;
+    if (operation?.effectiveLifetime !== undefined && !isExecutionLifetime(operation.effectiveLifetime)) return false;
+    if (operation?.terminationReason !== undefined && operation.terminationReason !== "execution_lifetime_expired") return false;
+    if (operation?.budgetExpiryRecorded !== undefined && typeof operation.budgetExpiryRecorded !== "boolean") return false;
+    if (operation?.budgetGrowthGranted !== undefined && typeof operation.budgetGrowthGranted !== "boolean") return false;
+    if (!isExternalPrerequisite(operation?.externalPrerequisite)) return false;
+    if (!isOperationDiagnostics(operation?.diagnostics)) return false;
+    if (operation?.diagnosticActions !== undefined && (!isRecord(operation.diagnosticActions) ||
+      !Object.entries(operation.diagnosticActions).every(([key, action]) => /^[a-f0-9]{64}$/.test(key) && isRecord(action) &&
+        ["diagnosticId", "toolCallId", "message"].every((field) => typeof action[field] === "string" && action[field].trim().length > 0) &&
+        ["pending", "queued", "cancelled", "rejected"].includes(String(action.state)) &&
+        [action.stopGeneration, action.requestedAt, action.nextAttemptAt].every((value) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0) &&
+        (action.lastReplyAt === undefined || (typeof action.lastReplyAt === "number" && Number.isSafeInteger(action.lastReplyAt) && action.lastReplyAt >= 0)) &&
+        (action.error === undefined || typeof action.error === "string")))) return false;
+    if (operation?.stopAcknowledged !== undefined && typeof operation.stopAcknowledged !== "boolean") return false;
+    if (operation?.launchFenced !== undefined && typeof operation.launchFenced !== "boolean") return false;
   }
+  if (run.budgetExhaustions !== undefined && (!isRecord(run.budgetExhaustions) ||
+    !Object.entries(run.budgetExhaustions).every(([key, value]) => key.length > 0 &&
+      typeof value === "number" && Number.isSafeInteger(value) && value >= 0))) return false;
+  if (run.budgetGrowths !== undefined && (!isRecord(run.budgetGrowths) ||
+    !Object.entries(run.budgetGrowths).every(([key, value]) => key.length > 0 &&
+      typeof value === "number" && Number.isSafeInteger(value) && value >= 0))) return false;
   if (!isUsage(run.usage)) return false;
+  if (run.lanePreparation !== undefined && (!isRecord(run.lanePreparation) ||
+    typeof run.lanePreparation.cwd !== "string" || !run.lanePreparation.cwd ||
+    typeof run.lanePreparation.branch !== "string" || !run.lanePreparation.branch ||
+    typeof run.lanePreparation.baselineCommit !== "string" || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(run.lanePreparation.baselineCommit) ||
+    !Number.isSafeInteger(run.lanePreparation.taskId) || run.lanePreparation.taskId < 0 ||
+    !["create", "bootstrap"].includes(run.lanePreparation.state) || !timestamp(run.lanePreparation.nextAttemptAt) ||
+    (run.lanePreparation.sourcePlanPath !== undefined && (typeof run.lanePreparation.sourcePlanPath !== "string" || !run.lanePreparation.sourcePlanPath)) ||
+    (run.lanePreparation.error !== undefined && typeof run.lanePreparation.error !== "string"))) return false;
+  if (run.outputTarget !== undefined &&
+    (!isRecord(run.outputTarget) || typeof run.outputTarget.cwd !== "string" || !run.outputTarget.cwd ||
+      typeof run.outputTarget.branch !== "string" || !run.outputTarget.branch ||
+      typeof run.outputTarget.initialHead !== "string" || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(run.outputTarget.initialHead) ||
+      typeof run.outputTarget.planRelativePath !== "string" || !run.outputTarget.planRelativePath ||
+      (run.outputTarget.progressRelativePath !== undefined && typeof run.outputTarget.progressRelativePath !== "string"))) return false;
+  if (run.outputPromotion !== undefined &&
+    (!isRecord(run.outputPromotion) || typeof run.outputPromotion.candidate !== "string" ||
+      !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(run.outputPromotion.candidate) ||
+      !["pending", "complete"].includes(run.outputPromotion.state) ||
+      (run.outputPromotion.commandStarted !== undefined && typeof run.outputPromotion.commandStarted !== "boolean") ||
+      (run.outputPromotion.attempt !== undefined && (!Number.isSafeInteger(run.outputPromotion.attempt) || run.outputPromotion.attempt < 0)))) return false;
+  if (run.archiveOperation !== undefined && (!isRecord(run.archiveOperation) ||
+    !["stage", "commit", "retired"].includes(run.archiveOperation.phase) ||
+    typeof run.archiveOperation.operationId !== "string" || !run.archiveOperation.operationId ||
+    !isCommands(run.archiveOperation.commands) || run.archiveOperation.commands.length === 0 || !Array.isArray(run.archiveOperation.paths) || run.archiveOperation.paths.length === 0 ||
+    !run.archiveOperation.paths.every((path) => typeof path === "string" && path.length > 0) ||
+    typeof run.archiveOperation.destination !== "string" || !run.archiveOperation.destination ||
+    !Number.isSafeInteger(run.archiveOperation.attempt) || run.archiveOperation.attempt < 0)) return false;
   if (run.statsReport !== undefined &&
     (!isRecord(run.statsReport) || !["summary", "reported", "unavailable"].includes(run.statsReport.state) ||
       typeof run.statsReport.summary !== "string" ||
@@ -820,9 +883,40 @@ function isAutonomousState(run: PlanExecRun): boolean {
     typeof task.taskId === "number" && task.taskId > 0 &&
     typeof task.state === "string" && states.has(task.state) &&
     typeof task.attempts === "number" && Number.isSafeInteger(task.attempts) && task.attempts >= 0 &&
+    isRecoverySource(task.recoverySource) &&
+    (task.recoveryHistory === undefined || (Array.isArray(task.recoveryHistory) && task.recoveryHistory.every(isRecoverySource))) &&
     Array.isArray(task.dependsOn) && task.dependsOn.every((dependency: unknown) =>
       typeof dependency === "number" && Number.isSafeInteger(dependency) && dependency > 0 && dependency < Number(task.taskId)) &&
-    new Set(task.dependsOn).size === task.dependsOn.length && timestamp(task.nextAttemptAt) && isUsage(task.usage));
+    new Set(task.dependsOn).size === task.dependsOn.length && timestamp(task.nextAttemptAt) && isUsage(task.usage) &&
+    isExternalPrerequisite(task.externalPrerequisite));
+}
+
+function isRecoverySource(value: unknown): boolean {
+  if (value === undefined) return true;
+  if (!isRecord(value)) return false;
+  return ["cwd", "branch", "checkpointRef"].every((key) => typeof value[key] === "string" && value[key].length > 0) &&
+    ["baselineCommit", "headCommit"].every((key) => typeof value[key] === "string" && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(value[key])) &&
+    (value.checkpointCommit === undefined || (typeof value.checkpointCommit === "string" && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(value.checkpointCommit)));
+}
+
+function isExternalPrerequisite(value: unknown): boolean {
+  return value === undefined || (isRecord(value) &&
+    ["credentials", "permission", "missing_executable", "runtime"].includes(String(value.kind)) &&
+    (value.source === "provider" || value.source === "worker") && typeof value.evidence === "string" && value.evidence.trim().length > 0);
+}
+
+function isOperationDiagnostics(value: unknown): boolean {
+  if (value === undefined) return true;
+  if (!isRecord(value) || !["observing", "tool_fault_reported", "exit_confirmed", "status_unavailable"].includes(String(value.assessment)) ||
+    !["probe", "repair_tool", "reconcile"].includes(String(value.action)) ||
+    ![value.observedAt, value.nextProbeAt].every((timestamp) => typeof timestamp === "number" && Number.isSafeInteger(timestamp) && timestamp >= 0) ||
+    (value.failureKey !== undefined && (typeof value.failureKey !== "string" || !/^[a-f0-9]{64}$/.test(value.failureKey))) ||
+    (value.error !== undefined && typeof value.error !== "string")) return false;
+  const activity = parseOperationActivity(value);
+  for (const key of ["phase", "state", "currentTool", "toolCallId", "currentToolStartedAt", "lastActivityAt", "lastModelActivityAt", "lastToolActivityAt", "runnerPid", "recentFailureSummary", "lastToolFailure"] as const) {
+    if (value[key] !== undefined && JSON.stringify(value[key]) !== JSON.stringify(activity[key])) return false;
+  }
+  return true;
 }
 
 function isUsage(value: unknown): boolean {

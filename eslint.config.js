@@ -30,7 +30,7 @@ export default tseslint.config(
   // Sole key, so these are global ignores. Paired with a `files` or
   // `languageOptions` key they would only scope that one config object, and
   // every other config would still lint the tool caches below.
-  { ignores: ["node_modules/", ".pi-subagents/", ".gitnexus/"] },
+  { ignores: ["node_modules/", ".pi/", ".revmux/tasks/", ".pi-subagents/", ".gitnexus/"] },
   js.configs.recommended,
   ...tseslint.configs.recommended,
   { languageOptions: { globals: globals.node } },

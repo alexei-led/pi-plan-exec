@@ -27,6 +27,7 @@
   },
   "files": [
     "src/*.ts",
+    "src/*.mjs",
     "skills/exec-plan"
   ],
   "publishConfig": {
@@ -35,6 +36,7 @@
   "scripts": {
     "check": "tsc --noEmit",
     "test": "node --import jiti/register --test test/*.test.ts",
+    "test:runtime-smoke": "node --test test/autonomous-runtime-smoke.mjs",
     "lint": "eslint . --cache --cache-strategy content",
     "pack:dry": "node scripts/check-pack.mjs",
     "test:all": "npm run lint && npm run check && npm test && npm run pack:dry"
@@ -54,7 +56,6 @@
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
     "@tintinweb/pi-tasks": ">=0.9.0",
-    "pi-subagents": ">=0.60.0",
     "typebox": "*"
   },
   "peerDependenciesMeta": {
@@ -66,21 +67,20 @@
     },
     "@tintinweb/pi-tasks": {
       "optional": true
-    },
-    "pi-subagents": {
-      "optional": true
     }
   },
+  "dependencies": {
+    "pi-subagents": "git+https://github.com/alexei-led/pi-subagents-codex-fix.git#778d7aeac0c6a8056f316f2e2a38381570c7bcae"
+  },
   "devDependencies": {
-    "@alexeiled/pi-fusion": "git+https://github.com/alexei-led/pi-fusion.git#766f8bc3c2d39a8e440c11d6e806bd8a45a54887",
-    "@alexeiled/pi-subagents-bridge": "git+https://github.com/alexei-led/pi-subagents-bridge.git#544f911571ec4552dcc71d5ce548175f1ad7f612",
+    "@alexeiled/pi-fusion": "git+https://github.com/alexei-led/pi-fusion.git#07f327d2df4d72feddc8fa5a08de74391773c8c9",
+    "@alexeiled/pi-subagents-bridge": "git+https://github.com/alexei-led/pi-subagents-bridge.git#fbd2a53199f37cd68eb5c2b9db1482246979ffa5",
     "@earendil-works/pi-coding-agent": "0.86.1",
     "@eslint/js": "^10.0.1",
     "@tintinweb/pi-tasks": "0.9.0",
     "eslint": "^10.6.0",
     "globals": "^17.7.0",
     "jiti": "^2.7.0",
-    "pi-subagents": "git+https://github.com/alexei-led/pi-subagents-codex-fix.git#7a9f03a97c19468f92a9ec78551955da9ef580a7",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.62.1"
   }

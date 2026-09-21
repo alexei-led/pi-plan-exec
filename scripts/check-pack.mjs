@@ -8,9 +8,10 @@ const REQUIRED = new Set([
   "skills/exec-plan/SKILL.md",
   "skills/exec-plan/references/recovery.md",
   "src/index.ts",
+  "src/local-operation-worker.mjs",
 ]);
 const RUNTIME_PATHS = [
-  /^src\/[^/]+\.ts$/,
+  /^src\/[^/]+\.(?:ts|mjs)$/,
   /^skills\/exec-plan\/(?:SKILL\.md|references\/[^/]+\.md)$/,
 ];
 

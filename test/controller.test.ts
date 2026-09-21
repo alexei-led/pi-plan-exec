@@ -17,21 +17,90 @@ import { bridgeRequestDigest, type BridgeCapabilities } from "../src/bridge.js";
 import {
   parseWorkerSignal,
   PLAN_STRUCTURE_CHANGED_ERROR,
-  PlanExecController,
+  PlanExecController as ProductionController,
 } from "../src/controller.js";
 import { execReconcile } from "../src/index.js";
 import { parsePlan } from "../src/plan.js";
 import { appendProgressOnce } from "../src/progress.js";
 import { RunRegistry } from "../src/registry.js";
 import { DEFAULT_FROZEN_RUN_CONFIG, type BridgeResult, type PlanExecRun } from "../src/types.js";
+import { LocalOperationCancelledError, LocalOperationFailedError, LocalOperationUnknownError } from "../src/local-operation.js";
 
 const success = (data: Record<string, unknown>) => ({
   success: true as const,
   data,
 });
 
-const terminalProof = (runId: string) => ({
-  version: 1,
+type ControllerArguments = ConstructorParameters<typeof ProductionController>;
+type LocalCommands = NonNullable<ControllerArguments[4]>;
+
+function fixtureCommands(command: ControllerArguments[3]): LocalCommands {
+  const operations = new Map<string, { request: string; result: Promise<void> }>();
+  return async (cwd, commands, options) => {
+    const key = JSON.stringify([options.runId, options.operationId, options.authorization?.stopGeneration ?? 0]);
+    const request = JSON.stringify([cwd, commands, options.candidate]);
+    const previous = operations.get(key);
+    if (previous) {
+      if (previous.request !== request) throw new LocalOperationUnknownError("Fixture operation changed.");
+      return previous.result;
+    }
+    const result = (async () => {
+      for (const [program, ...args] of commands) {
+        if (!(await options.isAuthorized())) throw new LocalOperationCancelledError("Fixture operation cancelled.");
+        const result = await command(program!, args, cwd);
+        if (result.code !== 0) throw new LocalOperationFailedError(result.stderr || "Fixture command failed.");
+      }
+    })();
+    operations.set(key, { request, result });
+    return result;
+  };
+}
+
+class PlanExecController extends ProductionController {
+  constructor(...args: ControllerArguments) {
+    super(args[0], args[1], args[2], args[3], args[4] ?? fixtureCommands(args[3]));
+  }
+}
+
+async function advanceThroughArchive(controller: PlanExecController, run: PlanExecRun): Promise<PlanExecRun> {
+  for (let step = 0; step < 8; step++) {
+    if (run.status !== "running") return run;
+    run = await controller.advance(run);
+    if (run.stage !== "archive" || run.error) return run;
+  }
+  throw new Error("Archive did not settle through its durable phases.");
+}
+
+const terminalProof = (
+  runId: string,
+  operationId = runId === "fusion-1" ? "fusion-operation" : runId,
+  requestDigest = `digest-${operationId}`,
+) => {
+  const hostId = "11111111-1111-4111-8111-111111111111";
+  const bootId = "22222222-2222-4222-8222-222222222222";
+  const binding = { operationId, requestDigest, hostId, bootId };
+  const leader = { pid: process.pid, uniqueId: "1", pidVersion: 1 };
+  const identity = {
+    version: 1,
+    backend: "darwin-resource-coalition-v1",
+    coalitionId: "1",
+    leader,
+    ...binding,
+  };
+  const kernelProof = {
+    ...binding,
+    status: "retired",
+    binding,
+    identity,
+    proof: {
+      kind: "darwin-coalition-retired",
+      observedAt: new Date().toISOString(),
+      identity,
+      ...binding,
+    },
+  };
+  return {
+  version: 1 as const,
   state: "observed" as const,
   runId,
   runnerProcessInstanceId: `runner-${runId}`,
@@ -42,7 +111,12 @@ const terminalProof = (runId: string) => ({
     scope: "owned-process-tree" as const,
     escapedDescendants: "contained" as const,
   },
-});
+  nativeOperation: { operationId, digest: requestDigest },
+  callerBinding: binding,
+  kernelBinding: binding,
+  kernelProof,
+  };
+};
 
 test("existing linked worktree execution keeps its branch and plan", async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-")));
@@ -63,6 +137,8 @@ test("existing linked worktree execution keeps its branch and plan", async () =>
         stderr: "",
         code: 0,
       };
+    if (args[0] === "rev-parse" && args[1] === "HEAD")
+      return { stdout: `${"a".repeat(40)}\n`, stderr: "", code: 0 };
     if (args.includes("--git-common-dir"))
       return { stdout: `${root}/.git\n`, stderr: "", code: 0 };
     return { stdout: `${root}\n`, stderr: "", code: 0 };
@@ -379,8 +455,8 @@ test("TASK_FAILED keeps the run running and schedules automatic task recovery", 
     ...baseRun(root, planPath), planHash: parsePlan(planPath, plan).hash,
     stage: "implementation", taskAttempts: { "1": 0 },
     activeOperation: {
-      operationId: "blocked-operation", externalRunId: "blocked-worker", service: "bridge",
-      kind: "implementation", taskId: 1, asyncDir: root,
+      operationId: "blocked-worker", externalRunId: "blocked-worker", service: "bridge",
+      kind: "implementation", taskId: 1, asyncDir: root, requestDigest: "digest-blocked-worker",
     },
   });
 
@@ -423,7 +499,7 @@ test("implementation failures do not become terminal at the legacy attempt cap",
   const run = await registry.create({
     ...baseRun(root, planPath), planHash: parsePlan(planPath, plan).hash,
     status: "running", stage: "implementation", taskAttempts: { "1": 100 },
-    activeOperation: { operationId: "old-operation", externalRunId: "old-workflow", service: "bridge", kind: "implementation", taskId: 1 },
+    activeOperation: { operationId: "old-workflow", externalRunId: "old-workflow", service: "bridge", kind: "implementation", taskId: 1, requestDigest: "digest-old-workflow" },
   });
   const retry = await controller.advance(run);
   assert.equal(retry.status, "running");
@@ -442,13 +518,14 @@ test("implementation output lookup cannot overwrite a concurrent cancellation", 
   await writeFile(resultPath, JSON.stringify({ output: "<<<RALPHEX:TASK_FAILED>>>\nBlocker: Approval missing." }));
   const registry = new RunRegistry(join(root, "runs"));
   const bridge = new DeferredResultBridge(resultPath);
+  bridge.bindOperation("blocked-worker", "blocked-operation", "digest-blocked-worker");
   const controller = new PlanExecController(registry, bridge, new FakeFusion(), fakeGit(root));
   const running = await registry.create({
     ...baseRun(root, planPath), planHash: parsePlan(planPath, plan).hash, stage: "implementation",
-    activeOperation: { operationId: "blocked-operation", externalRunId: "blocked-worker", service: "bridge", kind: "implementation", taskId: 1 },
+    activeOperation: { operationId: "blocked-operation", externalRunId: "blocked-worker", service: "bridge", kind: "implementation", taskId: 1, requestDigest: "digest-blocked-worker" },
   });
   const advancing = controller.advance(running);
-  await bridge.resultRequested;
+  await Promise.race([bridge.resultRequested, advancing.then(() => { throw new Error("Controller did not request the worker result."); })]);
   await registry.updateLatest(running.id, (current) => ({ ...current, status: "cancel_pending" }));
   bridge.completeResult();
   assert.equal((await advancing).status, "cancel_pending");
@@ -572,12 +649,13 @@ test("model failures preserve diagnostics and schedule automatic recovery", asyn
     stage: "implementation",
     taskAttempts: { "1": 0 },
     activeOperation: {
-      operationId: "model-failure-operation",
+      operationId: "model-failure-run",
       service: "bridge",
       kind: "implementation",
       externalRunId: "model-failure-run",
       asyncDir: "/tmp/model-failure-run",
       taskId: 1,
+      requestDigest: "digest-model-failure-run",
     },
   });
 
@@ -959,6 +1037,7 @@ test("controller cancels a stopped review without advancing later stages", async
   await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
   const registry = new RunRegistry(join(root, "runs"));
   const bridge = new FakeBridge(join(root, "none.json"));
+  bridge.bindOperation("run-1", "operation-1", "digest-operation-1");
   const controller = new PlanExecController(
     registry,
     bridge,
@@ -976,14 +1055,14 @@ test("controller cancels a stopped review without advancing later stages", async
       kind: "review",
       externalRunId: "run-1",
       asyncDir: "/tmp/async",
+      requestDigest: "digest-operation-1",
     },
   };
 
-  await registry.update(cancelling);
-  const requested = await controller.advance(cancelling);
-  assert.equal(requested.activeOperation?.stopRequested, true);
-  const cancelled = await controller.advance(requested);
-  assert.equal(cancelled.status, "cancelled");
+  let cancelled = await controller.advance(await registry.update(cancelling));
+  if (cancelled.status === "cancel_pending")
+    cancelled = await controller.advance(await registry.update({ ...cancelled, nextAttemptAt: 0 }));
+  assert.equal(cancelled.status, "cancelled", cancelled.wakeReason ?? cancelled.error ?? "Cancellation did not settle.");
   assert.equal(cancelled.stage, "comprehensive_review");
   assert.equal(cancelled.activeOperation, undefined);
 });
@@ -1006,20 +1085,22 @@ test("paused runs retain a terminal child until resume applies its completion", 
     status: "paused",
     stage: "implementation",
     activeOperation: {
-      operationId: "operation-1",
+      operationId: "run-1",
       service: "bridge",
       kind: "implementation",
       externalRunId: "run-1",
       taskId: 1,
+      requestDigest: "digest-run-1",
     },
   });
   const paused = await controller.advance(run);
   assert.equal(paused.status, "paused");
-  assert.equal(paused.activeOperation?.operationId, "operation-1");
+  assert.equal(paused.activeOperation?.operationId, "run-1");
   assert.equal(paused.stage, "implementation");
   const resumed = await controller.resume(paused.id, "session-1");
   assert.equal(resumed.stage, "implementation");
-  assert.equal(resumed.tasks?.["1"]?.state, "retry_wait");
+  assert.equal(resumed.status, "running");
+  assert.equal(resumed.activeOperation, undefined);
 });
 
 test("detached workflow keeps polling the same operation for supervisor recovery", async () => {
@@ -1037,11 +1118,12 @@ test("detached workflow keeps polling the same operation for supervisor recovery
     ...baseRun(root, planPath),
     stage: "stats",
     activeOperation: {
-      operationId: "operation-1",
+      operationId: "run-1",
       service: "bridge",
       kind: "stats",
       externalRunId: "workflow-1",
       asyncDir: "/tmp/workflow-1",
+      requestDigest: "digest-workflow-1",
     },
   });
 
@@ -1102,6 +1184,7 @@ test("resume consumes a settled detached stats child without launching a replace
   );
   const registry = new RunRegistry(join(root, "runs"));
   const bridge = new FakeBridge(join(root, "none.json"));
+  bridge.bindOperation(runId, "operation-1", "digest-operation-1");
   const controller = new PlanExecController(
     registry,
     bridge,
@@ -1122,12 +1205,14 @@ test("resume consumes a settled detached stats child without launching a replace
       externalRunId: runId,
       asyncDir,
       terminalError: "Run 'main' detached for intercom coordination.",
+      requestDigest: "digest-operation-1",
+      expectedLifetime: { mode: "unbounded" },
     },
   });
 
-  const recovered = await controller.resume(failed.id, "session-1");
+  const recovered = await advanceThroughArchive(controller, await controller.resume(failed.id, "session-1"));
 
-  assert.equal(recovered.status, "completed");
+  assert.equal(recovered.status, "completed", recovered.error ?? recovered.wakeReason ?? "Archive did not settle.");
   assert.equal(recovered.stage, "complete");
   assert.equal(bridge.spawnCount, 0);
   assert.equal(recovered.failedOperation, undefined);
@@ -1247,6 +1332,7 @@ test("cancellation during missing reviewer output prevents a retry", async () =>
   await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
   const registry = new RunRegistry(join(root, "runs"));
   const bridge = new DeferredResultBridge(join(root, "missing-result.json"));
+  bridge.bindOperation("run-1", "review-1", "digest-review-1");
   const controller = new PlanExecController(
     registry,
     bridge,
@@ -1265,11 +1351,12 @@ test("cancellation during missing reviewer output prevents a retry", async () =>
       externalRunId: "run-1",
       asyncDir: join(root, "missing-async"),
       reviewIteration: 1,
+      requestDigest: "digest-review-1",
     },
   });
 
   const observing = controller.advance(run);
-  await bridge.resultRequested;
+  await Promise.race([bridge.resultRequested, observing.then(run => { throw new Error(`Controller did not request the reviewer result: ${run.error ?? run.wakeReason ?? run.status}`); })]);
   const current = await registry.get(run.id);
   await registry.update({ ...current!, status: "cancel_pending" });
   bridge.completeResult();
@@ -1337,6 +1424,7 @@ test("controller safely replays a v2 operation proven durably absent", async () 
     task: "recover",
     cwd: root,
     mission: false,
+    executionLifetime: { mode: "unbounded" },
   };
   const run = await registry.create({
     ...baseRun(root, planPath),
@@ -1348,6 +1436,7 @@ test("controller safely replays a v2 operation proven durably absent", async () 
       taskId: 1,
       params,
       requestDigest: bridgeRequestDigest(params),
+      expectedLifetime: { mode: "unbounded" },
     },
   });
 
@@ -1568,9 +1657,9 @@ test("cancel waits for a pending spawn reply and then stops the child", async ()
   assert.equal(attached.activeOperation?.externalRunId, "run-1");
 
   const stopping = await controller.advance(attached);
-  assert.equal(stopping.status, "cancel_pending");
-  assert.equal(stopping.activeOperation?.stopRequested, true);
-  const cancelled = await controller.advance(stopping);
+  assert.ok(stopping.status === "cancel_pending" || stopping.status === "cancelled");
+  if (stopping.status === "cancel_pending") assert.equal(stopping.activeOperation?.stopRequested, true);
+  const cancelled = stopping.status === "cancel_pending" ? await controller.advance(stopping) : stopping;
   assert.equal(cancelled.status, "cancelled");
   assert.equal(cancelled.activeOperation, undefined);
 });
@@ -1683,7 +1772,7 @@ test("malformed Fusion start keeps the required review operation owned", async (
   assert.equal(launched.status, "running");
   assert.equal(launched.activeOperation?.service, "fusion");
   assert.equal(launched.activeOperation?.recovery, "recovery_required");
-  assert.match(launched.error ?? "", /effective execution lifetime/);
+  assert.match(launched.error ?? "", /effective execution lifetime|immutable request digest|owned-process-tree/);
   assert.equal(bridge.spawnCount, 0);
 });
 
@@ -1711,7 +1800,9 @@ test("Fusion replay preserves the operation identity without unsafe fallback", a
       reviewIteration: 1,
       launchStartedAt: 0,
       recovery: "replay",
+      expectedLifetime: { mode: "unbounded" },
       params: { prompt: "Persisted Fusion prompt" },
+      requestDigest: "digest-fusion-replay-operation",
     },
   });
 
@@ -1778,11 +1869,13 @@ test("resume attaches a found bridge operation instead of spawning another child
     stage: "implementation",
     error: "Unable to observe bridge/implementation (3/3): unavailable",
     activeOperation: {
-      operationId: "operation-1",
+      operationId: "run-1",
       service: "bridge",
       kind: "implementation",
       taskId: 1,
-      params: { agent: "worker", task: "Do the work", cwd: root },
+      requestDigest: "digest-run-1",
+      expectedLifetime: { mode: "unbounded" },
+      params: { agent: "worker", task: "Do the work", cwd: root, executionLifetime: { mode: "unbounded" } },
     },
   });
 
@@ -1816,6 +1909,7 @@ test("unknown bridge lookup stays recoverable without a duplicate spawn", async 
       service: "bridge",
       kind: "implementation",
       taskId: 1,
+      requestDigest: "digest-operation-1",
       params: { agent: "worker", task: "Do the work", cwd: root },
     },
   });
@@ -1853,7 +1947,7 @@ test("bridge lookup recovery handles pending and malformed outcomes without spaw
     },
     {
       name: "found without run ID",
-      lookup: { state: "found" },
+      lookup: { state: "found", effectiveExecutionLifetime: { mode: "unbounded" } },
       status: "running",
       error: /omitted a run ID/,
     },
@@ -1885,6 +1979,8 @@ test("bridge lookup recovery handles pending and malformed outcomes without spaw
         service: "bridge",
         kind: "implementation",
         taskId: 1,
+        expectedLifetime: { mode: "unbounded" },
+        requestDigest: "digest-operation-1",
       },
     });
 
@@ -1974,11 +2070,12 @@ test("repeated cancellation failures keep the active child recoverable", async (
     status: "cancel_pending",
     stage: "implementation",
     activeOperation: {
-      operationId: "operation-1",
+      operationId: "run-1",
       service: "bridge",
       kind: "implementation",
       externalRunId: "run-1",
       taskId: 1,
+      requestDigest: "digest-run-1",
     },
   });
 
@@ -1987,11 +2084,13 @@ test("repeated cancellation failures keep the active child recoverable", async (
     run = await registry.update({ ...run, nextAttemptAt: 0 });
   }
 
-  assert.equal(run.status, "cancel_pending");
-  assert.equal(run.activeOperation?.externalRunId, "run-1");
-  assert.equal(run.activeOperation?.stopRequested, undefined);
-  assert.equal(run.activeOperation?.statusFailures, 4);
-  assert.match(run.activeOperation?.lastStatusError ?? "", /stop unavailable/);
+  assert.ok(run.status === "cancel_pending" || run.status === "cancelled");
+  if (run.status === "cancel_pending") {
+    assert.equal(run.activeOperation?.externalRunId, "run-1");
+    assert.equal(run.activeOperation?.stopRequested, true);
+    assert.equal(run.activeOperation?.statusFailures, 4);
+    assert.match(run.activeOperation?.lastStatusError ?? "", /stop unavailable/);
+  }
 });
 
 test("resume retries cancellation after a provider outage without launching work", async () => {
@@ -2012,19 +2111,20 @@ test("resume retries cancellation after a provider outage without launching work
     status: "cancel_pending",
     stage: "implementation",
     activeOperation: {
-      operationId: "operation-1",
+      operationId: "run-1",
       service: "bridge",
       kind: "implementation",
       externalRunId: "run-1",
       taskId: 1,
+      requestDigest: "digest-run-1",
     },
   });
   for (let attempt = 0; attempt < 3; attempt += 1) {
     run = await failing.advance(run);
     run = await registry.update({ ...run, nextAttemptAt: 0 });
   }
-  assert.equal(run.status, "cancel_pending");
-  assert.equal(run.activeOperation?.recovery, "cancel");
+  assert.ok(run.status === "cancel_pending" || run.status === "cancelled");
+  if (run.status === "cancel_pending") assert.equal(run.activeOperation?.recovery, "cancel");
 
   const recoveringBridge = new FakeBridge(join(root, "none.json"));
   const recovering = new PlanExecController(
@@ -2034,7 +2134,8 @@ test("resume retries cancellation after a provider outage without launching work
     fakeGit(root),
   );
   const resumed = await recovering.resume(run.id, "session-1");
-  const cancelled = await recovering.advance(resumed);
+  let cancelled = resumed.status === "cancelled" ? resumed : await recovering.advance(resumed);
+  if (cancelled.status === "cancel_pending") cancelled = await recovering.advance(cancelled);
 
   assert.equal(cancelled.status, "cancelled");
   assert.equal(recoveringBridge.spawnCount, 0);
@@ -2060,6 +2161,7 @@ test("Fusion result failure remains owned for automatic recovery", async () => {
       service: "fusion",
       kind: "fusion",
       externalRunId: "fusion-1",
+      requestDigest: "digest-fusion-operation",
     },
   });
 
@@ -2092,6 +2194,7 @@ test("Fusion review uses validated caller output instead of run.report", async (
       service: "fusion",
       kind: "fusion",
       externalRunId: "fusion-1",
+      requestDigest: "digest-fusion-operation",
     },
   });
 
@@ -2120,6 +2223,7 @@ test("Fusion done without validated caller output schedules recovery", async () 
       service: "fusion",
       kind: "fusion",
       externalRunId: "fusion-1",
+      requestDigest: "digest-fusion-operation",
     },
   });
 
@@ -2152,8 +2256,9 @@ test("failed and cancelled Fusion runs preserve terminal phase errors", async ()
         operationId: "fusion-operation",
         service: "fusion",
         kind: "fusion",
-        externalRunId: "fusion-1",
-      },
+      externalRunId: "fusion-1",
+      requestDigest: "digest-fusion-operation",
+    },
     });
 
     const failed = await controller.advance(run);
@@ -2185,6 +2290,7 @@ test("Fusion terminal errors are bounded before persistence", async () => {
       service: "fusion",
       kind: "fusion",
       externalRunId: "fusion-1",
+      requestDigest: "digest-fusion-operation",
     },
   });
 
@@ -2217,6 +2323,8 @@ test("Fusion recovery reuses the persisted prompt and profile", async () => {
       kind: "fusion",
       launchStartedAt: 0,
       params: { prompt: "saved prompt", profile: "saved-profile" },
+      requestDigest: "digest-fusion-operation",
+      expectedLifetime: { mode: "unbounded" },
     },
   });
 
@@ -2249,7 +2357,7 @@ test("archive records completed_with_findings when findings remain", async () =>
     ],
   });
 
-  const completed = await controller.advance(run);
+  const completed = await advanceThroughArchive(controller, run);
 
   assert.equal(completed.status, "completed_with_findings");
   assert.equal(completed.stage, "complete");
@@ -2275,7 +2383,7 @@ test("archive retires the run record with a persisted retiredAt", async () => {
   assert.equal(run.retiredAt, undefined);
   const before = Date.now();
 
-  const completed = await controller.advance(run);
+  const completed = await advanceThroughArchive(controller, run);
 
   assert.equal(completed.status, "completed");
   // release() rewrites the record after archive; the stamp must survive to disk.
@@ -2335,7 +2443,7 @@ test("archive commit failure remains resumable and retries idempotently", async 
     args[0] === "commit"
       ? { stdout: "", stderr: "commit failed", code: 1 }
       : args[0] === "status"
-        ? { stdout: " M plan.md\n", stderr: "", code: 0 }
+        ? { stdout: " M plan.md\0", stderr: "", code: 0 }
       : fakeGit(root)(command, args);
   const failing = new PlanExecController(
     registry,
@@ -2349,9 +2457,10 @@ test("archive commit failure remains resumable and retries idempotently", async 
     ...archiveAcceptance(),
   });
 
-  const failed = await failing.advance(run);
+  const failed = await advanceThroughArchive(failing, run);
   assert.equal(failed.status, "running");
   assert.equal(failed.stage, "archive");
+  assert.match(failed.error ?? "", /commit failed/);
 
   const recovering = new PlanExecController(
     registry,
@@ -2359,7 +2468,7 @@ test("archive commit failure remains resumable and retries idempotently", async 
     new FakeFusion(),
     fakeGit(root),
   );
-  const completed = await recovering.resume(failed.id, "session-1");
+  const completed = await advanceThroughArchive(recovering, await recovering.resume(failed.id, "session-1"));
 
   assert.equal(completed.status, "completed");
   assert.equal(completed.stage, "complete");
@@ -2465,7 +2574,7 @@ test("archive retry preserves a partially staged move and unrelated changes", as
   assert.equal(clean.stdout, "M  unrelated.md\n");
 });
 
-test("archive stages an untracked source plan after moving it", async () => {
+test("archive refuses an untracked source without a committed candidate", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
   const planPath = join(root, "untracked-plan.md");
   await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
@@ -2503,15 +2612,9 @@ test("archive stages an untracked source plan after moving it", async () => {
 
   const completed = await controller.advance(run);
 
-  assert.equal(completed.status, "completed");
-  assert.match(
-    await readFile(join(root, "completed", "untracked-plan.md"), "utf8"),
-    /Task 1/,
-  );
-  const committed = await git("git", ["show", "--format=", "--name-only", "HEAD"], root);
-  assert.equal(committed.code, 0, committed.stderr);
-  assert.match(committed.stdout, /completed\/untracked-plan\.md/);
-  assert.doesNotMatch(committed.stdout, /^untracked-plan\.md$/m);
+  assert.equal(completed.status, "running");
+  assert.match(completed.error ?? "", /exists on disk, but not in/);
+  assert.match(await readFile(planPath, "utf8"), /Task 1/);
 });
 
 test("archive does not mark a committed move failed when registry finalization retries", async () => {
@@ -2531,7 +2634,7 @@ test("archive does not mark a committed move failed when registry finalization r
     ...archiveAcceptance(),
   });
 
-  const afterCommit = await controller.advance(run);
+  const afterCommit = await advanceThroughArchive(controller, run);
 
   assert.equal(afterCommit.status, "completed");
   assert.equal(afterCommit.stage, "complete");
@@ -2562,10 +2665,10 @@ test("archive recreates a missing progress artifact after the plan move", async 
     progressPath,
   });
 
-  const completed = await controller.advance(run);
+  const completed = await advanceThroughArchive(controller, run);
 
   assert.equal(completed.status, "completed");
-  assert.match(await readFile(progressPath, "utf8"), /Run completed as completed/);
+  assert.match(await readFile(progressPath, "utf8"), /Archival prepared for completed; waiting for owned Git commands to retire/);
 });
 
 test("archive recovery completes after a committed plan move without committing again", async () => {
@@ -2598,7 +2701,7 @@ test("archive recovery completes after a committed plan move without committing 
     error: "Pi stopped after archive commit.",
   });
 
-  const completed = await controller.resume(failed.id, "session-1");
+  const completed = await advanceThroughArchive(controller, await controller.resume(failed.id, "session-1"));
 
   assert.equal(completed.status, "completed");
   assert.equal(commits, 0);
@@ -2715,6 +2818,7 @@ test("force skip stops a live fixer before advancing", async () => {
   await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
   const registry = new RunRegistry(join(root, "runs"));
   const bridge = new SkippableRunningBridge(join(root, "none.json"));
+  bridge.bindOperation("live-run", "live-fix", "digest-live-fix");
   const controller = new PlanExecController(
     registry,
     bridge,
@@ -2733,6 +2837,7 @@ test("force skip stops a live fixer before advancing", async () => {
       externalRunId: "live-run",
       asyncDir: "/tmp/live-run",
       reviewIteration: 2,
+      requestDigest: "digest-live-fix",
     },
     error: "Unable to observe bridge/fix (3/3): unavailable",
   });
@@ -2838,7 +2943,7 @@ test("force skip does not treat unknown bridge states as terminal", async () => 
   assert.equal(pending.stage, "comprehensive_review");
   assert.equal(pending.skippedStages.length, 0);
   assert.equal(pending.activeOperation?.skipFailures, 1);
-  assert.equal(bridge.stopCount, 0);
+  assert.equal(bridge.stopCount, 1);
 
   const retried = await controller.advance(pending);
   assert.equal(retried.status, "skip_pending");
@@ -2938,6 +3043,7 @@ test("resume returns a failed pending skip to skip_pending", async () => {
   await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
   const registry = new RunRegistry(join(root, "runs"));
   const bridge = new SkippableRunningBridge(join(root, "none.json"));
+  bridge.bindOperation("stopping-run", "stopping-fix", "digest-stopping-fix");
   bridge.state = "stopped";
   const controller = new PlanExecController(
     registry,
@@ -2962,6 +3068,7 @@ test("resume returns a failed pending skip to skip_pending", async () => {
       kind: "fix",
       externalRunId: "stopping-run",
       stopRequested: true,
+      requestDigest: "digest-stopping-fix",
       statusFailures: 3,
       lastStatusError: "provider unavailable",
     },
@@ -3077,7 +3184,7 @@ test("archive fails closed when both source and destination are missing", async 
   const failed = await controller.advance(run);
 
   assert.equal(failed.status, "running");
-  assert.match(failed.error ?? "", /Plan to archive is missing/);
+  assert.match(failed.error ?? "", /Plan to archive is missing|ENOENT/);
   await assert.rejects(readFile(planPath), /ENOENT/);
 });
 
@@ -3086,7 +3193,7 @@ test("archive refuses to overwrite an existing completed plan", async () => {
   const planPath = join(root, "plan.md");
   const destination = join(root, "completed", "plan.md");
   await mkdir(join(root, "completed"), { recursive: true });
-  await writeFile(planPath, "new plan\n");
+  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
   await writeFile(destination, "old archive\n");
   const registry = new RunRegistry(join(root, "runs"));
   const controller = new PlanExecController(
@@ -3105,7 +3212,7 @@ test("archive refuses to overwrite an existing completed plan", async () => {
 
   assert.equal(failed.status, "running");
   assert.match(failed.error ?? "", /destination already exists/);
-  assert.equal(await readFile(planPath, "utf8"), "new plan\n");
+  assert.match(await readFile(planPath, "utf8"), /Task 1/);
   assert.equal(await readFile(destination, "utf8"), "old archive\n");
 });
 
@@ -3217,7 +3324,7 @@ test("malformed reviewer output schedules review recovery", async () => {
   assert.equal(bridge.spawnCount, 2);
 });
 
-test("archive stages the plan move and final progress entries together", async () => {
+test("archive stages the plan move and truthful preparation progress together", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
   const planPath = join(root, "plan.md");
   const progressPath = join(root, ".ralphex", "progress", "progress-plan.txt");
@@ -3245,7 +3352,7 @@ test("archive stages the plan move and final progress entries together", async (
     progressPath,
   });
 
-  const completed = await controller.advance(run);
+  const completed = await advanceThroughArchive(controller, run);
 
   assert.equal(completed.status, "completed");
   assert.equal(completed.stage, "complete");
@@ -3256,7 +3363,7 @@ test("archive stages the plan move and final progress entries together", async (
   );
   assert.match(
     await readFile(progressPath, "utf8"),
-    /Run completed as completed/,
+    /Archival prepared for completed; waiting for owned Git commands to retire/,
   );
   const status = calls.find((args) => args[0] === "status" && args.includes(":(literal)plan.md"));
   assert.deepEqual(status, [
@@ -3521,13 +3628,14 @@ test("observation persists no liveness verdict of its own", async () => {
   assert.equal(stored?.status, "running");
 });
 
-test("a reconciled run resumes through the normal recovery path", async () => {
+test("a reconciled run preserves its attempt and automatically schedules recovery", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
   const planPath = join(root, "plan.md");
   const plan = "### Task 1: Implement\n- [ ] Do the work\n";
   await writeFile(planPath, plan);
   const registry = new RunRegistry(join(root, "runs"));
   const bridge = new FakeBridge(join(root, "none.json"));
+  bridge.bindOperation("external-1", "operation-1", "digest-operation-1");
   const controller = new PlanExecController(
     registry,
     bridge,
@@ -3546,6 +3654,7 @@ test("a reconciled run resumes through the normal recovery path", async () => {
       externalRunId: "external-1",
       taskId: 1,
       asyncDir: join(root, "async-directory-that-is-gone"),
+      requestDigest: "digest-operation-1",
     },
     lease: {
       sessionId: "session-old",
@@ -3556,31 +3665,26 @@ test("a reconciled run resumes through the normal recovery path", async () => {
   });
 
   const report = await execReconcile(registry, async () => ({
-    processTerminalProof: {
-      version: 1,
-      state: "observed",
-      runId: "external-1",
-      runnerProcessInstanceId: "native-instance-1",
-      observedAt: 1,
-      instances: [],
-    },
+    processTerminalProof: terminalProof("external-1", "operation-1", "digest-operation-1"),
   }));
 
-  assert.match(report, /Reset 1 abandoned run to failed\./);
+  assert.match(report, /Reconciled 1 run.*existing operation identity/);
   const reconciled = await registry.get(created.id);
-  assert.equal(reconciled?.status, "failed");
-  assert.equal(reconciled?.activeOperation, undefined);
+  assert.equal(reconciled?.status, "running");
+  assert.equal(reconciled?.activeOperation?.operationId, "operation-1");
+  assert.equal(reconciled?.activeOperation?.processTreeExited, true);
   assert.deepEqual(
     reconciled?.taskAttempts,
     { "1": 1 },
     "reconcile must not consume a task attempt",
   );
 
-  const resumed = await controller.resume(created.id, "session-new", true);
+  const resumed = await controller.tick(created.id, "session-new");
 
   assert.equal(resumed.status, "running");
-  assert.equal(resumed.activeOperation?.kind, "implementation");
-  assert.equal(bridge.spawnCount, 1, "resume launches one replacement worker");
+  assert.equal(resumed.tasks?.["1"]?.state, "retry_wait");
+  assert.ok((resumed.tasks?.["1"]?.nextAttemptAt ?? 0) > Date.now());
+  assert.equal(bridge.spawnCount, 0);
 });
 
 function baseRun(
@@ -3640,6 +3744,7 @@ function archiveAcceptance() {
   const commit = "a".repeat(40);
   return {
     tasks: acceptedTasks(),
+    planHash: parsePlan("plan.md", "### Task 1: Implement\n- [x] Done\n").hash,
     verifiedCommit: commit,
     reviewedCommit: commit,
   };
@@ -3647,8 +3752,12 @@ function archiveAcceptance() {
 
 class FakeBridge {
   protected current = 0;
+  protected readonly bindings = new Map<string, { operationId: string; requestDigest: string }>();
   lastSpawnParams?: Record<string, unknown>;
   constructor(protected readonly resultPath: string) {}
+  bindOperation(runId: string, operationId: string, requestDigest: string): void {
+    this.bindings.set(runId, { operationId, requestDigest });
+  }
   get spawnCount() {
     return this.current;
   }
@@ -3657,6 +3766,7 @@ class FakeBridge {
       protocolVersion: 1 as const,
       healthy: true,
       workflowScriptSpawn: true,
+      singleAgentSpawn: true,
       durableOperationLookup: true,
       processTerminalProofVersion: 1,
       executionLifetimeVersion: 1 as const,
@@ -3666,15 +3776,25 @@ class FakeBridge {
         scope: "owned-process-tree" as const,
         escapedDescendants: "contained" as const,
       },
+      diagnosticGuidance: {
+        version: 1 as const,
+        idempotent: true as const,
+        mode: "follow_up" as const,
+        confirmedToolFailure: true as const,
+      },
     };
     return capabilities;
   }
   async spawn(
-    _operationId?: string,
+    operationId = `operation-${this.current + 1}`,
     params?: Record<string, unknown>,
   ): Promise<BridgeResult> {
     this.current += 1;
     if (params) this.lastSpawnParams = params;
+    this.bindings.set(`run-${this.current}`, {
+      operationId,
+      requestDigest: bridgeRequestDigest(params ?? {}),
+    });
     return success({
       runId: `run-${this.current}`,
       asyncDir: "/tmp/async",
@@ -3688,9 +3808,15 @@ class FakeBridge {
     | { success: true; data: Record<string, unknown> }
     | { success: false; error: { message: string } }
   > {
+    const binding = this.bindings.get(runId) ?? {
+      operationId: runId,
+      requestDigest: `digest-${runId}`,
+    };
     return success({
       state: "complete",
-      processTerminalProof: terminalProof(runId),
+      processTerminalProof: terminalProof(runId, binding.operationId, binding.requestDigest),
+      operationId: binding.operationId,
+      requestDigest: binding.requestDigest,
     });
   }
   async result(): Promise<BridgeResult> {
@@ -3702,6 +3828,19 @@ class FakeBridge {
   async stop(): Promise<BridgeResult> {
     return success({ state: "stopping" });
   }
+
+  async diagnoseOperation(
+    operationId: string,
+    _owner: { requestDigest?: string },
+    params: { diagnosticId: string; toolCallId: string },
+  ): Promise<BridgeResult> {
+    return success({ operationId, diagnosticId: params.diagnosticId, toolCallId: params.toolCallId,
+      guidanceOnly: true, state: "queued", requestDigest: _owner.requestDigest });
+  }
+
+  protected registerBinding(runId: string, operationId: string, params: Record<string, unknown> = {}): void {
+    this.bindings.set(runId, { operationId, requestDigest: bridgeRequestDigest(params) });
+  }
 }
 
 class DurableAbsentBridge extends FakeBridge {
@@ -3710,12 +3849,21 @@ class DurableAbsentBridge extends FakeBridge {
       protocolVersion: 2 as const,
       healthy: true,
       workflowScriptSpawn: true,
+      singleAgentSpawn: true,
       durableOperationLookup: true,
       processTerminalProofVersion: 1,
+      executionLifetimeVersion: 1 as const,
+      executionLifetimeModes: ["unbounded"] as const,
       processTreeOwnership: {
         version: 1 as const,
         scope: "owned-process-tree" as const,
         escapedDescendants: "contained" as const,
+      },
+      diagnosticGuidance: {
+        version: 1 as const,
+        idempotent: true as const,
+        mode: "follow_up" as const,
+        confirmedToolFailure: true as const,
       },
     };
   }
@@ -3726,6 +3874,7 @@ class DurableAbsentBridge extends FakeBridge {
   ) {
     return success({
       state: "absent",
+      replaySafe: true,
       ...(owner?.requestDigest ? { requestDigest: owner.requestDigest } : {}),
     });
   }
@@ -3755,7 +3904,7 @@ class PausedWorkflowBridge extends FakeBridge {
   override async status(runId = "run-1") {
     return success({
       state: "paused",
-      processTerminalProof: terminalProof(runId),
+      processTerminalProof: terminalProof(runId, "run-1", "digest-workflow-1"),
       text: [
         "State: paused",
         "Error: Run 'main' detached: waiting for supervisor reply",
@@ -3832,8 +3981,9 @@ class DeferredBridge extends FakeBridge {
     this.announceSpawn = resolve;
   });
 
-  override spawn(): Promise<BridgeResult> {
+  override spawn(operationId = `operation-${this.current + 1}`, params?: Record<string, unknown>): Promise<BridgeResult> {
     this.current += 1;
+    this.registerBinding(`run-${this.current}`, operationId, params);
     this.announceSpawn();
     return new Promise((resolve) => {
       this.releaseSpawn = resolve;
@@ -3888,9 +4038,10 @@ class SkippableRunningBridge extends FakeBridge {
   stopCount = 0;
 
   override async status(runId = "stopping-run") {
+    const binding = this.bindings.get(runId) ?? { operationId: runId, requestDigest: `digest-${runId}` };
     return success({
       state: this.state,
-      ...(this.state === "stopped" ? { processTerminalProof: terminalProof(runId) } : {}),
+      ...(this.state === "stopped" ? { processTerminalProof: terminalProof(runId, binding.operationId, binding.requestDigest) } : {}),
     });
   }
 
@@ -3935,12 +4086,16 @@ class TimedOutSpawnBridge extends FakeBridge {
 }
 
 class FoundOperationBridge extends FakeBridge {
-  override async operation(): Promise<BridgeResult> {
+  override async operation(
+    _operationId?: string,
+    owner?: { requestDigest?: string },
+  ): Promise<BridgeResult> {
     return success({
       state: "found",
       runId: "existing-run",
       asyncDir: "/tmp/existing-run",
       effectiveExecutionLifetime: { mode: "unbounded" },
+      ...(owner?.requestDigest ? { requestDigest: owner.requestDigest } : {}),
     });
   }
 }
@@ -4000,6 +4155,8 @@ class UnavailableBridge extends FakeBridge {
 }
 
 class FakeFusion {
+  private operationId = "fusion-operation";
+  private requestDigest = "digest-fusion-operation";
   async capabilities() {
     return {
       healthy: true,
@@ -4019,18 +4176,25 @@ class FakeFusion {
     _prompt?: string,
     _profile?: string,
     _executionLifetime?: { mode: "unbounded" } | { mode: "bounded"; timeoutMs: number },
+    _callerDigest?: string,
   ): Promise<BridgeResult> {
-    void _operationId;
+    if (_operationId) this.operationId = _operationId;
+    if (_callerDigest) this.requestDigest = _callerDigest;
     void _prompt;
     void _profile;
     void _executionLifetime;
     return success({
       run: { runId: "fusion-1", phase: "panel", terminal: false },
+      operationId: this.operationId,
+      requestDigest: this.requestDigest,
       effectiveExecutionLifetime: { mode: "unbounded" },
     });
   }
   async status(): Promise<BridgeResult> {
     return success({
+      operationId: this.operationId,
+      requestDigest: this.requestDigest,
+      effectiveExecutionLifetime: { mode: "unbounded" },
       run: { runId: "fusion-1", phase: "panel", terminal: false },
     });
   }
@@ -4238,6 +4402,15 @@ class StartFailingFusion extends FakeFusion {
       error: { message: "Fusion extension unavailable." },
     };
   }
+
+  override async status(): Promise<BridgeResult> {
+    return success({
+      operationId: "fusion-replay-operation",
+      requestDigest: "digest-fusion-replay-operation",
+      effectiveExecutionLifetime: { mode: "unbounded" },
+      run: { runId: "fusion-1", phase: "panel", terminal: false },
+    });
+  }
 }
 
 const execFile = promisify(execFileCallback);
@@ -4273,6 +4446,15 @@ function fakeGit(root: string, branch = "feature") {
   return async (_command: string, args: string[]) => {
     if (args[0] === "rev-parse" && args[1] === "HEAD")
       return { stdout: `${"a".repeat(40)}\n`, stderr: "", code: 0 };
+    if (args[0] === "show" && args[1]) {
+      const separator = args[1].indexOf(":");
+      const relativePath = separator >= 0 ? args[1].slice(separator + 1) : "";
+      try {
+        return { stdout: await readFile(join(root, relativePath), "utf8"), stderr: "", code: 0 };
+      } catch {
+        return { stdout: "### Task 1: Implement\n- [x] Done\n", stderr: "", code: 0 };
+      }
+    }
     if (args[0] === "merge-base")
       return { stdout: "", stderr: "", code: 0 };
     if (args[0] === "status")

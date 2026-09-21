@@ -34,11 +34,6 @@ export async function requiredChecks(cwd: string, configured: string[][]): Promi
     .filter((name) => name in scripts).map((name) => ["npm", "run", name]);
 }
 
-export async function runCommands(command: RunCommand, cwd: string, commands: string[][], options?: LocalOperationOptions): Promise<void> {
-  if (options) return runLocalOperation(cwd, commands, options);
-  for (const [program, ...args] of commands) {
-    if (!program) throw new Error("An empty verification/bootstrap command is invalid.");
-    const result = await command(program, args, cwd);
-    if (result.code !== 0) throw new Error(`${program} ${args.join(" ")} failed: ${result.stderr.trim() || result.stdout.trim()}`);
-  }
+export async function runCommands(cwd: string, commands: string[][], options: LocalOperationOptions): Promise<void> {
+  return runLocalOperation(cwd, commands, options);
 }
