@@ -2,7 +2,7 @@
 
 <!-- markdownlint-disable MD013 -->
 
-Status: implemented and verified; final cumulative confirmation pending
+Status: implemented and verified locally; final cumulative confirmation pending
 
 Baseline: `0f184ec80754683772b081ef41e6a22a6b8fdb27` (`origin/main`).
 
@@ -141,22 +141,24 @@ The scenario numbers below refer to section 13 of the approved autonomous execut
 
 ## Verification checkpoint
 
-- Main through `0efddef6f4d2c2871965895797da50cbfde23e81`: `npm run test:all` passed lint, TypeScript, all 506 tests (zero failures or skips), and package validation. Fresh Linux CI will verify the pushed revision.
+- Main through `4b281ff78b274c309cc8fc64e7c2e6a9a73a266e`: `npm run test:all` passed lint, TypeScript, all 511 tests (zero failures or skips), and package validation. Fresh Linux CI will verify the pushed revision.
 - Installed-runtime smoke: passed real controller, Bridge/native RPC, no-start recovery with zero model sessions, owned workers/checks, required review, promotion and archive. Model turns are scripted.
 - Saved-session handoff: real Git preparation and the installed SDK session fork preserve cwd, parent history and stop fences. SDK source inspection locates missing-cwd validation before session teardown.
 - Plan publication: actual SIGKILL and injected ENOSPC preserve the original plan. Tracked and untracked initial plans, lost publication replies, proven failure and repeated approval recover automatically under one operation identity; large content stays outside command arguments.
 - Native `798b70d8c94befd7ae96fc40d4ae9198a71810ef`: 3337 unit / 1090 integration passed, 14/7 skipped; typecheck, build, package and focused lint pass. Inherited legacy lint diagnostics are unchanged.
 - Bridge `c7ab396b2ab3f5354790c974abce41e04fea41a1`: 72 tests, exact native boundary including missing-exit-receipt expiry, typecheck, lint, package and remote CI pass.
-- Fusion `5b41a651b25c86e6164b1484f4371702b63faa34`: 251 unit / 115 integration / one E2E, typecheck, lint, package and remote CI pass.
-- Revmux dependency `398d8f11c13737cb26354fa963e0b347abcc916d`: formatting, build, race-enabled tests, lint and actual CLI lifetime smoke pass.
+- Fusion `a29934f32376f799235a6a00ec3ddcebf7cb0108`: 251 unit / 121 integration / one E2E, typecheck, lint, package and remote CI pass.
+- Revmux dependency `988904f30da351e76c29d5779c6833a6bf890b51`: formatting, build, race-enabled tests, lint and actual CLI lifetime/held-pipe smoke pass on Darwin. Linux tests crosscompile and the Windows package builds. Upstream Ubuntu CI awaits maintainer approval and has executed no jobs; no Linux runtime result is claimed.
 - Development review: rounds `02-after-fix`, `03-final` and `04-final` were complete and non-degraded; the corrections above need final cumulative confirmation.
 
 Round `04-final` reviewed the full cumulative main diff through `f6acd95`, native `e5f66f9`, Bridge `5719a27`, Fusion `eb8ab54` and Revmux `398d8f1`. It completed with two of two sources, no degradation, three major findings and one minor finding. Corrections now provide safe controller-lease retirement during Pi session replacement, consistent acceptance facts during plan adoption/publication, native bounded expiry with proven retirement but no exit receipt, and Fusion cancellation precedence.
 
 Initial publication and ordinary untracked-plan recovery now use the same owned atomic publisher as explicit plan adoption. One shared rule preserves trusted initial checkbox facts before the first accepted task commit, then uses accepted-commit facts. Independent reviews confirmed this correction and the session-handoff fixes after additional regressions for transient restore reads, late handoff cleanup, tracked initial plan edits and nested working directories. Both bounded reviews reported no remaining confirmed major or critical defects. Current dependency pins are installed and match the package and installed lockfiles.
 
+Round `05-final` reviewed through main `7fa6469`, native `798b70d`, Bridge `c7ab396`, Fusion `5b41a65` and Revmux `398d8f1`. It completed with two of two sources, no degradation, two major findings and one minor finding. The main correction tracks pending command mutations and allocated run IDs across session replacement, including the publication-before-return boundary. Read-only and UI promises do not hold retirement open; queued resume, rebind and skip cannot clear a newer stop generation. All 255 focused lifecycle tests pass, and independent bounded review reports no remaining major or critical defects. Fusion now atomically records panel intent for direct explicit-lifetime tool starts. Revmux observes direct-child exit before pipe EOF without reaping away its signal identity, retires the group and drains output. Neither correction adds a worker deadline. Dependency revisions and their verification results are recorded above.
+
 Strict ownership currently requires supported macOS GUI launchd and compiler prerequisites. Strict Fusion early-agreement mode is explicitly refused. Source installation uses the documented project-local Git dependency policy. No release, global installation, persistent daemon or merge is included.
 
 ## Next step
 
-Push the verified revision, verify CI, and run cumulative Revmux confirmation `05-final` from the recorded baselines. Keep all PRs draft and this plan unarchived until the review passes; process-group observations cannot be promoted to owned-tree proof.
+Push the verified revision, verify main CI, and run cumulative Revmux confirmation `06-final` from the recorded baselines. Keep all PRs draft and this plan unarchived until that review passes. Preserve the explicit limitation that upstream Revmux Linux CI is waiting for maintainer approval; process-group observations cannot be promoted to owned-tree proof.
