@@ -56,6 +56,14 @@ export async function requireGitRepository(
   return result.stdout.trim();
 }
 
+export async function gitCheckoutRoot(run: RunCommand, cwd: string): Promise<string> {
+  const result = await run("git", ["rev-parse", "--show-cdup"], cwd);
+  const upward = result.stdout.trim();
+  if (result.code !== 0 || !/^(?:\.\.\/)*$/.test(upward))
+    throw new Error(result.stderr.trim() || "Cannot determine the execution checkout root.");
+  return resolve(cwd, upward);
+}
+
 export async function defaultBranch(
   run: RunCommand,
   cwd: string,

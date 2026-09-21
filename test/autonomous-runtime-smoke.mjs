@@ -134,10 +134,29 @@ test("scripted model completes real controller, Bridge, kernel-owned workers, ch
   const fusion = new Proxy({}, { get: () => () => { throw new Error("Smoke requires the configured single-subagent review"); } });
   const controller = new PlanExecController(registry, bridge, fusion, command);
   const plan = await readPlan(join(lane, "plan.md"));
-  let run = await registry.create({ schemaVersion: 1, repositoryRoot: root, worktreeCwd: lane, planPath: plan.path, planHash: plan.hash,
+  const seed = { schemaVersion: 1, repositoryRoot: root, worktreeCwd: lane, planPath: plan.path, planHash: plan.hash,
     branch: "execution", defaultBranch: "main", outputTarget: { cwd: root, branch: "feature", initialHead: baseline, planRelativePath: "plan.md" },
     stage: "resolve", status: "running", taskAttempts: {}, stageAttempts: {}, reviewFindings: [], unresolvedFindings: [], skippedStages: [], branchRebindings: [],
-    config: { ...DEFAULT_FROZEN_RUN_CONFIG, retryDelayMs: 100, requiredChecks: [[process.execPath, "check.mjs"]] } });
+    config: { ...DEFAULT_FROZEN_RUN_CONFIG, retryDelayMs: 100, requiredChecks: [[process.execPath, "check.mjs"]] } };
+  let rejected = await registry.create({ ...seed, stage: "implementation",
+    config: { ...seed.config, workerAgent: "missing-smoke-agent" } });
+  for (let step = 0; step < 10 && !rejected.failedOperation?.launchFenced; step++) {
+    rejected = await registry.update({ ...rejected, nextAttemptAt: 0,
+      ...(rejected.activeOperation ? { activeOperation: { ...rejected.activeOperation, launchStartedAt: 0 } } : {}) });
+    rejected = await controller.tick(rejected.id, sessionId);
+  }
+  assert.equal(rejected.failedOperation?.launchFenced, true, rejected.error ?? "Rejected launch did not reconcile");
+  assert.equal(rejected.activeOperation, undefined);
+  assert.equal(rejected.tasks["1"].state, "retry_wait");
+  assert.ok(rejected.tasks["1"].nextAttemptAt > Date.now());
+  await assert.rejects(access(process.env.PI_AUTONOMOUS_SMOKE_CALLS), { code: "ENOENT" });
+  const rejectedOperationId = rejected.failedOperation.operationId;
+  const rejectedEvidence = { runId: rejected.id, operationId: rejectedOperationId,
+    state: rejected.tasks["1"].state, nextAttemptAt: rejected.tasks["1"].nextAttemptAt, modelSessions: 0 };
+  rejected = await registry.update({ ...rejected, status: "cancel_pending", userStopped: true, stopGeneration: 1 });
+  rejected = await controller.tick(rejected.id, sessionId);
+  assert.equal(rejected.status, "cancelled");
+  let run = await registry.create(seed);
   const transitions = [];
   const deadline = Date.now() + 90_000;
   while (run.status === "running" && Date.now() < deadline) {
@@ -147,7 +166,7 @@ test("scripted model completes real controller, Bridge, kernel-owned workers, ch
     if (run.tasks?.["1"]?.state === "retry_wait" || (run.stageAttempts.comprehensive_review ?? 0) > 1) break;
     if (run.activeOperation || (run.nextAttemptAt ?? 0) > Date.now()) await delay(100);
   }
-  await writeFile(join(sandbox, "evidence.json"), JSON.stringify({ model: "scripted", pins: { native: manifest.dependencies["pi-subagents"], bridge: manifest.devDependencies["@alexeiled/pi-subagents-bridge"] }, run, transitions }, null, 2));
+  await writeFile(join(sandbox, "evidence.json"), JSON.stringify({ model: "scripted", rejectedEvidence, pins: { native: manifest.dependencies["pi-subagents"], bridge: manifest.devDependencies["@alexeiled/pi-subagents-bridge"] }, run, transitions }, null, 2));
   assert.equal(run.status, "completed", JSON.stringify(transitions));
   assert.equal(run.tasks["1"].state, "accepted");
   assert.notEqual(run.acceptedHead, baseline);
@@ -165,10 +184,17 @@ test("scripted model completes real controller, Bridge, kernel-owned workers, ch
   assert.equal(calls[1].cwd, lane);
   assert.equal(calls[1].output, "NO_FINDINGS");
   assert.ok(calls.every((call) => call.pid !== process.pid && call.executionLifetime.mode === "unbounded"));
-  assert.equal(requests.length, 2);
+  assert.equal(requests.length, 3);
   for (const request of requests) {
     const operation = await bridge.operation(request.operationId, request.owner);
-    assert.ok(hasTerminalOwnershipProof(operation.data, operation.data.runId, { operationId: request.operationId, requestDigest: request.owner.requestDigest }));
+    const terminal = hasTerminalOwnershipProof(operation.data, operation.data.runId, { operationId: request.operationId, requestDigest: request.owner.requestDigest });
+    if (request.operationId === rejectedOperationId) {
+      assert.equal(operation.data.operationId, request.operationId);
+      assert.equal(operation.data.requestDigest, request.owner.requestDigest);
+      assert.equal(operation.data.neverStarted, true);
+      assert.equal(operation.data.cancellationRequested, true);
+      assert.equal(terminal, false);
+    } else assert.ok(terminal);
   }
   const localDirectories = await readdir(localRoot);
   let requiredCheckRuns = 0;

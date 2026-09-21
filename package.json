@@ -70,11 +70,11 @@
     }
   },
   "dependencies": {
-    "pi-subagents": "git+https://github.com/alexei-led/pi-subagents-codex-fix.git#778d7aeac0c6a8056f316f2e2a38381570c7bcae"
+    "pi-subagents": "git+https://github.com/alexei-led/pi-subagents-codex-fix.git#83d0f646eceeaa9e858406afe4ba2c5f8ff5ed8a"
   },
   "devDependencies": {
     "@alexeiled/pi-fusion": "git+https://github.com/alexei-led/pi-fusion.git#07f327d2df4d72feddc8fa5a08de74391773c8c9",
-    "@alexeiled/pi-subagents-bridge": "git+https://github.com/alexei-led/pi-subagents-bridge.git#fbd2a53199f37cd68eb5c2b9db1482246979ffa5",
+    "@alexeiled/pi-subagents-bridge": "git+https://github.com/alexei-led/pi-subagents-bridge.git#34ff4291fac06ac03458b482d55637bbce11f8f4",
     "@earendil-works/pi-coding-agent": "0.86.1",
     "@eslint/js": "^10.0.1",
     "@tintinweb/pi-tasks": "0.9.0",

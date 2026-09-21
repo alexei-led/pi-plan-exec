@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import {
+  access,
   chmod,
   mkdir,
   mkdtemp,
   readFile,
   readdir,
+  realpath,
+  rm,
   writeFile,
 } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
@@ -14,6 +17,9 @@ import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { RunRegistry } from "../src/registry.js";
+import { PlanExecController } from "../src/controller.js";
+import { LocalOperationFailedError } from "../src/local-operation.js";
+import { SessionManager, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import {
   abandonedRunsNotice,
   abandonmentProbe,
@@ -37,6 +43,7 @@ import {
   getExecArgumentCompletions,
   hasBridgeOperationMethod,
   hasBridgeWorkflowScriptSpawnCapability,
+  handleCommand,
   isActionAllowed,
   isRecoverableFailure,
   isStageWaiverAvailable,
@@ -3284,7 +3291,7 @@ test("a run on another host stays live until its owner releases it", async () =>
   assert.equal(kept.note, undefined);
 });
 
-test("a renamed machine keeps the remote lease protected", async () => {
+test("a renamed machine keeps the remote lease protected and explains the assertion", async () => {
   // A DHCP rename: the lease names something no probe can connect back here.
   const renamed = abandonedRun({
     lease: { ...DEAD_LEASE, hostname: `${thisHost()}-corp-dhcp` },
@@ -3294,8 +3301,11 @@ test("a renamed machine keeps the remote lease protected", async () => {
 
   const guidance = recoveryGuidance(renamed, await runEvidence(renamed));
 
-  assert.match(guidance.classification, /running/);
-  assert.doesNotMatch(guidance.action, /--same-machine/);
+  assert.match(guidance.classification, /cannot be observed here/);
+  assert.match(guidance.action, /--same-machine/);
+  const status = formatRunStatus(renamed, await runEvidence(renamed));
+  assert.match(status, /--same-machine/);
+  assert.doesNotMatch(status, /polling continues|controller is polling|; retrying|holds a live lease/);
   const stillOwned = await reconcileForResume(registry, renamed);
   assert.equal(stillOwned.run.status, "running");
   assert.equal(stillOwned.note, undefined);
@@ -3464,6 +3474,179 @@ test("--same-machine supplies a machine, never a verdict", async () => {
     /only applies to a run whose lease names another host/,
   );
   assert.equal(sameMachineRefusal(abandonedRun({ lease: foreignLease })), undefined);
+});
+
+test("same-machine rebinds settled and between-step leases without discarding ownership or stop state", async () => {
+  for (const status of ["running", "starting", "failed", "paused", "cancel_pending"] as const) {
+    const held = run({ status, lease: { ...DEAD_LEASE, hostname: "former-host" },
+      userStopped: status === "paused" || status === "cancel_pending",
+      stopGeneration: 4, localOperationActive: true });
+    delete held.activeOperation;
+    const registry = await seedRegistry([held]);
+    const recovered = await reconcileForResume(registry, held, undefined, true);
+    assert.equal(recovered.run.lease?.hostname, hostname());
+    assert.equal(recovered.run.status, held.status);
+    assert.equal(recovered.run.userStopped, held.userStopped);
+    assert.equal(recovered.run.stopGeneration, 4);
+    assert.equal(recovered.run.localOperationActive, true);
+    const claimed = await registry.claim(recovered.run, "new-session");
+    assert.equal(claimed.lease?.sessionId, "new-session");
+    assert.equal(claimed.localOperationActive, true);
+    assert.match(recoveryGuidance(held).command, /--same-machine/);
+  }
+});
+
+test("same-machine preserves a settled tracked operation and requires proof for unknown workers", async () => {
+  for (const status of ["failed", "paused", "cancel_pending"] as const) {
+    const held = abandonedRun({ status, lease: { ...DEAD_LEASE, hostname: "former-host" },
+      userStopped: true, stopGeneration: 2 });
+    const { registry, directory } = await seedDirectory([held]);
+    const before = await snapshotRuns(directory);
+    await assert.rejects(reconcileForResume(registry, held, abandonmentProbe(), true), /evidence is incomplete/);
+    assert.deepEqual(await snapshotRuns(directory), before);
+    const recovered = await reconcileForResume(registry, held, nativeTerminalProbe, true);
+    assert.equal(recovered.run.status, status);
+    assert.equal(recovered.run.lease?.hostname, hostname());
+    assert.deepEqual(recovered.run.activeOperation, held.activeOperation);
+    assert.equal(recovered.run.userStopped, true);
+    assert.equal(recovered.run.stopGeneration, 2);
+  }
+});
+
+test("same-machine never steals an actual live local PID under a foreign hostname", async () => {
+  for (const status of ["running", "failed", "paused", "cancel_pending"] as const) {
+    for (const tracked of [true, false]) {
+      const held = abandonedRun({ status, lease: { ...DEAD_LEASE, hostname: "former-host", pid: process.pid } });
+      if (!tracked) delete held.activeOperation;
+      const { registry, directory } = await seedDirectory([held]);
+      const before = await snapshotRuns(directory);
+      const recovered = await reconcileForResume(registry, held, async () => {
+        assert.fail("A live local controller must fence evidence gathering.");
+      }, true);
+      assert.equal(recovered.run, held);
+      assert.deepEqual(await snapshotRuns(directory), before);
+      await assert.rejects(registry.claim(recovered.run, "replacement-session"), /controlled by another active Pi session/);
+    }
+  }
+});
+
+test("same-machine cannot overwrite a stop recorded while checking a settled run", async () => {
+  const held = abandonedRun({ status: "failed", lease: { ...DEAD_LEASE, hostname: "former-host" } });
+  const registry = await seedRegistry([held]);
+  await assert.rejects(reconcileForResume(registry, held, async (subject) => {
+    await registry.update({ ...held, status: "cancel_pending", userStopped: true, stopGeneration: 1 });
+    return nativeTerminalProbe(subject);
+  }, true), /changed while its asserted host was being recorded/);
+  const current = await registry.get(held.id);
+  assert.equal(current?.lease?.hostname, "former-host");
+  assert.equal(current?.status, "cancel_pending");
+  assert.equal(current?.userStopped, true);
+  assert.equal(current?.stopGeneration, 1);
+});
+
+test("a saved session waits for durable Git lane creation and recovers creation failures automatically", async (t) => {
+  const initialCwd = process.cwd();
+  const root = await realpath(await mkdtemp(join(tmpdir(), "exec-saved-session-")));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const source = join(root, "source");
+  await mkdir(source);
+  const command = async (program: string, args: string[], cwd: string) => {
+    const result = spawnSync(program, args, { cwd, encoding: "utf8" });
+    return { stdout: result.stdout ?? "", stderr: result.stderr ?? "", code: result.status ?? 1 };
+  };
+  for (const args of [["init", "-b", "main"], ["-c", "user.name=Test", "-c", "user.email=test@example.org",
+    "-c", "commit.gpgSign=false", "-c", "core.hooksPath=/dev/null", "commit", "--allow-empty", "-m", "initial"]]) {
+    const result = await command("git", args, source);
+    assert.equal(result.code, 0, result.stderr);
+  }
+  await writeFile(join(source, "plan.md"), "### Task 1: Implement\n- [ ] Do the work\n");
+  const sourceSession = SessionManager.create(source, join(root, "sessions", "source"));
+  sourceSession.appendMessage({ role: "user", content: "Execute the saved plan.", timestamp: Date.now() });
+  sourceSession.appendMessage({ role: "assistant", content: [{ type: "text", text: "Ready to execute." }],
+    api: "openai-responses", provider: "openai", model: "test-fixture", stopReason: "stop", timestamp: Date.now(),
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } });
+  const sourceSessionFile = sourceSession.getSessionFile();
+  assert.ok(sourceSessionFile);
+  await access(sourceSessionFile);
+  const targetSessionDirectory = join(root, "sessions", "target");
+  const registry = new RunRegistry(join(root, "runs"));
+  const unavailable = async (): Promise<never> => { throw new Error("No worker should start before handoff."); };
+  let releaseCreation!: () => void;
+  const creationBarrier = new Promise<void>((resolve) => { releaseCreation = resolve; });
+  let attempted = 0;
+  const controller = new PlanExecController(registry,
+    { spawn: unavailable, operation: unavailable, status: unavailable, result: unavailable, adopt: unavailable, stop: unavailable },
+    { start: unavailable, status: unavailable, result: unavailable, adopt: unavailable, cancel: unavailable }, command,
+    async (cwd, commands, options) => {
+      assert.equal(await options.isAuthorized(), true);
+      attempted++;
+      if (attempted === 1) {
+        await creationBarrier;
+        throw new LocalOperationFailedError("temporary checkout failure");
+      }
+      for (const [program, ...args] of commands) {
+        const result = await command(program!, args, cwd);
+        assert.equal(result.code, 0, result.stderr);
+      }
+    });
+  const ctx = { cwd: source, hasUI: true,
+    ui: { select: async () => "Worktree (isolated)" },
+    sessionManager: sourceSession,
+  } as unknown as ExtensionCommandContext;
+  let started: PlanExecRun | undefined;
+  let afterTick: ((run: PlanExecRun) => Promise<boolean>) | undefined;
+  let forks = 0;
+  const response = await handleCommand("plan.md", ctx, {
+    controller,
+    startBackgroundController: (run, _sessionId, _cwd, _ctx, handoff) => { started = run; afterTick = handoff; },
+    syncProjection: async (run) => run,
+    checkRuntime: async () => undefined,
+    runtimeProblems: async () => [],
+    doctorProbe: async () => ({}),
+    handoff: async (_ctx, run) => {
+      await access(run.worktreeCwd);
+      assert.equal(run.lanePreparation?.state, "bootstrap");
+      assert.equal(_ctx.sessionManager.getSessionFile(), sourceSessionFile);
+      const targetSession = SessionManager.forkFrom(sourceSessionFile, run.worktreeCwd, targetSessionDirectory);
+      assert.equal(targetSession.getCwd(), run.worktreeCwd);
+      assert.equal(targetSession.getSessionDir(), targetSessionDirectory);
+      assert.notEqual(targetSession.getSessionId(), sourceSession.getSessionId());
+      assert.equal(targetSession.getHeader()?.parentSession, sourceSessionFile);
+      assert.deepEqual(targetSession.getEntries(), sourceSession.getEntries());
+      const targetSessionFile = targetSession.getSessionFile();
+      assert.ok(targetSessionFile);
+      await access(targetSessionFile);
+      assert.equal(process.cwd(), initialCwd);
+      forks++;
+      return true;
+    },
+  });
+  assert.match(response ?? "", /started/);
+  assert.ok(started);
+  assert.ok(afterTick);
+  assert.equal(forks, 0);
+  await assert.rejects(access(started.worktreeCwd));
+  assert.equal(await afterTick(started), false);
+  await mkdir(started.worktreeCwd, { recursive: true });
+  await writeFile(join(started.worktreeCwd, "unowned.txt"), "keep this directory");
+  assert.equal(await afterTick(started), false);
+  const firstTick = controller.tick(started.id, sourceSession.getSessionId());
+  releaseCreation();
+  let current = await firstTick;
+  assert.equal(current.lanePreparation?.state, "create");
+  assert.equal(await afterTick(current), false);
+  current = await registry.update({ ...current, nextAttemptAt: 0 });
+  current = await controller.tick(current.id, sourceSession.getSessionId());
+  assert.equal(current.lanePreparation?.state, "bootstrap");
+  assert.equal(await afterTick({ ...current, status: "paused", userStopped: true }), false);
+  assert.equal(await afterTick({ ...current, status: "cancel_pending", userStopped: true }), false);
+  assert.equal(await afterTick(current), true);
+  assert.equal(forks, 1);
+  assert.equal(attempted, 2);
+  assert.equal(await readFile(join(started.worktreeCwd, "unowned.txt"), "utf8"), "keep this directory");
+  assert.equal((await readdir(targetSessionDirectory)).length, 1);
+  assert.equal(process.cwd(), initialCwd);
 });
 
 test("a live lease is decisive on its own and nothing else is probed", async () => {
