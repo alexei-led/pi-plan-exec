@@ -422,5 +422,5 @@ Untrusted boundaries are validated at entry:
 
 The implementation originated from the detailed design in
 [`plans/2026-07-12-pi-plan-exec-design.md`](plans/2026-07-12-pi-plan-exec-design.md).
-That document records the design discussion and broader intended behavior. This
-file describes the current module boundaries and runtime contracts.
+That historical document predates autonomous recovery. This file describes the
+current module boundaries and runtime contracts.

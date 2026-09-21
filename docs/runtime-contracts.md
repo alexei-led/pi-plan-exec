@@ -17,6 +17,8 @@ workers, Fusion, and the Revmux adapter:
 - `prepareKernelOwnedProcess(request)` returns an immutable operation binding;
 - `launchKernelOwnedProcess(request)` starts the already prepared operation;
 - `observeKernelOwnedProcess(operationDirectory)` reports a bound operation;
+- `reconcileKernelOwnedProcess(operationDirectory)` recovers the same prepared
+  operation without replacing its immutable identity;
 - `cancelKernelOwnedProcess(operationDirectory, { deadlineMs })` requests
   retirement and returns proof or an unknown result;
 - `requestKernelOwnedProcessCancellation(operationDirectory)` records a durable
@@ -124,8 +126,9 @@ ownership decisions.
 model turns are scripted; a passing smoke run is not a live-LLM guarantee. A
 Darwin host with the native GUI/compiler prerequisites is required for the
 supported path. The full pipeline passed on the final dependency pins. The
-main full gate passed all 462 tests, lint, TypeScript and package validation;
-the final cumulative Revmux review remains pending.
+main full gate passed all 491 tests, lint, TypeScript and package validation,
+including the plan-publication follow-through. The cumulative Revmux
+confirmation remains pending.
 
 ## Source and review tracking
 
@@ -137,19 +140,19 @@ the final cumulative Revmux review remains pending.
 
 The source pins currently under review are:
 
-- native `pi-subagents`: `83d0f646eceeaa9e858406afe4ba2c5f8ff5ed8a`;
-- Bridge: `34ff4291fac06ac03458b482d55637bbce11f8f4`;
-- Fusion: `07f327d2df4d72feddc8fa5a08de74391773c8c9`;
+- native `pi-subagents`: `e5f66f9f8811a7af8fae05f892253eba2f0b6fa5`;
+- Bridge: `5719a27e133db7e06408eb9da1e713a05a77173c`;
+- Fusion: `eb8ab54d01c9f089c8baa1bb85e322c380603b62`;
 - Revmux: `398d8f11c13737cb26354fa963e0b347abcc916d`;
 - Pi SDK: `0.86.1`.
 
-Reported dependency checks are native 3328 unit and 1082 integration tests,
-Bridge 72 tests plus delayed-admission/restart/cancel smoke, Fusion 250 unit,
-105 integration, and one E2E, and the Revmux full Go gates. These are dependency
+Reported dependency checks are native 3329 unit and 1090 integration tests,
+Bridge 72 tests plus delayed-admission/restart/cancel smoke, Fusion 251 unit,
+112 integration, and one E2E, and the Revmux full Go gates. These are dependency
 evidence, not a claim that the main product gate or full production pipeline is
 complete.
 
 The main and dependency scopes have passed their checks. The
-final cumulative Revmux review is still pending. The implementation remains
-draft; no release or production support claim follows from host smoke checks or
-dependency test results alone.
+cumulative Revmux confirmation is still pending. The
+implementation remains draft; no release or production support claim follows
+from host smoke checks or dependency test results alone.
