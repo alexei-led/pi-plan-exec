@@ -76,16 +76,14 @@ the user accepts losing the in-flight work, end it and keep the worktree:
 /exec stop <full-run-id>
 ```
 
-### `running with no recent observation`
+### `running longer than its budget allows`
 
-The default `executionLifetime` is explicitly `{ "mode": "unbounded" }`, so
-plan-exec has no wall-clock deadline for a healthy operation. A bounded
-compatibility lifetime is used only when selected in the frozen run config.
-Missing activity or provider observations are diagnostic evidence, never proof
-that a child stopped and never permission to start a second writer.
-If status also prints `running longer than its budget allows`, treat it as an
-attention hint only; it does not stop the child, consume a retry, or authorize a
-replacement.
+Only an explicitly bounded `executionLifetime` can produce this classification.
+It means the configured `timeoutMs` has passed; there is no synthetic per-turn
+allowance. Unbounded runs never receive this classification and have no
+wall-clock deadline. The bounded classification is an attention hint only: it
+does not stop the child, consume a retry, or authorize a replacement. Missing
+activity or provider observations are never proof that a child stopped.
 
 Re-check while a live controller or lease is polling:
 
@@ -105,27 +103,31 @@ Never start a second run for the same plan.
 ### `the worker is gone, so nothing is running`
 
 Checked live at the moment status ran: a compatible v2 bridge supplied a
-matching native process-terminal proof for the tracked external run, **or** its
-durable operation lookup answered `absent` for an unbound launch. The terminal
-proof must cover an owned process tree; POSIX process-group observations with
-escaped descendants unverified do not qualify. Only decisive proof says no
-worker is writing. A missing async directory and a v1 bridge's missing record
-are diagnostics, not death proof; those runs remain ambiguous and must not be
-reset. With decisive proof, reset this one run and continue it:
+matching owned-tree process-terminal proof for the tracked external run, an
+authoritative never-started fence covers a launch that was prevented before
+dispatch, **or** a durable operation lookup answered `absent` for an unbound
+launch. POSIX process-group observations with escaped descendants unverified do
+not qualify. Only decisive proof says no worker is writing. A missing async
+directory and a v1 bridge's missing record are diagnostics, not death proof;
+those runs remain ambiguous and must not be reconciled. With decisive proof,
+reconcile this run and continue it:
 
 ```text
 /exec resume <full-run-id>
 ```
 
-Resume clears the dead worker, records the reset in the progress file, consumes
-no task attempt, and starts exactly one replacement. To end the run instead and
-keep its worktree, use `/exec cancel <full-run-id>`.
+Resume preserves the existing operation, candidate, and saved result identity,
+records the reconciliation, consumes no task attempt, and starts exactly one
+continuation. To end the run instead and keep its worktree, use
+`/exec cancel <full-run-id>`.
 
-`/exec doctor --reconcile` does the same reset for **every** abandoned run in
-the registry at once, without resuming any of them. It is the scripted answer
-for a restart that stranded several runs; for one named run, prefer resume.
-Neither touches a run whose lease is still live, and neither resets a
-`cancel_pending` run — that reset would erase the stop it is carrying.
+`/exec doctor --reconcile` performs the same reconciliation for **every**
+abandoned run in the registry at once, without resuming any of them. It
+preserves each operation, candidate, and saved result identity while recording
+the evidence; it launches no replacement. It is the scripted answer for a
+restart that stranded several runs; for one named run, prefer resume. Neither
+touches a run whose lease is still live, and neither reconciles a
+`cancel_pending` run — that would erase the stop it is carrying.
 
 ### `between steps`
 
@@ -159,23 +161,18 @@ polling on its own. Then re-check:
 The host is stamped on the lease when the run is claimed and never re-stamped,
 and the whole name identifies the machine — `foo.local`, `foo.lan`, and
 `foo.corp.example.com` are three different hosts, because two real machines can
-share a first label and a shared home shows both their runs. So any rename
-leaves the lease naming a machine this one is not. The operation directory and
-the bridge here belong to this machine, so nothing local can speak for the run:
-status reports it and never resets it, and resume refuses it.
-
-Only the operator knows whether that name was this machine. When it was, say so:
+share a first label and a shared home shows both their runs. A renamed host is
+therefore foreign until the operator asserts that it was this machine:
 
 ```text
 /exec resume <full-run-id> --same-machine
 ```
 
-That supplies the machine, not the verdict. Resume then gathers the same
-evidence it always does, so a worker still writing here keeps the run refused.
-The flag is refused outright while the lease heartbeat is under 30 seconds old:
-a beating heartbeat is a worker writing somewhere, and which machine it sits on
-does not change that. Wait for it to go stale.
-When the lease really does name a different machine, recover the run there.
+The flag creates a temporary local view for evidence gathering without rewriting
+the durable lease. Resume still refuses while a worker is writing here; decisive
+local evidence permits the normal reset and claim, which stamps the current
+host. When the lease really does name a different machine, recover the run
+there instead.
 
 ### Why no per-turn activity signal may exist
 
@@ -188,11 +185,11 @@ replacement launch.
 
 A run is **abandoned** only when all three hold at once: it claims `running`,
 `starting`, `skip_pending`, or `cancel_pending`; its lease is not live; and its
-operation is provably gone by a matching owned-tree process-terminal proof or
-(for an unbound launch only) v2 durable lookup with `absent`. A POSIX group-only
-observation, missing async directory, v1 absence response, or `absent` for an
-already-bound external run is incomplete evidence. Anything less is
-`ambiguous` and is never reset.
+operation is provably gone by a matching owned-tree process-terminal proof, an
+authoritative never-started fence, or (for an unbound launch only) v2 durable
+lookup with `absent`. A POSIX group-only observation, missing async directory,
+v1 absence response, or `absent` for an already-bound external run is incomplete
+evidence. Anything less is `ambiguous` and is never reset.
 
 Recover one named run — the usual case, and the smaller blast radius:
 
@@ -200,21 +197,22 @@ Recover one named run — the usual case, and the smaller blast radius:
 /exec resume <full-run-id>
 ```
 
-Resume reconciles that run first and then continues it. Reset every abandoned
-run in the registry at once, continuing none of them:
+Resume reconciles that run first and then continues it. Reconcile every
+abandoned run in the registry at once, continuing none of them:
 
 ```text
 /exec doctor --reconcile
 ```
 
-Neither launches a second worker. Per abandoned run the reset clears the active
-operation, sets `failed` with the evidence as the reason, appends that reason to
-the progress file, and leaves `taskAttempts` unchanged. A run that a live
-session reclaimed between the scan and the write is skipped, not overwritten.
+Neither launches a second worker. Per abandoned run reconciliation preserves the
+active operation, candidate, and saved result identity, records the evidence in
+the run and progress file, and leaves `taskAttempts` unchanged. A run that a
+live session reclaimed between the scan and the write is skipped, not
+overwritten.
 
-A `cancel_pending` run is never reset, however dead its worker: `failed` would
-erase the stop it is carrying and the next resume would restart plan work. It
-still wants cancelling:
+A `cancel_pending` run is never reconciled, however dead its worker: changing
+its recovery state would erase the stop it is carrying and the next resume
+could restart plan work. It still wants cancelling:
 
 ```text
 /exec cancel <full-run-id>
@@ -239,9 +237,10 @@ instead and keep its worktree:
 ## Paused
 
 An explicit user pause (`/exec pause` or the pause choice under `/exec stop`)
-is resumable. It preserves the active operation when child exit is unconfirmed;
-the controller continues observing that operation and applies its terminal result
-only after `/exec resume`.
+cancels the current attempt, preserves its stage, checkpoint, progress, and
+resumability, and waits for native or local cleanup proof. A reload restores
+pending cleanup without resuming plan work; `/exec resume` continues only after
+that cleanup is reconciled.
 
 `<<<RALPHEX:TASK_FAILED>>>` with unchecked items is not an implicit global
 pause. The controller records the blocker, preserves the partial lane and
@@ -249,6 +248,11 @@ accepted baseline, and schedules automatic recovery with backoff. A retry does
 not waive the plan's approvals, release checkpoints, or verification
 requirements. Use `/exec status <full-run-id>` to inspect the next automatic
 action; use `/exec stop` only when the operator wants to pause or cancel.
+
+Only an observed `Prerequisite: credentials|permission|missing_executable|runtime`
+with an `Evidence:` line changes the task to `waiting_external`; the controller
+records that evidence and schedules an automatic wake. Generic blocker prose
+does not prove an external prerequisite.
 
 Older releases may have stored the same `TASK_FAILED` output as a generic
 unchecked-checkbox failure. They remain recoverable through the same plan run's
@@ -303,13 +307,19 @@ that detached stage.
 - Provider reports the operation absent after an unknown launch outcome:
   plan-exec refuses a blind replay because another writer cannot be ruled out.
   Prove the worker is gone with `/exec status <full-run-id>`; a run it
-  classifies `abandoned` is reset and continued by `/exec resume <full-run-id>`.
+  classifies `abandoned` is reconciled and continued by `/exec resume <full-run-id>`.
 
 Turn limits are child launch parameters, not a plan-run terminal retry cap.
 Resume the plan run ID, not the child ID shown in pi-subagents output. A resume
 is idempotent for a healthy tracked child and reconciles it instead of creating
 another writer. Automatic recovery continues with backoff while ownership is
 known or uncertain; it never launches through an unresolved operation.
+
+Only a bounded operation with `terminationReason: execution_lifetime_expired`,
+full retirement proof, and recent verified model/tool progress can trigger
+adaptive recovery. The next bounded timeout doubles up to the native timer
+maximum and changes continuation strategy; unbounded operations and local
+checks never receive this adaptation. Heartbeats and silence are not progress.
 
 ## Model or provider failure
 
@@ -331,6 +341,11 @@ is authenticated and does not have the reported incompatibility or quota failure
 Do not keep retrying the same failing model. After resume, run status again and
 verify the failed external run ID was replaced only after its terminal state was
 recorded.
+
+For a confirmed tool failure, plan-exec queues at most one durable diagnostic
+follow-up for that failure identity. `queued` is guidance only and does not prove
+repair. A pause or cancel fence wins over a late diagnostic reply; restart
+reconciles the same diagnostic action.
 
 `/exec` is a Pi UI command. If the current agent cannot invoke slash commands,
 it must give the user the exact command instead of claiming recovery ran or
@@ -363,9 +378,10 @@ Use this only after inspecting the findings and active operation:
 Pi asks for interactive confirmation. The controller records `skip_pending`,
 stops any tracked Bridge, Fusion, or Revmux child, and waits for terminal
 provider evidence before it advances. Do not retry, start, or manually stop a
-child while that state is pending. A skipped review/finalize/stats stage is
-visibly audited, known findings remain unresolved, and the final run becomes
-`completed_with_findings`. Implementation and archive cannot be skipped.
+child while that state is pending. A skipped optional review/finalize/stats
+stage is visibly audited, known findings remain unresolved, and the final run
+becomes `completed_with_findings`. Required review and final verification,
+implementation, and archive cannot be skipped.
 
 ## Cancel pending or failed cancellation
 
@@ -452,12 +468,13 @@ child is live.
 
 ## Provider or command unavailable
 
-If `/exec` reports missing or incompatible Bridge, Fusion, Revmux,
-pi-subagents, or pi-tasks:
+If `/exec` reports missing or incompatible Bridge, Fusion, Revmux, or
+pi-subagents:
 
 1. Run `/exec status`. It names each missing or incompatible package and prints
    the install commands above the run list.
-2. Install the reported packages or select an explicitly supported backend.
+2. Restore the reported project-local pinned dependency or select an explicitly
+   supported backend. A missing pi-tasks projection is advisory.
 3. Run `/reload`.
 4. Run `/exec status` and `/exec status <full-run-id>`.
 5. Run `/exec resume <full-run-id>`. It takes over a lease left by a session
@@ -468,11 +485,11 @@ Installation and reload do not advance the run.
 The current implementation draft is validated against exact dependency feature
 commits and linked PRs recorded in [runtime contracts](../../../docs/runtime-contracts.md)
 and the [active implementation plan](../../../docs/plans/2026-09-21-autonomous-execution.md).
-The tested native, Bridge, Fusion, and Revmux runtimes expose only POSIX
-process-group ownership with escaped descendants unverified, so strict preflight
-refuses actual launches before spawn. Nonempty local checks and bootstrap are
-refused for the same reason. Do not treat the latest npm release or the pinned
-draft dependencies as a fully working production runtime.
+The native kernel-owned dependency and its Darwin GUI/compiler prerequisites are
+still pending as a public exact pin. Local checks/bootstrap and selected
+provider operations remain fenced when that dependency or its retirement proof
+is unavailable. Do not treat the latest npm release or pending pins as a fully
+working production runtime.
 
 If `/exec` itself is missing after reload, inspect `pi list` and the Pi package
 configuration. Restore the package before touching the preserved run.
@@ -532,8 +549,9 @@ With explicit user approval to change the installed Pi package:
 7. Retry `/exec status <id>` and `/exec resume <id>` on the same run.
 8. Verify the same worktree and operation identity were retained.
 
-Do not manually invoke implementation, review, fix, finalizer, or statistics
-subagents while repairing the extension.
+Do not manually invoke implementation, review, fix, or statistics subagents
+while repairing the extension. Final verification is a controller-owned check,
+not a separate finalizer child.
 
 ## Terminal states
 
