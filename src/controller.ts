@@ -45,6 +45,7 @@ import {
   ensureCleanForWorktree,
   isPathWithin,
   requireGitRepository,
+  gitCheckoutRoot,
   verifyExistingWorktree,
   verifyExecutionRepository,
   verifyExecutionTree,
@@ -632,6 +633,7 @@ export class PlanExecController {
     if (plan.hash !== run.planHash) {
       return this.pauseForReview(run, PLAN_STRUCTURE_CHANGED_ERROR);
     }
+    const checkoutRoot = await gitCheckoutRoot(this.runCommand, run.worktreeCwd);
     const tasks = reconcileTasks(plan.tasks, run.tasks);
     for (const execution of Object.values(tasks)) {
       if (execution.state !== RUN_STATUS.RUNNING && execution.state !== "verifying") continue;
@@ -643,7 +645,7 @@ export class PlanExecController {
       }
     }
     if (Object.values(tasks).every((task) => task.state === "accepted")) {
-      const committed = await gitValue(this.runCommand, run.worktreeCwd, ["show", `HEAD:${gitPath(relative(run.worktreeCwd, run.planPath))}`]);
+      const committed = await gitValue(this.runCommand, run.worktreeCwd, ["show", `HEAD:${gitPath(relative(checkoutRoot, run.planPath))}`]);
       assertAcceptedCheckboxes({ ...run, tasks }, parsePlan(run.planPath, committed));
       return this.transition(
         { ...run, tasks },
@@ -676,15 +678,16 @@ export class PlanExecController {
       delete nextTask.laneBranch;
       delete nextTask.candidateCommit;
       return this.registry.update({ ...run, tasks: { ...tasks, [String(selected.taskId)]: nextTask }, acceptedHead,
-        lanePreparation: { taskId: selected.taskId, cwd: join(dirname(run.worktreeCwd), `plan-exec-${run.id}-${token}`),
+        lanePreparation: { taskId: selected.taskId, cwd: join(dirname(checkoutRoot), `plan-exec-${run.id}-${token}`),
           branch: `plan-exec/${run.id}/${token}`, baselineCommit: acceptedHead, state: "create" },
       });
     }
     if (selected.laneCwd && selected.laneCwd !== run.worktreeCwd) {
+      const targetRoot = await gitCheckoutRoot(this.runCommand, selected.laneCwd);
       const laneRun = await this.registry.updateIfCurrent({ ...run, tasks, acceptedHead,
-        planPath: join(selected.laneCwd, relative(run.worktreeCwd, run.planPath)),
+        planPath: join(targetRoot, relative(checkoutRoot, run.planPath)),
         worktreeCwd: selected.laneCwd, branch: selected.laneBranch!,
-        ...(run.progressPath ? { progressPath: join(selected.laneCwd, relative(run.worktreeCwd, run.progressPath)) } : {}),
+        ...(run.progressPath ? { progressPath: join(targetRoot, relative(checkoutRoot, run.progressPath)) } : {}),
       }, run.updatedAt);
       return laneRun.run;
     }
@@ -692,7 +695,7 @@ export class PlanExecController {
     if (occupied && !selected.laneCwd) {
       const token = randomUUID().slice(0, LANE_TOKEN_LENGTH);
       return (await this.registry.updateIfCurrent({ ...run, tasks, acceptedHead,
-        lanePreparation: { taskId: task.id, cwd: join(dirname(run.worktreeCwd), `plan-exec-${run.id}-${token}`),
+        lanePreparation: { taskId: task.id, cwd: join(dirname(checkoutRoot), `plan-exec-${run.id}-${token}`),
           branch: `plan-exec/${run.id}/${token}`, baselineCommit: acceptedHead, state: "create" },
       }, run.updatedAt)).run;
     }
@@ -745,7 +748,10 @@ export class PlanExecController {
         if (!knownHeads.has(current)) throw new Error("Original output branch changed outside accepted task commits; refusing to overwrite it.");
         await gitValue(this.runCommand, target.cwd, ["merge-base", "--is-ancestor", current, candidate]);
         const dirty = await worktreeChanges(this.runCommand, target.cwd);
-        if (dirty.some((path) => path !== target.progressRelativePath))
+        const targetRoot = await gitCheckoutRoot(this.runCommand, target.cwd);
+        const progress = target.progressRelativePath === undefined ? undefined
+          : gitPath(relative(targetRoot, join(target.cwd, target.progressRelativePath)));
+        if (dirty.some((path) => path !== progress))
           throw new Error("Original output worktree has preserved or user changes; waiting for a safe fast-forward without resetting them.");
         const intended = await this.registry.updateIfCurrent({ ...run, outputPromotion: { ...run.outputPromotion!, commandStarted: true } }, run.updatedAt);
         if (!intended.applied) return intended.run;
@@ -773,6 +779,10 @@ export class PlanExecController {
     if (run.status === RUN_STATUS.STARTING) return this.registry.update({ ...run, status: RUN_STATUS.RUNNING });
     const preparation = run.lanePreparation!;
     try {
+      const sourceRoot = preparation.taskId === 0 ? run.worktreeCwd
+        : await gitCheckoutRoot(this.runCommand, run.worktreeCwd);
+      const workerCwd = join(preparation.cwd, relative(sourceRoot, run.worktreeCwd));
+      const planPath = join(preparation.cwd, relative(sourceRoot, run.planPath));
       if (preparation.state === "create") {
         await this.executeLocalCommands(run.repositoryRoot,
           [["git", "worktree", "add", "-b", preparation.branch, preparation.cwd, preparation.baselineCommit]],
@@ -780,19 +790,18 @@ export class PlanExecController {
         await verifyExecutionTree(this.runCommand, preparation.cwd, run.repositoryRoot, preparation.branch);
         const head = await gitValue(this.runCommand, preparation.cwd, ["rev-parse", "HEAD"]);
         if (head !== preparation.baselineCommit) throw new Error("Lane creation found an unexpected HEAD; refusing to reuse it.");
-        const planPath = join(preparation.cwd, relative(run.worktreeCwd, run.planPath));
         if (!await pathExists(planPath)) await copyPlanIntoWorktree(preparation.sourcePlanPath ?? run.planPath, planPath);
         return (await this.registry.updateIfCurrent({ ...run, lanePreparation: { ...preparation, state: "bootstrap" } }, run.updatedAt)).run;
       }
-      await this.executeLocalCommands(preparation.cwd, await bootstrapCommands(preparation.cwd, run.config.bootstrapCommands),
+      await this.executeLocalCommands(workerCwd, await bootstrapCommands(workerCwd, run.config.bootstrapCommands),
         await this.localOptions(run, `bootstrap:${preparation.cwd}:${preparation.nextAttemptAt ?? 0}`));
       const task = run.tasks?.[String(preparation.taskId)];
       if (!task && preparation.taskId !== 0) throw new Error("Lane preparation lost its task.");
       const prepared = { ...run,
-        worktreeCwd: preparation.cwd, branch: preparation.branch,
-        planPath: join(preparation.cwd, relative(run.worktreeCwd, run.planPath)),
-        ...(run.progressPath ? { progressPath: join(preparation.cwd, relative(run.worktreeCwd, run.progressPath)) } : {}),
-        ...(task ? { tasks: { ...run.tasks, [String(task.taskId)]: { ...task, laneCwd: preparation.cwd,
+        worktreeCwd: workerCwd, branch: preparation.branch,
+        planPath,
+        ...(run.progressPath ? { progressPath: join(preparation.cwd, relative(sourceRoot, run.progressPath)) } : {}),
+        ...(task ? { tasks: { ...run.tasks, [String(task.taskId)]: { ...task, laneCwd: workerCwd,
           laneBranch: preparation.branch, baselineCommit: preparation.baselineCommit } } } : {}),
         nextAttemptAt: 0,
       };
@@ -824,7 +833,8 @@ export class PlanExecController {
     const head = await gitValue(this.runCommand, run.worktreeCwd, ["rev-parse", "HEAD"]);
     if (head !== candidate) throw new Error("HEAD changed while verifying the candidate.");
     const dirty = await worktreeChanges(this.runCommand, run.worktreeCwd);
-    const progress = run.progressPath ? relative(run.worktreeCwd, run.progressPath) : undefined;
+    const checkoutRoot = await gitCheckoutRoot(this.runCommand, run.worktreeCwd);
+    const progress = run.progressPath ? gitPath(relative(checkoutRoot, run.progressPath)) : undefined;
     if (dirty.some((path) => path !== progress))
       throw new Error("Candidate has uncommitted source changes after verification.");
   }
@@ -1122,6 +1132,8 @@ export class PlanExecController {
         if (fenced.status === RUN_STATUS.PAUSED || fenced.userStopped) return fenced;
         return this.recoverFencedOperation(fenced);
       }
+      if (isBoundNeverStarted(lookup.data, operation))
+        return this.fenceRejectedLaunch(run, operation, lookup.data);
       if (lookupState === EXTERNAL_OPERATION_STATE.FOUND) {
         const expectedLifetime = operationExpectedLifetime(operation);
         if (!expectedLifetime || !sameLifetime(parseExecutionLifetime(lookup.data.effectiveExecutionLifetime), expectedLifetime))
@@ -1461,10 +1473,24 @@ export class PlanExecController {
     const operation = run.activeOperation;
     if (!operation?.launchFenced) return run;
     const task = operation.taskId ? run.tasks?.[String(operation.taskId)] : undefined;
-    return this.registry.update(withoutOperation({ ...run, nextAttemptAt: 0,
+    const recoveryAttempts = (run.recoveryAttempts ?? 0) + 1;
+    const retryAt = Date.now() + retryDelay(run.config.retryDelayMs, recoveryAttempts);
+    const reason = operation.terminalError ?? "The original launch was fenced before dispatch; retrying the preserved task.";
+    return (await this.registry.updateIfCurrent(withoutOperation({ ...run,
+      nextAttemptAt: task ? 0 : retryAt, recoveryAttempts, wakeReason: reason, failedOperation: operation,
       ...(task ? { tasks: { ...run.tasks, [String(task.taskId)]: { ...task, state: "retry_wait",
-        attempts: Math.max(task.attempts - 1, 0), nextAttemptAt: Date.now(), reason: "The original launch was fenced before dispatch; retrying the preserved task." } } } : {}),
-    }));
+        attempts: Math.max(task.attempts - 1, 0), nextAttemptAt: retryAt, reason } } } : {}),
+    }), run.updatedAt)).run;
+  }
+
+  private async fenceRejectedLaunch(run: PlanExecRun, operation: ActiveOperation, data: Record<string, unknown>): Promise<PlanExecRun> {
+    const rejected = await this.updateActiveOperation(run, operation.operationId, {
+      terminalError: `Provider rejected the launch before dispatch: ${text(data.text) ?? "no child was started"}`.slice(0, MAX_TERMINAL_ERROR_LENGTH),
+    });
+    if (!sameOperationState(run, rejected, operation)) return rejected;
+    const fenced = await this.requestOperationCancellation(rejected);
+    if (fenced.status !== RUN_STATUS.RUNNING || fenced.userStopped) return fenced;
+    return fenced.activeOperation?.launchFenced ? this.recoverFencedOperation(fenced) : fenced;
   }
 
   private async observeBridge(
@@ -1488,6 +1514,8 @@ export class PlanExecController {
       status.data,
     );
     if (!sameOperationState(run, observed, operation)) return observed;
+    if (isBoundNeverStarted(status.data, operation))
+      return this.fenceRejectedLaunch(observed, operation, status.data);
     if (
       !state ||
       state === EXTERNAL_OPERATION_STATE.RUNNING ||
@@ -2013,8 +2041,24 @@ export class PlanExecController {
     run: PlanExecRun,
     error: string,
   ): Promise<PlanExecRun> {
+    const operation = run.activeOperation;
+    let next: PlanExecRun = { ...run, status: RUN_STATUS.PAUSED, error };
+    if (!operation || operation.processTreeExited === true) {
+      if (operation) {
+        next.failedOperation = { ...operation, terminalError: error };
+        const task = operation.taskId ? run.tasks?.[String(operation.taskId)] : undefined;
+        if (operation.kind === OPERATION_KIND.IMPLEMENTATION && task && task.state !== "accepted") {
+          const retry = { ...task, state: "retry_wait" as const, nextAttemptAt: Date.now(), reason: error,
+            laneCwd: task.laneCwd ?? run.worktreeCwd, laneBranch: task.laneBranch ?? run.branch };
+          delete retry.candidateCommit;
+          next.tasks = { ...run.tasks, [String(task.taskId)]: retry };
+          next.taskAttempts = { ...run.taskAttempts, [String(task.taskId)]: (run.taskAttempts[String(task.taskId)] ?? 0) + 1 };
+        }
+      }
+      next = withoutOperation(next);
+    }
     const paused = await this.registry.updateIfCurrent(
-      withoutOperation({ ...run, status: RUN_STATUS.PAUSED, error }),
+      next,
       run.updatedAt,
     );
     if (!paused.applied) return paused.run;
@@ -2038,7 +2082,7 @@ export class PlanExecController {
       return this.fail(run, "Implementation operation has no task ID.");
     const plan = await readPlan(run.planPath);
     if (plan.hash !== run.planHash)
-      return this.pauseForReview(run, PLAN_STRUCTURE_CHANGED_ERROR);
+      return this.pauseForReview({ ...run, activeOperation: operation }, PLAN_STRUCTURE_CHANGED_ERROR);
     const task = plan.tasks.find((candidate) => candidate.id === taskId);
     if (!task)
       return this.fail(run, `Task ${taskId} disappeared from the plan.`);
@@ -2054,7 +2098,8 @@ export class PlanExecController {
         const candidate = execution.state === "verifying" && execution.operationId === operation.operationId && execution.candidateCommit
           ? execution.candidateCommit : await gitValue(this.runCommand, run.worktreeCwd, ["rev-parse", "HEAD"]);
         if (candidate === execution.baselineCommit) throw new Error("Task candidate did not advance its baseline commit.");
-        const committedPlanText = await gitValue(this.runCommand, run.worktreeCwd, ["show", `${candidate}:${gitPath(relative(run.worktreeCwd, run.planPath))}`]);
+        const checkoutRoot = await gitCheckoutRoot(this.runCommand, run.worktreeCwd);
+        const committedPlanText = await gitValue(this.runCommand, run.worktreeCwd, ["show", `${candidate}:${gitPath(relative(checkoutRoot, run.planPath))}`]);
         const committedPlan = parsePlan(run.planPath, committedPlanText);
         assertAcceptedCheckboxes(run, committedPlan);
         const checkpoints: TaskRecoverySource[] = [];
@@ -2166,9 +2211,10 @@ export class PlanExecController {
       const priorBlockers = run.reviewFindings.filter((finding) => finding.severity !== "MINOR");
       const downgraded = findings.some((finding) => priorBlockers.some((previous) => normalizedSummary(previous.summary) === normalizedSummary(finding.summary)));
       if (downgraded) {
-        const metadata = new Set([gitPath(relative(run.worktreeCwd, run.planPath)),
-          ...(run.progressPath ? [gitPath(relative(run.worktreeCwd, run.progressPath))] : [])]);
-        const changes = await this.runCommand("git", ["diff", "--name-only", "-z", run.reviewRecovery.lastReviewedCommit, "HEAD"], run.worktreeCwd);
+        const checkoutRoot = await gitCheckoutRoot(this.runCommand, run.worktreeCwd);
+        const metadata = new Set([gitPath(relative(checkoutRoot, run.planPath)),
+          ...(run.progressPath ? [gitPath(relative(checkoutRoot, run.progressPath))] : [])]);
+        const changes = await this.runCommand("git", ["diff", "--name-only", "--no-relative", "-z", run.reviewRecovery.lastReviewedCommit, "HEAD"], run.worktreeCwd);
         if (changes.code !== 0) return this.reviewFailure(run, "Unable to verify the change supporting review adjudication.");
         if (!changes.stdout.split("\0").some((path) => path && !metadata.has(path)))
           return this.reviewFailure(run, "A previously blocking finding was relabeled MINOR without a changed tree or explicit adjudication; required review remains unmet.");
@@ -2300,10 +2346,11 @@ export class PlanExecController {
     const progressRelative = run.progressPath
       ? relative(run.worktreeCwd, run.progressPath)
       : undefined;
+    const checkoutRoot = await gitCheckoutRoot(this.runCommand, run.worktreeCwd);
     if (
-      !isInsideWorktree(sourceRelative) ||
-      !isInsideWorktree(destinationRelative) ||
-      (progressRelative !== undefined && !isInsideWorktree(progressRelative))
+      !isInsideWorktree(relative(checkoutRoot, run.planPath)) ||
+      !isInsideWorktree(relative(checkoutRoot, destination)) ||
+      (run.progressPath !== undefined && !isInsideWorktree(relative(checkoutRoot, run.progressPath)))
     )
       return this.fail(run, "Archive paths must stay inside the execution worktree.");
 
@@ -2311,10 +2358,10 @@ export class PlanExecController {
     const source = gitPath(sourceRelative);
     const destinationPath = gitPath(destinationRelative);
     try {
-      await assertNoSymlinkPath(run.worktreeCwd, run.planPath);
-      await assertNoSymlinkPath(run.worktreeCwd, destination);
+      await assertNoSymlinkPath(checkoutRoot, run.planPath);
+      await assertNoSymlinkPath(checkoutRoot, destination);
       if (run.progressPath)
-        await assertNoSymlinkPath(run.worktreeCwd, run.progressPath);
+        await assertNoSymlinkPath(checkoutRoot, run.progressPath);
       await mkdir(dirname(destination), { recursive: true });
       const sourceExists = await pathExists(run.planPath);
       const destinationExists = await pathExists(destination);
@@ -2467,14 +2514,15 @@ export class PlanExecController {
     if (!run.tasks || !Object.values(run.tasks).length || Object.values(run.tasks).some((task) => task.state !== "accepted"))
       return "Completion requires every implementation task to be accepted; skipped or unchecked tasks remain unmet.";
     const head = await gitValue(this.runCommand, run.worktreeCwd, ["rev-parse", "HEAD"]);
+    const checkoutRoot = await gitCheckoutRoot(this.runCommand, run.worktreeCwd);
     if (!run.verifiedCommit) return "Required checks do not cover the current final commit.";
     if (run.config.reviewRequired && run.reviewedCommit !== run.verifiedCommit) return "Required review does not cover the final verified commit.";
-    const archivePaths = new Set([relative(run.worktreeCwd, run.planPath),
-      relative(run.worktreeCwd, join(dirname(run.planPath), COMPLETED_PLANS_DIRECTORY, basename(run.planPath))),
-      ...(run.progressPath ? [relative(run.worktreeCwd, run.progressPath)] : [])]);
+    const archivePaths = new Set([gitPath(relative(checkoutRoot, run.planPath)),
+      gitPath(relative(checkoutRoot, join(dirname(run.planPath), COMPLETED_PLANS_DIRECTORY, basename(run.planPath)))),
+      ...(run.progressPath ? [gitPath(relative(checkoutRoot, run.progressPath))] : [])]);
     if (run.verifiedCommit !== head) {
       const archived = !(await pathExists(run.planPath));
-      const changes = await this.runCommand("git", ["diff", "--name-only", "-z", run.verifiedCommit, head], run.worktreeCwd);
+      const changes = await this.runCommand("git", ["diff", "--name-only", "--no-relative", "-z", run.verifiedCommit, head], run.worktreeCwd);
       if (!archived || changes.code !== 0 || changes.stdout.split("\0").some((path) => path && !archivePaths.has(path)))
         return "Current code differs from the final verified and reviewed commit.";
     }
@@ -2482,7 +2530,7 @@ export class PlanExecController {
     try {
       assertAcceptedCheckboxes(run, await readPlan(planPath));
       const committedPath = run.verifiedCommit === head ? run.planPath : planPath;
-      const committed = await gitValue(this.runCommand, run.worktreeCwd, ["show", `${head}:${gitPath(relative(run.worktreeCwd, committedPath))}`]);
+      const committed = await gitValue(this.runCommand, run.worktreeCwd, ["show", `${head}:${gitPath(relative(checkoutRoot, committedPath))}`]);
       assertAcceptedCheckboxes(run, parsePlan(committedPath, committed));
     } catch (error) { return error instanceof Error ? error.message : String(error); }
     const dirty = await worktreeChanges(this.runCommand, run.worktreeCwd);
@@ -2866,6 +2914,11 @@ function isFencedReviewCancellation(data: Record<string, unknown>, operation: Ac
   return data.operationId === operation.operationId && data.state === RUN_STATUS.CANCELLED && data.replaySafe === false &&
     data.neverStarted === true && data.cancellationRequested === true &&
     (data.requestDigest === undefined || data.requestDigest === operation.requestDigest);
+}
+
+function isBoundNeverStarted(data: Record<string, unknown>, operation: ActiveOperation): boolean {
+  return data.neverStarted === true && data.operationId === operation.operationId &&
+    Boolean(operation.requestDigest) && data.requestDigest === operation.requestDigest;
 }
 
 function isFencedCancellation(data: Record<string, unknown>, operation: ActiveOperation): boolean {

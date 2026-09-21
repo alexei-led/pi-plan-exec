@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
@@ -122,7 +122,7 @@ class DurableReviewBackend {
   adopt(runId: string) { return this.status(runId); }
 }
 
-async function fixture(t: TestContext, content = "### Task 1: A\n- [ ] A\n") {
+async function fixture(t: TestContext, content = "### Task 1: A\n- [ ] A\n", subdirectory = "", planDirectory = subdirectory) {
   const root = await realpath(await mkdtemp(join(tmpdir(), "autonomous-controller-")));
   t.after(() => rm(root, { recursive: true, force: true }));
   const git = async (...args: string[]) => {
@@ -135,15 +135,18 @@ async function fixture(t: TestContext, content = "### Task 1: A\n- [ ] A\n") {
   await git("config", "user.name", "Test");
   await git("config", "commit.gpgSign", "false");
   await git("config", "core.hooksPath", "/dev/null");
-  const planPath = join(root, "plan.md");
+  const workerCwd = join(root, subdirectory);
+  await mkdir(workerCwd, { recursive: true });
+  const planPath = join(root, planDirectory, "plan.md");
+  await mkdir(dirname(planPath), { recursive: true });
   await writeFile(planPath, content);
-  await git("add", "plan.md"); await git("commit", "-m", "baseline");
+  await git("add", relative(root, planPath)); await git("commit", "-m", "baseline");
   const plan = await readPlan(planPath);
   const registry = new RunRegistry(join(root, ".git", "runs"));
   const worker = new Worker(join(root, ".git", "result.json"));
   const localExecutor = createControllerLocalExecutor();
   const controller = new PlanExecController(registry, worker, fusion, command, localExecutor);
-  const run = await registry.create({ schemaVersion: 1, repositoryRoot: root, worktreeCwd: root,
+  const run = await registry.create({ schemaVersion: 1, repositoryRoot: root, worktreeCwd: workerCwd,
     planPath, planHash: plan.hash, branch: "feature", defaultBranch: "main", stage: "implementation",
     status: "running", taskAttempts: {}, stageAttempts: {}, reviewFindings: [], unresolvedFindings: [],
     config: { ...DEFAULT_FROZEN_RUN_CONFIG, retryDelayMs: 10 }, skippedStages: [], branchRebindings: [],
@@ -154,6 +157,165 @@ async function fixture(t: TestContext, content = "### Task 1: A\n- [ ] A\n") {
 async function due(registry: RunRegistry, run: PlanExecRun) {
   return registry.update({ ...run, nextAttemptAt: 0, ...(run.activeOperation ? { activeOperation: { ...run.activeOperation, launchStartedAt: 0 } } : {}) });
 }
+
+for (const planDirectory of ["packages/api", "docs/plans"]) {
+test(`nested execution keeps the worker cwd with plan in ${planDirectory}`, async (t) => {
+  const f = await fixture(t, "### Task 1: A\n- [ ] A\n", "packages/api", planDirectory);
+  const cwd = f.run.worktreeCwd;
+  await f.git("config", "diff.relative", "true");
+  let run = await f.registry.update({ ...f.run, progressPath: join(cwd, "progress.txt") });
+  run = await f.controller.tick(run.id, "session");
+  assert.equal(f.worker.launches[0]?.params.cwd, cwd);
+  await writeFile(f.planPath, "### Task 1: A\n- [x] A\n");
+  await writeFile(join(cwd, "result.txt"), "accepted\n");
+  await f.git("add", relative(f.root, f.planPath), "packages/api/result.txt");
+  await f.git("commit", "-m", "nested candidate");
+  await writeFile(run.progressPath!, "task progress\n");
+  f.worker.state = "complete"; f.worker.proof = true;
+  run = await f.controller.tick(run.id, "session");
+  assert.equal(run.tasks?.["1"]?.state, "accepted", run.error ?? "nested candidate rejected");
+  f.worker.output = "NO_FINDINGS";
+  for (let step = 0; step < 20 && run.status === "running"; step++) {
+    run = await due(f.registry, run);
+    run = await f.controller.tick(run.id, "session");
+  }
+  assert.equal(run.status, "completed", run.error ?? run.wakeReason ?? "nested run did not complete");
+  assert.equal(run.worktreeCwd, cwd);
+  assert.ok(f.worker.launches.every(launch => launch.params.cwd === cwd));
+  assert.match(await readFile(join(dirname(f.planPath), "completed/plan.md"), "utf8"), /\[x\] A/);
+  assert.equal(await f.git("status", "--porcelain"), "");
+});
+}
+
+test("nested independent task lane preserves the cwd and excludes partial work", async (t) => {
+  const content = "### Task 1: A\n- [ ] A\n### Task 2: B\ndependsOn: []\n- [ ] B\n";
+  const f = await fixture(t, content, "packages/api");
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const lanes = new Set<string>();
+  t.after(async () => { for (const lane of lanes) await rm(lane, { recursive: true, force: true }); });
+  let run = await f.controller.tick(f.run.id, "session");
+  const original = run.worktreeCwd;
+  await writeFile(join(original, "partial.txt"), "preserved A\n");
+  f.worker.state = "failed"; f.worker.proof = true;
+  f.worker.output = "<<<RALPHEX:TASK_FAILED>>>\nPrerequisite: credentials\nEvidence: provider returned HTTP 401";
+  run = await f.controller.tick(run.id, "session");
+  f.worker.state = "running"; f.worker.proof = false; f.worker.output = "";
+  for (let step = 0; step < 12 && f.worker.launches.length < 2; step++) {
+    if (run.lanePreparation) lanes.add(run.lanePreparation.cwd);
+    run = await due(f.registry, run);
+    run = await f.controller.tick(run.id, "session");
+  }
+  assert.equal(run.activeOperation?.taskId, 2, run.error ?? "independent task did not launch");
+  assert.notEqual(run.worktreeCwd, original);
+  assert.ok(run.worktreeCwd.endsWith("/packages/api"));
+  assert.equal(run.planPath, join(run.worktreeCwd, "plan.md"));
+  await assert.rejects(readFile(join(run.worktreeCwd, "partial.txt")), { code: "ENOENT" });
+  assert.equal(await readFile(join(original, "partial.txt"), "utf8"), "preserved A\n");
+  await writeFile(run.planPath, content.replace("[ ] B", "[x] B"));
+  assert.equal((await command("git", ["add", "plan.md"], run.worktreeCwd)).code, 0);
+  assert.equal((await command("git", ["commit", "-m", "independent nested candidate"], run.worktreeCwd)).code, 0);
+  f.worker.state = "complete"; f.worker.proof = true;
+  run = await f.controller.tick(run.id, "session");
+  assert.equal(run.tasks?.["2"]?.state, "accepted", run.error ?? "nested lane candidate rejected");
+  assert.equal(run.tasks?.["1"]?.state, "waiting_external");
+});
+
+test("plan drift after proven exit retains task recovery evidence across repair and resume", async (t) => {
+  const original = "### Task 1: A\n- [ ] A\n";
+  const f = await fixture(t, original);
+  let run = await f.controller.tick(f.run.id, "session");
+  const operationId = run.activeOperation!.operationId;
+  await writeFile(f.planPath, "### Task 1: Changed requirement\n- [ ] A\n");
+  await writeFile(join(f.root, "partial.txt"), "retained work\n");
+  f.worker.state = "complete"; f.worker.proof = true;
+  run = await f.controller.tick(run.id, "session");
+  assert.equal(run.status, "paused");
+  assert.equal(run.activeOperation, undefined);
+  assert.equal(run.failedOperation?.operationId, operationId);
+  assert.equal(run.failedOperation?.processTreeExited, true);
+  assert.equal(run.tasks?.["1"]?.state, "retry_wait");
+  assert.equal(run.taskAttempts["1"], 1);
+  await writeFile(f.planPath, original);
+  f.worker.state = "running"; f.worker.proof = false;
+  run = await f.controller.resume(run.id, "session");
+  for (let step = 0; step < 4 && !run.activeOperation; step++) run = await f.controller.tick(run.id, "session");
+  assert.equal(run.status, "running");
+  assert.equal(run.activeOperation?.kind, "implementation");
+  assert.notEqual(run.activeOperation?.operationId, operationId);
+  assert.equal(f.worker.launches.length, 2);
+  assert.equal(await readFile(join(f.root, "partial.txt"), "utf8"), "retained work\n");
+});
+
+for (const lostReply of [false, true]) {
+  test(`pre-dispatch rejection with ${lostReply ? "lost" : "bound"} spawn reply fences automatically before retry`, async (t) => {
+    const f = await fixture(t);
+    t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+    class RejectedWorker extends Worker {
+      reject = true;
+      cancellations = 0;
+      children = 0;
+      rejected = new Set<string>();
+      override async spawn(id: string, params: Record<string, unknown>) {
+        if (!this.launches.some(launch => launch.id === id)) {
+          if (this.reject) this.rejected.add(id); else this.children++;
+        }
+        return super.spawn(id, params);
+      }
+      receipt(id: string) {
+        return ok({ state: "found", runId: id, operationId: id,
+          requestDigest: bridgeRequestDigest(this.launches.find(launch => launch.id === id)!.params),
+          neverStarted: true, isError: true, text: "Unknown agent: worker" });
+      }
+      override async status(id: string) { return this.rejected.has(id) ? this.receipt(id) : super.status(id); }
+      override async operation(id: string) { return this.rejected.has(id) ? this.receipt(id) : super.operation(id); }
+      async cancelOperation(id: string, owner: BridgeOperationOwner) {
+        this.cancellations++;
+        if (this.cancellations === 1) return { success: false as const, error: { message: "cancel reply lost" } };
+        return ok({ state: "cancelled", operationId: id, requestDigest: owner.requestDigest,
+          neverStarted: true, cancellationRequested: true });
+      }
+    }
+    const worker = new RejectedWorker(f.worker.resultPath);
+    worker.loseSpawn = lostReply;
+    let controller = new PlanExecController(f.registry, worker, fusion, command, f.localExecutor);
+    let run = await controller.tick(f.run.id, "session");
+    const operationId = run.activeOperation!.operationId;
+    run = await due(f.registry, run);
+    run = await controller.tick(run.id, "session");
+    assert.equal(worker.cancellations, 1);
+    assert.equal(run.activeOperation?.operationId, operationId);
+    assert.equal(worker.launches.length, 1);
+    assert.equal(worker.children, 0);
+    controller = new PlanExecController(f.registry, worker, fusion, command, f.localExecutor);
+    run = await due(f.registry, run);
+    run = await controller.tick(run.id, "session");
+    assert.equal(run.activeOperation, undefined);
+    assert.equal(run.failedOperation?.launchFenced, true);
+    assert.equal(run.tasks?.["1"]?.state, "retry_wait");
+    assert.ok((run.tasks?.["1"]?.nextAttemptAt ?? 0) > Date.now());
+    await controller.tick(run.id, "session");
+    assert.equal(worker.launches.length, 1);
+    worker.reject = false; worker.loseSpawn = false;
+    t.mock.timers.tick(run.tasks!["1"]!.nextAttemptAt! - Date.now());
+    run = await due(f.registry, (await f.registry.get(run.id))!);
+    run = await controller.tick(run.id, "session");
+    assert.notEqual(run.activeOperation?.operationId, operationId);
+    assert.equal(worker.launches.length, 2);
+    assert.equal(worker.children, 1);
+  });
+}
+
+test("a foreign never-started receipt cannot cancel or replace the tracked worker", async (t) => {
+  const f = await fixture(t);
+  let run = await f.controller.tick(f.run.id, "session");
+  const operationId = run.activeOperation!.operationId;
+  f.worker.status = async (id) => ok({ state: "found", operationId: id, requestDigest: "foreign-digest", neverStarted: true });
+  run = await f.controller.tick(run.id, "session");
+  assert.equal(run.activeOperation?.operationId, operationId);
+  assert.equal(f.worker.stopCalls, 0);
+  assert.equal(f.worker.launches.length, 1);
+  assert.equal(run.activeOperation?.launchFenced, undefined);
+});
 
 test("status uncertainty beyond diagnostic burst preserves one writer and automatic wake", async (t) => {
   const f = await fixture(t);
@@ -874,7 +1036,7 @@ test("output fast-forward recovery reconciles a lost reply and preserves a concu
   });
   let lost = false;
   const crashCommand: typeof runCommands = async (cwd, commands, options) => {
-    await runCommands(cwd, commands, options);
+    await f.localExecutor(cwd, commands, options);
     if (!lost) { lost = true; throw new LocalOperationUnknownError("lost fast-forward reply"); }
   };
   run = await new PlanExecController(f.registry, f.worker, fusion, command, crashCommand).tick(run.id, "session");
@@ -882,7 +1044,7 @@ test("output fast-forward recovery reconciles a lost reply and preserves a concu
   assert.equal(run.outputPromotion?.state, "pending");
   run = await due(f.registry, run);
   const stopCommand: typeof runCommands = async (cwd, commands, options) => {
-    await runCommands(cwd, commands, options);
+    await f.localExecutor(cwd, commands, options);
     if (commands[0]?.[1] === "merge") {
       const current = await f.registry.get(run.id);
       assert.ok(current);
@@ -1405,6 +1567,7 @@ test("diagnostic capability does not trigger guidance or cancellation for a sile
 
 test("initial worktree creation records ownership before any Git mutation", async (t) => {
   const f = await fixture(t);
+  await f.registry.update({ ...f.run, status: "cancelled" });
   await f.git("branch", "main");
   const invocations: string[] = [];
   const execute: typeof runCommands = async (cwd, commands, options) => {
@@ -1414,7 +1577,7 @@ test("initial worktree creation records ownership before any Git mutation", asyn
     assert.equal(persisted?.lanePreparation?.state, "create");
     assert.equal(persisted?.lanePreparation?.sourcePlanPath, f.planPath);
     assert.equal(cwd, f.root);
-    await runCommands(cwd, commands, options);
+    await f.localExecutor(cwd, commands, options);
   };
   const controller = new PlanExecController(f.registry, f.worker, fusion, command, execute);
   let run = await controller.start({ cwd: f.root, planPath: f.planPath, useWorktree: true, sessionId: "initial-session" });

@@ -4444,6 +4444,8 @@ function realGit() {
 
 function fakeGit(root: string, branch = "feature") {
   return async (_command: string, args: string[]) => {
+    if (args[0] === "rev-parse" && args[1] === "--show-cdup")
+      return { stdout: "", stderr: "", code: 0 };
     if (args[0] === "rev-parse" && args[1] === "HEAD")
       return { stdout: `${"a".repeat(40)}\n`, stderr: "", code: 0 };
     if (args[0] === "show" && args[1]) {

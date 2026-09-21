@@ -148,6 +148,76 @@ test("concurrent starts through different path aliases admit exactly one run", a
   assert.equal((await registry.list()).length, 1);
 });
 
+test("lane changes retain output, preparation, task and recovery checkouts across resumable and unknown ownership states", async (t) => {
+  for (const status of ["running", "paused", "failed", "cancelled"] as const) {
+    const { registry, directory } = await seedRegistry();
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const paths = Object.fromEntries(["current", "output", "preparing", "source-plan", "task", "recovery", "history"].map(name => [name, join(directory, name)]));
+    const recovery = (cwd: string) => ({ cwd, branch: "preserved", baselineCommit: "a".repeat(40), headCommit: "b".repeat(40), checkpointRef: "refs/plan-exec/checkpoint" });
+    const existing = await registry.create(runSeed({
+      status, worktreeCwd: paths.current!, planPath: join(paths.current!, "plan.md"),
+      outputTarget: { cwd: paths.output!, branch: "feature", initialHead: "a".repeat(40), planRelativePath: "plan.md" },
+      lanePreparation: { cwd: paths.preparing!, branch: "new-lane", baselineCommit: "a".repeat(40), taskId: 1, state: "create", sourcePlanPath: join(paths["source-plan"]!, "plan.md") },
+      tasks: { "1": { taskId: 1, dependsOn: [], state: "retry_wait", attempts: 1, laneCwd: paths.task!, laneBranch: "task-a", recoverySource: recovery(paths.recovery!), recoveryHistory: [recovery(paths.history!)] } },
+      ...(status === "cancelled" ? { activeOperation: { operationId: "unknown-writer", service: "bridge" as const, kind: "implementation" as const, recovery: "recovery_required" as const } } : {}),
+    }), { exclusive: true });
+    for (const [name, cwd] of Object.entries(paths)) {
+      await assert.rejects(registry.create(runSeed({ worktreeCwd: cwd, planPath: join(cwd, "other.md") }), { exclusive: true }), new RegExp(existing.id), `${status}: ${name}`);
+    }
+    const independent = await registry.create(runSeed({ worktreeCwd: join(directory, "unrelated"), planPath: join(directory, "unrelated", "plan.md") }), { exclusive: true });
+    assert.notEqual(independent.id, existing.id);
+    await registry.assertExclusive(existing);
+  }
+});
+
+test("prospective reservations cannot overlap an existing run through noncurrent checkout fields", async (t) => {
+  const { registry, directory } = await seedRegistry();
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const occupied = join(directory, "occupied");
+  const existing = await registry.create(runSeed({ worktreeCwd: occupied, planPath: join(occupied, "plan.md") }));
+  const recovery = { cwd: occupied, branch: "preserved", baselineCommit: "a".repeat(40), headCommit: "b".repeat(40), checkpointRef: "refs/plan-exec/checkpoint" };
+  const reservations: Partial<RunSeed>[] = [
+    { outputTarget: { cwd: occupied, branch: "feature", initialHead: "a".repeat(40), planRelativePath: "plan.md" } },
+    { lanePreparation: { cwd: occupied, branch: "prepared", baselineCommit: "a".repeat(40), taskId: 1, state: "create" } },
+    { tasks: { "1": { taskId: 1, dependsOn: [], state: "retry_wait", attempts: 1, laneCwd: occupied } } },
+    { tasks: { "1": { taskId: 1, dependsOn: [], state: "retry_wait", attempts: 1, recoverySource: recovery } } },
+    { tasks: { "1": { taskId: 1, dependsOn: [], state: "retry_wait", attempts: 1, recoveryHistory: [recovery] } } },
+  ];
+  for (const reservation of reservations) {
+    await assert.rejects(registry.create(runSeed({ worktreeCwd: join(directory, "new"), planPath: join(directory, "new", "plan.md"), ...reservation }), { exclusive: true }), new RegExp(existing.id));
+  }
+});
+
+test("not-yet-created lanes reserve the same path through a symlinked parent", async (t) => {
+  const { registry, directory } = await seedRegistry();
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const lanes = join(directory, "lanes");
+  const alias = join(directory, "alias");
+  await mkdir(lanes);
+  await symlink(lanes, alias);
+  const existing = await registry.create(runSeed({ worktreeCwd: join(directory, "current"), planPath: join(directory, "current", "plan.md"),
+    lanePreparation: { cwd: join(lanes, "future"), branch: "prepared", baselineCommit: "a".repeat(40), taskId: 1, state: "create" } }));
+  await assert.rejects(registry.create(runSeed({ worktreeCwd: join(alias, "future"), planPath: join(alias, "future", "other.md") }), { exclusive: true }), new RegExp(existing.id));
+});
+
+test("settled terminal runs release retained checkouts only after the independent local ownership fence clears", async (t) => {
+  for (const status of ["completed", "completed_with_findings", "cancelled"] as const) {
+    const { registry, directory } = await seedRegistry();
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const output = join(directory, "output");
+    const old = await registry.create(runSeed({ status, worktreeCwd: join(directory, "current"), planPath: join(directory, "current", "plan.md"),
+      outputTarget: { cwd: output, branch: "feature", initialHead: "a".repeat(40), planRelativePath: "plan.md" } }));
+    const index = registry.localOperationsPath(old.id);
+    await mkdir(index, { recursive: true });
+    const entry = join(index, `${"c".repeat(64)}.json`);
+    await writeFile(entry, "{unresolved-local-ownership");
+    await assert.rejects(registry.create(runSeed({ worktreeCwd: output, planPath: join(output, "other.md") }), { exclusive: true }), new RegExp(old.id));
+    await rm(entry);
+    const replacement = await registry.create(runSeed({ worktreeCwd: output, planPath: join(output, "other.md") }), { exclusive: true });
+    assert.notEqual(replacement.id, old.id);
+  }
+});
+
 test("deleted nested worktrees retain separate ownership from the enclosing checkout", async (t) => {
   const { registry, directory } = await seedRegistry();
   t.after(() => rm(directory, { recursive: true, force: true }));

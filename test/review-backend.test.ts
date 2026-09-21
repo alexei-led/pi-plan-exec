@@ -55,6 +55,24 @@ test("Revmux preserves confirmed blocker severity and supporting evidence", () =
     summary: "Broken authorization", evidence: "auth.ts:9 Missing check", suggestion: "Check permission" }]);
 });
 
+test("Revmux optional fixes remain unavailable without weakening finding validation", () => {
+  const finding = { id: "f1", severity: "minor", title: "Missing retry detail", file: "retry.ts", line: 9,
+    body: "The failed attempt omits its retry reason.", verdict: "confirmed" };
+  for (const severity of ["minor", "major"]) {
+    for (const optional of [{}, { fix: "" }, { fix: " \t" }]) {
+      const findings = parseRevmuxReport({ ...report(), findings: [{ ...finding, severity, ...optional }] });
+      assert.equal(findings.length, 1);
+      assert.equal(findings[0]?.severity, severity.toUpperCase());
+      assert.equal(findings[0]?.suggestion, undefined);
+      assert.equal(findings[0]?.evidence, "retry.ts:9 The failed attempt omits its retry reason.");
+    }
+  }
+  for (const invalid of [
+    { fix: null }, { fix: 42 }, { body: "" }, { title: " " }, { file: "" },
+    { severity: "unknown" }, { verdict: "unverified" }, { line: -1 },
+  ]) assert.throws(() => parseRevmuxReport({ ...report(), findings: [{ ...finding, ...invalid }] }));
+});
+
 async function harness(t: test.TestContext, behavior = "complete") {
   const cwd = await mkdtemp(join(tmpdir(), "plan-exec-review-"));
   t.after(() => rm(cwd, { recursive: true, force: true }));
@@ -84,6 +102,11 @@ if (args.includes('--capabilities')) {
   fs.appendFileSync(path.join(process.cwd(),'launches'), JSON.stringify(args)+'\n');
   const report = {sources:{expected:1,reported:1,degraded:[],agents:[{degraded:false}]},
     findings:[],open_questions:[],pre_existing:[],immaterial:[]};
+  if (behavior === 'optional-fix-minor' || behavior === 'optional-fix-major') {
+    report.findings.push({id:'f1',severity:behavior === 'optional-fix-minor' ? 'minor' : 'major',
+      title:'Missing retry detail',file:'retry.ts',line:9,body:'The failed attempt omits its retry reason.',verdict:'confirmed',
+      ...(behavior === 'optional-fix-minor' ? {fix:''} : {})});
+  }
   if (behavior === 'escaped-wait') {
     const child=require('node:child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'});
     fs.writeFileSync(path.join(process.cwd(),'escaped-pid'),String(child.pid));
@@ -165,6 +188,26 @@ async function eventually(action: () => Promise<boolean>, attempts = 200) {
   }
   assert.fail("Review did not reach the expected state.");
 }
+
+test("completed Revmux review preserves optional-fix findings through the strict caller contract", async (t) => {
+  for (const severity of ["minor", "major"]) {
+    const { client } = await harness(t, `optional-fix-${severity}`);
+    await client.start("op", "Review", undefined, { mode: "unbounded" }, "caller-digest");
+    await eventually(async () => {
+      const result = await client.result("op");
+      return result.success && (result.data.run as { terminal: boolean }).terminal;
+    });
+    const result = await client.result("op");
+    assert.ok(result.success);
+    assert.equal((result.data.run as { phase: string }).phase, "done");
+    const output = (result.data.callerOutput as { output: string }).output;
+    assert.match(output, /Fix: Unavailable: reviewer supplied no suggested fix\./);
+    const validated = validateReviewResult(output, "abc", "abc");
+    assert.equal(validated.findings[0]?.severity, severity.toUpperCase());
+    assert.equal(validated.blocking, severity === "major");
+    assert.equal(result.data.requestDigest, "caller-digest");
+  }
+});
 
 test("controlled Revmux review survives client restart and replays exactly one operation", async (t) => {
   const { client, options, cwd } = await harness(t);

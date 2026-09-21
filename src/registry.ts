@@ -3,14 +3,15 @@ import {
   mkdir,
   open,
   readFile,
+  realpath,
   rename,
   rm,
   stat,
   writeFile,
 } from "node:fs/promises";
 import { homedir, hostname } from "node:os";
-import { dirname, join } from "node:path";
-import { canonicalPath, worktreeIdentity } from "./git.js";
+import { basename, dirname, join, resolve } from "node:path";
+import { worktreeIdentity } from "./git.js";
 import { isSkippableStage, isTerminalStatus } from "./lifecycle.js";
 import { parseOperationActivity } from "./diagnostics.js";
 import { hasActiveLocalOperations } from "./local-operation.js";
@@ -41,6 +42,35 @@ const RUN_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 type RunLease = NonNullable<PlanExecRun["lease"]>;
+type RunReservations = Pick<PlanExecRun, "worktreeCwd" | "planPath"> &
+  Partial<Pick<PlanExecRun, "id" | "outputTarget" | "lanePreparation" | "tasks">>;
+
+/** Pending lanes retain their own identity while resolving existing parent aliases. */
+async function canonicalReservationPath(path: string): Promise<string> {
+  const absolute = resolve(path);
+  try { return await realpath(absolute); }
+  catch (error) {
+    if (!isNodeError(error, "ENOENT")) throw error;
+    const parent = dirname(absolute);
+    return parent === absolute ? absolute : join(await canonicalReservationPath(parent), basename(absolute));
+  }
+}
+
+async function reservedCheckouts(run: RunReservations): Promise<Set<string>> {
+  const paths = [
+    run.worktreeCwd,
+    run.outputTarget?.cwd,
+    run.lanePreparation?.cwd,
+    ...(run.lanePreparation?.sourcePlanPath ? [dirname(run.lanePreparation.sourcePlanPath)] : []),
+    ...Object.values(run.tasks ?? {}).flatMap(task => [
+      task.laneCwd,
+      task.recoverySource?.cwd,
+      ...(task.recoveryHistory ?? []).map(source => source.cwd),
+    ]),
+  ];
+  const unique = new Set(paths.filter((path): path is string => path !== undefined));
+  return new Set(await Promise.all([...unique].map(async path => canonicalReservationPath(await worktreeIdentity(path)))));
+}
 
 /**
  * Whether the name frozen on a lease is this machine. The whole name decides,
@@ -179,13 +209,13 @@ export class RunRegistry {
 
   /** Create holds the registry lock; resume already owns a reserved run. */
   async assertExclusive(
-    run: Pick<PlanExecRun, "worktreeCwd" | "planPath"> & { id?: string },
+    run: RunReservations,
   ): Promise<void> {
     const { runs, errors } = await this.listWithErrors();
     if (errors.length)
       throw new Error(`Cannot verify execution ownership: unreadable run ${errors[0]!.runId}. Use /exec status.`);
-    const worktree = await worktreeIdentity(run.worktreeCwd);
-    const plan = await canonicalPath(run.planPath);
+    const worktrees = await reservedCheckouts(run);
+    const plan = await canonicalReservationPath(run.planPath);
     for (const existing of runs) {
       if (existing.id === run.id) continue;
       if (isTerminalStatus(existing.status) &&
@@ -193,8 +223,8 @@ export class RunRegistry {
           !existing.activeOperation &&
           !existing.localOperationActive &&
           !(existing.lease && isLeaseLive(existing.lease))) continue;
-      const sameWorktree = await worktreeIdentity(existing.worktreeCwd) === worktree;
-      const samePlan = await canonicalPath(existing.planPath) === plan;
+      const sameWorktree = [...await reservedCheckouts(existing)].some(path => worktrees.has(path));
+      const samePlan = await canonicalReservationPath(existing.planPath) === plan;
       if (sameWorktree || samePlan)
         throw new Error(
           `Plan execution already exists for ${sameWorktree ? "worktree" : "plan"}: ${existing.id}. Use /exec status ${existing.id} or /exec resume ${existing.id}.`,

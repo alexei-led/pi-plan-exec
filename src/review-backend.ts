@@ -28,6 +28,8 @@ export interface ValidatedReviewResult {
   blocking: boolean;
 }
 
+const UNAVAILABLE_REVMUX_FIX = "Unavailable: reviewer supplied no suggested fix.";
+
 /** Persist alongside the launch intent; replay cannot change the scope or lifetime. */
 export function reviewRequestDigest(request: ReviewRequest): string {
   return `sha256:${createHash("sha256").update(JSON.stringify([
@@ -72,7 +74,8 @@ export function parseRevmuxReport(value: unknown): ReviewFinding[] {
     throw new Error("Revmux report cannot dismiss blocking findings as immaterial.");
   for (const entry of [...value.findings, ...value.immaterial]) {
     if (!isRecord(entry) || !nonempty(entry.id) || ids.has(entry.id) ||
-      !nonempty(entry.title) || !nonempty(entry.body) || !nonempty(entry.fix) ||
+      !nonempty(entry.title) || !nonempty(entry.body) ||
+      (entry.fix !== undefined && typeof entry.fix !== "string") ||
       !nonempty(entry.file) || !Number.isInteger(entry.line) ||
       typeof entry.line !== "number" || entry.line < 0 ||
       (entry.verdict !== "confirmed" && entry.verdict !== "refined" &&
@@ -83,7 +86,8 @@ export function parseRevmuxReport(value: unknown): ReviewFinding[] {
       throw new Error("Revmux report contains an invalid finding severity.");
     ids.add(entry.id);
     findings.push({ id: entry.id, severity, summary: singleLine(entry.title),
-      evidence: singleLine(`${entry.file}:${entry.line} ${entry.body}`), suggestion: singleLine(entry.fix) });
+      evidence: singleLine(`${entry.file}:${entry.line} ${entry.body}`),
+      ...(nonempty(entry.fix) ? { suggestion: singleLine(entry.fix) } : {}) });
   }
   return findings;
 }
@@ -346,7 +350,9 @@ export class RevmuxReviewClient {
       try {
         const findings = parseRevmuxReport(await readJson(join(directory, "report.json")));
         data.callerOutput = { contract: PLAN_REVIEW_OUTPUT_CONTRACT,
-          output: findings.length ? formatFindings(findings) : "NO_FINDINGS" };
+          output: findings.length ? formatFindings(findings.map((finding) => ({
+            ...finding, suggestion: finding.suggestion ?? UNAVAILABLE_REVMUX_FIX,
+          }))) : "NO_FINDINGS" };
       } catch (error) {
         data.run = { runId: operationId, operationId, phase: FUSION_PHASE.FAILED, terminal: true, error: String(error) };
       }

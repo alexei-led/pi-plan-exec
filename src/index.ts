@@ -233,6 +233,7 @@ type StartBackgroundController = (
   sessionId: string,
   cwd: string,
   ctx: ExtensionContext,
+  handoffWhenReady?: (run: PlanExecRun) => Promise<boolean>,
 ) => void;
 type RuntimeCheck = () => Promise<void>;
 /** Prerequisite problems in report form; empty when every package is present. */
@@ -430,6 +431,7 @@ export default function planExecExtension(pi: ExtensionAPI): void {
     sessionId,
     cwd,
     ctx,
+    handoffWhenReady,
   ): void => {
     const runId = initialRun.id;
     if (activeControllers.has(runId)) return;
@@ -440,7 +442,18 @@ export default function planExecExtension(pi: ExtensionAPI): void {
       inFlightControllers.add(runId);
       void controller
         .tick(runId, sessionId)
-        .then((run) => {
+        .then(async (run) => {
+          if (handoffWhenReady && canHandoffPreparedWorktree(run)) {
+            // Session startup must be able to install the target's controller.
+            stopBackgroundController(runId);
+            let handedOff = false;
+            try {
+              handedOff = await handoffWhenReady(run);
+            } finally {
+              if (!handedOff) startBackgroundController(run, sessionId, cwd, ctx);
+            }
+            if (handedOff) return run;
+          }
           setStatus(run, ctx);
           const previous = lastStates.get(runId);
           lastStates.set(runId, runState(run));
@@ -793,6 +806,12 @@ export function recoveryGuidance(
       action: `This run is over and there is nothing to recover. Run /exec cleanup once you no longer need its record.`,
       command: commands.cleanup,
     };
+  if (leaseNamesAnotherHost(run))
+    return {
+      classification: "its lease names a machine that cannot be observed here",
+      action: `The lease was stamped on ${run.lease?.hostname} and this machine answers to ${hostname()}. Its ownership remains protected; that does not prove its worker is running. If that name was this machine before it was renamed, run ${resume} ${SAME_MACHINE_OPTION}; it checks the local owner and tracked worker before rebinding the lease. If it was a different machine, recover the run there.`,
+      command: `${resume} ${SAME_MACHINE_OPTION}`,
+    };
   // Only when nothing is tracked. With an unresolved operation this would
   // recommend a takeover the recovery gate then refuses; the operation branches
   // below answer that case instead. A run already told to stop, or already
@@ -867,20 +886,6 @@ export function recoveryGuidance(
       command: stageWaiverCommand(run),
     };
   }
-  // Ahead of every other unknown: no local probe can settle a run whose lease
-  // names another machine, so the operator's override is the only action left.
-  // A run with nothing tracked belongs to the takeover branch above; a settled
-  // one needs no override, because its resume gathers no evidence at all.
-  if (
-    isInFlightStatus(run.status) &&
-    leaseNamesAnotherHost(run) &&
-    run.activeOperation
-  )
-    return {
-      classification: "its lease names a machine that is not this one",
-      action: `The lease was stamped on ${run.lease?.hostname} and this machine answers to ${hostname()}, so nothing here can observe its worker. If that name was this machine before it was renamed, run ${resume} ${SAME_MACHINE_OPTION}; it checks the worker here and still refuses while one is running. If it was a different machine, recover the run there.`,
-      command: `${resume} ${SAME_MACHINE_OPTION}`,
-    };
   if (
     run.activeOperation?.recovery === OPERATION_RECOVERY.REQUIRED ||
     run.activeOperation?.lastObservedState ===
@@ -1090,9 +1095,9 @@ export function sameMachineRefusal(run: PlanExecRun): string | undefined {
   return undefined;
 }
 
-/** A dead lease naming a host this machine is not: no local check can speak. */
+/** A foreign lease remains protected regardless of heartbeat age. */
 function leaseNamesAnotherHost(run: PlanExecRun): boolean {
-  return isStaleOwner(run) && !isLocalRun(run);
+  return Boolean(run.lease) && !isLocalRun(run);
 }
 
 function isStaleOwner(run: PlanExecRun): boolean {
@@ -1196,7 +1201,7 @@ export function formatRunStatus(
     lines.push(`tool guidance: ${action.state} for ${action.toolCallId} — guidance only, not a repair confirmation${action.error ? `; ${action.error}` : ""}`);
   // The failure counts below are stored facts and print either way. Only an
   // observed live lease adds the claim that something is still trying.
-  const polling = evidence?.leaseLive === true ? "; retrying" : "";
+  const polling = evidence?.leaseLive === true && isLocalRun(run) ? "; retrying" : "";
   if (operation?.statusFailures) {
     lines.push(
       `observation: unavailable (${operation.statusFailures} failed probes)${polling}${operation.lastStatusError ? ` — ${operation.lastStatusError}` : ""}`,
@@ -1277,7 +1282,7 @@ function workerSignalLines(
   const operation = run.activeOperation;
   if (!operation) return [];
   const signal = operation.workerSignal;
-  const activity = reportedActivity(operation, evidence);
+  const activity = reportedActivity(operation, isLocalRun(run) ? evidence : undefined);
   const since = operation.launchStartedAt
     ? `, ${elapsedLabel(Date.now() - operation.launchStartedAt)} since launch`
     : "";
@@ -2042,6 +2047,20 @@ export async function reconcileForResume(
   probe: EvidenceProbe = abandonmentProbe(),
   sameMachine = false,
 ): Promise<{ run: PlanExecRun; note?: string }> {
+  if (sameMachine && !isLocalRun(run) &&
+    (!isInFlightStatus(run.status) || isRecoverableRun(run) || !run.activeOperation || run.userStopped)) {
+    const subject = asLocalRun(run);
+    const evidence = await runEvidence(subject, () => probe(subject));
+    if (evidence.leaseLive) return { run };
+    const operation = run.activeOperation;
+    if (operation && !operation.processTreeExited && !operation.launchFenced &&
+      classifyAbandonment({ ...subject, status: RUN_STATUS.RUNNING }, evidence) === ABANDONMENT.AMBIGUOUS)
+      throw new Error(`Run ${shortRunId(run.id)} evidence is incomplete: its tracked worker has not been proven safe to recover. Nothing was changed.`);
+    const rebound = await registry.updateIfCurrent(subject, run.updatedAt);
+    if (!rebound.applied)
+      throw new Error(`Run ${shortRunId(run.id)} changed while its asserted host was being recorded; nothing was changed. Use /exec status ${run.id}.`);
+    return { run: rebound.run, note: `Run ${shortRunId(run.id)} lease rebound to this machine after checking its local owner; its status, stop request, and tracked operations were preserved.` };
+  }
   if (!isInFlightStatus(run.status) || isRecoverableRun(run)) return { run };
   // The operator asserted the host, so every text below reads the run that way
   // too. Evidence still has to prove local PID/process-tree termination before
@@ -2101,7 +2120,9 @@ function evidenceText(diagnosis: ObservedRun): string {
   const lease = diagnosis.run.lease;
   const leaseText = !lease
     ? "no session holds it"
-    : diagnosis.evidence.leaseLive
+    : !isLocalRun(diagnosis.run)
+      ? `session ${lease.sessionId} retains protected ownership on unobserved host ${lease.hostname}`
+      : diagnosis.evidence.leaseLive
       ? `session ${lease.sessionId} holds a live lease`
       : `its lease for session ${lease.sessionId} is dead, last beat ${relativeTime(lease.heartbeatAt)}`;
   return `${leaseText}; ${operationEvidence(diagnosis)}${overdueText(diagnosis)}`;
@@ -2110,7 +2131,7 @@ function evidenceText(diagnosis: ObservedRun): string {
 /** Without it a run far past its bound reads like one launched a minute ago. */
 function overdueText(diagnosis: ObservedRun): string {
   const run = diagnosis.run;
-  const overdue = reportedActivity(run.activeOperation, diagnosis.evidence)
+  const overdue = reportedActivity(run.activeOperation, isLocalRun(run) ? diagnosis.evidence : undefined)
     ? undefined
     : longRunningOperation(run);
   return overdue
@@ -2188,6 +2209,7 @@ interface CommandDependencies {
   checkRuntime: RuntimeCheck;
   runtimeProblems: RuntimeProbe;
   doctorProbe: EvidenceProbe;
+  handoff?: typeof handoffToWorktree;
 }
 
 export function shouldRepairProjectionForSession(
@@ -2257,7 +2279,7 @@ async function repairProjectionForRead(
   }
 }
 
-async function handleCommand(
+export async function handleCommand(
   args: string,
   ctx: ExtensionCommandContext,
   dependencies: CommandDependencies,
@@ -2333,7 +2355,10 @@ async function handleCommand(
     ...(worktreePath ? { existingWorktree: worktreePath } : {}),
     sessionId: ctx.sessionManager.getSessionId(),
   });
-  if (await handoffToWorktree(ctx, started, syncProjection)) return undefined;
+  const handoff = dependencies.handoff ?? handoffToWorktree;
+  const deferredHandoff = started.lanePreparation?.state === "create" &&
+    Boolean(ctx.sessionManager.getSessionFile());
+  if (!deferredHandoff && await handoff(ctx, started, syncProjection)) return undefined;
   const run = await syncProjection(started, {
     cwd: ctx.cwd,
     sessionId: ctx.sessionManager.getSessionId(),
@@ -2343,6 +2368,8 @@ async function handleCommand(
     ctx.sessionManager.getSessionId(),
     ctx.cwd,
     ctx,
+    deferredHandoff ? async (prepared) => canHandoffPreparedWorktree(prepared) &&
+      handoff(ctx, prepared, syncProjection, undefined, true) : undefined,
   );
   return `Run ${shortRunId(run.id)} started: ${run.status} (${run.stage})\nbranch: ${run.branch}\nworktree: ${run.worktreeCwd}\nUse /exec status ${run.id} for live progress.`;
 }
@@ -2656,12 +2683,25 @@ export function prioritizeRunCandidates(
   return exactWorktree.length > 0 ? exactWorktree : candidates;
 }
 
+export function canHandoffPreparedWorktree(run: PlanExecRun): boolean {
+  return run.status === RUN_STATUS.RUNNING && !run.userStopped &&
+    !run.localOperationActive && run.lanePreparation?.state !== "create";
+}
+
 async function handoffToWorktree(
   ctx: ExtensionCommandContext,
   run: PlanExecRun,
   syncProjection: SyncProjection,
   followUp?: string,
+  automatic = false,
 ): Promise<boolean> {
+  if (automatic) {
+    const current = await defaultRegistry.get(run.id);
+    if (!current || !canHandoffPreparedWorktree(current) ||
+      (current.stopGeneration ?? 0) !== (run.stopGeneration ?? 0)) return false;
+    run = current;
+  }
+  if (run.lanePreparation?.state === "create") return false;
   if (resolve(run.worktreeCwd) === resolve(ctx.cwd)) return false;
   const sourceSessionFile = ctx.sessionManager.getSessionFile();
   if (!sourceSessionFile) return false;
@@ -2690,6 +2730,11 @@ async function handoffToWorktree(
     cwd: targetSession.getCwd(),
     sessionId: targetSession.getSessionId(),
   });
+  if (automatic && (!canHandoffPreparedWorktree(claimed) ||
+    (claimed.stopGeneration ?? 0) !== (run.stopGeneration ?? 0))) {
+    await restoreSourceLease(run.id, sourceSessionId);
+    return false;
+  }
   let switched = false;
   try {
     const result = await ctx.switchSession(targetSessionFile, {
@@ -2760,6 +2805,7 @@ export function isActionAllowed(
       : run.status === RUN_STATUS.STARTING ||
           run.status === RUN_STATUS.RUNNING ||
           run.status === RUN_STATUS.PAUSED ||
+          (run.status === RUN_STATUS.SKIP_PENDING && leaseNamesAnotherHost(run)) ||
           isRecoverableFailure(run) ||
           isClaimableRun(run);
   if (action === EXEC_ACTION.SKIP) return isStageWaiverAvailable(run);
@@ -3064,6 +3110,7 @@ function progressTransition(
 }
 
 function observationLabel(run: PlanExecRun): string {
+  if (!isLocalRun(run)) return "owner is on an unobserved host";
   const failures = run.activeOperation?.statusFailures;
   return failures
     ? `cannot observe worker (${failures} failed probes)`
