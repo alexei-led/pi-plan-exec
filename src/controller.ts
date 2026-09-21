@@ -175,6 +175,7 @@ export interface StartRunOptions {
   /** Use this already-registered linked worktree instead of creating one. */
   existingWorktree?: string;
   sessionId: string;
+  onRunAllocated?: (run: PlanExecRun) => void;
 }
 
 /** Deterministic controller. It chooses transitions; existing extensions execute work. */
@@ -272,7 +273,7 @@ export class PlanExecController {
       ...(options.useWorktree ? { lanePreparation: { cwd: executionWorktreeCwd, branch,
         baselineCommit: initialHead,
         taskId: 0, state: "create" as const, sourcePlanPath: plan.path } } : {}),
-    }, { exclusive: true });
+    }, { exclusive: true, ...(options.onRunAllocated ? { onAllocated: options.onRunAllocated } : {}) });
     return this.advance(await this.registry.claim(run, options.sessionId));
   }
 
@@ -311,6 +312,7 @@ export class PlanExecController {
     reviewedPlanHash?: string,
     retryTask = false,
     recoveryModel?: string,
+    expectedStopGeneration?: number,
   ): Promise<PlanExecRun> {
     const coordinated = await this.registry.withControllerLock(runId, () =>
       this.resumeLocked(
@@ -320,6 +322,7 @@ export class PlanExecController {
         reviewedPlanHash,
         retryTask,
         recoveryModel,
+        expectedStopGeneration,
       ),
     );
     if (coordinated) return coordinated;
@@ -335,9 +338,11 @@ export class PlanExecController {
     reviewedPlanHash?: string,
     retryTask = false,
     recoveryModel?: string,
+    expectedStopGeneration?: number,
   ): Promise<PlanExecRun> {
     const existing = await this.registry.get(runId);
     if (!existing) throw new Error(`Plan execution run not found: ${runId}`);
+    if (expectedStopGeneration !== undefined && (existing.stopGeneration ?? 0) !== expectedStopGeneration) return existing;
     if (explicit) await this.registry.assertExclusive(existing);
     const claimed = await this.registry.claim(existing, sessionId);
     if (explicit && (claimed.stopGeneration ?? 0) !== (existing.stopGeneration ?? 0))
@@ -413,9 +418,10 @@ export class PlanExecController {
   async rebindBranchAndResume(
     runId: string,
     sessionId: string,
+    expectedStopGeneration?: number,
   ): Promise<PlanExecRun> {
     const coordinated = await this.registry.withControllerLock(runId, () =>
-      this.rebindBranchAndResumeLocked(runId, sessionId),
+      this.rebindBranchAndResumeLocked(runId, sessionId, expectedStopGeneration),
     );
     if (coordinated) return coordinated;
     const current = await this.registry.get(runId);
@@ -426,11 +432,14 @@ export class PlanExecController {
   private async rebindBranchAndResumeLocked(
     runId: string,
     sessionId: string,
+    expectedStopGeneration?: number,
   ): Promise<PlanExecRun> {
     const existing = await this.registry.get(runId);
     if (!existing) throw new Error(`Plan execution run not found: ${runId}`);
+    if (expectedStopGeneration !== undefined && (existing.stopGeneration ?? 0) !== expectedStopGeneration) return existing;
     await this.registry.assertExclusive(existing);
     const claimed = await this.registry.claim(existing, sessionId);
+    if (expectedStopGeneration !== undefined && (claimed.stopGeneration ?? 0) !== expectedStopGeneration) return claimed;
     if (
       isTerminalStatus(claimed.status) &&
       claimed.status !== RUN_STATUS.FAILED
@@ -475,7 +484,7 @@ export class PlanExecController {
       rebound.run.status === RUN_STATUS.PAUSED ||
       rebound.run.status === RUN_STATUS.CANCEL_PENDING
     )
-      return this.resumeLocked(runId, sessionId, true);
+      return this.resumeLocked(runId, sessionId, true, undefined, false, undefined, expectedStopGeneration);
     return this.advanceUnlocked(rebound.run);
   }
 
@@ -483,9 +492,10 @@ export class PlanExecController {
     runId: string,
     sessionId: string,
     reason: string,
+    expectedStopGeneration?: number,
   ): Promise<PlanExecRun> {
     const coordinated = await this.registry.withControllerLock(runId, () =>
-      this.skipLocked(runId, sessionId, reason),
+      this.skipLocked(runId, sessionId, reason, expectedStopGeneration),
     );
     if (coordinated) return coordinated;
     const current = await this.registry.get(runId);
@@ -497,12 +507,15 @@ export class PlanExecController {
     runId: string,
     sessionId: string,
     reason: string,
+    expectedStopGeneration?: number,
   ): Promise<PlanExecRun> {
     const trimmedReason = reason.trim();
     if (!trimmedReason) throw new Error("Force-skip requires a reason.");
     const existing = await this.registry.get(runId);
     if (!existing) throw new Error(`Plan execution run not found: ${runId}`);
+    if (expectedStopGeneration !== undefined && (existing.stopGeneration ?? 0) !== expectedStopGeneration) return existing;
     const claimed = await this.registry.claim(existing, sessionId);
+    if (expectedStopGeneration !== undefined && (claimed.stopGeneration ?? 0) !== expectedStopGeneration) return claimed;
     if (!isSkippableStage(claimed.stage))
       throw new Error(`Stage ${claimed.stage} cannot be force-skipped.`);
     if ((claimed.config.reviewRequired && isReviewStage(claimed.stage)) ||
