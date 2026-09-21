@@ -76,23 +76,24 @@ the user accepts losing the in-flight work, end it and keep the worktree:
 /exec stop <full-run-id>
 ```
 
-### `running longer than its budget allows`
+### `running with no recent observation`
 
-The run has claimed an active worker for longer than the bound derived from its
-own stage budget: two minutes per turn, so 150 minutes for the default 75-turn
-worker and 60 minutes for the default 30-turn reviewer. Nothing has reported on
-that worker since — the elapsed time is the whole of the evidence. The bound
-fires only when no trustworthy activity signal exists, and elapsed time is not
-proof that the worker is stuck: a worker mid-model-call reports nothing for a
-long time.
+The default `executionLifetime` is explicitly `{ "mode": "unbounded" }`, so
+plan-exec has no wall-clock deadline for a healthy operation. A bounded
+compatibility lifetime is used only when selected in the frozen run config.
+Missing activity or provider observations are diagnostic evidence, never proof
+that a child stopped and never permission to start a second writer.
+If status also prints `running longer than its budget allows`, treat it as an
+attention hint only; it does not stop the child, consume a retry, or authorize a
+replacement.
 
-Re-check first:
+Re-check while a live controller or lease is polling:
 
 ```text
 /exec status <full-run-id>
 ```
 
-Once the user accepts losing the in-flight work, stop the run and keep the
+If the user accepts losing the in-flight work, stop the run and keep the
 worktree:
 
 ```text
@@ -103,10 +104,12 @@ Never start a second run for the same plan.
 
 ### `the worker is gone, so nothing is running`
 
-Checked live at the moment status ran: a v2 bridge supplied a matching native
-process-terminal proof for the tracked external run, **or** its durable
-operation lookup answered `absent` for an unbound launch. Only either proof says
-no worker is writing. A missing async directory and a v1 bridge's missing record
+Checked live at the moment status ran: a compatible v2 bridge supplied a
+matching native process-terminal proof for the tracked external run, **or** its
+durable operation lookup answered `absent` for an unbound launch. The terminal
+proof must cover an owned process tree; POSIX process-group observations with
+escaped descendants unverified do not qualify. Only decisive proof says no
+worker is writing. A missing async directory and a v1 bridge's missing record
 are diagnostics, not death proof; those runs remain ambiguous and must not be
 reset. With decisive proof, reset this one run and continue it:
 
@@ -174,23 +177,22 @@ a beating heartbeat is a worker writing somewhere, and which machine it sits on
 does not change that. Wait for it to go stale.
 When the lease really does name a different machine, recover the run there.
 
-### Why no per-turn activity signal exists
+### Why no per-turn activity signal may exist
 
-The bridge spawns workflow-mode runs. pi-subagents anchors the `Activity:` age
-of a workflow-mode run to its launch time, so the age grows without bound while
-the worker is healthy, and the run never escalates to `needs_attention`.
-plan-exec discards that value rather than render a false signal, which leaves
-elapsed time against the stage's turn budget as the only bound. The limit is
-upstream and temporary: `nicobailon/pi-subagents#920`.
+Workflow-mode providers may omit a trustworthy per-turn signal. The controller
+keeps the durable operation attached, records the last observation, and keeps
+automatic recovery scheduled. Do not convert silence into a deadline or a
+replacement launch.
 
 ## Abandoned after a Pi restart
 
 A run is **abandoned** only when all three hold at once: it claims `running`,
 `starting`, `skip_pending`, or `cancel_pending`; its lease is not live; and its
-operation is provably gone by a matching native process-terminal proof or (for
-an unbound launch only) v2 durable lookup with `absent`. A missing async
-directory, a v1 absence response, or `absent` for an already-bound external run
-is incomplete evidence. Anything less is `ambiguous` and is never reset.
+operation is provably gone by a matching owned-tree process-terminal proof or
+(for an unbound launch only) v2 durable lookup with `absent`. A POSIX group-only
+observation, missing async directory, v1 absence response, or `absent` for an
+already-bound external run is incomplete evidence. Anything less is
+`ambiguous` and is never reset.
 
 Recover one named run — the usual case, and the smaller blast radius:
 
@@ -236,21 +238,22 @@ instead and keep its worktree:
 
 ## Paused
 
-`paused for a task blocker` means the worker explicitly returned
-`<<<RALPHEX:TASK_FAILED>>>` while the task still has unchecked items. The
-controller records the reason and stopped operation, preserves the worktree,
-and stops polling without consuming a retry or starting another worker.
+An explicit user pause (`/exec pause` or the pause choice under `/exec stop`)
+is resumable. It preserves the active operation when child exit is unconfirmed;
+the controller continues observing that operation and applies its terminal result
+only after `/exec resume`.
 
-Resolve the displayed prerequisite or obtain the required operator decision,
-then use `/exec resume <full-run-id>` and confirm retrying that task. A scripted
-caller may use `--retry-task` only with that confirmation. Do not loop on this
-flag, create another run, or manually resume the child. Retrying does not waive
-the plan's approvals, release checkpoints, or verification requirements.
+`<<<RALPHEX:TASK_FAILED>>>` with unchecked items is not an implicit global
+pause. The controller records the blocker, preserves the partial lane and
+accepted baseline, and schedules automatic recovery with backoff. A retry does
+not waive the plan's approvals, release checkpoints, or verification
+requirements. Use `/exec status <full-run-id>` to inspect the next automatic
+action; use `/exec stop` only when the operator wants to pause or cancel.
 
 Older releases may have stored the same `TASK_FAILED` output as a generic
 unchecked-checkbox failure. They remain recoverable through the same plan run's
 `/exec resume`; status identifies the external blocker rather than recommending
-an unconfirmed retry.
+an unconfirmed second writer.
 
 A run without an active operation or task blocker is classified
 `paused, waiting for you to continue it`. Use:
@@ -286,8 +289,9 @@ that detached stage.
   the user explicitly requested resume. A run classified
   `a task is blocked by something outside this run` — billing, credentials,
   quota, network, or a manual step — asks for interactive confirmation, or
-  takes `--retry-task` from a caller with no human. Implementation is
-  sequential; it cannot be skipped.
+  takes `--retry-task` from a caller with no human. Omitted dependencies remain
+  sequential, explicit `dependsOn: []` tasks are independent, and implementation
+  cannot be skipped.
 - Preserved active operation: `/exec resume <id>` adopts or looks up that exact
   operation before retrying.
 - Operation lookup is `pending`: wait, reload if needed, then run
@@ -301,10 +305,11 @@ that detached stage.
   Prove the worker is gone with `/exec status <full-run-id>`; a run it
   classifies `abandoned` is reset and continued by `/exec resume <full-run-id>`.
 
-Budget exhaustion is a plan-run failure. Resume the plan run ID, not the child
-ID shown in pi-subagents output. Recovery raises implementation and review
-budgets where supported. A resume is idempotent for a healthy tracked child and
-reconciles it instead of creating another writer.
+Turn limits are child launch parameters, not a plan-run terminal retry cap.
+Resume the plan run ID, not the child ID shown in pi-subagents output. A resume
+is idempotent for a healthy tracked child and reconciles it instead of creating
+another writer. Automatic recovery continues with backoff while ownership is
+known or uncertain; it never launches through an unresolved operation.
 
 ## Model or provider failure
 
@@ -333,6 +338,11 @@ launching a child directly.
 
 ## Force-skip a blocked stage
 
+The statistics stage is deterministic bookkeeping by default: `statsEnabled`
+defaults to `false`, so no report child is launched. An explicitly enabled
+statistics child is optional; a report failure is advisory, but an unknown
+child remains fenced and must be reconciled before any replacement.
+
 While the waiver is pending, status classifies the run
 `waiting for the stage you waived to stop` and names the one command for the
 state it observed. With a session polling the run, that command is another
@@ -351,10 +361,10 @@ Use this only after inspecting the findings and active operation:
 ```
 
 Pi asks for interactive confirmation. The controller records `skip_pending`,
-stops any tracked Bridge/Fusion child, and waits for terminal provider evidence
-before it advances. Do not retry, start, or manually stop a child while that
-state is pending. A skipped review/finalize/stats stage is visibly audited,
-known findings remain unresolved, and the final run becomes
+stops any tracked Bridge, Fusion, or Revmux child, and waits for terminal
+provider evidence before it advances. Do not retry, start, or manually stop a
+child while that state is pending. A skipped review/finalize/stats stage is
+visibly audited, known findings remain unresolved, and the final run becomes
 `completed_with_findings`. Implementation and archive cannot be skipped.
 
 ## Cancel pending or failed cancellation
@@ -442,17 +452,27 @@ child is live.
 
 ## Provider or command unavailable
 
-If `/exec` reports missing Bridge, Fusion, pi-subagents, or pi-tasks:
+If `/exec` reports missing or incompatible Bridge, Fusion, Revmux,
+pi-subagents, or pi-tasks:
 
 1. Run `/exec status`. It names each missing or incompatible package and prints
    the install commands above the run list.
-2. Install the reported compatible packages.
+2. Install the reported packages or select an explicitly supported backend.
 3. Run `/reload`.
 4. Run `/exec status` and `/exec status <full-run-id>`.
 5. Run `/exec resume <full-run-id>`. It takes over a lease left by a session
    that is provably gone; nothing else is needed for that.
 
 Installation and reload do not advance the run.
+
+The current implementation draft is validated against exact dependency feature
+commits and linked PRs recorded in [runtime contracts](../../../docs/runtime-contracts.md)
+and the [active implementation plan](../../../docs/plans/2026-09-21-autonomous-execution.md).
+The tested native, Bridge, Fusion, and Revmux runtimes expose only POSIX
+process-group ownership with escaped descendants unverified, so strict preflight
+refuses actual launches before spawn. Nonempty local checks and bootstrap are
+refused for the same reason. Do not treat the latest npm release or the pinned
+draft dependencies as a fully working production runtime.
 
 If `/exec` itself is missing after reload, inspect `pi list` and the Pi package
 configuration. Restore the package before touching the preserved run.

@@ -13,18 +13,32 @@ contracts and component ownership.
 - A Git repository with a non-detached `HEAD`.
 - A plan file inside that repository. When using an existing linked worktree,
   the plan must be inside that selected worktree.
-- These independently installed Pi packages, at compatible versions. Use
-  `pi-subagents` 0.60.x and `@tintinweb/pi-tasks` 0.9.x. Use the latest Bridge;
-  v2 durable-operation and process-terminal capabilities enable automatic proof,
-  while v1 remains safe but cannot prove a missing launch is gone:
+- These independently installed Pi packages, with the runtime capabilities
+  described in [runtime contracts](runtime-contracts.md):
   - `pi-subagents`;
   - `@tintinweb/pi-tasks`;
   - `@alexeiled/pi-subagents-bridge`;
-  - optional `@alexeiled/pi-fusion` for the preferred Fusion review provider;
+  - optional `@alexeiled/pi-fusion` when Fusion is selected as the review backend;
+  - optional Revmux executable when Revmux is selected as the review backend;
   - `@alexeiled/pi-plan-exec`.
+
+The branch is validated against exact dependency feature commits recorded in
+the [active implementation plan](plans/2026-09-21-autonomous-execution.md),
+with linked dependency PRs in [runtime contracts](runtime-contracts.md). Do
+not substitute the latest npm package and assume the autonomous runtime is
+supported.
 
 `pi-plan-exec` uses pi-subagents’ built-in `worker` and `reviewer` agents. It
 does not require cc-thingz agents.
+
+This branch is an incomplete implementation draft. The strict autonomous
+controller requires an explicit lifetime and an owned-process-tree capability.
+The tested native, Bridge, Fusion, and Revmux runtimes expose only POSIX
+process-group ownership with escaped descendants unverified, so production
+preflight rejects them before dispatch. Local nonempty bootstrap and required
+check commands are also refused for the same reason. See
+[runtime contracts](runtime-contracts.md) for the exact limitation and linked
+dependency PRs.
 
 ## Install
 
@@ -41,6 +55,26 @@ Reload Pi after installing:
 ```text
 /reload
 ```
+
+The frozen run defaults are explicit: `{ "mode": "unbounded" }` execution
+lifetime, one required `subagent` reviewer, and an empty fallback list (`none`).
+Use a repository `.pi/plan-exec.json` to select a bounded compatibility lifetime
+or another review backend deliberately. A bounded lifetime must include a
+positive `timeoutMs`; `reviewFallback` must list each allowed backend explicitly.
+The selection is frozen into `run.json` when the run starts.
+
+```json
+{
+  "executionLifetime": { "mode": "bounded", "timeoutMs": 1800000 },
+  "reviewBackend": "fusion",
+  "reviewFallback": [],
+  "statsEnabled": false
+}
+```
+
+Production admission still requires an owned-process-tree capability from the
+selected runtime. The current tested POSIX group implementations are rejected
+before dispatch; see [runtime contracts](runtime-contracts.md).
 
 ## Prepare a goal
 
@@ -92,6 +126,15 @@ Optional context is allowed before, between, and inside task sections.
 - [ ] Run the relevant documentation checks.
 ```
 
+To make Task 2 independent of Task 1, declare that choice explicitly:
+
+```markdown
+### Task 2: Document the behavior
+dependsOn: []
+
+- [ ] Add the user-facing documentation.
+```
+
 The parser accepts a small set of heading-based formats. The original format
 remains supported:
 
@@ -113,7 +156,12 @@ Lightweight variants are also accepted:
 `Task` and `Iteration` headings keep their existing numbering rule. They must
 start at `1` and be consecutive. Other supported labels are normalized to
 execution order, so `P0` becomes the first runtime task and `P1` the second.
-Each task needs one or more ordinary GFM-style checkbox items. These list
+Each task may declare dependencies immediately below its heading. Omit
+`dependsOn` to retain legacy sequential ordering; use `dependsOn: []` for an
+independent task, or list only earlier task IDs such as `dependsOn: [1, 2]`.
+Dependencies must be valid JSON and cannot contain duplicates. A task becomes
+ready only after all listed tasks are accepted. Each task needs one or more
+ordinary GFM-style checkbox items. These list
 markers are accepted:
 
 ```text
@@ -126,25 +174,33 @@ markers are accepted:
 `[x]` and `[X]` mean checked. Nested checkbox items are treated as additional
 items in the same task. Checkboxes inside fenced code blocks are ignored.
 
-Text that is not a matching checkbox is context only. It does not create work or
-complete a task. The parser does not infer tasks from prose, tables, dependencies,
-parallelism, approvals, or special statuses. Keep the plan inside the Git
-repository. During an active run, change only checkbox markers; do not change
-headings, checkbox text, or add/remove items. A structure change pauses the run
-for review.
+Text that is not a matching checkbox or dependency declaration is context only;
+it does not create work or complete a task. The parser does not infer task
+dependencies, approvals, parallelism, or special statuses from prose or tables.
+Keep the plan inside the Git repository. During an active run, change only
+checkbox markers; do not change headings, dependency metadata, checkbox text,
+or add/remove items. A structure change pauses the run for review.
 
 ### Completion semantics
 
-A task is incomplete while it has any unchecked item. The controller starts the
-first incomplete task, then re-reads the plan after the worker finishes:
+A task is incomplete while it has any unchecked item. The controller schedules a
+ready task, then re-reads the plan after the worker finishes:
 
 - `[ ]` means pending work.
 - `[x]` or `[X]` means completed work.
 - A worker’s chat summary does **not** complete a task.
-- Checking every item in a task advances to the next numbered task.
+- Checking every item in a task makes its committed candidate eligible for
+  acceptance; dependent tasks wait until that acceptance is recorded.
+- Independent ready tasks can use a clean lane based on the last accepted
+  commit. A failed task's partial work remains in its preserved lane.
 - Changing task structure during a run pauses the run for review. Restore the
   original structure, or use interactive `/exec resume` to explicitly adopt the
   current structure before continuing.
+
+Completion acceptance also requires the candidate commit to descend from the
+accepted baseline, pass the frozen required checks captured at run creation,
+leave no uncommitted tracked source changes, and contain the completed plan
+checkboxes. The worker's response alone never accepts a task.
 
 Write concrete, verifiable items. Each item should name an outcome and, where
 possible, its verification. Avoid broad items such as “finish feature” that
@@ -314,17 +370,17 @@ absence of a signal as health. Every in-flight situation reads differently:
   activity, and the observation that carried it is recent enough that something
   is still polling this run. Wait for it.
 - `running, but nothing proves the worker is alive` — nothing reports what the
-  worker is doing, so it is neither confirmed alive nor confirmed dead. An
-  activity value that no session has refreshed for 30 seconds counts as nothing
-  reported: it froze when its owner died. Re-check later — and when the lease is
-  dead too, nothing is polling, so the wait is unbounded and `/exec stop` is the
-  arm that ends it. Do not start a second run.
-- `running longer than its budget allows` — the run has claimed an active worker
-  past a wall-clock bound derived from that stage's own turn budget (75 turns
-  for an implementation worker, 30 for a reviewer or the statistics pass) times
-  a per-turn allowance of 2 minutes. The allowance is a deliberately generous
-  placeholder pending measurement across real runs. It is a prompt to look,
-  never proof of a stall.
+  worker is doing, so it is neither confirmed alive nor confirmed dead. Re-check
+  later; a missing or stale signal is never permission to start a second run.
+  When the lease is dead too, nothing is polling, so use `/exec stop` if the
+  operator wants to end the run.
+- `running with no recent observation` — the default execution lifetime has no
+  wall-clock deadline. Status reports the last observation and schedules the
+  next provider probe; silence is diagnostic evidence, never proof that the
+  child exited. Use `/exec stop` when the user wants to end it.
+- Some status views may additionally report `running longer than its budget
+  allows`. This is an attention hint from the child turn budget; it does not
+  stop the operation, consume a retry, or authorize a replacement.
 - `the worker is gone, so nothing is running` — checked at the moment status
   ran: the directory the worker was writing to is absent, or the bridge has no
   record of its operation. `/exec resume` clears the dead worker and continues
@@ -360,9 +416,10 @@ you to wait is only ever printed when nothing proved the worker gone — decisiv
 evidence outranks a pending waiver, a pending stop, and an unreachable provider
 alike.
 
-A run spawned in workflow mode reports no trustworthy per-turn activity, so
-elapsed time is the only bound available for it. That limit is upstream and
-temporary: `nicobailon/pi-subagents#920`.
+The default unbounded lifetime has no controller wall-clock deadline. A bounded
+compatibility lifetime is only used when selected explicitly in the frozen run
+configuration. Neither silence nor an observation-failure counter authorizes a
+replacement while ownership is uncertain.
 
 A lease is live only when its heartbeat is fresh and — on this host, where the
 pid means something — that process still exists. Whose session ID is on it never
@@ -393,26 +450,25 @@ stale and resume as usual.
 ### Recovering a failure
 
 After repeated provider-observation failures, plan-exec records the failure
-without discarding the external operation ID. A failed run preserves its
-worktree and remains visible in `/exec status` and the projected task
-description. `/exec resume` reconciles that known operation before retrying the
-stage; it does not create a duplicate worker. If the provider has no record of an
-operation whose launch outcome is unknown, plan-exec stops rather than guessing
-and creating a duplicate worker. Legacy runs stopped by a plan structure mismatch
-can be resumed interactively after confirming the current structure. The first
-resume may only transition a legacy mismatch to `paused`; status explains that a
-second interactive resume is required after review. An explicit `/exec resume`
-retries a no-progress implementation task in the preserved worktree. A run
-reading `a task is blocked by something outside this run` or `paused for a task
-blocker` asks for confirmation before retrying; implementation still cannot be skipped.
+without discarding the external operation ID and schedules another probe with
+backoff. A failed run preserves its worktree and remains visible in `/exec
+status` and the projected task description. `/exec resume` reconciles that
+known operation before retrying the stage; it does not create a duplicate
+worker. If the provider has no record of an operation whose launch outcome is
+unknown, plan-exec stops rather than guessing and creating a duplicate worker.
+Legacy runs stopped by a plan structure mismatch can be resumed interactively
+after confirming the current structure. The first resume may only transition a
+legacy mismatch to `paused`; status explains that a second interactive resume
+is required after review. An explicit `/exec resume` retries a no-progress
+implementation task in the preserved worktree.
 
 When a worker returns `<<<RALPHEX:TASK_FAILED>>>` with incomplete checkboxes,
-the controller pauses with the reported reason and stops automatic retries.
-The same run, worktree, completed tasks, and failed operation identity survive
-reload. Resolve the prerequisite, then use `/exec resume <full-run-id>` and
-confirm. Scripted callers use `--retry-task` after operator confirmation, not
-in a retry loop. A completed workflow receipt is not evidence that the task
-succeeded, and retrying does not waive required approvals or checks.
+the controller keeps the run in automatic recovery with the reported reason and
+schedules another evidence-gathering attempt. It does not globally pause or
+terminate the run at a retry cap. The same run, worktree, accepted baseline,
+preserved partial lane, completed tasks, and failed operation identity survive
+reload. A completed workflow receipt is not evidence that the task succeeded,
+and recovery does not waive required approvals or checks.
 
 A run reading `stopped because the model or provider could not be used` is
 recorded separately from task progress. The controller keeps the failed child ID
@@ -423,7 +479,7 @@ it never pins later workers in the run.
 
 `/exec skip` is a last-resort waiver, not a pass. It is available only while a
 review, finalization, or statistics stage is failed, paused, or already
-skip-pending. If a Bridge/Fusion operation is tracked, the controller requests
+skip-pending. If a Bridge, Fusion, or Revmux operation is tracked, the controller requests
 stop and remains `skip_pending` until the provider proves that operation is
 terminal. The skipped stage remains visible in status and projected tasks, its
 known findings remain unresolved, and final completion is
@@ -439,9 +495,11 @@ same question in advance.
 
 ## Watching and recovering a long run
 
-The controller polls an active worker or review operation every second. It does
-not impose a wall-clock limit of its own, and it has been exercised in runs
-lasting a few hours. You do not need to keep reissuing `/exec` while it works.
+The controller polls an active worker or review operation every second. Under
+the default unbounded lifetime it does not impose a wall-clock limit of its own.
+This branch remains an incomplete implementation draft and strict runtime
+preflight refuses actual runtimes until owned-tree containment is available. You
+do not need to keep reissuing `/exec` while a supported run works.
 Use this sequence instead:
 
 1. Run `/exec status` to see every run, what each one needs, and one next command
@@ -482,14 +540,26 @@ A run:
 1. Validates the Git repository and executable-plan contract.
 2. Asks for in-place execution or worktree isolation.
 3. Creates a durable global run record and a pi-tasks projection.
-4. Runs implementation tasks in order with fresh `worker` subagents.
+4. Schedules dependency-ready implementation tasks with fresh `worker`
+   subagents. Omitted dependencies preserve sequential plans; explicit empty
+   dependencies allow independent work in a clean lane.
 5. Re-reads plan checkboxes after every worker; worker prose is not completion
-   evidence.
-6. Runs comprehensive, smells, optional Fusion (or pi-subagents fallback), and critical review/fix stages.
+   evidence. It accepts only a committed candidate that descends from the
+   accepted baseline, passes the frozen checks, and leaves the tracked tree
+   clean.
+6. Runs one required reviewer by default. Fusion or Revmux is used only when
+   selected explicitly in the frozen config; fallback defaults to `none`, and an
+   ambiguous provider start remains owned instead of being replaced.
 7. Finalizes, collects statistics, and archives the completed plan best effort.
 
-Only one writer is active in the execution worktree. Every implementation,
-review, and fix operation has fresh subagent context.
+Statistics are bookkeeping by default: `statsEnabled` defaults to `false`, so
+the controller records a deterministic usage/task summary without launching an
+additional model. Set it explicitly to request the optional report child; a
+report failure is advisory bookkeeping, while an unknown child remains fenced
+and recoverable.
+
+Only one child is active at a time, and each execution lane has one writer.
+Every implementation, review, and fix operation has fresh subagent context.
 
 ## Review results
 
@@ -507,15 +577,15 @@ Evidence: src/input.ts:17 accepts an empty value and later throws.
 Fix: Reject empty input at the boundary.
 ```
 
-Supported severities are `CRITICAL`, `MAJOR`, and `MINOR`. Fusion review requests the `plan-review-v1` output contract and consumes only
-Fusion's validated top-level `callerOutput.output`. Missing, blank, malformed,
-or mismatched caller output fails closed; `run.report` is never used as a
-fallback. If the optional Fusion provider is absent or its launch response is
-unusable, the stage falls back to the pi-subagents reviewer with the same
-operation ID.
-If known findings survive configured review caps, or any stage is force-skipped,
-the result is `completed_with_findings`. The controller does not claim that
-reviews passed.
+Supported severities are `CRITICAL`, `MAJOR`, and `MINOR`. Fusion review
+requests the `plan-review-v1` output contract and consumes only Fusion's
+validated top-level `callerOutput.output`. Revmux reports must prove complete
+source coverage and contain no unresolved questions. Missing, blank,
+malformed, or mismatched output fails closed; a partial `run.report` is never
+an approval fallback. The default fallback list is empty, so an unavailable or
+ambiguous provider operation stays recoverable under its original operation ID.
+Blocking findings keep review unmet; only adjudicated advisory findings or an
+explicit stage waiver can produce `completed_with_findings`.
 
 ## Recovery and safety
 
@@ -552,16 +622,31 @@ record itself after 7 days. Nothing in that lifecycle touches the worktree, the
 branch, or the progress log — deleting a record only gives up the ability to
 `/exec resume` or inspect that run.
 
+After Pi starts or reloads, the native controller restores unfinished runs when
+their lease is claimable. It never steals a live foreign lease or an explicit
+user pause. A tracked operation is reattached by its durable operation ID; an
+uncertain launch remains fenced until the provider proves absence or terminal
+ownership. The native widget and `/exec status` are projections of `run.json`:
+they show task counts, dependency or retry waits, next automatic action,
+verified activity, usage, selected review backend, and lifetime. A broken
+pi-tasks/Fleet projection cannot block recovery.
+
 Safety limits:
 
 - Git only; Mercurial and detached `HEAD` are rejected.
 - Dirty state is not silently copied into a worktree.
 - The execution directory and branch are checked before writer stages.
-- Implementation tasks never run in parallel.
+- The controller launches one child at a time, while dependency-ready tasks may
+  use separate lanes; an unfinished task's partial lane is preserved.
 - Finalization, statistics, and plan archival are best effort.
 
-The package is experimental. Use disposable repositories or reviewable
-worktrees until it has seen more production plan runs.
+The package is an incomplete implementation draft. Native, Bridge, Fusion, and
+Revmux process ownership currently exposes only POSIX process groups with
+escaped descendants unverified, so strict preflight refuses actual production
+runtimes before spawn. Nonempty local bootstrap and required-check commands are
+also refused. Use [runtime contracts](runtime-contracts.md) for the exact
+limitation and dependency PR links; do not treat the latest npm package as a
+fully working autonomous runtime.
 
 For local setup, validation, and tag-driven releases, see
 [DEVELOPMENT.md](../DEVELOPMENT.md).

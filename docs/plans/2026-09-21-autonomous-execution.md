@@ -1,6 +1,6 @@
 # Autonomous plan execution
 
-Status: implementation in progress
+Status: implementation in progress; strict runtime ownership is blocked
 
 Baseline: `0f184ec80754683772b081ef41e6a22a6b8fdb27` (`origin/main`).
 
@@ -22,7 +22,7 @@ dependsOn: []
 - [x] Install locked dependencies and record fresh baseline checks.
 - [x] Verify current dependency source versions and exact runtime APIs.
 - [ ] Implement explicit lifetime propagation, effective capability, durable launch reconciliation, cancellation fences and truthful child exit in dependency source worktrees where needed.
-- [ ] Pin reproducible dependency commits and prepare linked dependency PRs.
+- [x] Pin reproducible dependency commits and prepare linked dependency PRs.
 - [ ] Test actual adapter boundaries, lost replies, restart, stop races and absence of hidden elapsed timers.
 
 ## Task 2: Automatic controller recovery
@@ -83,7 +83,18 @@ dependsOn: [5]
 - Ownership follow-up: local verification/bootstrap commands need durable identity and reconciliation across Pi process death. An ephemeral per-command runner is being implemented; this is not a new always-running service.
 - Native workflow completion must attest closed dispatch plus strict proofs from all detached children. The workflow lives inside Pi, so pretending its host process exited is forbidden.
 - Revmux dependency commit `5fbd8a6670d1102d613561a504bec66b3258a97d` demonstrates scoped process-group proof and the escaped-descendant limitation. The main adapter rejects that scope. It cannot yet satisfy the full owned-tree guarantee and must not be represented as a successful supported review.
+- Independent review reproduced the same escaped-descendant gap in local checks and the native runtime process-group tracker. Production admission must require explicit owned-tree containment; group-only observations are diagnostic. Local nonempty check/bootstrap batches are refused before launch. See [runtime contracts](../runtime-contracts.md).
+- Independent review also identified artifact-only recovery bypass, candidate-controlled check discovery, a cancellation-journal crash window and cross-session stop routing. Fixes are being tested, not assumed complete.
+- First integrated main test run: 350 tests, 285 passed and 65 failed. Failures are in legacy controller and UI expectations after ownership/acceptance changes; owners are updating fixtures and investigating real regressions. Typecheck and npm package validation passed at this checkpoint. A fresh final run is still mandatory.
+- Main draft PR: https://github.com/alexei-led/pi-plan-exec/pull/8. Revmux dependency draft: https://github.com/umputun/revmux/pull/35. No PR is ready and no plan archival is authorized by these checkpoints.
+- Dependency pins: native `7a9f03a97c19468f92a9ec78551955da9ef580a7` ([PR 2376](https://github.com/nicobailon/pi-subagents/pull/2376)); Bridge `544f911571ec4552dcc71d5ce548175f1ad7f612` ([PR 2](https://github.com/alexei-led/pi-subagents-bridge/pull/2)); Fusion `766f8bc3c2d39a8e440c11d6e806bd8a45a54887` ([PR 12](https://github.com/alexei-led/pi-fusion/pull/12)). Main package and lockfile use immutable Git refs and Pi SDK 0.86.1.
+- Native final checks: 3287 unit tests passed / 12 skipped; 1067 integration tests passed / 7 skipped; typecheck and package build passed. New lint diagnostics are zero; existing legacy lint diagnostics remain and are not reported as a clean global lint run.
+- Bridge final checks: 61 tests, typecheck, lint, pack, actual native boundary smoke, actionlint, zizmor and remote CI passed. Fusion final checks: 233 unit + 90 integration + 1 E2E, typecheck, lint and pack passed.
+- Main cold-cache `npm ci --ignore-scripts` passed with npm 12.0.2 and project-scoped `allow-git=root`. CI explicitly selects npm 12.0.2 because npm 11.12.1 rejects normalized direct Git refs under this policy. Global npm configuration is unchanged.
+- Real Pi RPC smoke passed on the pinned SDK: extension loading, `/exec` and `/goal` registration, isolated `/exec status`, and no model dispatch. This does not imply a successful strict worker execution; admission is correctly blocked by unsupported containment.
+- Integrated main gate after fixes: `npm run test:all` passed lint, typecheck, all **364 tests** (zero failures/skips), and package validation (27 shipped files). The earlier 65 failures were resolved; they are retained above as checkpoint history, not current failures.
+- CI syntax/security checks: actionlint passed; zizmor offline mode reported no findings. The complete cumulative Revmux review is the next delivery gate.
 
 ## Next step
 
-Finish runtime contracts and cross-repository boundary tests, integrate controller acceptance and lane recovery, then run all acceptance scenarios before the cumulative Revmux development review. No task is complete merely because baseline tests passed.
+Review the complete cumulative change with Revmux and fix confirmed critical/major defects. Keep all PRs draft and this plan unarchived. Completing the original target then requires a real owned-process-tree containment backend for native workers, Revmux and local check/bootstrap commands; process-group observations cannot be promoted to that guarantee.

@@ -8,8 +8,8 @@ description: Plan, run, inspect, pause, resume, adopt, diagnose, reconcile, reti
 # Plan Execution
 
 Use `/exec` for a plan-exec workflow. The controller owns the worktree writer,
-task order, retries, recovery, and review stages. Never replace controller
-recovery with a manually launched subagent.
+dependency scheduling, retries, recovery, accepted commits, and review stages.
+Never replace controller recovery with a manually launched subagent.
 
 ## Choose the job
 
@@ -43,7 +43,12 @@ recovery with a manually launched subagent.
   judged by its heartbeat alone; wait out the 30-second heartbeat window before
   treating it as stale.
 - Recover a run `stopped because the model or provider could not be used`: `/exec resume [full-run-id]` uses the active authenticated Pi model.
-- A normal resume retries a no-progress implementation task. `paused for a task blocker` means the worker explicitly stopped with `TASK_FAILED`; it preserves the reason and does not automatically retry. Resolve the blocker before confirming resume. Both this state and `a task is blocked by something outside this run` require retry confirmation; implementation cannot be skipped.
+- A normal resume retries a no-progress implementation task. A worker that
+  reports `TASK_FAILED` with unchecked items keeps the run in automatic recovery;
+  it preserves the blocker, schedules another attempt with backoff, and does
+  not create a terminal retry cap. A task blocked by something outside this run
+  may still require explicit retry confirmation; implementation cannot be
+  skipped.
 - Stop a run and choose the outcome: `/exec stop <full-run-id>`. It asks whether
   to pause (resumable) or cancel (final, worktree preserved). It needs a human
   to answer, so an agent uses the scripted path below.
@@ -131,21 +136,25 @@ and are consecutive; lightweight labels are normalized to document order.
 
 Keep the plan inside the Git repository. The parser accepts `-`, `*`, `+`, or
 ordered list markers before `[ ]`, `[x]`, or `[X]`; it ignores fenced code blocks.
-It does not infer tasks from prose or tables. Once a run exists, change only
-checkbox markers from `[ ]` to `[x]` or `[X]`. Do not change headings, labels,
-checkbox text, or checkbox count. A structural change requires interactive
-review before resume.
+Omit `dependsOn` to retain legacy sequential ordering. Use `dependsOn: []` for
+an independent task, or a JSON array of earlier task IDs for explicit
+dependencies. It does not infer dependencies, approvals, or parallelism from
+prose or tables. Once a run exists, change only checkbox markers from `[ ]` to
+`[x]` or `[X]`. Do not change headings, labels, dependency metadata, checkbox
+text, or checkbox count. A structural change requires interactive review before
+resume.
 
 ## Review provider
 
-- Fusion is the preferred provider for the `fusion_review` stage, but it is
-  optional. The required pi-subagents bridge is the fallback reviewer.
-- If Fusion is absent, rejects a launch, or returns an unusable start response,
-  the controller launches the same review through pi-subagents instead.
-- Fallback keeps the persisted operation ID and review stage. Do not launch a
-  second provider manually; use `/exec resume` for recovery.
-- A Fusion run with a tracked external run ID is observed before any fallback;
-  do not duplicate an active review because a provider is slow.
+- The default is one required `subagent` reviewer with `reviewFallback: []`
+  (`none`).
+- Fusion and Revmux are explicit backend selections under the same lifecycle
+  and reviewed-commit contract. They are not implicit fallbacks.
+- If a fallback list is configured, it is an explicit ordered policy. A prior
+  backend must be proven not to own a live child before another backend starts.
+- An unavailable or ambiguous provider keeps the durable operation ID and review
+  stage. Do not launch a second provider manually; use `/exec resume` for
+  recovery.
 
 ## Start safely
 
@@ -158,6 +167,14 @@ against the same plan or worktree.
 Before starting, use `/exec status` to ensure the same plan is not already
 active.
 A slow or silent run is not a reason to start the plan again.
+
+After Pi starts or reloads, the native controller automatically restores an
+unfinished run when its lease is claimable. It preserves explicit user pauses,
+does not steal a live foreign lease, and reattaches durable operations by ID.
+The native widget and `/exec status` report task counts, dependency/retry waits,
+the next automatic action, verified activity, cumulative usage, selected review
+backend, and lifetime. Optional projection repair is visibility only and cannot
+gate recovery.
 
 ## Observe before controlling
 
@@ -182,7 +199,10 @@ A run without a per-turn activity signal is neither alive nor dead as far as
 plan-exec can tell, and `/exec status` says so in those words. Absence of a
 signal is not evidence that the worker died. Do not treat
 `running, but nothing proves the worker is alive` or
-`running longer than its budget allows` as permission to start a second run.
+an observation failure as permission to start a second run. The default
+unbounded lifetime has no wall-clock deadline; bounded compatibility is an
+explicit frozen choice. A status hint that a turn budget was exceeded is
+diagnostic only and never authorizes a replacement child.
 
 `/exec status` names `/exec stop <id>` because it writes for a human at a
 keyboard, and `/exec stop` asks whether to pause or to cancel. An agent has
@@ -213,13 +233,14 @@ second writer.
   active child. It verifies the same repository and records the branch change
   before resuming.
 - A normal resume resets a no-progress implementation retry and preserves the
-  sequential checkbox contract. A task blocked by something outside the run
-  needs interactive confirmation before retrying; implementation cannot be
+  dependency contract. Omitted dependencies remain sequential and explicit
+  `dependsOn: []` remains independent. A task blocked by something outside the
+  run needs interactive confirmation before retrying; implementation cannot be
   skipped.
-- A model or provider failure is different: the child is terminal, its
-  error and operation are preserved, and the implementation retry budget is not
-  consumed. Normal resume uses the current authenticated Pi model. Do not retry
-  the same unusable model repeatedly.
+- A model or provider failure is different: the child is terminal, its error
+  and operation are preserved, and recovery keeps scheduling without a global
+  terminal retry cap. Normal resume uses the current authenticated Pi model.
+  Do not retry the same unusable model repeatedly.
 - A model override applies only to the replacement child; it never pins later
   launches in this run.
 - `/exec skip` is a last-resort waiver, not a review pass. It requires an
@@ -249,11 +270,14 @@ second writer.
 ## Completion truth
 
 Plan checkboxes are implementation truth. Worker prose alone does not complete
-a task. A worker whose prerequisite cannot be satisfied leaves its checkboxes
+a task. The controller accepts a task only after its committed plan checkboxes,
+accepted-baseline ancestry, frozen required checks, and clean tracked tree are
+verified. A worker whose prerequisite cannot be satisfied leaves its checkboxes
 open and starts its final response with `<<<RALPHEX:TASK_FAILED>>>` on its own
 line, followed by `Blocker: <reason>` and `Next step: <required action>`. The
-controller pauses the same run; workflow `ok: true` is not task completion.
-Do not request repeated retries without new prerequisite evidence.
+controller preserves the partial lane and schedules automatic recovery;
+workflow `ok: true` is not task completion. Do not manually launch a replacement
+child while the operation identity is unresolved.
 Review output is either `NO_FINDINGS` or structured
 `FINDING: CRITICAL|MAJOR|MINOR | ...` records.
 
@@ -283,9 +307,16 @@ record, worktree, active-operation evidence, and approval or runtime fix needed.
 ## Prerequisites
 
 `pi-plan-exec` requires compatible installations of `pi-subagents`,
-`@tintinweb/pi-tasks`, and the latest `@alexeiled/pi-subagents-bridge`. Plan-exec uses Bridge v2 recovery proof when advertised and fails closed under v1 when proof is unavailable.
-`@alexeiled/pi-fusion` is optional; install it to use the preferred Fusion
-review provider:
-`pi install npm:@alexeiled/pi-fusion`. Run `/exec status`, install
-what it reports, run `/reload`, then return to the same run ID. Installing
-dependencies does not replace or complete the preserved run.
+`@tintinweb/pi-tasks`, and `@alexeiled/pi-subagents-bridge`; Fusion and Revmux
+are optional explicit review backends. The strict controller requires an
+explicit lifetime capability and full owned-process-tree containment. The
+tested native, Bridge, Fusion, and Revmux runtimes currently expose only POSIX
+process groups with escaped descendants unverified, so production preflight
+refuses them before spawn. Nonempty local checks and bootstrap are refused for
+the same reason. Read [runtime contracts](../../docs/runtime-contracts.md) for
+the exact limitation and dependency PR links.
+
+The development checkout and CI use npm 12.0.2 with `.npmrc` `allow-git=root`
+for pinned git dependencies. Run `/exec status`, install what it reports, run
+`/reload`, then return to the same run ID. Installing dependencies does not
+replace or complete the preserved run.
