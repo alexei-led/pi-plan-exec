@@ -200,8 +200,8 @@ ownership of subagent execution, task UI, and multi-model review.
   contracts, stages, and trust boundaries.
 - [Development](DEVELOPMENT.md) — local verification and release process.
 - [Changelog](CHANGELOG.md) — release history and compatibility changes.
-- [Original design record](docs/plans/2026-07-12-pi-plan-exec-design.md) —
-  design decisions and intended behavior.
+- [Historical design record](docs/plans/2026-07-12-pi-plan-exec-design.md) —
+  the original design before autonomous recovery.
 
 ## License
 

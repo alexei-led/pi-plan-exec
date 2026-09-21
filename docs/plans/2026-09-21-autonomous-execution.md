@@ -2,7 +2,7 @@
 
 <!-- markdownlint-disable MD013 -->
 
-Status: review corrections verified locally; CI and confirmation review pending
+Status: addressing confirmed second-round recovery gaps; final validation pending
 
 Baseline: `0f184ec80754683772b081ef41e6a22a6b8fdb27` (`origin/main`).
 
@@ -140,6 +140,17 @@ Related foreign-host guidance was corrected. The minor duplication of the immuta
 
 ## Acceptance traceability
 
+Round `03-final` completed with two of two sources and no degradation, but reported six further major findings. The plan remains active. Their integrated gate passed 485 tests and actual runtime smoke. Follow-through regressions cover crash-safe approved-plan publication and initially untracked plans before another full gate and confirmation review.
+
+| Finding | Correction and regression evidence |
+| --- | --- |
+| `adversarial-1` | Explicit pause starts cancellation recovery even for an orphaned run selected from an unrelated cwd. The command-level regression retires the old operation without another worker. |
+| `adversarial-2` | Explicit approval persists the plan snapshot, refreshes dependency edges, and prevents acceptance before newly added dependencies. Fresh lanes combine approved structure with accepted baseline checkbox facts. |
+| `adversarial-6` | A durable generation fence closes incomplete local journals before a successor can start. Independent-process races cover late old intent publication and stale callers; an empty successor batch cannot bypass retirement. |
+| `bugs+impl-1` | Read-only source plans do not reserve an entire source checkout. Actual output, preparation and retained writer lanes remain exclusive. |
+| `adversarial-3` | Fusion persists replayable preflight intent before asynchronous admission work; restart hydrates and retries the same request, while cancellation still wins. |
+| `adversarial-4` | Native dispatch arbitration distinguishes proven early rejection from uncertain launch. Independent-process crash fixtures cover bare claims, prepared operations, dispatch gates and live owners; actual Bridge no-start evidence launches no SDK session. |
+
 The scenario numbers below refer to section 13 of the approved autonomous execution design. Test presence is not a passing result; the final verification checkpoint must record the completed suites.
 
 | Scenario | Regression evidence |
@@ -166,17 +177,18 @@ The scenario numbers below refer to section 13 of the approved autonomous execut
 
 ## Verification checkpoint
 
-- Main: `npm run test:all` passed lint, TypeScript, all 462 tests (zero failures or skips), and package validation.
+- Main: `npm run test:all` passed lint, TypeScript, all 491 tests (zero failures or skips), and package validation after the plan-publication follow-through.
 - Installed-runtime smoke: passed real controller, Bridge/native RPC, no-start recovery with zero model sessions, owned workers/checks, required review, promotion and archive. Model turns are scripted.
 - Saved-session handoff: real Git preparation and the installed SDK session fork preserve cwd, parent history and stop fences. SDK source inspection locates missing-cwd validation before session teardown.
-- Native `83d0f646eceeaa9e858406afe4ba2c5f8ff5ed8a`: 3328 unit / 1082 integration passed, 14/7 skipped; typecheck, build, package and focused lint pass. Inherited legacy lint diagnostics are unchanged.
-- Bridge `34ff4291fac06ac03458b482d55637bbce11f8f4`: 72 tests, exact native boundary, typecheck, lint, package and remote CI pass.
-- Fusion `07f327d2df4d72feddc8fa5a08de74391773c8c9`: 250 unit / 105 integration / one E2E, typecheck, lint, package and remote CI pass.
+- Plan publication: actual SIGKILL and injected ENOSPC preserve the original plan. Tracked and untracked initial plans, lost publication replies, proven failure and repeated approval recover automatically under one operation identity; large content stays outside command arguments.
+- Native `e5f66f9f8811a7af8fae05f892253eba2f0b6fa5`: 3329 unit / 1090 integration passed, 14/7 skipped; typecheck, build, package and focused lint pass. Inherited legacy lint diagnostics are unchanged.
+- Bridge `5719a27e133db7e06408eb9da1e713a05a77173c`: 72 tests, exact native boundary, typecheck, lint, package and remote CI pass.
+- Fusion `eb8ab54d01c9f089c8baa1bb85e322c380603b62`: 251 unit / 112 integration / one E2E, typecheck, lint, package and remote CI pass.
 - Revmux dependency `398d8f11c13737cb26354fa963e0b347abcc916d`: formatting, build, race-enabled tests, lint and actual CLI lifetime smoke pass.
-- Development review: round `02-after-fix` was complete and non-degraded; the corrections above need final confirmation.
+- Development review: rounds `02-after-fix` and `03-final` were complete and non-degraded; the corrections above need final confirmation.
 
 Strict ownership currently requires supported macOS GUI launchd and compiler prerequisites. Strict Fusion early-agreement mode is explicitly refused. Source installation uses the documented project-local Git dependency policy. No release, global installation, persistent daemon or merge is included.
 
 ## Next step
 
-Commit and push the review corrections, verify the Linux CI run, and perform a final cumulative Revmux confirmation from the recorded baselines. Keep all PRs draft and this plan unarchived until the review passes; process-group observations cannot be promoted to owned-tree proof.
+Commit and push the verified review corrections, verify Linux CI, and perform cumulative Revmux confirmation round `04-final` from the recorded baselines. Keep all PRs draft and this plan unarchived until the review passes; process-group observations cannot be promoted to owned-tree proof.

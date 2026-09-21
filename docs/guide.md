@@ -571,7 +571,8 @@ A run:
 
 1. Validates the Git repository and executable-plan contract.
 2. Asks for in-place execution or worktree isolation.
-3. Creates a durable global run record and a pi-tasks projection.
+3. Creates a durable global run record and may create an optional pi-tasks
+   projection.
 4. Schedules dependency-ready implementation tasks with fresh `worker`
    subagents. Omitted dependencies preserve sequential plans; explicit empty
    dependencies allow independent work in a clean lane.
