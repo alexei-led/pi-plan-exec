@@ -7,12 +7,12 @@ owns plan-specific policy, durable transitions, automatic recovery, commit
 acceptance, and provider reconciliation, not model execution or task UI.
 
 This branch is an incomplete implementation draft. The strict autonomous path
-requires an explicit lifetime and an owned-process-tree capability. The tested
-native, Bridge, Fusion, and Revmux runtimes expose only POSIX process-group
-ownership with escaped descendants unverified, so production preflight rejects
-them before dispatch. Local nonempty bootstrap and required-check commands are
-also refused. See [runtime contracts](runtime-contracts.md) for the exact
-limitation and dependency PR links.
+requires the public `pi-subagents/kernel-owned-process` Darwin dependency and
+matching Bridge, Fusion, and Revmux ownership contracts. Host smoke evidence
+exists, and the native source pin is under review, but package publication is pending;
+unsupported APIs and unknown ownership remain fenced. Local bootstrap and
+required checks use the same unbounded kernel-owned executor. See [runtime
+contracts](runtime-contracts.md) for API boundaries, prerequisites, and links.
 
 ## Design goals
 
@@ -64,10 +64,10 @@ flowchart LR
     command --> controller[plan-exec controller]
     controller --> registry["global run registry"]
     controller --> projection[pi-tasks projection]
-    controller --> bridge[pi-subagents-bridge RPC]
-    bridge --> agents["pi-subagents worker / reviewer"]
+    controller --> bridge[pi-subagents-bridge direct owned single-agent RPC]
+    bridge --> agents["kernel-owned pi-subagents worker / reviewer"]
     controller --> fusion[selected Fusion or Revmux backend]
-    fusion --> panel[panel and judge]
+    fusion --> panel[structured panel and single judge]
     agents --> worktree[Git execution worktree]
     panel --> controller
     worktree --> plan[plan checkboxes]
@@ -83,10 +83,28 @@ an independent task. For an incomplete task, a leading
 `<<<RALPHEX:TASK_FAILED>>>` records the blocker and schedules automatic
 recovery while keeping the run owned. It does not create a global pause or
 terminal retry cap. Candidate acceptance requires ancestry from the accepted
-commit, the frozen required checks, and a clean tracked tree. Failed partial
-work stays in its lane; independent work starts from a prepared clean lane at
-the last accepted commit. Concurrent stop/cancel changes take precedence over a
-late output lookup.
+commit, the frozen required checks, and a clean worktree with no uncommitted or
+untracked non-ignored files. Failed partial work stays in its lane; independent
+work starts from a prepared clean lane at the last accepted commit. Concurrent
+stop/cancel changes take precedence over a late output lookup.
+When a retry observes an advanced accepted head, the controller creates a fresh
+lane from that head and carries forward only the selective recovery checkpoint;
+an old candidate is never reverified against a newer baseline.
+
+Only a worker `TASK_FAILED` response with an observed
+`Prerequisite: credentials|permission|missing_executable|runtime` and an
+`Evidence:` line creates `waiting_external`; the controller records the
+evidence and schedules an automatic wake. Generic blocker text does not infer
+an external prerequisite.
+
+For isolated runs, `outputTarget` records the original worktree, branch, initial
+head, plan path, and progress path. Once every task is accepted, the controller
+validates the accepted plan and fast-forwards that output branch from a known
+accepted ancestor only when its current head and worktree are safe. The
+promotion is durable (`pending`/`complete`), preserves user changes, and moves
+the run back to the output target before review, final verification, and
+archive. The final reviewed fast-forward is guarded against overwriting ignored
+or preserved user files.
 
 ## Source modules
 
@@ -102,7 +120,7 @@ late output lookup.
 | `src/plan.ts` | Strict Markdown plan parser and structure hash |
 | `src/scheduler.ts` | Dependency reconciliation, ready-task selection, and wake scheduling |
 | `src/lanes.ts` | Frozen required checks/bootstrap resolution and local-operation dispatch |
-| `src/local-operation.ts` | Durable local command intent, authorization fence, and process-group diagnostics |
+| `src/local-operation.ts` | Durable local command intent, authorization fence, kernel-owned command execution, and retirement proof |
 | `src/git.ts` | Repository, branch, dirty-state, common-dir, and worktree safety |
 | `src/bridge.ts` | Typed v1/v2 bridge client, capability negotiation, request digests, and proof validation |
 | `src/fusion.ts` | Typed client for `fusion:rpc:v1` |
@@ -129,6 +147,7 @@ includes:
 - status and current stage;
 - dependency-aware task states, attempts, lane paths, candidate and accepted commits;
 - stage attempt counters and scheduled next wake;
+- original output target and promotion state when isolated lanes are used;
 - active operation ID, external run ID, parameters, and result location;
 - frozen execution lifetime, required checks, bootstrap commands, review backend,
   fallback policy, and optional statistics setting;
@@ -148,13 +167,15 @@ fields existed still parse, and `assertRun` validates none of them.
 
 ### Lease liveness
 
-A stored lease is a claim, not evidence. `isLeaseLive` treats a lease as live
-when the calling session owns it; otherwise a heartbeat older than 30 seconds is
-dead, and a fresh heartbeat is live unless the lease names this host, in which
-case the recorded pid must still be running. A lease naming a different host, or
-no host at all — the shape of every record written before the field existed — has
-no pid this machine can check, so its fresh heartbeat is the only evidence
-available and it counts as live.
+A stored lease is a claim, not evidence. For an ordinary liveness check,
+`isLeaseLive` treats a lease with no hostname (the legacy record shape) as live
+only while its heartbeat is fresh. A lease naming another host is always live;
+its heartbeat is not evidence that this machine can safely take it over. A
+lease naming this host is live while its recorded pid is running; a dead local
+pid makes it stale immediately. Passing a session ID to `isLeaseLive` is an
+explicit same-session observation and returns live for that session, but
+`takeoverRefusal` also requires the current process pid and local hostname to
+match before allowing that process to reclaim the lease.
 
 `claim` stamps the host once and `heartbeat` never re-stamps it, so the name is
 frozen for the run's whole life while `os.hostname()` moves with the network.
@@ -167,11 +188,12 @@ under it. A name that is not exactly this one is treated as another machine, and
 the renamed machine that reduction was meant to help is recovered by the
 operator instead, with `--same-machine` below.
 
-A session may claim a run when no lease exists, the lease belongs to that
-session, or the prior lease is not live by that rule. A dead local pid therefore
-frees the run at once instead of after the heartbeat window. The lease controls
-cross-session ownership; compare-and-set updates and the per-run controller lock
-serialize same-session reload instances.
+A session may claim a run when no lease exists, the current process is the
+recorded local owner, or the prior lease is not live by the rules above. A dead
+local pid therefore frees the run at once instead of after the heartbeat
+window. A matching session string from a different process is not enough to
+take over. The lease controls cross-session ownership; compare-and-set updates
+and the per-run controller lock serialize same-session reload instances.
 
 Claiming is not the only consumer: the same predicate answers whether a run is
 safe to remove, and it is one third of the abandonment conjunction, so ownership,
@@ -214,15 +236,16 @@ rethrown rather than answered with a recursive delete.
 ### Abandonment
 
 A run is `abandoned` only on the full conjunction: an in-flight status, a lease
-that is not live, and either a v2 bridge `processTerminal` proof with
-`state: observed` for the matching native run ID, or a v2 healthy durable lookup
-that proves an unbound operation is absent. Missing bridge memory, a missing
-`asyncDir`, v1 `absent`, and `pending`/`unknown` proof are inconclusive. They are
-reported as `recovery_required`/`unknown_launch` and never trigger a duplicate
-worker. Reconciliation clears the operation only after proof, records a `failed`
-status naming the evidence, stamps `reconciledAt`, appends the reason to the
-progress log, and leaves `taskAttempts` untouched — the worker never ran.
-Recovery is then the ordinary `/exec resume` path.
+that is not live, and either a matching owned-tree `processTerminal` proof with
+`state: observed`, an authoritative never-started fence, or a v2 healthy durable
+lookup that proves an unbound operation is absent. Missing bridge memory, a
+missing `asyncDir`, v1 `absent`, and `pending`/`unknown` proof are inconclusive.
+They are reported as `recovery_required`/`unknown_launch` and never trigger a
+duplicate worker. Reconciliation records the evidence without clearing or
+replacing the operation, candidate, or saved result identity, stamps
+`reconciledAt`, appends the reason to the progress log, and leaves
+`taskAttempts` untouched — the worker never ran. Recovery is then the ordinary
+`/exec resume` path.
 
 One function maps a run and its evidence to a verdict and exactly one next
 command. The sweep row, the settled row, the detail view, and the refusal the
@@ -243,23 +266,18 @@ session polls — the instant that stops being true is the instant the question
 matters. Evidence measured here is also discarded for a run whose lease names
 another host: its directory and its bridge are on that machine, and an absence
 observed locally would be an absence of the wrong thing. Any rename at all is
-indistinguishable from a genuinely foreign host, so nothing observable can
-settle such a run and it would stay `ambiguous` forever. The
-operator breaks that tie: `/exec resume <id> --same-machine` asserts that the
-frozen name was this machine, unblocks the local checks, and changes nothing
-else — the abandonment conjunction still decides, so a worker still writing here
-keeps the run `ambiguous` and resume still refuses. Only the probe reads the
-asserted host; lease liveness keeps reading the stored lease, so a beating
-heartbeat still reads `live` whichever machine stamped it. The assertion is
-never written back; the reset's own `claim` re-stamps the current host. It is
-refused on a run this machine can already observe, refused while the lease is
-still beating, and `/exec doctor --reconcile` has no equivalent: a
-registry-wide host assertion would speak for every run at once.
+treated as a foreign host until the operator supplies `/exec resume <id> --same-machine`;
+the flag asserts that the frozen name was this machine, creates a temporary local
+view for the probe and abandonment decision, and changes nothing in
+the durable lease. A worker still writing here keeps the run live; decisive
+local evidence permits the normal reset and claim, which stamps the current
+host. `/exec doctor --reconcile` has no equivalent because a registry-wide host
+assertion would speak for every run at once.
 
 One writer performs every reset, so both callers inherit its exclusions.
-A `cancel_pending` run is never reset however dead its worker: `failed` would
-erase the stop the operator asked for, and the next resume would restart plan
-work instead of finishing the cancellation. `/exec resume <id>` reconciles the
+A `cancel_pending` run is never reconciled however dead its worker: changing
+its recovery state would erase the stop the operator asked for, and the next
+resume could restart plan work instead of finishing the cancellation. `/exec resume <id>` reconciles the
 single run it recovers; the registry-wide sweep behind `/exec doctor
 --reconcile` is dispatched as a write command and is unreachable from any read.
 
@@ -270,19 +288,25 @@ External starts follow this order:
 1. Generate a durable operation ID and canonical request digest.
 2. Persist operation intent, replay parameters, digest, and `mission: false`.
 3. Admit the selected runtime only when it advertises the frozen explicit
-   lifetime and full owned-process-tree capability. The tested native, Bridge,
-   Fusion, and Revmux POSIX group runtimes fail this preflight before spawn.
-   Once a compatible runtime exists, call Bridge with the v2 owner DTO when
-   advertised, or the v1-compatible DTO; v1 recovery fails closed when it
-   cannot prove a launch outcome.
+   lifetime and full owned-process-tree capability. Native, Bridge, Fusion, and
+   Revmux paths use the kernel-owned boundary; missing public APIs, unsupported
+   capabilities, or unknown ownership fail closed before spawn. Once a
+   compatible Bridge exists, call it with the v2 owner DTO; v1 recovery fails
+   closed when it cannot prove a launch outcome.
 4. Persist the returned external run ID.
+
+The plan-exec caller digest, provider/native operation digest, and kernel binding
+digest are separate namespaces. Terminal evidence must bind all required layers
+to the same operation; no caller digest is accepted as a kernel retirement proof.
+Local checks and bootstrap use the kernel-owned operation directly with an
+unbounded lifetime, durable grants, and user stop generation.
 
 Each plan run is also exposed as exactly one `pi-subagents` external-runs row and
 one background-work provider. Reload reconciliation uses `run.json`, replaces
 only this extension's registrations, and never creates native child rows.
-Pi-tasks remains a rebuildable cache: owned tasks carry the plan owner, run ID,
-key, revision, status, and projection version. Scope, path, and the installed
-`pi-tasks` 0.9.x version are checked exactly. A failed repair records visible
+Pi-tasks remains an optional rebuildable cache: owned tasks carry the plan
+owner, run ID, key, revision, status, and projection version. When present, its
+scope, path, and package version are checked. A failed repair records visible
 degraded projection state while the controller continues.
 
 Startup restores an unfinished run when its lease is claimable, preserving an
@@ -290,8 +314,10 @@ explicit user pause and refusing a live foreign lease. The native widget and
 status render durable task counts, dependency/retry waits, next automatic
 action, verified activity, usage, review backend, and lifetime. These are
 projections of `run.json`; optional pi-tasks/Fleet visibility cannot gate
-controller recovery. Statistics default to a deterministic usage/task summary;
-an optional report child is enabled only by frozen `statsEnabled`.
+controller recovery. Projection writes coalesce one in-flight update plus the
+latest pending snapshot, and a cold technical prerequisite cannot discard an
+authorized start. Statistics default to a deterministic usage/task summary; an
+optional report child is enabled only by frozen `statsEnabled`.
 
 If Pi stops between steps 2 and 4, or a start reply times out or is malformed,
 recovery reconciles the same operation ID. The Bridge reports an operation as
@@ -329,9 +355,11 @@ explicit empty dependencies are independent. The default configuration enables
 one required `subagent` reviewer with `reviewFallback: []` (`none`). Fusion and
 Revmux are explicit backend selections under the same review lifecycle. Review
 stage names remain in the schema for compatibility with older run records, but
-the selected backend controls the active review path. Blocking findings remain
-unmet and schedule recovery; only adjudicated advisory findings or an explicit
-waiver can produce `completed_with_findings`.
+the selected backend controls the active review path. CRITICAL and MAJOR
+findings remain unmet and schedule recovery. MINOR-only advisory findings may
+be recorded as unresolved while the reviewed commit advances, producing
+`completed_with_findings`; an explicit waiver has the same terminal status and
+is audited.
 
 ## Cancellation, pause, and force-skip
 
@@ -339,8 +367,8 @@ waiver can produce `completed_with_findings`.
 still take, asks even when one remains, and refuses without a UI; the two
 outcomes below are also the non-interactive entry points.
 
-- `pause` allows the active external operation to finish, then removes it without
-  advancing the stage.
+- `pause` cancels the current attempt, waits for native or local cleanup proof,
+  and preserves the stage, checkpoint, progress, and resumability.
 - `cancel` requests Bridge, Fusion, Revmux, or local-operation stop when
   possible, keeps polling through `cancel_pending`, retries provider errors
   without discarding operation state, and ends at `cancelled` only after the
@@ -350,11 +378,12 @@ outcomes below are also the non-interactive entry points.
   is recorded explicitly before resuming. Interactive `resume` asks for it when
   the run's error is an execution-branch mismatch and nothing is tracked;
   `--adopt-current-branch` answers the same question for a caller with no human.
-- `skip` is an interactive, auditable waiver for review, finalization, and
-  statistics only. It first persists `skip_pending`, then stops and terminally
+- `skip` is an interactive, auditable waiver for optional review, finalization,
+  and statistics only. Required review and final verification cannot be
+  skipped. It first persists `skip_pending`, then stops and terminally
   reconciles any tracked operation before clearing it and advancing exactly one
   stage. Skipped stages retain current findings as unresolved and cause
-  `completed_with_findings`; implementation and archive are not skippable.
+  `completed_with_findings`; implementation and archive are never skippable.
 
 The background loop serializes ticks per run. It temporarily hides active tools
 from the main agent so projected pi-tasks rows are not interpreted as a second
@@ -376,10 +405,14 @@ Untrusted boundaries are validated at entry:
 - Reviewer output must be `NO_FINDINGS` or structured findings.
 - Runtime admission requires explicit lifetime support and
   `scope: "owned-process-tree"` with `escapedDescendants: "contained"`.
-  POSIX process-group observations are diagnostic only. Local nonempty check or
-  bootstrap batches fail closed before launch until the same containment proof
-  is available.
+  POSIX process-group observations are diagnostic only. Unknown native module,
+  kernel binding, or retirement evidence fails closed. Local checks and
+  bootstrap use the kernel-owned path with unbounded user-stoppable lifetime.
 - Git common-directory and branch checks protect writer stages.
+- Controller Git writes for worktree creation, task checkpoints, output
+  promotion, and archive use durable owned commands with workspace-safe
+  environment injection. Observations disable fsmonitor and optional index
+  writes so Git state cannot be silently synthesized by a cache.
 - `src/types.ts` owns persisted run/status/stage/operation constants. ESLint
   rejects raw domain values in control-flow comparisons and non-trivial magic
   numbers in runtime source, keeping state-machine changes reviewable.

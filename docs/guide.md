@@ -16,7 +16,7 @@ contracts and component ownership.
 - These independently installed Pi packages, with the runtime capabilities
   described in [runtime contracts](runtime-contracts.md):
   - `pi-subagents`;
-  - `@tintinweb/pi-tasks`;
+  - optional `@tintinweb/pi-tasks` projection cache;
   - `@alexeiled/pi-subagents-bridge`;
   - optional `@alexeiled/pi-fusion` when Fusion is selected as the review backend;
   - optional Revmux executable when Revmux is selected as the review backend;
@@ -24,31 +24,30 @@ contracts and component ownership.
 
 The branch is validated against exact dependency feature commits recorded in
 the [active implementation plan](plans/2026-09-21-autonomous-execution.md),
-with linked dependency PRs in [runtime contracts](runtime-contracts.md). Do
-not substitute the latest npm package and assume the autonomous runtime is
-supported.
+with linked dependency PRs in [runtime contracts](runtime-contracts.md). The
+pre-release setup uses npm 12.0.2 and project-local Git settings for transitive
+refs.
 
 `pi-plan-exec` uses pi-subagents’ built-in `worker` and `reviewer` agents. It
 does not require cc-thingz agents.
 
-This branch is an incomplete implementation draft. The strict autonomous
-controller requires an explicit lifetime and an owned-process-tree capability.
-The tested native, Bridge, Fusion, and Revmux runtimes expose only POSIX
-process-group ownership with escaped descendants unverified, so production
-preflight rejects them before dispatch. Local nonempty bootstrap and required
-check commands are also refused for the same reason. See
-[runtime contracts](runtime-contracts.md) for the exact limitation and linked
-dependency PRs.
+This branch is an incomplete implementation draft. Strict autonomous execution
+requires the public `pi-subagents/kernel-owned-process` Darwin dependency plus
+matching Bridge, Fusion, and Revmux ownership contracts. Host smoke evidence
+exists, and the native source pin is under review, but package publication is
+still pending; unsupported APIs and unknown ownership remain fenced. Local bootstrap
+and required checks use the same unbounded kernel-owned executor and remain
+unavailable when that dependency is missing. See [runtime contracts](runtime-contracts.md)
+for prerequisites, API boundaries, and linked dependency PRs.
 
 ## Install
 
-```bash
-pi install npm:pi-subagents
-pi install npm:@tintinweb/pi-tasks
-pi install npm:@alexeiled/pi-subagents-bridge
-pi install npm:@alexeiled/pi-fusion
-pi install npm:@alexeiled/pi-plan-exec
-```
+Use a project-local source checkout with the exact Git refs listed in
+[runtime contracts](runtime-contracts.md). The public native dependency is not
+available as a published npm runtime yet, and pi-tasks is an optional projection
+cache. Do not install the latest packages and assume that they expose the
+required ownership APIs. Preserve the project-local `.npmrc` policy; do not
+change global npm configuration.
 
 Reload Pi after installing:
 
@@ -73,8 +72,22 @@ The selection is frozen into `run.json` when the run starts.
 ```
 
 Production admission still requires an owned-process-tree capability from the
-selected runtime. The current tested POSIX group implementations are rejected
-before dispatch; see [runtime contracts](runtime-contracts.md).
+selected runtime. The exact native dependency and Darwin prerequisites are not
+yet published as a supported npm installation; see [runtime contracts](runtime-contracts.md).
+
+Local bootstrap and required checks always use an unbounded, user-stoppable
+kernel-owned operation. A run configured with bounded compatibility lifetime
+does not impose that bounded timer on local commands. Success or failure is
+accepted only after the kernel reports retirement for the matching durable
+binding; unknown or malformed ownership remains fenced.
+
+For a bounded worker or review operation, the controller adapts only after
+confirmed `execution_lifetime_expired`, full retirement proof, and recent
+verified model/tool progress: it doubles the next bounded timeout up to the
+native timer maximum and changes the continuation strategy. The frozen base
+remains unchanged. Heartbeats, silence, unknown results, wrapper exits,
+cancellation acknowledgements, and process-group snapshots do not count as
+progress or expiry.
 
 ## Prepare a goal
 
@@ -199,8 +212,9 @@ ready task, then re-reads the plan after the worker finishes:
 
 Completion acceptance also requires the candidate commit to descend from the
 accepted baseline, pass the frozen required checks captured at run creation,
-leave no uncommitted tracked source changes, and contain the completed plan
-checkboxes. The worker's response alone never accepts a task.
+leave a clean worktree with no uncommitted or untracked non-ignored files, and
+contain the completed plan checkboxes. The worker's response alone never
+accepts a task.
 
 Write concrete, verifiable items. Each item should name an outcome and, where
 possible, its verification. Avoid broad items such as “finish feature” that
@@ -297,12 +311,12 @@ full ID is always in front of you.
 /exec --worktree <path> <plan>  Use an existing worktree and its current branch
 /exec status [run-id]   No run ID: every run grouped by what it needs, any missing package, and one next command per run. With a run ID: that run in detail
 /exec resume [run-id] [--model current|provider/model]
-                        Continue a stuck run: take the lease over from a dead session, reset a run whose worker is provably gone, retry a failure in the same stage and worktree
+                        Continue a stuck run: take over a dead session's lease, reconcile a provably gone worker, retry a failure in the same stage and worktree
 /exec stop [run-id]     Ask whether to pause the run (resumable) or cancel it (final, worktree preserved)
 /exec cleanup [full-run-id] [--apply]
                         Preview retired runs older than 7 days; --apply deletes their registry entries only
 /exec skip <full-run-id> --reason <text>
-                        Stop the tracked child, waive a blocked review/finalize/stats stage, and continue
+                        Stop the tracked child, waive an optional review/finalize/stats stage, and continue
 /exec help              Show this list
 ```
 
@@ -347,11 +361,13 @@ only when a package is missing, `/exec adopt` means `/exec resume`, and
 `/exec start` was deleted outright: it was the same code path as bare `/exec`,
 and typing it now says so instead of reading the word as a plan path.
 
-One retired flag writes: `/exec doctor --reconcile` resets **every** provably
-abandoned run in the registry to a recoverable `failed`, launching nothing. It
-is dispatched as a write command, so no read path can reach it. `/exec resume
-<full-run-id>` performs the same reset for the one run it is recovering, which
-is the scoped answer to prefer.
+One retired flag writes: `/exec doctor --reconcile` reconciles **every**
+provably abandoned run in the registry without launching a worker or creating a
+new operation. It preserves each existing operation, candidate, and saved
+result identity, records the evidence, and leaves the run ready for the normal
+recovery path. It is dispatched as a write command, so no read path can reach
+it. `/exec resume <full-run-id>` performs the same reconciliation for one run,
+which is the scoped answer to prefer.
 
 ### Following a run in flight
 
@@ -374,16 +390,17 @@ absence of a signal as health. Every in-flight situation reads differently:
   later; a missing or stale signal is never permission to start a second run.
   When the lease is dead too, nothing is polling, so use `/exec stop` if the
   operator wants to end the run.
-- `running with no recent observation` — the default execution lifetime has no
-  wall-clock deadline. Status reports the last observation and schedules the
-  next provider probe; silence is diagnostic evidence, never proof that the
-  child exited. Use `/exec stop` when the user wants to end it.
-- Some status views may additionally report `running longer than its budget
-  allows`. This is an attention hint from the child turn budget; it does not
-  stop the operation, consume a retry, or authorize a replacement.
+- `running longer than its budget allows` — only an explicitly bounded
+  `executionLifetime` can produce this classification. It means the configured
+  `timeoutMs` has passed; there is no synthetic per-turn allowance. Unbounded
+  runs never receive this classification and have no wall-clock deadline. The
+  bounded classification is diagnostic only and does not authorize a
+  replacement; use `/exec stop` when the user wants to end the run.
 - `the worker is gone, so nothing is running` — checked at the moment status
-  ran: the directory the worker was writing to is absent, or the bridge has no
-  record of its operation. `/exec resume` clears the dead worker and continues
+  ran: a matching owned-process-tree terminal proof covers the bound external
+  run, or an authoritative never-started fence or durable `absent` lookup covers
+  an unbound launch. A missing directory or bridge record alone is inconclusive;
+  `/exec resume` clears the worker only after decisive evidence and continues
   without starting a second one.
 - `the worker is gone, so the waived stage cannot finish` — the same evidence on
   a run whose waiver is still pending. Nothing is left to stop, so the run
@@ -421,13 +438,14 @@ compatibility lifetime is only used when selected explicitly in the frozen run
 configuration. Neither silence nor an observation-failure counter authorizes a
 replacement while ownership is uncertain.
 
-A lease is live only when its heartbeat is fresh and — on this host, where the
-pid means something — that process still exists. Whose session ID is on it never
-enters that answer for status, the sweep, or the resume gate; only re-claiming a
-run reads the name, so a session can renew its own lease. A lease whose pid is
-dead on this host is stale at once, so `/exec resume` takes the run over with no
-wait, including when the dead lease names the caller. A lease recorded before
-the hostname field existed is judged by its 30-second heartbeat window alone.
+A lease's liveness depends on its frozen hostname. A lease naming this host is
+live while its recorded pid is running, and a dead local pid is stale
+immediately. A lease naming another host is always live because local evidence
+cannot speak for that worker. Legacy leases without a hostname use their
+heartbeat freshness as the only available evidence. A matching session ID is
+not enough for takeover from another process: the reclaiming process must also
+match the recorded pid and local hostname. The explicit session observation used
+by status and resume does not change those ownership rules.
 
 The host on a lease is frozen when the run is claimed, and the whole name
 identifies the machine: a Mac that republishes itself as `foo.local`, `foo.lan`,
@@ -435,17 +453,11 @@ or `foo.corp.example.com` names a different host each time. Matching on the
 first label alone would absorb those renames, but it would also read
 `build.a.example` as `build.b.example` — two real machines that share a registry
 on an NFS home — and then an absence measured here would start a second worker
-over a live remote one. So any rename at all makes the lease name a machine this
-one is not, and then no local check can speak for the run: the operation
-directory and the bridge here belong to this machine. `/exec status` says so and
-names the way out. Only you know whether that name was this machine, so
-`/exec resume <run-id> --same-machine` is how you say it. The flag supplies the
-machine, not the verdict: resume then checks the
-worker here as usual and still refuses while one is running. It is refused
-outright on a run this machine can already observe, and refused while the lease
-is still beating — a heartbeat under 30 seconds old is a worker writing
-somewhere, and no claim about which machine changes that. Wait for it to go
-stale and resume as usual.
+over a live remote one. `/exec resume <run-id> --same-machine` is the explicit
+operator assertion that the frozen host was this machine. It creates a temporary
+local view for the probe and abandonment decision without rewriting the lease;
+a worker still writing here keeps the run live, while decisive local evidence
+permits recovery and lets the subsequent claim stamp the current host.
 
 ### Recovering a failure
 
@@ -470,6 +482,17 @@ preserved partial lane, completed tasks, and failed operation identity survive
 reload. A completed workflow receipt is not evidence that the task succeeded,
 and recovery does not waive required approvals or checks.
 
+If the accepted baseline advances while a task is retrying, the next attempt
+uses a fresh lane from that baseline and retains only the selective recovery
+checkpoint needed from the failed lane. It does not replay an old candidate
+against a newer accepted head.
+
+If the worker also reports an observed `Prerequisite:` value of `credentials`,
+`permission`, `missing_executable`, or `runtime` plus an `Evidence:` line, the
+task is recorded as `waiting_external` with that evidence and receives an
+automatic wake. Generic words such as “credentials” without observed evidence
+remain ordinary recovery and do not create an external-wait state.
+
 A run reading `stopped because the model or provider could not be used` is
 recorded separately from task progress. The controller keeps the failed child ID
 and terminal error, does not consume an implementation retry, and retries with
@@ -477,9 +500,16 @@ the current authenticated Pi model. `--model current` or
 `--model provider/model` is an advanced override for that one replacement child;
 it never pins later workers in the run.
 
-`/exec skip` is a last-resort waiver, not a pass. It is available only while a
-review, finalization, or statistics stage is failed, paused, or already
-skip-pending. If a Bridge, Fusion, or Revmux operation is tracked, the controller requests
+For a confirmed tool failure, the controller queues at most one durable
+diagnostic follow-up for that failure identity. `queued` means the provider
+accepted guidance; it does not mean the tool was repaired. A pause or cancel
+fence wins over a late diagnostic reply, and the same diagnostic action is
+reconciled after restart.
+
+`/exec skip` is a last-resort waiver, not a pass. It is available only while an
+optional review, finalization, or statistics stage is failed, paused, or already
+skip-pending. Required review and final verification cannot be skipped. If a
+Bridge, Fusion, or Revmux operation is tracked, the controller requests
 stop and remains `skip_pending` until the provider proves that operation is
 terminal. The skipped stage remains visible in status and projected tasks, its
 known findings remain unresolved, and final completion is
@@ -506,7 +536,9 @@ Use this sequence instead:
    per run. Add a full run ID for the stage, active operation, worktree, branch,
    progress path, and any error of that one run. It only observes.
 2. Run `/exec stop` when you want the run to end and pick pause or cancel at the
-   prompt. Run `/exec resume` when you are ready to continue a paused run. If
+   prompt. Pause cancels the current attempt, preserves its checkpoint and
+   progress, and remains resumable after cleanup. Run `/exec resume` when you are
+   ready to continue a paused run. If
    status says the workflow needs supervisor input, answer that displayed
    request first. A live controller keeps polling and continues automatically.
    After a restart, resume consumes the finished child result or reattaches the
@@ -515,8 +547,9 @@ Use this sequence instead:
    one run matches the repository and Pi cannot choose unambiguously.
 4. After a Pi restart or a session handoff, run `/exec status` first. A matching
    run owned by the returning session reattaches automatically; `/exec resume`
-   takes over an unfinished run whose owning session is proven dead, and resets a
-   run whose worker is provably gone before continuing it.
+   takes over an unfinished run whose owning session is proven dead, and
+   reconciles the existing operation when its worker is provably gone before
+   continuing it.
 5. For a run reading `stopped because the model or provider could not be used`,
    run `/exec resume`. It uses the current authenticated Pi model. Use
    `--model current|provider/model` only to override that one replacement child.
@@ -545,12 +578,19 @@ A run:
    dependencies allow independent work in a clean lane.
 5. Re-reads plan checkboxes after every worker; worker prose is not completion
    evidence. It accepts only a committed candidate that descends from the
-   accepted baseline, passes the frozen checks, and leaves the tracked tree
-   clean.
+   accepted baseline, passes the frozen checks, and leaves a clean worktree
+   with no uncommitted or untracked non-ignored files.
+   If work ran in an internal lane, the controller durably promotes the accepted
+   candidate back to the original output branch with a fast-forward after
+   checking known ancestry and preserving user changes. Review and final
+   verification run from that output target.
 6. Runs one required reviewer by default. Fusion or Revmux is used only when
    selected explicitly in the frozen config; fallback defaults to `none`, and an
    ambiguous provider start remains owned instead of being replaced.
-7. Finalizes, collects statistics, and archives the completed plan best effort.
+7. Runs mandatory final verification of the reviewed commit, records the
+   deterministic or optional statistics result, and archives the completed
+   plan. Verification and archival failures remain recoverable run failures;
+   they are not silently ignored.
 
 Statistics are bookkeeping by default: `statsEnabled` defaults to `false`, so
 the controller records a deterministic usage/task summary without launching an
@@ -579,13 +619,18 @@ Fix: Reject empty input at the boundary.
 
 Supported severities are `CRITICAL`, `MAJOR`, and `MINOR`. Fusion review
 requests the `plan-review-v1` output contract and consumes only Fusion's
-validated top-level `callerOutput.output`. Revmux reports must prove complete
-source coverage and contain no unresolved questions. Missing, blank,
+validated top-level `callerOutput.output`; its production path uses a structured
+panel with one judge. Strict early-agreement profiles are rejected before
+dispatch. Revmux reports must prove complete source coverage and contain no unresolved questions;
+its explicit `--execution-lifetime` flag is wrapped by the outer kernel-owned
+runtime. Missing, blank,
 malformed, or mismatched output fails closed; a partial `run.report` is never
 an approval fallback. The default fallback list is empty, so an unavailable or
 ambiguous provider operation stays recoverable under its original operation ID.
-Blocking findings keep review unmet; only adjudicated advisory findings or an
-explicit stage waiver can produce `completed_with_findings`.
+CRITICAL and MAJOR findings keep review unmet and schedule recovery. MINOR-only
+advisory findings may be recorded as unresolved while the reviewed commit
+advances; the terminal result is then `completed_with_findings`. An explicit
+stage waiver also produces `completed_with_findings` and remains audited.
 
 ## Recovery and safety
 
@@ -606,11 +651,11 @@ overwriting cancellation, pause, or operation state.
 
 Pi-subagents receives one top-level PlanExec external-run row and one
 background-work provider. Reload reads `run.json` and safely re-registers those
-owned records; native child rows are not duplicated. Pi-tasks is a session-scoped,
-rebuildable UI cache. Owned tasks carry owner, run, key, revision, status, and
-projection version metadata. Scope, path, and the installed 0.9.x version are
-checked. A cache repair failure is visible as degraded projection state while
-plan execution continues.
+owned records; native child rows are not duplicated. Pi-tasks is an optional,
+session-scoped, rebuildable UI cache. Owned tasks carry owner, run, key,
+revision, status, and projection version metadata. When present, its scope,
+path, and package version are checked. A cache repair failure is visible as
+degraded projection state while plan execution continues.
 
 Pause, cancellation, failure, and completion preserve the worktree for review.
 Cancellation retries transient provider failures without dropping the active
@@ -624,29 +669,43 @@ branch, or the progress log — deleting a record only gives up the ability to
 
 After Pi starts or reloads, the native controller restores unfinished runs when
 their lease is claimable. It never steals a live foreign lease or an explicit
-user pause. A tracked operation is reattached by its durable operation ID; an
-uncertain launch remains fenced until the provider proves absence or terminal
-ownership. The native widget and `/exec status` are projections of `run.json`:
+user pause. Pending native or local cleanup is restored and reconciled without
+resuming plan work. A tracked operation is reattached by its durable operation
+ID; an uncertain launch remains fenced until the provider proves absence or
+terminal ownership. The native widget and `/exec status` are projections of
+`run.json`:
 they show task counts, dependency or retry waits, next automatic action,
 verified activity, usage, selected review backend, and lifetime. A broken
-pi-tasks/Fleet projection cannot block recovery.
+pi-tasks/Fleet projection cannot block recovery. Projection writes coalesce one
+in-flight update and one latest snapshot; a cold technical prerequisite does not
+discard an authorized start.
 
 Safety limits:
 
 - Git only; Mercurial and detached `HEAD` are rejected.
 - Dirty state is not silently copied into a worktree.
 - The execution directory and branch are checked before writer stages.
+- Controller Git writes use durable owned commands with workspace-safe
+  environment injection; Git observations disable fsmonitor and optional index
+  writes.
 - The controller launches one child at a time, while dependency-ready tasks may
   use separate lanes; an unfinished task's partial lane is preserved.
-- Finalization, statistics, and plan archival are best effort.
+- Final verification is mandatory. Statistics are deterministic bookkeeping by
+  default, with an optional report child. Plan archival must succeed before the
+  run becomes terminal.
 
-The package is an incomplete implementation draft. Native, Bridge, Fusion, and
-Revmux process ownership currently exposes only POSIX process groups with
-escaped descendants unverified, so strict preflight refuses actual production
-runtimes before spawn. Nonempty local bootstrap and required-check commands are
-also refused. Use [runtime contracts](runtime-contracts.md) for the exact
-limitation and dependency PR links; do not treat the latest npm package as a
-fully working autonomous runtime.
+The package is an incomplete implementation draft. The strict path now uses a
+kernel-owned Darwin boundary for native workers, local commands, Bridge, Fusion,
+and Revmux, but the exact public native dependency pin and package publication
+are still pending. Host smoke evidence does not establish release readiness;
+unknown kernel/API ownership remains fenced. Use [runtime contracts](runtime-contracts.md)
+for the exact prerequisites and dependency PR links; do not treat the latest
+npm package as a fully working autonomous runtime.
 
 For local setup, validation, and tag-driven releases, see
 [DEVELOPMENT.md](../DEVELOPMENT.md).
+
+The declared host-boundary check is `npm run test:runtime-smoke`. It uses
+scripted model turns and does not prove a live-LLM run. Supported Darwin
+prerequisites are required; the real full pipeline has passed once and is still
+scheduled for repetition after the final pins.

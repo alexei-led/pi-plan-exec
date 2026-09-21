@@ -22,18 +22,19 @@ providers.
 It executes ready checked-list tasks in a Git checkout you choose, then runs
 the required review and fix stages with fresh Pi subagents or an explicitly
 selected review backend. A worker saying “done” is not enough: the plan’s
-checked items, accepted commit, required checks, and clean tracked tree are the
-implementation record.
+checked items, accepted commit, required checks, and a clean worktree with no
+uncommitted or untracked non-ignored files are the implementation record.
 
-> Experimental implementation draft. The strict controller currently requires
-> an owned-process-tree runtime capability. The tested native, Bridge, Fusion,
-> and Revmux implementations provide only POSIX process-group ownership with
-> escaped descendants unverified, so strict production preflight rejects them
-> before dispatch. Do not treat the latest npm package as ready for autonomous
-> production runs; see [runtime contracts](docs/runtime-contracts.md).
+> Experimental implementation draft. The strict controller requires the new
+> `pi-subagents/kernel-owned-process` Darwin runtime and matching Bridge,
+> Fusion, and Revmux ownership contracts. Host smoke evidence exists, and the
+> native source pin is under review, but package publication is still pending;
+> unsupported APIs and unknown ownership remain fenced. Do not treat the latest
+> npm package as ready for autonomous production runs; see [runtime contracts](docs/runtime-contracts.md).
 
-Nonempty local bootstrap and required-check batches are also refused before
-launch until the same containment proof exists.
+Local bootstrap and required-check batches run through the same kernel-owned
+executor, with unbounded user-stoppable lifetime and durable retirement proof.
+They remain unavailable when the exact native dependency is missing.
 
 ## What it does
 
@@ -46,40 +47,41 @@ launch until the same containment proof exists.
   candidate.
 - **Recovers deliberately.** A reload reattaches a matching run owned by the
   returning session. `/exec resume` takes over a run whose owning session is
-  proven dead, and resets a run whose worker is provably gone before continuing
-  it. Compare-and-set records, operation IDs, controller locks, and leases avoid
+  proven dead, and reconciles its existing operation before continuing it.
+  Compare-and-set records, operation IDs, controller locks, and leases avoid
   intentionally starting another writer or losing a pause or cancellation.
 - **Requires a valid candidate before completion.** A task is accepted only
-  after its committed plan checkboxes, ancestry, frozen required checks, and
-  clean tracked tree are verified. The default review is one required
+  after its committed plan checkboxes, ancestry, frozen required checks, and a
+  clean worktree with no uncommitted or untracked non-ignored files are
+  verified. The default review is one required
   subagent reviewer; blocking findings remain unmet and schedule recovery.
 - **Schedules dependencies and preserves partial work.** Omitted `dependsOn`
   metadata keeps legacy sequential order. `dependsOn: []` declares an
   independent task. A failed partial task stays in its lane while an eligible
   independent task can use a clean lane from the last accepted commit.
+  Completed lane work is promoted back to the original output branch by a
+  guarded fast-forward before review.
 
 ## Install and run
 
-Install the required packages, then plan-exec. Fusion and Revmux are optional
-explicit review backends; the default backend is one required subagent reviewer:
-
-```bash
-pi install npm:pi-subagents
-pi install npm:@tintinweb/pi-tasks
-pi install npm:@alexeiled/pi-subagents-bridge
-pi install npm:@alexeiled/pi-fusion
-pi install npm:@alexeiled/pi-plan-exec
-```
+Use a project-local source checkout with the exact dependency Git refs listed
+in [runtime contracts](docs/runtime-contracts.md). This pre-release path is not
+provided by the published npm runtime; do not install the latest provider
+versions and assume that they expose the required native contract. The exact
+native pin is recorded in the runtime contract and remains under review until
+the linked dependency PR publishes the public API. Fusion and Revmux are optional explicit review backends; the
+default backend is one required subagent reviewer. `@tintinweb/pi-tasks` is an
+optional projection cache.
 
 The providers remain independent Pi packages. This incomplete implementation
 draft is tested against the exact dependency commits and linked dependency PRs
-listed in [runtime contracts](docs/runtime-contracts.md); installing the latest
-npm releases does not provide the required ownership contract. The default
+listed in [runtime contracts](docs/runtime-contracts.md). The default
 review backend is `subagent` with an empty fallback list (`none`). An ambiguous
 Fusion or Revmux launch keeps its operation ID and remains recoverable instead
 of starting another reviewer over an unknown child. The development checkout
-and CI use npm 12.0.2, and `.npmrc`'s `allow-git=root` setting is required for
-those pinned git dependencies.
+and CI use npm 12.0.2. The repository `.npmrc` uses `allow-git=root`; a packed
+consumer must use a project-local `allow-git=all` for transitive Git refs. Do
+not change global npm configuration.
 
 Reload Pi. From an interactive session in a Git repository, prepare a short goal
 or run an existing executable plan:
@@ -113,11 +115,11 @@ Four verbs cover everything after the start:
   every row in one next command. Add a full run ID for one run in detail, or
   `--all` to include terminal runs older than a day.
 - `/exec resume` continues or recovers anything stuck. It takes the lease over
-  from a session proven dead, resets a run whose worker is provably gone and then
-  continues it, and asks before retrying a task blocked outside the run or
+  from a session proven dead, reconciles the existing operation when its worker
+  is provably gone and then continues it, and asks before retrying a task blocked outside the run or
   rebinding the execution branch after external work moved the worktree. It never
   launches on partial evidence: a run whose worker cannot be proven gone is
-  reported, not reset. A model or provider failure is retried with the model this
+  reported, not reconciled. A model or provider failure is retried with the model this
   Pi session is signed in to and does not consume an implementation retry;
   `--model current` or `--model provider/model` is an advanced override for that
   one replacement child and never pins later workers. When a child pauses for a
@@ -125,8 +127,9 @@ Four verbs cover everything after the start:
   continues automatically after the reply. After a restart, resume consumes its
   durable result or reattaches the same operation; it does not launch a
   duplicate. Missing bridge memory, a missing async directory, and v1 absence
-  are inconclusive; only matching v2 durable absence or native process-terminal
-  proof permits recovery to launch again.
+  are inconclusive; only a matching owned-tree terminal proof, an authoritative
+  never-started fence, or v2 durable absence for an unbound launch permits
+  recovery to launch again.
 - `/exec stop` asks whether to pause the run (resumable) or cancel it (final,
   worktree preserved).
 - `/exec cleanup` retires run records. It previews by default and deletes
@@ -149,13 +152,19 @@ failure counters do not become a terminal retry cap or a second writer. The
 worktree, accepted commits, and completed tasks are preserved; a successful
 workflow transport result does not mean the task succeeded.
 
+When the worker supplies an observed `Prerequisite:` value of `credentials`,
+`permission`, `missing_executable`, or `runtime` together with `Evidence:`,
+the task enters `waiting_external` and receives an automatic wake. Generic
+blocker wording does not create that classification.
+
 Task dependencies control eligibility, while plan-exec still runs one child at
 a time per controller and keeps one writer per lane. When a provider operation
 may still exist, plan-exec keeps its recorded operation ID and reconciles it
-before any retry. If a review, finalization, or statistics stage cannot recover,
-`/exec skip <full-run-id> --reason <text>` stops the tracked child before
-recording an explicit waiver and advancing. It never skips implementation or
-archival, and the run finishes as `completed_with_findings`.
+before any retry. If an optional review, finalization, or statistics stage
+cannot recover, `/exec skip <full-run-id> --reason <text>` stops the tracked
+child before recording an explicit waiver and advancing. Required review and
+final verification cannot be skipped; implementation and archival never can.
+The run finishes as `completed_with_findings`.
 The installed `exec-plan` skill is also available as `/skill:exec-plan` for the
 plan format, the recovery rules, and the retired names and flags a scripted agent
 uses instead of a prompt.

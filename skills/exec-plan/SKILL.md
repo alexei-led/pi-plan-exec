@@ -30,25 +30,32 @@ Never replace controller recovery with a manually launched subagent.
   at session start when its startup sweep finds an abandoned run.
 - Inspect one run: `/exec status <full-run-id>`.
 - Continue or recover anything stuck: `/exec resume [full-run-id]`. It takes the
-  lease over from a session proven dead, resets a run whose worker is provably
-  gone and then continues it, reconciles a running child, continues a paused
+  lease over from a session proven dead, reconciles a run whose worker is
+  provably gone and then continues it, reconciles a running child, continues a paused
   run, or safely retries a recoverable failed run. A workflow paused for a
   supervisor reply stays attached and a live controller continues automatically
   after the reply. After a restart, resume consumes its durable child result or
   reattaches the same operation without launching a duplicate. It never launches
   on partial evidence: a run whose worker cannot be proven gone is reported, not
-  reset.
-- A lease whose pid is dead on this host is stale at once, so `/exec resume`
-  takes that run over with no wait. A lease recorded without a hostname is
-  judged by its heartbeat alone; wait out the 30-second heartbeat window before
-  treating it as stale.
+  reconciled.
+- A lease naming this host whose recorded pid is dead is stale at once, so
+  `/exec resume` takes that run over with no wait. A lease recorded without a
+  hostname is judged by its heartbeat alone; wait out the 30-second heartbeat
+  window before treating it as stale. A lease naming another host remains live
+  until `--same-machine` supplies an explicit local view.
 - Recover a run `stopped because the model or provider could not be used`: `/exec resume [full-run-id]` uses the active authenticated Pi model.
 - A normal resume retries a no-progress implementation task. A worker that
-  reports `TASK_FAILED` with unchecked items keeps the run in automatic recovery;
-  it preserves the blocker, schedules another attempt with backoff, and does
-  not create a terminal retry cap. A task blocked by something outside this run
-  may still require explicit retry confirmation; implementation cannot be
-  skipped.
+reports `TASK_FAILED` with unchecked items keeps the run in automatic recovery;
+it preserves the blocker, schedules another attempt with backoff, and does
+not create a terminal retry cap. A task blocked by something outside this run
+may still require explicit retry confirmation; implementation cannot be
+skipped.
+
+Only an observed `Prerequisite: credentials|permission|missing_executable|runtime`
+with an `Evidence:` line creates `waiting_external`; the controller records it
+and schedules an automatic wake. Generic blocker wording never proves an
+external prerequisite.
+
 - Stop a run and choose the outcome: `/exec stop <full-run-id>`. It asks whether
   to pause (resumable) or cancel (final, worktree preserved). It needs a human
   to answer, so an agent uses the scripted path below.
@@ -57,7 +64,7 @@ Never replace controller recovery with a manually launched subagent.
   after its last update. `failed` runs are excluded, because their registry
   entry is what `/exec resume` needs. Removal deletes the registry entry only;
   the worktree, branch, and progress file stay in place.
-- Waive a blocked review/finalize/stats stage: `/exec skip <full-run-id> --reason <text>`. It is a waiver of last resort and needs a human; see below.
+- Waive an optional review/finalize/stats stage: `/exec skip <full-run-id> --reason <text>`. Required review and final verification cannot be skipped. It is a waiver of last resort and needs a human; see below.
 - Inspect live command support: `/exec help`.
 
 Use the full run ID whenever more than one run exists, after a reload, or when
@@ -75,14 +82,16 @@ Retired names, each still dispatching to its replacement and saying so once:
 
 - `/exec runs` and `/exec runs --all` → `/exec status`. `--all` also lists
   terminal runs older than a day, under either name.
-- `/exec doctor` → `/exec status`. `/exec doctor --reconcile` resets provably
-  abandoned runs to a recoverable `failed`; `/exec resume` performs the same
-  reset for the one run it is recovering.
+- `/exec doctor` → `/exec status`. `/exec doctor --reconcile` reconciles
+  provably abandoned runs while preserving their operation, candidate, and
+  saved result identities; `/exec resume` performs the same reconciliation for
+  the one run it is recovering.
 - `/exec setup` → `/exec status`, which reports a missing package with its
   install command.
 - `/exec adopt <full-run-id>` → `/exec resume <full-run-id>`.
-- `/exec pause <full-run-id>` → `/exec stop` without the question. It stops
-  after the active operation and leaves the run resumable.
+- `/exec pause <full-run-id>` → `/exec stop` without the question. It cancels
+  the current attempt, preserves the checkpoint, and leaves the run resumable
+  after cleanup.
 - `/exec cancel <full-run-id>` → `/exec stop` without the question. It is final
   and preserves the worktree.
 
@@ -94,9 +103,9 @@ Flags that answer a prompt in advance:
   to the verified current execution branch.
 - `/exec resume <full-run-id> --same-machine` states that the host frozen on the
   lease was this machine under an older name. Only use it when that is a fact;
-  it unblocks the local checks and nothing else, so a worker still running keeps
-  the run refused. It is also refused while the lease heartbeat is under 30
-  seconds old, whatever host it names.
+  it creates a temporary local view for evidence gathering without rewriting the
+  lease. A worker still running keeps the run refused; decisive local evidence
+  permits the normal reset and claim.
 - `/exec resume <full-run-id> --model current|provider/model` overrides the
   model for one replacement child after a model or provider failure.
 - `/exec cleanup <full-run-id> --apply` removes one named record;
@@ -200,9 +209,10 @@ plan-exec can tell, and `/exec status` says so in those words. Absence of a
 signal is not evidence that the worker died. Do not treat
 `running, but nothing proves the worker is alive` or
 an observation failure as permission to start a second run. The default
-unbounded lifetime has no wall-clock deadline; bounded compatibility is an
-explicit frozen choice. A status hint that a turn budget was exceeded is
-diagnostic only and never authorizes a replacement child.
+unbounded lifetime has no wall-clock deadline and never emits an over-budget
+classification. Bounded compatibility is an explicit frozen choice with its
+`timeoutMs`; any timeout classification is diagnostic only and never authorizes
+a replacement child.
 
 `/exec status` names `/exec stop <id>` because it writes for a human at a
 keyboard, and `/exec stop` asks whether to pause or to cancel. An agent has
@@ -245,8 +255,9 @@ second writer.
   launches in this run.
 - `/exec skip` is a last-resort waiver, not a review pass. It requires an
   interactive confirmation and reason, stops any tracked child before advancing,
-  and ends as `completed_with_findings`. Never use it for implementation or
-  archive stages.
+  and ends as `completed_with_findings`. It applies only to optional review,
+  finalization, or statistics stages. Required review/final verification,
+  implementation, and archive cannot be skipped.
 - Reconciling never launches a worker. It only converts a provably abandoned
   run into a recoverable `failed` run, leaves `taskAttempts` unchanged, and
   skips any run a live session reclaimed while it was being diagnosed. Recovery
@@ -271,8 +282,9 @@ second writer.
 
 Plan checkboxes are implementation truth. Worker prose alone does not complete
 a task. The controller accepts a task only after its committed plan checkboxes,
-accepted-baseline ancestry, frozen required checks, and clean tracked tree are
-verified. A worker whose prerequisite cannot be satisfied leaves its checkboxes
+accepted-baseline ancestry, frozen required checks, and a clean worktree with no
+uncommitted or untracked non-ignored files are verified. A worker whose
+prerequisite cannot be satisfied leaves its checkboxes
 open and starts its final response with `<<<RALPHEX:TASK_FAILED>>>` on its own
 line, followed by `Blocker: <reason>` and `Next step: <required action>`. The
 controller preserves the partial lane and schedules automatic recovery;
@@ -306,17 +318,20 @@ record, worktree, active-operation evidence, and approval or runtime fix needed.
 
 ## Prerequisites
 
-`pi-plan-exec` requires compatible installations of `pi-subagents`,
-`@tintinweb/pi-tasks`, and `@alexeiled/pi-subagents-bridge`; Fusion and Revmux
-are optional explicit review backends. The strict controller requires an
-explicit lifetime capability and full owned-process-tree containment. The
-tested native, Bridge, Fusion, and Revmux runtimes currently expose only POSIX
-process groups with escaped descendants unverified, so production preflight
-refuses them before spawn. Nonempty local checks and bootstrap are refused for
-the same reason. Read [runtime contracts](../../docs/runtime-contracts.md) for
-the exact limitation and dependency PR links.
+`pi-plan-exec` requires compatible installations of `pi-subagents` and
+`@alexeiled/pi-subagents-bridge`, plus the pending
+public `pi-subagents/kernel-owned-process` Darwin dependency. Fusion and Revmux
+are optional explicit review backends; `@tintinweb/pi-tasks` is an optional
+projection cache. The strict controller requires explicit
+lifetime support and full owned-process-tree containment. Unknown native APIs,
+kernel bindings, or retirement evidence remain fenced. Read [runtime
+contracts](../../docs/runtime-contracts.md) for the exact API, Darwin
+prerequisites, and dependency PR links; installing the latest npm package does
+not provide this contract.
 
-The development checkout and CI use npm 12.0.2 with `.npmrc` `allow-git=root`
-for pinned git dependencies. Run `/exec status`, install what it reports, run
-`/reload`, then return to the same run ID. Installing dependencies does not
-replace or complete the preserved run.
+The development checkout and CI use npm 12.0.2 with repository `.npmrc`
+`allow-git=root`. A packed consumer needs a project-local `allow-git=all` for
+transitive Git refs; never change global npm configuration. Run `/exec status`,
+restore the reported project-local dependency, run `/reload`, then return to the
+same run ID. Installing dependencies does not replace or complete the preserved
+run.
