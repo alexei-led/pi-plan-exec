@@ -90,6 +90,7 @@ const STATUS_KEY = "plan-exec";
 const PROVIDER_PROBE_TIMEOUT_MS = 1_500;
 const PROJECTION_TIMEOUT_MS = 1_500;
 const COMMAND_CAS_RETRIES = 5;
+const SESSION_RETIREMENTS_KEY = Symbol.for("pi-plan-exec.session-retirements.v1");
 const MILLISECONDS_PER_SECOND = 1_000;
 const SECONDS_PER_MINUTE = 60;
 const MINUTES_PER_HOUR = 60;
@@ -243,6 +244,88 @@ type SyncProjection = (
   options: { cwd: string; sessionId: string },
 ) => Promise<PlanExecRun>;
 
+/** Survives extension replacement while an outgoing controller finishes its tick. */
+interface SessionRetirement {
+  sessionId: string;
+  runIds: ReadonlySet<string>;
+  settled: Promise<void>;
+}
+
+interface HandoffLifecycle {
+  isClosed(): boolean;
+  beginPreparation(runId: string): { finish(): void; switchingTo(sessionFile: string): void };
+}
+
+function sessionRetirements(): Set<SessionRetirement> {
+  const existing: unknown = Reflect.get(globalThis, SESSION_RETIREMENTS_KEY);
+  if (existing instanceof Set) return existing as Set<SessionRetirement>;
+  const pending = new Set<SessionRetirement>();
+  Reflect.set(globalThis, SESSION_RETIREMENTS_KEY, pending);
+  return pending;
+}
+
+function retiringSession(run: PlanExecRun): SessionRetirement | undefined {
+  if (!isLocalRun(run) || run.lease?.pid !== process.pid) return undefined;
+  return [...sessionRetirements()].find((retirement) =>
+    retirement.sessionId === run.lease?.sessionId && retirement.runIds.has(run.id));
+}
+
+async function retireSessionLeases(sessionId: string, runIds: ReadonlySet<string>): Promise<void> {
+  const owns = (run: PlanExecRun) => isLocalRun(run) &&
+    run.lease?.sessionId === sessionId && run.lease.pid === process.pid;
+  for (const runId of runIds) {
+    for (let attempt = 0; attempt < COMMAND_CAS_RETRIES; attempt++) {
+      const current = await defaultRegistry.get(runId);
+      if (!current || !owns(current)) break;
+      const released = { ...current };
+      delete released.lease;
+      if ((await defaultRegistry.updateIfCurrent(released, current.updatedAt)).applied) break;
+      if (attempt === COMMAND_CAS_RETRIES - 1)
+        throw new Error(`Run ${runId} changed repeatedly while retiring its session lease.`);
+    }
+  }
+}
+
+async function retrySessionRetirement(sessionId: string, runIds: ReadonlySet<string>): Promise<void> {
+  for (;;) {
+    try {
+      await retireSessionLeases(sessionId, runIds);
+      return;
+    } catch {
+      await waitForControllerPoll();
+    }
+  }
+}
+
+function waitForControllerPoll(): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, CONTROLLER_POLL_INTERVAL_MS);
+    timer.unref?.();
+  });
+}
+
+async function restoreRetiredRun(
+  runId: string,
+  ctx: ExtensionContext,
+  start: StartBackgroundController,
+  isClosed: () => boolean,
+  contextOnly = false,
+): Promise<void> {
+  while (!isClosed()) {
+    try {
+      const run = await defaultRegistry.get(runId);
+      if (isClosed() || !run || (contextOnly && !matchesContext(run, ctx.cwd))) return;
+      const retiring = retiringSession(run);
+      if (retiring) { await retiring.settled; continue; }
+      const sessionId = ctx.sessionManager.getSessionId();
+      if (shouldAutoRestoreRun(run, sessionId)) start(run, sessionId, ctx.cwd, ctx);
+      return;
+    } catch {
+      await waitForControllerPoll();
+    }
+  }
+}
+
 function goalPreparationPrompt(prepared: PendingGoalPlan): string {
   return [
     "Prepare a meaningful executable Markdown plan for this repository. This is preparation only: do not execute work, create a run, launch a child, or change any repository file.",
@@ -365,9 +448,27 @@ export default function planExecExtension(pi: ExtensionAPI): void {
   );
 
   const activeControllers = new Map<string, ReturnType<typeof setInterval>>();
-  const inFlightControllers = new Set<string>();
+  const inFlightControllers = new Map<string, Promise<PlanExecRun>>();
+  const ownedRuns = new Set<string>();
+  const handoffPreparations = new Set<{ settled: Promise<void>; targetSessionFile?: string }>();
+  let sessionClosed = false;
+  const handoffLifecycle: HandoffLifecycle = {
+    isClosed: () => sessionClosed,
+    beginPreparation: (runId) => {
+      ownedRuns.add(runId);
+      let finish!: () => void;
+      const pending = new Promise<void>((resolve) => { finish = resolve; });
+      const handoff: { settled: Promise<void>; targetSessionFile?: string } = { settled: pending };
+      handoffPreparations.add(handoff);
+      return {
+        finish: () => { handoffPreparations.delete(handoff); finish(); },
+        switchingTo: (sessionFile) => { handoff.targetSessionFile = sessionFile; },
+      };
+    },
+  };
   const lastStates = new Map<string, RunState>();
   const setStatus = (run: PlanExecRun, ctx: ExtensionContext): void => {
+    if (sessionClosed) return;
     try {
       ctx.ui.setStatus(STATUS_KEY, compactRunStatus(run));
       ctx.ui.setWidget(STATUS_KEY, [
@@ -390,6 +491,7 @@ export default function planExecExtension(pi: ExtensionAPI): void {
     message: string,
     level: NotificationLevel,
   ): void => {
+    if (sessionClosed) return;
     try {
       ctx.ui.notify(message, level);
     } catch {
@@ -434,15 +536,17 @@ export default function planExecExtension(pi: ExtensionAPI): void {
     handoffWhenReady,
   ): void => {
     const runId = initialRun.id;
-    if (activeControllers.has(runId)) return;
+    if (sessionClosed || retiringSession(initialRun) || activeControllers.has(runId)) return;
+    ownedRuns.add(runId);
     lastStates.set(runId, runState(initialRun));
     setStatus(initialRun, ctx);
     const timer = setInterval(() => {
-      if (inFlightControllers.has(runId)) return;
-      inFlightControllers.add(runId);
-      void controller
-        .tick(runId, sessionId)
+      if (sessionClosed || inFlightControllers.has(runId)) return;
+      const ticking = controller.tick(runId, sessionId);
+      inFlightControllers.set(runId, ticking);
+      void ticking
         .then(async (run) => {
+          if (sessionClosed) return run;
           if (handoffWhenReady && canHandoffPreparedWorktree(run)) {
             // Session startup must be able to install the target's controller.
             stopBackgroundController(runId);
@@ -491,7 +595,9 @@ export default function planExecExtension(pi: ExtensionAPI): void {
             "warning",
           );
         })
-        .finally(() => inFlightControllers.delete(runId));
+        .finally(() => {
+          if (inFlightControllers.get(runId) === ticking) inFlightControllers.delete(runId);
+        });
     }, CONTROLLER_POLL_INTERVAL_MS);
     timer.unref();
     activeControllers.set(runId, timer);
@@ -510,6 +616,8 @@ export default function planExecExtension(pi: ExtensionAPI): void {
           checkRuntime,
           runtimeProblems,
           doctorProbe,
+          isSessionClosed: () => sessionClosed,
+          handoffLifecycle,
         });
         if (message) ctx.ui.notify(message, "info");
       } catch (error: unknown) {
@@ -658,9 +766,14 @@ export default function planExecExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    const retiring = [...sessionRetirements()];
     const sessionId = ctx.sessionManager.getSessionId();
     const { runs, errors } = await defaultRegistry.listWithErrors();
     const contextualRuns = runs.filter((run) => matchesContext(run, ctx.cwd));
+    for (const run of runs) {
+      if (isLocalRun(run) && run.lease?.sessionId === sessionId && run.lease.pid === process.pid && !retiringSession(run))
+        ownedRuns.add(run.id);
+    }
     if (errors.length > 0)
       notify(
         ctx,
@@ -670,6 +783,12 @@ export default function planExecExtension(pi: ExtensionAPI): void {
     for (const run of contextualRuns) {
       if (shouldAutoRestoreRun(run, sessionId))
         startBackgroundController(run, sessionId, ctx.cwd, ctx);
+    }
+    for (const retirement of retiring) {
+      void retirement.settled.then(async () => {
+        await Promise.all([...retirement.runIds].map((runId) =>
+          restoreRetiredRun(runId, ctx, startBackgroundController, () => sessionClosed, true)));
+      }).catch(() => undefined);
     }
     for (const run of contextualRuns) {
       if (shouldRepairProjectionForSession(run, sessionId))
@@ -686,14 +805,26 @@ export default function planExecExtension(pi: ExtensionAPI): void {
     }).catch(() => undefined);
   });
 
-  pi.on("session_shutdown", () => {
+  pi.on("session_shutdown", async (event, ctx) => {
+    sessionClosed = true;
     for (const timer of activeControllers.values()) clearInterval(timer);
     activeControllers.clear();
-    inFlightControllers.clear();
     lastStates.clear();
+    // A handoff cannot await itself; other replacements drain its cleanup too.
+    const sessionId = ctx.sessionManager.getSessionId();
+    const runIds = new Set(ownedRuns);
+    const retirement: SessionRetirement = { sessionId, runIds,
+      settled: Promise.allSettled([...inFlightControllers.values(), ...[...handoffPreparations]
+        .filter((handoff) => !(event.reason === EXEC_ACTION.RESUME && handoff.targetSessionFile &&
+          event.targetSessionFile === handoff.targetSessionFile)).map((handoff) => handoff.settled)])
+        .then(() => retrySessionRetirement(sessionId, runIds)) };
+    const retirements = sessionRetirements();
+    retirements.add(retirement);
+    void retirement.settled.finally(() => retirements.delete(retirement)).catch(() => undefined);
     void boundedPromise(runtimeIntegration, PROJECTION_TIMEOUT_MS).then(async (integration) => {
       if (integration) await boundedPromise(Promise.resolve(integration.dispose()), PROJECTION_TIMEOUT_MS);
     }).catch(() => undefined);
+    await boundedPromise(retirement.settled, PROJECTION_TIMEOUT_MS).catch(() => undefined);
     // Status is session-scoped in Pi, so the next session starts clean.
   });
 }
@@ -2210,6 +2341,8 @@ interface CommandDependencies {
   runtimeProblems: RuntimeProbe;
   doctorProbe: EvidenceProbe;
   handoff?: typeof handoffToWorktree;
+  isSessionClosed?: () => boolean;
+  handoffLifecycle?: HandoffLifecycle;
 }
 
 export function shouldRepairProjectionForSession(
@@ -2358,7 +2491,8 @@ export async function handleCommand(
   const handoff = dependencies.handoff ?? handoffToWorktree;
   const deferredHandoff = started.lanePreparation?.state === "create" &&
     Boolean(ctx.sessionManager.getSessionFile());
-  if (!deferredHandoff && await handoff(ctx, started, syncProjection)) return undefined;
+  if (!deferredHandoff && await handoff(ctx, started, syncProjection, undefined, false, dependencies.handoffLifecycle)) return undefined;
+  if (dependencies.isSessionClosed?.()) return undefined;
   const run = await syncProjection(started, {
     cwd: ctx.cwd,
     sessionId: ctx.sessionManager.getSessionId(),
@@ -2369,7 +2503,7 @@ export async function handleCommand(
     ctx.cwd,
     ctx,
     deferredHandoff ? async (prepared) => canHandoffPreparedWorktree(prepared) &&
-      handoff(ctx, prepared, syncProjection, undefined, true) : undefined,
+      handoff(ctx, prepared, syncProjection, undefined, true, dependencies.handoffLifecycle) : undefined,
   );
   return `Run ${shortRunId(run.id)} started: ${run.status} (${run.stage})\nbranch: ${run.branch}\nworktree: ${run.worktreeCwd}\nUse /exec status ${run.id} for live progress.`;
 }
@@ -2433,20 +2567,30 @@ async function runAction(
       ? await chooseStopOutcome(resolved, ctx)
       : action;
   const sessionId = ctx.sessionManager.getSessionId();
-  const claimed = await defaultRegistry.claim(resolved, sessionId);
+  const retiring = retiringSession(resolved);
+  const claimed = retiring ? resolved : await defaultRegistry.claim(resolved, sessionId);
+  const startCleanup = (run: PlanExecRun): void => {
+    if (!retiring) {
+      startBackgroundController(run, sessionId, ctx.cwd, ctx);
+      return;
+    }
+    // Only the durable stop request crosses a draining controller's live lease.
+    void retiring.settled.then(() => restoreRetiredRun(run.id, ctx, startBackgroundController,
+      dependencies.isSessionClosed ?? (() => false))).catch(() => undefined);
+  };
   if (outcome === EXEC_ACTION.PAUSE) {
     const paused = await syncProjection(
       await requestStatus(claimed, EXEC_ACTION.PAUSE),
       { cwd: ctx.cwd, sessionId },
     );
-    startBackgroundController(paused, sessionId, ctx.cwd, ctx);
+    startCleanup(paused);
     return `Run ${shortRunId(paused.id)} paused; its current attempt is stopping and its checkpoint is preserved. Use /exec resume ${paused.id} to continue after confirmed exit.`;
   }
   const cancelled = await syncProjection(
     await requestStatus(claimed, EXEC_ACTION.CANCEL),
     { cwd: ctx.cwd, sessionId },
   );
-  startBackgroundController(cancelled, sessionId, ctx.cwd, ctx);
+  startCleanup(cancelled);
   return `Run ${shortRunId(cancelled.id)} marked cancel-pending. Its worktree is preserved.`;
 }
 
@@ -2456,6 +2600,8 @@ async function resumeRun(
   ctx: ExtensionCommandContext,
   dependencies: CommandDependencies,
 ): Promise<string | undefined> {
+  if (retiringSession(resolved))
+    throw new Error(`Run ${shortRunId(resolved.id)} is finishing its outgoing session's controller tick. Automatic recovery continues after it settles; /exec stop ${resolved.id} can still stop the current attempt.`);
   const {
     controller,
     startBackgroundController,
@@ -2497,10 +2643,12 @@ async function resumeRun(
     run,
     syncProjection,
     `resume ${run.id}${adoptCurrentBranch ? " --adopt-current-branch" : ""}${retryTask ? ` ${TASK_RETRY_OPTION}` : ""}${recoveryModel ? ` ${RECOVERY_MODEL_OPTION} ${recoveryModel}` : ""}`,
+    false,
+    dependencies.handoffLifecycle,
   );
   // The forked session re-enters the gate on an already-reset run, so this is
   // the note's only chance to be printed.
-  if (handedOff) return recovered.note;
+  if (handedOff || dependencies.isSessionClosed?.()) return recovered.note;
   if (adoptCurrentBranch) {
     if (!ctx.hasUI)
       throw new Error("Branch adoption requires interactive confirmation.");
@@ -2565,8 +2713,10 @@ async function skipStage(
     run,
     syncProjection,
     `skip ${run.id} --reason ${reason}`,
+    false,
+    dependencies.handoffLifecycle,
   );
-  if (handedOff) return undefined;
+  if (handedOff || dependencies.isSessionClosed?.()) return undefined;
   if (!ctx.hasUI)
     throw new Error("Force-skip requires interactive confirmation.");
   const operation = run.activeOperation;
@@ -2695,6 +2845,26 @@ async function handoffToWorktree(
   syncProjection: SyncProjection,
   followUp?: string,
   automatic = false,
+  lifecycle?: HandoffLifecycle,
+): Promise<boolean> {
+  if (lifecycle?.isClosed()) return false;
+  const preparation = lifecycle?.beginPreparation(run.id);
+  try {
+    return await prepareSessionHandoff(ctx, run, syncProjection, followUp, automatic,
+      lifecycle?.isClosed ?? (() => false), preparation?.switchingTo ?? (() => undefined));
+  } finally {
+    preparation?.finish();
+  }
+}
+
+async function prepareSessionHandoff(
+  ctx: ExtensionCommandContext,
+  run: PlanExecRun,
+  syncProjection: SyncProjection,
+  followUp: string | undefined,
+  automatic: boolean,
+  isClosed: () => boolean,
+  switchingTo: (sessionFile: string) => void,
 ): Promise<boolean> {
   if (automatic) {
     const current = await defaultRegistry.get(run.id);
@@ -2702,6 +2872,7 @@ async function handoffToWorktree(
       (current.stopGeneration ?? 0) !== (run.stopGeneration ?? 0)) return false;
     run = current;
   }
+  if (isClosed()) return false;
   if (run.lanePreparation?.state === "create") return false;
   if (resolve(run.worktreeCwd) === resolve(ctx.cwd)) return false;
   const sourceSessionFile = ctx.sessionManager.getSessionFile();
@@ -2723,19 +2894,22 @@ async function handoffToWorktree(
     throw new Error("Could not create a worktree Pi session.");
   }
 
-  let claimed = await defaultRegistry.claim(
-    await defaultRegistry.release(run),
-    targetSession.getSessionId(),
-  );
-  claimed = await syncProjection(claimed, {
-    cwd: targetSession.getCwd(),
-    sessionId: targetSession.getSessionId(),
-  });
-  if (automatic && (!canHandoffPreparedWorktree(claimed) ||
-    (claimed.stopGeneration ?? 0) !== (run.stopGeneration ?? 0))) {
-    await restoreSourceLease(run.id, sourceSessionId);
+  let claimed: PlanExecRun;
+  try {
+    claimed = await defaultRegistry.claim(
+      await defaultRegistry.release(run),
+      targetSession.getSessionId(),
+    );
+  } catch (error: unknown) {
+    await restoreSourceLease(run.id, sourceSessionId, targetSession.getSessionId(), isClosed);
+    throw error;
+  }
+  if (isClosed() || (automatic && (!canHandoffPreparedWorktree(claimed) ||
+    (claimed.stopGeneration ?? 0) !== (run.stopGeneration ?? 0)))) {
+    await restoreSourceLease(run.id, sourceSessionId, targetSession.getSessionId(), isClosed);
     return false;
   }
+  switchingTo(targetSessionFile);
   let switched = false;
   try {
     const result = await ctx.switchSession(targetSessionFile, {
@@ -2749,27 +2923,41 @@ async function handoffToWorktree(
         if (followUp) await worktreeCtx.sendUserMessage(`/exec ${followUp}`);
       },
     });
-    if (!result.cancelled) return true;
+    if (!result.cancelled) {
+      void syncProjection(claimed, { cwd: targetSession.getCwd(), sessionId: targetSession.getSessionId() }).catch(() => undefined);
+      return true;
+    }
   } catch (error: unknown) {
     if (switched) throw error;
-    await restoreSourceLease(run.id, sourceSessionId);
+    await restoreSourceLease(run.id, sourceSessionId, targetSession.getSessionId(), isClosed);
     throw error;
   }
 
-  await restoreSourceLease(run.id, sourceSessionId);
+  await restoreSourceLease(run.id, sourceSessionId, targetSession.getSessionId(), isClosed);
   return false;
 }
 
 async function restoreSourceLease(
   runId: string,
   sourceSessionId: string,
+  targetSessionId: string,
+  isClosed: () => boolean,
 ): Promise<void> {
-  const current = await defaultRegistry.get(runId);
-  if (!current) return;
-  await defaultRegistry.claim(
-    await defaultRegistry.release(current),
-    sourceSessionId,
-  );
+  for (;;) {
+    try {
+      const current = await defaultRegistry.get(runId);
+      if (!current || !isLocalRun(current) || current.lease?.pid !== process.pid ||
+        current.lease.sessionId !== targetSessionId) return;
+      const released = { ...current };
+      delete released.lease;
+      const updated = await defaultRegistry.updateIfCurrent(released, current.updatedAt);
+      if (!updated.applied) continue;
+      if (!isClosed()) await defaultRegistry.claim(updated.run, sourceSessionId);
+      return;
+    } catch {
+      await waitForControllerPoll();
+    }
+  }
 }
 
 function matchesContext(run: PlanExecRun, cwd: string): boolean {
