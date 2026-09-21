@@ -4,7 +4,7 @@ import {
   type ProcessTerminalProof,
 } from "./lifecycle.js";
 import { requestRpc, type EventBus } from "./rpc.js";
-import type { BridgeResult } from "./types.js";
+import type { BridgeResult, ExecutionLifetime } from "./types.js";
 
 export type { EventBus } from "./rpc.js";
 
@@ -29,6 +29,81 @@ export interface BridgeCapabilities {
   workflowScriptSpawn: boolean;
   durableOperationLookup: boolean;
   processTerminalProofVersion?: number;
+  workflowTerminalProofVersion?: 1;
+  executionLifetimeVersion?: 1;
+  executionLifetimeModes?: readonly ExecutionLifetime["mode"][];
+  processTreeOwnership?: ProcessTreeOwnership;
+}
+
+export interface ProcessTreeOwnership {
+  version: 1;
+  scope: "owned-process-tree" | "posix-process-group" | "process-groups";
+  escapedDescendants: "contained" | "unverified" | "unsupported";
+}
+
+export function processTreeOwnershipCapabilities(value: unknown):
+  Pick<BridgeCapabilities, "processTreeOwnership"> {
+  if (!isRecord(value) || value.version !== 1 ||
+    (value.scope !== "owned-process-tree" && value.scope !== "posix-process-group" && value.scope !== "process-groups") ||
+    (value.escapedDescendants !== "contained" && value.escapedDescendants !== "unverified" && value.escapedDescendants !== "unsupported"))
+    return {};
+  return { processTreeOwnership: { version: 1, scope: value.scope, escapedDescendants: value.escapedDescendants } };
+}
+
+export function supportsOwnedProcessTree(capabilities: Pick<BridgeCapabilities, "processTreeOwnership"> | undefined): boolean {
+  return capabilities?.processTreeOwnership?.version === 1 &&
+    capabilities.processTreeOwnership.scope === "owned-process-tree" &&
+    capabilities.processTreeOwnership.escapedDescendants === "contained";
+}
+
+export interface WorkflowTerminalProof {
+  version: 1;
+  kind: "workflow";
+  state: "observed";
+  runId: string;
+  dispatchClosed: true;
+  observedAt: number;
+  children: Array<ProcessTerminalProof | WorkflowTerminalProof>;
+}
+
+const MAX_WORKFLOW_PROOF_DEPTH = 32;
+
+/** A persistent workflow host need not exit, but every dispatched child must. */
+export function workflowTerminalProof(
+  value: unknown,
+  expectedRunId: string,
+  depth = 0,
+): WorkflowTerminalProof | undefined {
+  if (depth > MAX_WORKFLOW_PROOF_DEPTH || !isRecord(value) || value.version !== 1 ||
+    value.scope === "process-groups" || value.scope === "posix-process-group" ||
+    value.escapedDescendants === "unsupported" || value.escapedDescendants === "unverified" ||
+    value.containment === "unverified" ||
+    value.kind !== "workflow" || value.state !== PROCESS_TERMINAL_STATE.OBSERVED ||
+    value.runId !== expectedRunId || value.dispatchClosed !== true ||
+    typeof value.observedAt !== "number" || !Number.isFinite(value.observedAt) ||
+    !Array.isArray(value.children)) return undefined;
+  const children: WorkflowTerminalProof["children"] = [];
+  for (const child of value.children) {
+    if (!isRecord(child) || typeof child.runId !== "string" || !child.runId) return undefined;
+    const parsed = child.kind === "workflow"
+      ? workflowTerminalProof(child, child.runId, depth + 1)
+      : processTerminalProof(child, child.runId);
+    if (!parsed || parsed.state !== PROCESS_TERMINAL_STATE.OBSERVED) return undefined;
+    children.push(parsed);
+  }
+  return { version: 1, kind: "workflow", state: "observed", runId: expectedRunId,
+    dispatchClosed: true, observedAt: value.observedAt, children };
+}
+
+export function terminalProofObserved(value: unknown, expectedRunId: string): boolean {
+  return workflowTerminalProof(value, expectedRunId) !== undefined ||
+    processTerminalProof(value, expectedRunId)?.state === PROCESS_TERMINAL_STATE.OBSERVED;
+}
+
+export function hasTerminalOwnershipProof(data: Record<string, unknown>, runId: string): boolean {
+  if (data.workflowTerminalProof !== undefined)
+    return workflowTerminalProof(data.workflowTerminalProof, runId) !== undefined;
+  return terminalProofObserved(data.processTerminalProof, runId);
 }
 
 const V1_CAPABILITIES: BridgeCapabilities = {
@@ -58,6 +133,11 @@ export function processTerminalProof(
   if (
     !isRecord(value) ||
     value.version !== 1 ||
+    value.scope === "process-groups" ||
+    value.scope === "posix-process-group" ||
+    value.escapedDescendants === "unsupported" ||
+    value.escapedDescendants === "unverified" ||
+    value.containment === "unverified" ||
     value.runId !== expectedRunId ||
     typeof value.runnerProcessInstanceId !== "string" ||
     !value.runnerProcessInstanceId.trim() ||
@@ -72,7 +152,11 @@ export function processTerminalProof(
     (value.state === PROCESS_TERMINAL_STATE.OBSERVED &&
       (typeof value.observedAt !== "number" ||
         !Number.isFinite(value.observedAt) ||
-        !Array.isArray(value.instances))) ||
+        !Array.isArray(value.instances) ||
+        !supportsOwnedProcessTree(processTreeOwnershipCapabilities(value.processTreeOwnership)) ||
+        value.instances.some((instance: unknown) => !isRecord(instance) ||
+          (isRecord(instance.processTree) && (instance.processTree.mechanism === "posix-process-group" ||
+            instance.processTree.containment === "unverified"))))) ||
     (value.state === PROCESS_TERMINAL_STATE.UNKNOWN &&
       (typeof value.reason !== "string" || !value.reason.trim()))
   )
@@ -87,11 +171,34 @@ export function processTerminalProof(
       : {}),
     ...(Array.isArray(value.instances) ? { instances: value.instances } : {}),
     ...(typeof value.reason === "string" ? { reason: value.reason } : {}),
+    ...processTreeOwnershipCapabilities(value.processTreeOwnership),
   };
+}
+
+/** Absence or a malformed capability never implies support for no deadline. */
+export function executionLifetimeCapabilities(value: unknown):
+  Pick<BridgeCapabilities, "executionLifetimeVersion" | "executionLifetimeModes"> {
+  if (!isRecord(value) || value.version !== 1 || !Array.isArray(value.modes) ||
+    !value.modes.length || value.modes.some((mode) => mode !== "unbounded" && mode !== "bounded"))
+    return {};
+  return { executionLifetimeVersion: 1,
+    executionLifetimeModes: value.modes.filter((mode): mode is ExecutionLifetime["mode"] =>
+      mode === "unbounded" || mode === "bounded") };
+}
+
+export function parseExecutionLifetime(value: unknown): ExecutionLifetime | undefined {
+  if (!isRecord(value)) return undefined;
+  if (value.mode === "unbounded" && value.timeoutMs === undefined)
+    return { mode: "unbounded" };
+  if (value.mode === "bounded" && typeof value.timeoutMs === "number" &&
+    Number.isSafeInteger(value.timeoutMs) && value.timeoutMs > 0)
+    return { mode: "bounded", timeoutMs: value.timeoutMs };
+  return undefined;
 }
 
 export class BridgeClient {
   private negotiated?: BridgeCapabilities;
+  private capabilityProbe?: Promise<BridgeResult>;
   private readonly negotiationTimeoutMs: number;
 
   constructor(
@@ -106,14 +213,13 @@ export class BridgeClient {
   }
 
   async ping(): Promise<BridgeResult> {
-    if (this.negotiated)
-      return this.request(
-        this.negotiated.protocolVersion,
-        "ping",
-        {},
-        this.negotiationTimeoutMs,
-      );
+    if (this.capabilityProbe) return this.capabilityProbe;
+    this.capabilityProbe = this.refreshCapabilities();
+    try { return await this.capabilityProbe; }
+    finally { delete this.capabilityProbe; }
+  }
 
+  private async refreshCapabilities(): Promise<BridgeResult> {
     const v2Reply = await this.request(
       2,
       "ping",
@@ -125,6 +231,10 @@ export class BridgeClient {
       this.negotiated = capabilities;
       return v2Reply;
     }
+    if (this.negotiated?.protocolVersion === 2) {
+      this.negotiated = { ...this.negotiated, healthy: false };
+      return v2Reply;
+    }
 
     const v1Reply = await this.request(
       1,
@@ -132,12 +242,12 @@ export class BridgeClient {
       {},
       this.negotiationTimeoutMs,
     );
-    if (v1Reply.success) this.negotiated = { ...V1_CAPABILITIES, healthy: true };
+    this.negotiated = { ...V1_CAPABILITIES, healthy: v1Reply.success };
     return v1Reply;
   }
 
   async capabilities(): Promise<BridgeCapabilities> {
-    if (!this.negotiated) await this.ping();
+    await this.ping();
     return this.negotiated ?? V1_CAPABILITIES;
   }
 
@@ -146,6 +256,13 @@ export class BridgeClient {
     params: Record<string, unknown>,
     owner?: BridgeOperationOwner,
   ): Promise<BridgeResult> {
+    if (params.executionLifetime !== undefined) {
+      const lifetime = parseExecutionLifetime(params.executionLifetime);
+      if (!lifetime || this.negotiated?.healthy !== true ||
+        !this.negotiated.executionLifetimeModes?.includes(lifetime.mode) || !supportsOwnedProcessTree(this.negotiated))
+        return Promise.resolve({ success: false, error: { code: "unsupported",
+          message: "Bridge has not advertised the requested explicit execution lifetime and full owned-process-tree containment." } });
+    }
     const effectiveParams: Record<string, unknown> = {
       ...params,
       mission: false,
@@ -178,6 +295,13 @@ export class BridgeClient {
     owner?: BridgeOperationOwner,
   ): Promise<BridgeResult> {
     return this.request(this.protocolVersion(), "operation", {
+      operationId,
+      ...(this.protocolVersion() === 2 && owner ? { owner } : {}),
+    });
+  }
+
+  cancelOperation(operationId: string, owner?: BridgeOperationOwner): Promise<BridgeResult> {
+    return this.request(this.protocolVersion(), "cancelOperation", {
       operationId,
       ...(this.protocolVersion() === 2 && owner ? { owner } : {}),
     });
@@ -270,6 +394,10 @@ function parseV2Capabilities(
     workflowScriptSpawn: true,
     durableOperationLookup: true,
     processTerminalProofVersion: 1,
+    ...(isRecord(capabilities.workflowTerminalProof) && capabilities.workflowTerminalProof.version === 1
+      ? { workflowTerminalProofVersion: 1 as const } : {}),
+    ...executionLifetimeCapabilities(capabilities.executionLifetime),
+    ...processTreeOwnershipCapabilities(capabilities.processTreeOwnership),
   };
 }
 

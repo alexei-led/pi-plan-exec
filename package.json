@@ -19,6 +19,7 @@
     "url": "https://github.com/alexei-led/pi-plan-exec/issues"
   },
   "type": "module",
+  "packageManager": "npm@12.0.2",
   "main": "./src/index.ts",
   "license": "MIT",
   "engines": {
@@ -71,13 +72,15 @@
     }
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "0.84.4",
+    "@alexeiled/pi-fusion": "git+https://github.com/alexei-led/pi-fusion.git#766f8bc3c2d39a8e440c11d6e806bd8a45a54887",
+    "@alexeiled/pi-subagents-bridge": "git+https://github.com/alexei-led/pi-subagents-bridge.git#544f911571ec4552dcc71d5ce548175f1ad7f612",
+    "@earendil-works/pi-coding-agent": "0.86.1",
     "@eslint/js": "^10.0.1",
     "@tintinweb/pi-tasks": "0.9.0",
     "eslint": "^10.6.0",
     "globals": "^17.7.0",
     "jiti": "^2.7.0",
-    "pi-subagents": "0.60.0",
+    "pi-subagents": "git+https://github.com/alexei-led/pi-subagents-codex-fix.git#7a9f03a97c19468f92a9ec78551955da9ef580a7",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.62.1"
   }

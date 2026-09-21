@@ -8,6 +8,7 @@ const TASK_HEADING =
 const CHECKBOX = /^\s*(?:[-+*]|\d+[.)])\s+\[([ xX])\]\s+(.+?)\s*$/;
 const FENCE = /^\s{0,3}(`{3,}|~{3,})/;
 const CLOSING_FENCE = /^\s{0,3}(`{3,}|~{3,})\s*$/;
+const DEPENDENCIES = /^\s*dependsOn\s*:\s*(.*?)\s*$/i;
 
 type TaskHeading = {
   id: number;
@@ -58,6 +59,15 @@ export function parsePlan(path: string, content: string): ParsedPlan {
 
   const tasks: PlanTask[] = headings.map((heading, index) => {
     const endLine = headings[index + 1]?.line ?? lines.length;
+    const dependencyLines = lines.slice(heading.line + 1, endLine)
+      .flatMap((line, offset) => {
+        if (ignoredLines[heading.line + 1 + offset]) return [];
+        const match = DEPENDENCIES.exec(line);
+        return match ? [match[1] ?? ""] : [];
+      });
+    if (dependencyLines.length > 1)
+      throw new Error(`Task ${index + 1} has duplicate dependsOn metadata.`);
+    const dependsOn = parseDependencies(dependencyLines[0], index + 1);
     const checkboxes = lines
       .slice(heading.line + 1, endLine)
       .flatMap((line, offset) => {
@@ -72,6 +82,7 @@ export function parsePlan(path: string, content: string): ParsedPlan {
     }
     return {
       id: index + 1,
+      dependsOn,
       title: heading.title,
       startLine: heading.line + 1,
       endLine,
@@ -83,6 +94,24 @@ export function parsePlan(path: string, content: string): ParsedPlan {
   });
 
   return { path, hash: structureHash(tasks), tasks };
+}
+
+function parseDependencies(value: string | undefined, taskId: number): number[] {
+  if (value === undefined) return taskId > 1 ? [taskId - 1] : [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw new Error(`Task ${taskId} dependsOn must be a JSON array of earlier task IDs.`);
+  }
+  if (!Array.isArray(parsed) || !parsed.every((id: unknown) =>
+    typeof id === "number" && Number.isSafeInteger(id) && id >= 1 && id < taskId,
+  ))
+    throw new Error(`Task ${taskId} dependsOn must contain only earlier task IDs.`);
+  const dependencies = parsed as number[];
+  if (new Set(dependencies).size !== dependencies.length)
+    throw new Error(`Task ${taskId} dependsOn contains duplicate IDs.`);
+  return dependencies;
 }
 
 function parseTaskHeading(line: string, lineNumber: number): TaskHeading | undefined {
@@ -132,6 +161,7 @@ function structureHash(tasks: PlanTask[]): string {
     id: task.id,
     title: task.title,
     items: task.items,
+    dependsOn: task.dependsOn,
   }));
   return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
 }

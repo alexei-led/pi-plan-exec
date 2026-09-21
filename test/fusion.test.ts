@@ -110,6 +110,58 @@ test("Fusion client rejects ambiguous selectors without emitting a request", asy
   assert.equal(bus.count(FUSION_REQUEST_EVENT), 0);
 });
 
+test("Fusion start and replay preserve explicit no-deadline policy", async () => {
+  const bus = new FakeEventBus();
+  const client = new FusionClient(bus, 100);
+  const preflight = client.capabilities();
+  const ping = bus.last(FUSION_REQUEST_EVENT);
+  assert.ok(isRecord(ping));
+  bus.emit(`${FUSION_REPLY_PREFIX}${ping.requestId}`, { success: true, data: { capabilities: {
+    executionLifetime: { version: 1, modes: ["unbounded"] },
+    processTreeOwnership: { version: 1, scope: "owned-process-tree", escapedDescendants: "contained" },
+  } } });
+  await preflight;
+  for (const operationId of ["operation-1", "operation-1"]) {
+    const pending = client.start(operationId, "Review", undefined, { mode: "unbounded" });
+    const request = bus.last(FUSION_REQUEST_EVENT);
+    assert.ok(isRecord(request) && isRecord(request.params));
+    assert.deepEqual(request.params.executionLifetime, { mode: "unbounded" });
+    bus.emit(`${FUSION_REPLY_PREFIX}${request.requestId}`, { success: true, data: { runId: "fusion-1" } });
+    assert.equal((await pending).success, true);
+  }
+});
+
+test("Fusion refuses group-only runtime before starting a strict review", async () => {
+  const bus = new FakeEventBus();
+  const client = new FusionClient(bus, 100);
+  const pending = client.capabilities();
+  const request = bus.last(FUSION_REQUEST_EVENT);
+  assert.ok(isRecord(request));
+  bus.emit(`${FUSION_REPLY_PREFIX}${request.requestId}`, { success: true, data: { capabilities: {
+    executionLifetime: { version: 1, modes: ["unbounded"] },
+    processTreeOwnership: { version: 1, scope: "posix-process-group", escapedDescendants: "unverified" },
+  } } });
+  assert.deepEqual((await pending).executionLifetimeModes, ["unbounded"]);
+  const result = await client.start("op", "Review", undefined, { mode: "unbounded" });
+  assert.ok(!result.success);
+  assert.equal(result.error.code, "unsupported");
+  assert.equal(bus.count(FUSION_REQUEST_EVENT), 1);
+});
+
+test("Fusion preflight recognizes only explicit advertised capabilities", async () => {
+  const bus = new FakeEventBus();
+  const client = new FusionClient(bus, 100);
+  const pending = client.capabilities();
+  const request = bus.last(FUSION_REQUEST_EVENT);
+  assert.ok(isRecord(request));
+  bus.emit(`${FUSION_REPLY_PREFIX}${request.requestId}`, { success: true, data: { capabilities: {
+    executionLifetime: { version: 1, modes: ["unbounded"] },
+    processTerminalProof: { version: 1 }, durableOperationLookup: { version: 1 },
+  } } });
+  assert.deepEqual(await pending, { healthy: true, durableOperationLookup: true,
+    executionLifetimeVersion: 1, executionLifetimeModes: ["unbounded"], processTerminalProofVersion: 1 });
+});
+
 class FakeEventBus {
   private readonly handlers = new Map<
     string,

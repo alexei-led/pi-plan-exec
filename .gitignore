@@ -6,6 +6,7 @@ node_modules/
 .pi/
 .pi-subagents/
 .ralphex/
+.revmux/tasks/
 
 # GitNexus index and its generated tool skills
 .gitnexus/

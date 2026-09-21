@@ -19,7 +19,6 @@ import {
   isExternalManualBlocker,
   isModelProviderFailure,
   isTaskRetryConfirmationRequired,
-  MAX_STATUS_FAILURES,
   PLAN_STRUCTURE_CHANGED_ERROR,
   PlanExecController,
   TASK_RETRY_OPTION,
@@ -58,7 +57,11 @@ import {
 import { readPlan } from "./plan.js";
 import { appendProgress } from "./progress.js";
 import { loadPlanExecRuntimeIntegration } from "./runtime-integration.js";
-import { TaskProjector } from "./task-projection.js";
+import {
+  TaskProjector,
+  TASK_EXECUTION_STATE,
+  taskProjectionSummary,
+} from "./task-projection.js";
 import {
   COMPLETED_PLANS_DIRECTORY,
   EXEC_ACTION,
@@ -78,6 +81,7 @@ const defaultRegistry = new RunRegistry();
 const STATUS_KEY = "plan-exec";
 const PROVIDER_PROBE_TIMEOUT_MS = 1_500;
 const CONTROLLER_POLL_INTERVAL_MS = 1_000;
+const PROJECTION_TIMEOUT_MS = 1_500;
 const COMMAND_CAS_RETRIES = 5;
 const MILLISECONDS_PER_SECOND = 1_000;
 const SECONDS_PER_MINUTE = 60;
@@ -228,6 +232,7 @@ function goalPreparationPrompt(prepared: PendingGoalPlan): string {
     "Prepare a meaningful executable Markdown plan for this repository. This is preparation only: do not execute work, create a run, launch a child, or change any repository file.",
     `Requested goal: ${prepared.goal}`,
     `Use only the enabled read-only tools. Pi enforces at most ${GOAL_MAX_READ_CALLS} read-tool calls for this turn; use them on the most relevant files, then produce 2 to 6 ordered tasks that name the concrete modules, tests, interfaces, and verification commands discovered in this repository.`,
+    "Declare dependencies explicitly in each task heading with JSON metadata such as `dependsOn: [1]`; use `dependsOn: []` for work that is independent. IDs are normalized from 1 in plan order and may reference only earlier tasks. Omit the field only when preserving the legacy sequential default is intentional.",
     "Before finalizing, make every claim traceable to the repository. Do not invent paths or generic Implement/Verify steps.",
     "Call finalize_goal_plan exactly once with the plan body and no frontmatter. Its required shape is:",
     "# <specific plan title>",
@@ -238,9 +243,11 @@ function goalPreparationPrompt(prepared: PendingGoalPlan): string {
     "- `actual/path.ts`: what this file establishes for the plan.",
     "",
     "### Task 1: <concrete repository change>",
+    "dependsOn: []",
     "- [ ] <specific implementation and test work>",
     "",
     "### Task 2: <next concrete change>",
+    "dependsOn: [1]",
     "- [ ] <specific verification work>",
   ].join("\n");
 }
@@ -258,18 +265,32 @@ export default function planExecExtension(pi: ExtensionAPI): void {
       .then(() => projector.sync(run, options))
       .then(async (projected) => {
         try {
-          (await runtimeIntegration)?.sync(projected, options.sessionId);
+          const integration = await boundedPromise(
+            runtimeIntegration,
+            PROJECTION_TIMEOUT_MS,
+          );
+          if (integration)
+            await boundedPromise(
+              Promise.resolve(integration.sync(projected, options.sessionId)),
+              PROJECTION_TIMEOUT_MS,
+            );
         } catch {
           // Fleet visibility is a cache too; the durable run still proceeds.
         }
         return projected;
       });
     projectionQueues.set(run.id, next);
-    void next.finally(() => {
+    void next.then(() => undefined, () => undefined).finally(() => {
       if (projectionQueues.get(run.id) === next)
         projectionQueues.delete(run.id);
     });
-    return next;
+    // A broken pi-tasks/runtime integration must not hold controller progress.
+    // `next` remains the sole writer and is serialized with later projections;
+    // callers receive a bounded snapshot while a slow cache repair finishes.
+    return boundedPromise(next, PROJECTION_TIMEOUT_MS).then(
+      (projected) => projected ?? run,
+      () => run,
+    );
   };
   const bridge = new BridgeClient(pi.events);
   const fusion = new FusionClient(pi.events);
@@ -323,11 +344,16 @@ export default function planExecExtension(pi: ExtensionAPI): void {
   const inFlightControllers = new Set<string>();
   const lastStates = new Map<string, RunState>();
   const setStatus = (run: PlanExecRun, ctx: ExtensionContext): void => {
-    ctx.ui.setStatus(STATUS_KEY, compactRunStatus(run));
-    ctx.ui.setWidget(STATUS_KEY, [
-      `Plan worktree: ${run.worktreeCwd}`,
-      `Git branch: ${run.branch}  ·  use !git status --short --branch for details`,
-    ]);
+    try {
+      ctx.ui.setStatus(STATUS_KEY, compactRunStatus(run));
+      ctx.ui.setWidget(STATUS_KEY, [
+        ...formatRunWidget(run),
+        `Plan worktree: ${run.worktreeCwd}`,
+        `Git branch: ${run.branch}  ·  use !git status --short --branch for details`,
+      ]);
+    } catch {
+      // TUI/RPC teardown must never affect the durable controller.
+    }
   };
   const stopBackgroundController = (runId: string): void => {
     const timer = activeControllers.get(runId);
@@ -344,45 +370,6 @@ export default function planExecExtension(pi: ExtensionAPI): void {
       ctx.ui.notify(message, level);
     } catch {
       // UI can disappear during reload or shutdown; the registry remains authoritative.
-    }
-  };
-  const handleBackgroundFailure = async (
-    runId: string,
-    sessionId: string,
-    cwd: string,
-    ctx: ExtensionContext,
-    error: unknown,
-  ): Promise<void> => {
-    const message = error instanceof Error ? error.message : String(error);
-    try {
-      const failed = await controller.markFailed(runId, error);
-      if (!failed) {
-        notify(
-          ctx,
-          `Plan execution ${shortRunId(runId)} stopped: ${message}`,
-          "error",
-        );
-        return;
-      }
-      setStatus(failed, ctx);
-      try {
-        await syncProjection(failed, { sessionId, cwd });
-      } catch {
-        // A projection failure must not hide the persisted controller failure.
-      }
-      notify(
-        ctx,
-        `Plan execution ${shortRunId(failed.id)} failed at ${failed.stage}: ${failed.error ?? message}. Worktree preserved. Use /exec status ${failed.id} to inspect it.`,
-        "error",
-      );
-    } catch (markError: unknown) {
-      const detail =
-        markError instanceof Error ? markError.message : String(markError);
-      notify(
-        ctx,
-        `Plan execution ${shortRunId(runId)} failed and could not be recorded: ${detail}.`,
-        "error",
-      );
     }
   };
   // Reported, not thrown: /exec status prints the same problems next to the
@@ -436,8 +423,7 @@ export default function planExecExtension(pi: ExtensionAPI): void {
       if (inFlightControllers.has(runId)) return;
       inFlightControllers.add(runId);
       void controller
-        .resume(runId, sessionId, false)
-        .then((run) => syncProjection(run, { sessionId, cwd }))
+        .tick(runId, sessionId)
         .then((run) => {
           setStatus(run, ctx);
           const previous = lastStates.get(runId);
@@ -447,7 +433,7 @@ export default function planExecExtension(pi: ExtensionAPI): void {
             const level: NotificationLevel =
               run.status === RUN_STATUS.FAILED ? "error" : "info";
             notify(ctx, terminalMessage(run), level);
-          } else if (run.status === RUN_STATUS.PAUSED) {
+          } else if (shouldStopBackgroundController(run)) {
             stopBackgroundController(runId);
             notify(
               ctx,
@@ -458,11 +444,23 @@ export default function planExecExtension(pi: ExtensionAPI): void {
             const transition = progressTransition(previous, run);
             if (transition) notify(ctx, transition, "info");
           }
+          // Projection is a cache repair. Keep it serialized per run, but do
+          // not hold the controller's next tick on a slow or broken cache.
+          void syncProjection(run, { sessionId, cwd })
+            .then((projected) => setStatus(projected, ctx))
+            .catch(() => undefined);
           return run;
         })
         .catch((error: unknown) => {
-          stopBackgroundController(runId);
-          void handleBackgroundFailure(runId, sessionId, cwd, ctx, error);
+          // A transient claim/UI/provider error is a recovery observation. The
+          // next timer tick retries it; only explicit controller state can stop
+          // the timer. In particular, this path never marks a run failed.
+          const message = error instanceof Error ? error.message : String(error);
+          notify(
+            ctx,
+            `Plan execution ${shortRunId(runId)} recovery probe unavailable: ${message}. Automatic retry continues.`,
+            "warning",
+          );
         })
         .finally(() => inFlightControllers.delete(runId));
     }, CONTROLLER_POLL_INTERVAL_MS);
@@ -649,7 +647,7 @@ export default function planExecExtension(pi: ExtensionAPI): void {
       const repaired = shouldRepairProjectionForSession(run, sessionId)
         ? await syncProjection(run, { cwd: ctx.cwd, sessionId })
         : run;
-      if (!isTerminal(repaired.status) && repaired.lease?.sessionId === sessionId)
+      if (shouldAutoRestoreRun(repaired, sessionId))
         startBackgroundController(repaired, sessionId, ctx.cwd, ctx);
     }
     // Advisory only: a failed diagnosis must not take the session down with it.
@@ -1146,6 +1144,11 @@ export function formatRunStatus(
       );
   }
   if (run.progressPath) lines.push(`progress: ${run.progressPath}`);
+  lines.push(...taskStatusLines(run));
+  const usage = totalUsage(run);
+  if (usage) lines.push(`usage: ${usage}`);
+  if (run.statsReport)
+    lines.push(`stats report: ${run.statsReport.state} — ${run.statsReport.error ?? run.statsReport.summary}`);
   if (run.taskProjection?.state === "degraded")
     lines.push(
       `task projection: degraded — ${run.taskProjection.error ?? "unknown error"}`,
@@ -1164,12 +1167,12 @@ export function formatRunStatus(
   const polling = evidence?.leaseLive === true ? "; retrying" : "";
   if (operation?.statusFailures) {
     lines.push(
-      `observation: unavailable (${operation.statusFailures}/${MAX_STATUS_FAILURES})${polling}${operation.lastStatusError ? ` — ${operation.lastStatusError}` : ""}`,
+      `observation: unavailable (${operation.statusFailures} failed probes)${polling}${operation.lastStatusError ? ` — ${operation.lastStatusError}` : ""}`,
     );
   }
   if (operation?.skipFailures) {
     lines.push(
-      `waived stage: could not stop the worker (${operation.skipFailures}/${MAX_STATUS_FAILURES})${polling}${operation.lastSkipError ? ` — ${operation.lastSkipError}` : ""}`,
+      `waived stage: could not stop the worker (${operation.skipFailures} failed requests)${polling}${operation.lastSkipError ? ` — ${operation.lastSkipError}` : ""}`,
     );
   } else if (operation && !operation.statusFailures && polling) {
     lines.push(
@@ -1205,6 +1208,29 @@ export function formatRunStatus(
     );
   lines.push(`next safe action: ${guidance.action}`);
   return lines.join("\n");
+}
+
+function taskStatusLines(run: PlanExecRun): string[] {
+  const summary = taskProjectionSummary(run);
+  if (summary.total === 0) return [];
+  const lines = [
+    `tasks: ${summary.accepted}/${summary.total} accepted; ready ${summary.ready}; running ${summary.running}; retry ${summary.retry}; dependency ${summary.dependency}; external ${summary.external}`,
+  ];
+  for (const task of Object.values(run.tasks ?? {}).sort(
+    (left, right) => left.taskId - right.taskId,
+  )) {
+    if (task.state === TASK_EXECUTION_STATE.ACCEPTED) continue;
+    const next = task.nextAttemptAt
+      ? `; next automatic action ${new Date(task.nextAttemptAt).toISOString()}`
+      : "";
+    const verified = task.lastVerifiedActivityAt
+      ? `; last verified ${new Date(task.lastVerifiedActivityAt).toISOString()}`
+      : "";
+    lines.push(
+      `task ${task.taskId}: ${task.state}; attempts ${task.attempts}${task.reason ? `; reason ${task.reason}` : ""}${next}${verified}`,
+    );
+  }
+  return lines;
 }
 
 /**
@@ -2124,6 +2150,31 @@ export function shouldRepairProjectionForSession(
   );
 }
 
+/**
+ * Startup may resume a recoverable in-flight run only when it can claim the
+ * durable lease. A live lease from another session is observed and left alone;
+ * a user pause remains authoritative, while cancel-pending is allowed to
+ * finish its cleanup automatically.
+ */
+export function shouldAutoRestoreRun(
+  run: PlanExecRun,
+  sessionId: string,
+): boolean {
+  if (!isInFlightStatus(run.status) || isTerminal(run.status)) return false;
+  if (run.status !== RUN_STATUS.CANCEL_PENDING && run.userStopped === true)
+    return false;
+  const lease = run.lease;
+  if (!lease) return true;
+  if (lease.sessionId === sessionId) return true;
+  return !isLeaseLive(lease, sessionId);
+}
+
+/** Keep polling a paused tracked child until its exit is actually observed. */
+export function shouldStopBackgroundController(run: PlanExecRun): boolean {
+  return isTerminal(run.status) ||
+    (run.status === RUN_STATUS.PAUSED && run.activeOperation === undefined);
+}
+
 async function repairProjectionForRead(
   args: string[],
   ctx: ExtensionCommandContext,
@@ -2867,16 +2918,19 @@ export async function reviewedPlanHashForResume(
   return current.hash;
 }
 
-async function requestStatus(
+export async function requestStatus(
   run: PlanExecRun,
   action: typeof EXEC_ACTION.PAUSE | typeof EXEC_ACTION.CANCEL,
+  registry: RunRegistry = defaultRegistry,
 ): Promise<PlanExecRun> {
   let current = run;
   for (let attempt = 0; attempt < COMMAND_CAS_RETRIES; attempt += 1) {
     assertActionAllowed(action, current);
-    const requested = await defaultRegistry.updateIfCurrent(
+    const requested = await registry.updateIfCurrent(
       {
         ...current,
+        userStopped: true,
+        stopGeneration: (current.stopGeneration ?? 0) + 1,
         status:
           action === EXEC_ACTION.PAUSE
             ? RUN_STATUS.PAUSED
@@ -2955,14 +3009,188 @@ function progressTransition(
 function observationLabel(run: PlanExecRun): string {
   const failures = run.activeOperation?.statusFailures;
   return failures
-    ? `cannot observe worker (${failures}/${MAX_STATUS_FAILURES})`
+    ? `cannot observe worker (${failures} failed probes)`
     : "polling worker";
 }
 
 function compactRunStatus(run: PlanExecRun): string {
   const projection =
     run.taskProjection?.state === "degraded" ? " · projection degraded" : "";
-  return `exec ${run.status} · ${run.stage} · ${activeOperationLabel(run)} · ${observationLabel(run)}${projection}`;
+  const summary = taskProjectionSummary(run);
+  const taskCount =
+    summary.total > 0
+      ? ` · tasks ${summary.accepted}/${summary.total}`
+      : "";
+  return `exec ${run.status} · ${run.stage} · ${activeOperationLabel(run)} · ${observationLabel(run)}${taskCount}${projection}`;
+}
+
+/**
+ * Render the durable controller snapshot for the native Pi widget. Every line
+ * is derived from run.json; pi-tasks is intentionally absent from this path so
+ * a broken optional projection cannot block status or recovery.
+ */
+export function formatRunWidget(
+  run: PlanExecRun,
+  now = Date.now(),
+): string[] {
+  const summary = taskProjectionSummary(run);
+  const taskCounts = [
+    `${summary.accepted}/${summary.total} accepted`,
+    `ready ${summary.ready}`,
+    `retry ${summary.retry}`,
+    `dependency ${summary.dependency}`,
+    `external ${summary.external}`,
+  ].join("  ");
+  const lines = [`Plan ${basename(run.planPath)}  ${taskCounts}`];
+  const tasks = Object.values(run.tasks ?? {});
+  const active = tasks.find(
+    (task) =>
+      task.state === TASK_EXECUTION_STATE.RUNNING ||
+      task.state === TASK_EXECUTION_STATE.VERIFYING,
+  );
+  const waiting = tasks.find(
+    (task) =>
+      task.state === TASK_EXECUTION_STATE.RETRY_WAIT ||
+      task.state === TASK_EXECUTION_STATE.WAITING_DEPENDENCY ||
+      task.state === TASK_EXECUTION_STATE.WAITING_EXTERNAL,
+  );
+  const dependencyWait = tasks.find(
+    (task) => task.state === TASK_EXECUTION_STATE.WAITING_DEPENDENCY,
+  );
+  if (active) {
+    const usage = usageLabel(active.usage);
+    const elapsed = active.lastScheduledAt
+      ? ` · elapsed ${elapsedLabel(now - active.lastScheduledAt)}`
+      : "";
+    lines.push(
+      `Task ${active.taskId}: ${active.state} · attempts ${active.attempts}${usage}${elapsed} · deadline ${executionDeadlineLabel(run)}`,
+    );
+  } else if (waiting) {
+    const next = waiting.nextAttemptAt
+      ? ` · next ${relativeTimeAt(waiting.nextAttemptAt, now)}`
+      : "";
+    lines.push(
+      `Task ${waiting.taskId}: ${waiting.state} · attempts ${waiting.attempts}${next}${waiting.reason ? ` · ${waiting.reason}` : ""}`,
+    );
+  } else if (run.wakeReason) {
+    lines.push(`Run ${run.status}: ${run.wakeReason}`);
+  }
+  if (run.lanePreparation) {
+    lines.push(
+      `Lane preparation: Task ${run.lanePreparation.taskId} · ${run.lanePreparation.state}${run.lanePreparation.error ? ` · ${run.lanePreparation.error}` : ""}`,
+    );
+  }
+  if (dependencyWait) {
+    lines.push(
+      `Next automatic action: after task ${dependencyWait.dependsOn.join(", ") || "its prerequisite"} is accepted`,
+    );
+  } else if (run.nextAttemptAt && run.nextAttemptAt > now)
+    lines.push(
+      `Next automatic action: ${relativeTimeAt(run.nextAttemptAt, now)}${run.wakeReason ? ` · ${run.wakeReason}` : ""}`,
+    );
+  const lastVerified = latestVerifiedActivity(run);
+  lines.push(
+    lastVerified
+      ? `Last verified progress: ${new Date(lastVerified).toISOString()}`
+      : "Last verified progress: unavailable",
+  );
+  if (run.lease)
+    lines.push(`Owner: Pi/${run.lease.sessionId} · heartbeat ${relativeTimeAt(run.lease.heartbeatAt, now)}`);
+  if (run.needsAttention) lines.push("Needs attention: yes; automatic recovery remains scheduled");
+  if (run.taskProjection?.state === "degraded")
+    lines.push(`Projection: unavailable · ${run.taskProjection.error ?? "unknown error"}`);
+  const usage = totalUsage(run);
+  if (usage) lines.push(`Usage: ${usage}`);
+  const reviewRequired = run.config?.reviewRequired === true;
+  const reviewBackend = run.config?.reviewBackend ?? "unavailable";
+  lines.push(
+    `Review: ${reviewRequired ? "required" : "optional"} · ${reviewBackend}`,
+    `Lifetime: ${executionLifetimeLabel(run)}`,
+    `Details: /exec status ${run.id}`,
+  );
+  return lines;
+}
+
+function usageLabel(
+  usage: { inputTokens?: number; outputTokens?: number; cost?: number } | undefined,
+): string {
+  const formatted = formatUsage(usage);
+  return formatted ? ` · ${formatted}` : "";
+}
+
+function formatUsage(
+  usage: { inputTokens?: number; outputTokens?: number; cost?: number } | undefined,
+): string | undefined {
+  if (!usage) return undefined;
+  const tokens = (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0);
+  const parts = tokens > 0 ? [`tokens ${tokens}`] : [];
+  if (usage.cost !== undefined) parts.push(`cost ${usage.cost}`);
+  return parts.length > 0 ? parts.join(", ") : undefined;
+}
+
+function executionDeadlineLabel(run: PlanExecRun): string {
+  const lifetime = run.config?.executionLifetime;
+  return lifetime?.mode !== "bounded"
+    ? "none (unbounded)"
+    : `${elapsedLabel(lifetime.timeoutMs)} compatibility mode`;
+}
+
+function executionLifetimeLabel(run: PlanExecRun): string {
+  const lifetime = run.config?.executionLifetime;
+  return lifetime?.mode !== "bounded"
+    ? "unbounded end-to-end verified"
+    : `${elapsedLabel(lifetime.timeoutMs)} compatibility mode`;
+}
+
+function totalUsage(run: PlanExecRun): string | undefined {
+  const recorded = formatUsage(run.usage);
+  if (recorded) return recorded;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let cost = 0;
+  let hasCost = false;
+  for (const task of Object.values(run.tasks ?? {})) {
+    if (task.usage?.inputTokens !== undefined) inputTokens += task.usage.inputTokens;
+    if (task.usage?.outputTokens !== undefined) outputTokens += task.usage.outputTokens;
+    if (task.usage?.cost !== undefined) {
+      cost += task.usage.cost;
+      hasCost = true;
+    }
+  }
+  const tokens = inputTokens + outputTokens;
+  if (tokens === 0 && !hasCost) return undefined;
+  return [
+    ...(tokens > 0 ? [`tokens ${tokens}`] : []),
+    ...(hasCost ? [`cost ${cost}`] : []),
+  ].join(", ");
+}
+
+function latestVerifiedActivity(run: PlanExecRun): number | undefined {
+  return Object.values(run.tasks ?? {})
+    .map((task) => task.lastVerifiedActivityAt)
+    .filter((value): value is number => value !== undefined)
+    .sort((left, right) => right - left)[0];
+}
+
+function relativeTimeAt(timestamp: number, now: number): string {
+  const delta = timestamp - now;
+  if (delta > 0) return `in ${elapsedLabel(delta)}`;
+  return `${elapsedLabel(-delta)} ago`;
+}
+
+function boundedPromise<T>(
+  promise: Promise<T> | undefined,
+  timeoutMs: number,
+): Promise<T | undefined> {
+  if (!promise) return Promise.resolve(undefined);
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<undefined>((resolve) => {
+    timeout = setTimeout(() => resolve(undefined), timeoutMs);
+    timeout.unref?.();
+  });
+  return Promise.race([promise, deadline]).finally(() => {
+    if (timeout) clearTimeout(timeout);
+  });
 }
 
 export function pausedMessage(run: PlanExecRun): string {

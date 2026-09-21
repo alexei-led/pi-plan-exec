@@ -5,7 +5,7 @@ import {
   type BackgroundWorkProvider,
   type ExternalRunRecord,
 } from "../src/runtime-integration.js";
-import type { PlanExecRun } from "../src/types.js";
+import { DEFAULT_FROZEN_RUN_CONFIG, type PlanExecRun } from "../src/types.js";
 
 class FakeRuntimeApi {
   readonly rows = new Map<string, ExternalRunRecord>();
@@ -63,6 +63,7 @@ function run(overrides: Partial<PlanExecRun> = {}): PlanExecRun {
     branchRebindings: [],
     lease: { sessionId: "session-1", pid: process.pid, heartbeatAt: 1 },
     config: {
+      ...DEFAULT_FROZEN_RUN_CONFIG,
       taskRetries: 1,
       maxTaskIterations: 50,
       reviewIterations: 5,

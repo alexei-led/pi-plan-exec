@@ -75,7 +75,26 @@ export const RUN_STATUSES: readonly RunStatus[] = Object.freeze(
   Object.values(RUN_STATUS),
 );
 
+export type ExecutionLifetime =
+  | { mode: "unbounded" }
+  | { mode: "bounded"; timeoutMs: number };
+
+export const MAX_EXECUTION_TIMEOUT_MS = 2_147_483_647;
+
+export type ReviewBackend = "subagent" | "fusion" | "revmux";
+
 export interface FrozenRunConfig {
+  executionLifetime: ExecutionLifetime;
+  retryDelayMs: number;
+  requiredChecks: string[][];
+  bootstrapCommands: string[][];
+  reviewEnabled: boolean;
+  reviewRequired: boolean;
+  reviewBackend: ReviewBackend;
+  reviewFallback: ReviewBackend[];
+  statsEnabled: boolean;
+  revmuxExecutable?: string;
+  revmuxProfile?: string;
   taskRetries: number;
   maxTaskIterations: number;
   reviewIterations: number;
@@ -94,6 +113,15 @@ export interface FrozenRunConfig {
 }
 
 export const DEFAULT_FROZEN_RUN_CONFIG = {
+  executionLifetime: { mode: "unbounded" },
+  retryDelayMs: 5_000,
+  requiredChecks: [],
+  bootstrapCommands: [],
+  reviewEnabled: true,
+  reviewRequired: true,
+  reviewBackend: "subagent",
+  reviewFallback: [],
+  statsEnabled: false,
   taskRetries: 1,
   maxTaskIterations: 50,
   reviewIterations: 5,
@@ -158,6 +186,7 @@ export const EXTERNAL_OPERATION_STATE = {
 
 export interface PlanTask {
   id: number;
+  dependsOn: number[];
   title: string;
   startLine: number;
   endLine: number;
@@ -236,6 +265,7 @@ export interface ActiveOperation {
   requestDigest?: string;
   taskId?: number;
   reviewIteration?: number;
+  reviewedCommit?: string;
   stopRequested?: boolean;
   recovery?: OperationRecovery;
   launchFailures?: number;
@@ -249,6 +279,38 @@ export interface ActiveOperation {
   lastSkipError?: string;
   /** Last digest parsed from the provider status text; absent when unreported. */
   workerSignal?: WorkerSignal;
+  processTreeExited?: boolean;
+  stopGeneration?: number;
+  nextAttemptAt?: number;
+  effectiveLifetime?: ExecutionLifetime;
+  reportedUsage?: { inputTokens?: number; outputTokens?: number; cost?: number };
+}
+
+export type TaskExecutionState =
+  | "ready"
+  | "running"
+  | "verifying"
+  | "retry_wait"
+  | "waiting_dependency"
+  | "waiting_external"
+  | "accepted";
+
+export interface TaskExecution {
+  taskId: number;
+  dependsOn: number[];
+  state: TaskExecutionState;
+  attempts: number;
+  nextAttemptAt?: number;
+  reason?: string;
+  laneCwd?: string;
+  laneBranch?: string;
+  baselineCommit?: string;
+  candidateCommit?: string;
+  acceptedCommit?: string;
+  operationId?: string;
+  lastScheduledAt?: number;
+  lastVerifiedActivityAt?: number;
+  usage?: { inputTokens?: number; outputTokens?: number; cost?: number };
 }
 
 export interface PlanExecRun {
@@ -265,6 +327,27 @@ export interface PlanExecRun {
   status: RunStatus;
   stage: RunStage;
   taskAttempts: Record<string, number>;
+  tasks?: Record<string, TaskExecution>;
+  acceptedHead?: string;
+  reviewedCommit?: string;
+  verifiedCommit?: string;
+  nextAttemptAt?: number;
+  wakeReason?: string;
+  recoveryAttempts?: number;
+  usage?: { inputTokens?: number; outputTokens?: number; cost?: number };
+  statsReport?: { state: "summary" | "reported" | "unavailable"; summary: string; error?: string };
+  needsAttention?: boolean;
+  stopGeneration?: number;
+  userStopped?: boolean;
+  lanePreparation?: {
+    cwd: string;
+    branch: string;
+    baselineCommit: string;
+    taskId: number;
+    state: "create" | "bootstrap";
+    nextAttemptAt?: number;
+    error?: string;
+  };
   stageAttempts: Partial<Record<RunStage, number>>;
   reviewFindings: ReviewFinding[];
   skippedStages: SkippedStage[];
