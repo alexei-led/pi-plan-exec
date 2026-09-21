@@ -73,7 +73,7 @@
     "pi-subagents": "git+https://github.com/alexei-led/pi-subagents-codex-fix.git#798b70d8c94befd7ae96fc40d4ae9198a71810ef"
   },
   "devDependencies": {
-    "@alexeiled/pi-fusion": "git+https://github.com/alexei-led/pi-fusion.git#5b41a651b25c86e6164b1484f4371702b63faa34",
+    "@alexeiled/pi-fusion": "git+https://github.com/alexei-led/pi-fusion.git#a29934f32376f799235a6a00ec3ddcebf7cb0108",
     "@alexeiled/pi-subagents-bridge": "git+https://github.com/alexei-led/pi-subagents-bridge.git#c7ab396b2ab3f5354790c974abce41e04fea41a1",
     "@earendil-works/pi-coding-agent": "0.86.1",
     "@eslint/js": "^10.0.1",
