@@ -158,7 +158,7 @@ polling on its own. Then re-check:
 
 ### `its lease names a machine that is not this one`
 
-The host is stamped on the lease when the run is claimed and never re-stamped,
+The host is stamped on the lease when the run is claimed,
 and the whole name identifies the machine — `foo.local`, `foo.lan`, and
 `foo.corp.example.com` are three different hosts, because two real machines can
 share a first label and a shared home shows both their runs. A renamed host is
@@ -168,11 +168,11 @@ therefore foreign until the operator asserts that it was this machine:
 /exec resume <full-run-id> --same-machine
 ```
 
-The flag creates a temporary local view for evidence gathering without rewriting
-the durable lease. Resume still refuses while a worker is writing here; decisive
-local evidence permits the normal reset and claim, which stamps the current
-host. When the lease really does name a different machine, recover the run
-there instead.
+The flag permits local evidence gathering. A live local controller still fences
+the claim, and an unresolved tracked worker still needs ownership evidence.
+After those checks pass, recovery rebinds the stored hostname while preserving
+operation and stop state. When the lease really names a different machine,
+recover the run there instead.
 
 ### Why no per-turn activity signal may exist
 

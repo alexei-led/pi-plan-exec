@@ -2,7 +2,7 @@
 
 <!-- markdownlint-disable MD013 -->
 
-Status: implementation and integration checks complete; cumulative review in progress
+Status: review corrections verified locally; CI and confirmation review pending
 
 Baseline: `0f184ec80754683772b081ef41e6a22a6b8fdb27` (`origin/main`).
 
@@ -121,6 +121,23 @@ These record intermediate findings. The final verification and next-step section
 - Remaining ownership correction: controller-created worktrees, output promotion and archive Git mutations need durable owned execution before adoption of visible directories or HEAD changes. Initial run intent must precede worktree creation. Real hook/parent-death regressions are required. Git repository-routing environment variables must not escape from a parent hook into another lane; main and native launch boundaries are being hardened, preserving identity and authentication settings.
 - Remaining lifetime correction: native upstream has separate inherited per-tool defaults. Explicit unbounded mode must suppress these as well as session deadlines; only an explicitly selected command budget may remain finite. Test an actual open tool across the virtual thirty-minute boundary. In bounded compatibility mode, growth requires verified useful activity near expiry; unknown or stale activity instead schedules a changed recovery approach without rewarding a suspected stall.
 
+## Review corrections
+
+Revmux round `02-after-fix` reviewed the full cumulative scope with four of four sources and no degradation. Exit 1 reported eight major and two minor findings, with no critical findings. The following corrections require confirmation in the final round:
+
+| Finding | Correction and regression evidence |
+| --- | --- |
+| `adversarial-1` | Saved-session handoff waits for durable lane creation; source polling survives creation retries and stop fences. Real Git plus installed SDK session fork regression passes. |
+| `adversarial-2` | Registry reserves current, output, preparation and retained task/recovery checkouts on both sides of admission. All 43 registry tests pass. |
+| `adversarial-3` | Git object paths and status comparisons use the checkout root while workers keep the requested nested cwd. Nested acceptance/archive, independent lanes and `diff.relative` regressions pass. |
+| `adversarial-4` | Native nested delegation parses the actual JSON ownership marker and verifies its full binding and kernel membership. Real foreground and async nested launches pass. |
+| `adversarial-5` | Audited native pre-dispatch rejection produces durable no-start evidence. Main obtains a correlated cancellation fence and schedules a backed-off retry; it never substitutes this for process-exit proof. Actual controller/Bridge/native smoke confirms zero model sessions for the rejected launch. |
+| `adversarial-6` | A plan-drift pause retains proven terminal evidence and moves the task to retry state atomically; repair and resume do not lose ownership history or partial work. |
+| `adversarial-7` | Revmux findings may omit a suggested fix. Missing suggestions are explicitly unavailable; blocking severity and other report validation remain strict. |
+| `docs+tests-1` | Explicit same-machine recovery can rebind settled and between-step leases after safe local verification, preserving operation and stop state. Actual live PID and CAS races remain fenced. |
+
+Related foreign-host guidance was corrected. The minor duplication of the immutable JSON insertion primitive is retained to avoid an unrelated durability refactor. The Linux CI fixture correction uses the existing idempotent test executor inside three fault-injection wrappers; all real kernel boundary tests remain intact.
+
 ## Acceptance traceability
 
 The scenario numbers below refer to section 13 of the approved autonomous execution design. Test presence is not a passing result; the final verification checkpoint must record the completed suites.
@@ -147,14 +164,19 @@ The scenario numbers below refer to section 13 of the approved autonomous execut
 | 18. Lifetime and digest survive adoption | Bridge, lifecycle and review-adapter binding/lifetime tests; actual installed-runtime smoke |
 | 19. Evidence-based diagnosis and unbounded stop | Diagnostic evidence tests, bound tool follow-up deduplication, real detached-descendant retirement and monitor-death tests |
 
+## Verification checkpoint
+
+- Main: `npm run test:all` passed lint, TypeScript, all 462 tests (zero failures or skips), and package validation.
+- Installed-runtime smoke: passed real controller, Bridge/native RPC, no-start recovery with zero model sessions, owned workers/checks, required review, promotion and archive. Model turns are scripted.
+- Saved-session handoff: real Git preparation and the installed SDK session fork preserve cwd, parent history and stop fences. SDK source inspection locates missing-cwd validation before session teardown.
+- Native `83d0f646eceeaa9e858406afe4ba2c5f8ff5ed8a`: 3328 unit / 1082 integration passed, 14/7 skipped; typecheck, build, package and focused lint pass. Inherited legacy lint diagnostics are unchanged.
+- Bridge `34ff4291fac06ac03458b482d55637bbce11f8f4`: 72 tests, exact native boundary, typecheck, lint, package and remote CI pass.
+- Fusion `07f327d2df4d72feddc8fa5a08de74391773c8c9`: 250 unit / 105 integration / one E2E, typecheck, lint, package and remote CI pass.
+- Revmux dependency `398d8f11c13737cb26354fa963e0b347abcc916d`: formatting, build, race-enabled tests, lint and actual CLI lifetime smoke pass.
+- Development review: round `02-after-fix` was complete and non-degraded; the corrections above need final confirmation.
+
+Strict ownership currently requires supported macOS GUI launchd and compiler prerequisites. Strict Fusion early-agreement mode is explicitly refused. Source installation uses the documented project-local Git dependency policy. No release, global installation, persistent daemon or merge is included.
+
 ## Next step
 
-Final integration checkpoint: durable Git mutations, private local-operation cancellation indexing, Git environment isolation, unbounded tool handling, and activity-qualified bounded recovery are implemented. Restarted pause/cancel retains the worktree fence until matching full-tree retirement or never-started proof. Focused cancellation/restart tests and the installed runtime smoke passed. The smoke exercises real controller, Bridge/native RPC, owned processes, Git changes, required local checks, single-subagent review, promotion and archive; only model turns are scripted.
-
-Current pinned revisions: native `778d7aeac0c6a8056f316f2e2a38381570c7bcae`, Bridge `fbd2a53199f37cd68eb5c2b9db1482246979ffa5`, Fusion `07f327d2df4d72feddc8fa5a08de74391773c8c9`. Revmux CLI dependency remains `398d8f11c13737cb26354fa963e0b347abcc916d`. Final native full suites passed: 3325 unit passed/14 skipped and 1080 integration passed/7 skipped. The latest revision fixes a demonstrated observation race: exit metadata must be reread after the kernel confirms retirement. Its deterministic regressions fail on the old source and pass after the fix; 21 boundary tests and 18 actual-host/package tests also passed. Inherited legacy lint diagnostics are unchanged and new modules pass lint. Bridge has 72 passing tests; repeat its actual native boundary on the final pin. Fusion has 250 unit, 105 integration and one E2E passing tests plus passing CI. Revmux formatting, build, race-enabled tests and lint passed.
-
-The earlier main full suite exposed stale unit fixtures. The updated goal/package/registry tests passed, the registry ownership-corruption regression passed, and all 60 autonomous controller tests now pass with a portable idempotent test executor. The legacy controller suite also passes all 94 tests after explicit operation bindings and durable archive-phase expectations were corrected; its former deferred-result hangs now fail promptly when a fixture cannot reach the expected boundary. Production ownership remains covered by actual kernel tests and the installed-runtime smoke, which passed again on the final pins. The exact final Bridge/native boundary also passed, including delayed launch, lost reply, restart, tool-guidance deduplication, detached descendants and root termination. Main typecheck, lint and package validation passed individually; the combined full main suite is running after legacy controller fixture corrections.
-
-Final main gate passed: `npm run test:all` completed lint, TypeScript, all 444 tests (zero failed or skipped), and package validation. The installed-runtime smoke also passed on the final pins. All four dependency feature worktrees are clean, committed and pushed.
-
-Commit the main implementation and review the complete cumulative change with Revmux (the new kernel/runtime surface requires the comprehensive profile). Fix confirmed critical/major defects, verify the fixes and publish the remaining commits. Keep all PRs draft and this plan unarchived until the review passes; process-group observations cannot be promoted to owned-tree proof.
+Commit and push the review corrections, verify the Linux CI run, and perform a final cumulative Revmux confirmation from the recorded baselines. Keep all PRs draft and this plan unarchived until the review passes; process-group observations cannot be promoted to owned-tree proof.

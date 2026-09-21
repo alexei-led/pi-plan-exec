@@ -97,15 +97,15 @@ Retired names, each still dispatching to its replacement and saying so once:
 
 Flags that answer a prompt in advance:
 
-- `/exec resume <full-run-id> --retry-task` confirms retrying a task blocked by
-  something outside the run.
+- `/exec resume <full-run-id> --retry-task` requests a retry of a preserved task;
+  ordinary automatic retries do not require this command.
 - `/exec resume <full-run-id> --adopt-current-branch` confirms rebinding the run
   to the verified current execution branch.
 - `/exec resume <full-run-id> --same-machine` states that the host frozen on the
   lease was this machine under an older name. Only use it when that is a fact;
-  it creates a temporary local view for evidence gathering without rewriting the
-  lease. A worker still running keeps the run refused; decisive local evidence
-  permits the normal reset and claim.
+  it permits local evidence gathering. A live local controller still fences the
+  claim. After the required evidence is verified, recovery rebinds the stored
+  hostname while preserving the operation identity and stop state.
 - `/exec resume <full-run-id> --model current|provider/model` overrides the
   model for one replacement child after a model or provider failure.
 - `/exec cleanup <full-run-id> --apply` removes one named record;
