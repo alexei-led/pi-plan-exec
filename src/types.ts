@@ -336,6 +336,7 @@ export interface PlanExecRun {
   recoveryAttempts?: number;
   usage?: { inputTokens?: number; outputTokens?: number; cost?: number };
   statsReport?: { state: "summary" | "reported" | "unavailable"; summary: string; error?: string };
+  reviewRecovery?: { fingerprint: string; repeats: number; pendingFix: boolean; lastReviewedCommit?: string };
   needsAttention?: boolean;
   stopGeneration?: number;
   userStopped?: boolean;

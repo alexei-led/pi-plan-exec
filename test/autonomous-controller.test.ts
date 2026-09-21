@@ -427,3 +427,50 @@ test("optional statistics failure needs exit proof but cannot block mandatory co
   assert.match(run.statsReport?.error ?? "", /ended as failed/);
   assert.equal(f.worker.launches.length, 1);
 });
+
+test("repeated blocking findings across commit churn schedule a changed fix without waiving review", async (t) => {
+  const f = await fixture(t, "### Task 1: A\n- [x] A\n");
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const baseline = await f.git("rev-parse", "HEAD");
+  let run = await f.registry.update({ ...f.run, stage: "comprehensive_review", acceptedHead: baseline,
+    tasks: { "1": { taskId: 1, dependsOn: [], state: "accepted", attempts: 1, acceptedCommit: baseline } },
+  });
+  f.worker.state = "complete"; f.worker.proof = true;
+  f.worker.output = "FINDING: MAJOR | Shared state remains unsafe\nEvidence: worker.ts:1 concurrent updates lose data\nFix: reproduce the race and serialize writes";
+  run = await f.controller.tick(run.id, "session");
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    run = await f.controller.tick(run.id, "session");
+    assert.equal(run.activeOperation?.kind, "fix");
+    await writeFile(join(f.root, "churn.txt"), `ineffective fix ${attempt}\n`);
+    await f.git("add", "churn.txt"); await f.git("commit", "-m", `ineffective fix ${attempt}`);
+    run = await f.controller.tick(run.id, "session");
+    assert.equal(run.activeOperation?.kind, "review");
+  }
+  run = await f.controller.tick(run.id, "session");
+  assert.equal(run.stage, "comprehensive_review");
+  assert.equal(run.activeOperation, undefined);
+  assert.equal(run.reviewRecovery?.repeats, 3);
+  assert.equal(run.reviewRecovery?.pendingFix, true);
+  assert.equal(run.reviewFindings[0]?.severity, "MAJOR");
+  assert.equal(run.reviewedCommit, undefined);
+  assert.equal(run.unresolvedFindings.length, 0);
+  assert.ok(run.nextAttemptAt! > Date.now());
+  const launches = f.worker.launches.length;
+  run = await f.controller.tick(run.id, "session");
+  assert.equal(f.worker.launches.length, launches);
+  t.mock.timers.tick(run.nextAttemptAt! - Date.now());
+  const restarted = new PlanExecController(f.registry, f.worker, fusion, command);
+  run = await restarted.tick(run.id, "session");
+  assert.equal(run.activeOperation?.kind, "fix");
+  assert.equal(run.reviewRecovery?.pendingFix, false);
+  assert.match(String(f.worker.launches.at(-1)?.params.task), /Change the diagnosis before editing again/);
+  await writeFile(join(f.root, "churn.txt"), "serialized write verified\n");
+  await f.git("add", "churn.txt"); await f.git("commit", "-m", "fix shared state race");
+  run = await f.controller.tick(run.id, "session");
+  assert.equal(run.activeOperation?.kind, "review");
+  f.worker.output = "NO_FINDINGS";
+  run = await f.controller.tick(run.id, "session");
+  assert.equal(run.reviewRecovery, undefined);
+  assert.equal(run.reviewedCommit, await f.git("rev-parse", "HEAD"));
+  assert.equal(run.stage, "stats");
+});

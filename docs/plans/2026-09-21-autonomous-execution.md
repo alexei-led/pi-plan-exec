@@ -94,6 +94,7 @@ dependsOn: [5]
 - Real Pi RPC smoke passed on the pinned SDK: extension loading, `/exec` and `/goal` registration, isolated `/exec status`, and no model dispatch. This does not imply a successful strict worker execution; admission is correctly blocked by unsupported containment.
 - Integrated main gate after fixes: `npm run test:all` passed lint, typecheck, all **364 tests** (zero failures/skips), and package validation (27 shipped files). The earlier 65 failures were resolved; they are retained above as checkpoint history, not current failures.
 - CI syntax/security checks: actionlint passed; zizmor offline mode reported no findings. The complete cumulative Revmux review is the next delivery gate.
+- Final pre-review follow-up: repeated blocking findings retain a durable pending fix and capped backoff; commit churn does not reset their fingerprint. The restart/backoff regression passed. The fresh complete main gate now passes **365/365 tests**, lint, typecheck and package validation.
 
 ## Next step
 
