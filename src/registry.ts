@@ -802,6 +802,12 @@ function isAutonomousState(run: PlanExecRun): boolean {
     (!isRecord(run.statsReport) || !["summary", "reported", "unavailable"].includes(run.statsReport.state) ||
       typeof run.statsReport.summary !== "string" ||
       (run.statsReport.error !== undefined && typeof run.statsReport.error !== "string"))) return false;
+  if (run.reviewRecovery !== undefined &&
+    (!isRecord(run.reviewRecovery) || typeof run.reviewRecovery.fingerprint !== "string" || !run.reviewRecovery.fingerprint ||
+      !Number.isSafeInteger(run.reviewRecovery.repeats) || run.reviewRecovery.repeats < 0 ||
+      typeof run.reviewRecovery.pendingFix !== "boolean" ||
+      (run.reviewRecovery.lastReviewedCommit !== undefined &&
+        !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(run.reviewRecovery.lastReviewedCommit)))) return false;
   if (!timestamp(run.nextAttemptAt) || !timestamp(run.stopGeneration)) return false;
   if (run.recoveryAttempts !== undefined &&
     (!Number.isSafeInteger(run.recoveryAttempts) || run.recoveryAttempts < 0)) return false;

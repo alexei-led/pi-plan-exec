@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   access,
   lstat,
@@ -112,6 +112,7 @@ const LANE_TOKEN_LENGTH = 12;
 const PORCELAIN_PATH_OFFSET = 3;
 const MAX_AUTOMATIC_RETRY_DELAY_MS = 300_000;
 const MAX_BACKOFF_EXPONENT = 16;
+const REVIEW_DIAGNOSTIC_BURST = 2;
 export const PLAN_STRUCTURE_CHANGED_ERROR =
   "Plan task structure changed outside checkbox completion.";
 
@@ -548,6 +549,8 @@ export class PlanExecController {
       run.repositoryRoot,
       run.branch,
     );
+    if (run.reviewRecovery?.pendingFix && isReviewStage(run.stage))
+      return this.launchPendingReviewFix(run);
     switch (run.stage) {
       case RUN_STAGE.RESOLVE:
         return this.transition(
@@ -915,6 +918,9 @@ export class PlanExecController {
         ...(input.taskId && run.tasks?.[String(input.taskId)] ? { tasks: { ...run.tasks,
           [String(input.taskId)]: { ...run.tasks[String(input.taskId)]!, state: "running", operationId,
             attempts: run.tasks[String(input.taskId)]!.attempts + 1 } } } : {}),
+        ...(input.kind === OPERATION_KIND.FIX && run.reviewRecovery ? {
+          reviewRecovery: { ...run.reviewRecovery, pendingFix: false },
+        } : {}),
       },
       run.updatedAt,
     );
@@ -1792,6 +1798,7 @@ export class PlanExecController {
     }
     const cleared = withoutOperation({ ...run, reviewFindings: findings });
     if (findings.length === 0) {
+      delete cleared.reviewRecovery;
       cleared.reviewedCommit = await gitValue(this.runCommand, run.worktreeCwd, ["rev-parse", "HEAD"]);
       await appendProgress(cleared, `${run.stage} found no issues.`);
       return this.advanceUnlocked(
@@ -1802,13 +1809,27 @@ export class PlanExecController {
         ),
       );
     }
-    const iteration = operation.reviewIteration ?? 1;
-    return this.launchBridge(cleared, {
+    const fingerprint = reviewFingerprint(findings);
+    const repeats = run.reviewRecovery?.fingerprint === fingerprint ? run.reviewRecovery.repeats + 1 : 1;
+    const delayed = repeats > REVIEW_DIAGNOSTIC_BURST;
+    const pending = await this.registry.updateIfCurrent({ ...cleared,
+      reviewRecovery: { fingerprint, repeats, pendingFix: true,
+        ...(reviewedCommit ? { lastReviewedCommit: reviewedCommit } : {}),
+      },
+      nextAttemptAt: delayed ? Date.now() + retryDelay(run.config.retryDelayMs, repeats - REVIEW_DIAGNOSTIC_BURST) : 0,
+      wakeReason: delayed ? `The same review findings remain after ${repeats} reviews; a different diagnosis is scheduled.` : "Review findings require a fix.",
+    }, run.updatedAt);
+    if (!pending.applied || delayed) return pending.run;
+    return this.launchPendingReviewFix(pending.run);
+  }
+
+  private launchPendingReviewFix(run: PlanExecRun): Promise<PlanExecRun> {
+    return this.launchBridge(run, {
       kind: OPERATION_KIND.FIX,
-      reviewIteration: iteration,
-      agent: cleared.config.workerAgent,
-      maxTurns: cleared.config.workerMaxTurns,
-      task: fixerPrompt(cleared, findings, output),
+      reviewIteration: run.stageAttempts[run.stage] ?? 1,
+      agent: run.config.workerAgent,
+      maxTurns: run.config.workerMaxTurns,
+      task: fixerPrompt(run, run.reviewFindings, formatFindings(run.reviewFindings)),
     });
   }
 
@@ -1821,7 +1842,9 @@ export class PlanExecController {
     const cleared = withoutOperation(run);
     if (state !== EXTERNAL_OPERATION_STATE.COMPLETE)
       return this.fail(
-        withTerminalError(run, operation, terminalError),
+        { ...withTerminalError(run, operation, terminalError),
+          ...(run.reviewRecovery ? { reviewRecovery: { ...run.reviewRecovery, pendingFix: true } } : {}),
+        },
         operationFailureMessage(
           `Fix operation ended as ${state}.`,
           terminalError,
@@ -2794,6 +2817,10 @@ function fixerPrompt(
     "You are the sole worker fixing review findings in an existing plan execution.",
     `Plan: ${run.planPath}`,
     `Stage: ${run.stage}`,
+    ...(run.reviewRecovery && run.reviewRecovery.repeats > 1 ? [
+      `The same normalized findings remain after ${run.reviewRecovery.repeats} reviews, including commit ${run.reviewRecovery.lastReviewedCommit ?? "unavailable"}. Commit creation has not resolved them.`,
+      "Change the diagnosis before editing again: reproduce each blocking scenario, identify why the previous fix missed it, and validate a different repair against that reproduction. Do not repeat the same edit or dismiss the finding to finish.",
+    ] : []),
     "Apply only justified findings, run relevant verification, and commit the fixes.",
     "Do not modify plan task checkboxes unless the implementation task itself requires it.",
     "Structured findings:",
@@ -2801,6 +2828,12 @@ function fixerPrompt(
     "Raw reviewer output:",
     rawOutput,
   ].join("\n\n");
+}
+
+function reviewFingerprint(findings: ReviewFinding[]): string {
+  const normalized = [...new Set(findings.map((finding) =>
+    `${finding.severity}:${finding.summary.trim().replace(/\s+/g, " ").toLowerCase()}`))].sort();
+  return createHash("sha256").update(JSON.stringify(normalized)).digest("hex");
 }
 
 function statsPrompt(run: PlanExecRun): string {
