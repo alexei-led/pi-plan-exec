@@ -1094,6 +1094,107 @@ test("required review cannot be waived by explicit skip", async (t) => {
   assert.equal((await f.registry.get(run.id))?.stage, "comprehensive_review");
 });
 
+for (const stage of ["comprehensive_review", "stats"] as const) {
+  test(`explicit skip of paused optional ${stage} continues automatically`, async (t) => {
+    const f = await fixture(t, "### Task 1: A\n- [x] A\n");
+    const head = await f.git("rev-parse", "HEAD");
+    let run = await f.registry.update({ ...f.run, stage, status: "paused", userStopped: true,
+      stopGeneration: 1, nextAttemptAt: Date.now() + 60_000, acceptedHead: head, verifiedCommit: head,
+      tasks: { "1": { taskId: 1, dependsOn: [], state: "accepted", attempts: 1, acceptedCommit: head } },
+      config: { ...f.run.config, reviewRequired: false, statsEnabled: true } });
+    run = await f.controller.skip(run.id, "session", "Optional stage explicitly waived", 1);
+    assert.equal(run.userStopped, false);
+    assert.equal(run.stopGeneration, 1);
+    assert.equal(run.skippedStages[0]?.stage, stage);
+    assert.equal(run.pendingStageSkip, undefined);
+    if (stage === "comprehensive_review") {
+      assert.equal(run.stage, "smells_review");
+      assert.equal(run.activeOperation?.kind, "review");
+      assert.equal(f.worker.launches.length, 1);
+    } else {
+      assert.ok(run.archiveOperation);
+      for (let tick = 0; tick < 30 && run.status !== "completed_with_findings"; tick++) run = await f.controller.tick(run.id, "session");
+      assert.equal(run.status, "completed_with_findings");
+      assert.equal(run.skippedStages[0]?.stage, "stats");
+      assert.equal(f.worker.launches.length, 0);
+    }
+  });
+}
+
+test("paused optional review skip survives restart and waits for child retirement", async (t) => {
+  const f = await fixture(t, "### Task 1: A\n- [x] A\n");
+  let run = await f.registry.update({ ...f.run, stage: "comprehensive_review",
+    config: { ...f.run.config, reviewRequired: false },
+    reviewFindings: [{ id: "unresolved", severity: "MAJOR", summary: "Still blocking" }] });
+  run = await f.controller.tick(run.id, "session");
+  const originalOperation = run.activeOperation!.operationId;
+  run = await f.registry.update({ ...run, status: "paused", userStopped: true, stopGeneration: 1 });
+  run = await f.controller.skip(run.id, "session", "Optional stage explicitly waived", 1);
+  assert.equal(run.status, "skip_pending");
+  assert.equal(run.userStopped, false);
+  assert.equal(run.activeOperation?.operationId, originalOperation);
+  assert.equal(f.worker.launches.length, 1);
+  assert.ok(f.worker.stopCalls > 0);
+  f.worker.state = "stopped";
+  f.worker.proof = true;
+  const restarted = new PlanExecController(f.registry, f.worker, fusion, command, f.localExecutor);
+  run = await restarted.tick(run.id, "session");
+  assert.equal(run.status, "running");
+  assert.equal(run.stage, "smells_review");
+  assert.equal(run.skippedStages.length, 1);
+  assert.equal(run.unresolvedFindings[0]?.severity, "MAJOR");
+  assert.notEqual(run.activeOperation?.operationId, originalOperation);
+  assert.equal(f.worker.launches.length, 2);
+});
+
+test("a newer pause wins over optional skip completion", async (t) => {
+  const f = await fixture(t, "### Task 1: A\n- [x] A\n");
+  let run = await f.registry.update({ ...f.run, stage: "comprehensive_review", status: "paused",
+    userStopped: true, stopGeneration: 1, config: { ...f.run.config, reviewRequired: false } });
+  const update = f.registry.updateIfCurrent.bind(f.registry);
+  let paused = false;
+  f.registry.updateIfCurrent = async (candidate, revision, preserveRevision) => {
+    if (!paused && candidate.skippedStages.length > 0 && !candidate.pendingStageSkip) {
+      paused = true;
+      const current = await f.registry.get(run.id);
+      assert.ok(current);
+      await update({ ...current, status: "paused", userStopped: true, stopGeneration: 2 }, current.updatedAt);
+    }
+    return update(candidate, revision, preserveRevision);
+  };
+  run = await f.controller.skip(run.id, "session", "Optional stage explicitly waived", 1);
+  assert.equal(paused, true);
+  assert.equal(run.status, "paused");
+  assert.equal(run.userStopped, true);
+  assert.equal(run.stopGeneration, 2);
+  assert.equal(run.skippedStages.length, 0);
+  assert.equal(f.worker.launches.length, 0);
+});
+
+test("a late optional skip cannot reclaim a lease after cancellation", async (t) => {
+  const f = await fixture(t, "### Task 1: A\n- [x] A\n");
+  let run = await f.registry.update({ ...f.run, stage: "comprehensive_review", status: "paused",
+    userStopped: true, stopGeneration: 1, config: { ...f.run.config, reviewRequired: false } });
+  const update = f.registry.updateIfCurrent.bind(f.registry);
+  let cancelled = false;
+  f.registry.updateIfCurrent = async (candidate, revision, preserveRevision) => {
+    if (!cancelled && candidate.lease) {
+      cancelled = true;
+      const current = await f.registry.get(run.id);
+      assert.ok(current);
+      await update({ ...current, status: "cancelled", userStopped: true, stopGeneration: 2 }, current.updatedAt);
+    }
+    return update(candidate, revision, preserveRevision);
+  };
+  run = await f.controller.skip(run.id, "session", "Optional stage explicitly waived", 1);
+  assert.equal(cancelled, true);
+  assert.equal(run.status, "cancelled");
+  assert.equal(run.userStopped, true);
+  assert.equal(run.lease, undefined);
+  assert.equal(run.skippedStages.length, 0);
+  assert.equal(f.worker.launches.length, 0);
+});
+
 test("paused runs observe a tracked child without accepting it or dispatching a replacement", async (t) => {
   const f = await fixture(t);
   let run = await f.controller.tick(f.run.id, "session");

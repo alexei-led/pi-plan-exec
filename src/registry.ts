@@ -378,6 +378,7 @@ export class RunRegistry {
       throw new Error("A Pi session ID is required to claim a run.");
     let current = run;
     for (let attempt = 0; attempt < CLAIM_CAS_RETRIES; attempt += 1) {
+      if (isTerminalStatus(current.status) && current.status !== RUN_STATUS.FAILED) return current;
       const now = Date.now();
       const refusal = takeoverRefusal(current, sessionId);
       if (refusal) throw new Error(refusal);
