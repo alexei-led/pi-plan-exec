@@ -345,6 +345,220 @@ test("approved dependency addition prevents acceptance of an already active B", 
   assert.ok(run.failedOperation?.processTreeExited);
 });
 
+for (const initialSnapshot of [false, true]) {
+test(`default untracked independent lane excludes failed task checkbox claims ${initialSnapshot ? "with" : "without"} an initial snapshot`, async (t) => {
+  const content = "### Task 1: A\n- [ ] A\n### Task 2: B\ndependsOn: []\n- [ ] B\n### Task 3: C\ndependsOn: [1]\n- [ ] C\n### Task 4: Existing\ndependsOn: []\n- [x] Existing work\n";
+  const f = await fixture(t, content, "", "", false);
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const lanes = new Set<string>();
+  t.after(async () => { for (const lane of lanes) await rm(lane, { recursive: true, force: true }); });
+  let run = initialSnapshot ? await f.registry.update({ ...f.run, initialPlan: { hash: f.run.planHash, content } }) : f.run;
+  run = await f.controller.tick(run.id, "session");
+  const partial = content.replace("[ ] A", "[x] A");
+  await writeFile(f.planPath, partial);
+  await writeFile(join(f.root, "partial.txt"), "A partial code");
+  f.worker.state = "failed"; f.worker.proof = true;
+  f.worker.output = "<<<RALPHEX:TASK_FAILED>>>\nPrerequisite: credentials\nEvidence: provider returned HTTP 401";
+  run = await f.controller.tick(run.id, "session");
+  f.worker.state = "running"; f.worker.proof = false; f.worker.output = "";
+  for (let step = 0; step < 12 && f.worker.launches.length < 2; step++) {
+    if (run.lanePreparation) lanes.add(run.lanePreparation.cwd);
+    run = await f.controller.tick((await due(f.registry, run)).id, "session");
+  }
+  assert.equal(run.activeOperation?.taskId, 2, run.error ?? "B did not launch");
+  assert.equal((await readPlan(run.planPath)).tasks[0]?.unchecked.length, 1);
+  assert.equal(run.approvedPlan, undefined);
+  await assert.rejects(readFile(join(run.worktreeCwd, "partial.txt")), { code: "ENOENT" });
+  await writeFile(run.planPath, (await readFile(run.planPath, "utf8")).replace("[ ] B", "[x] B"));
+  for (const args of [["add", "plan.md"], ["commit", "-m", "independent B"]])
+    assert.equal((await command("git", args, run.worktreeCwd)).code, 0);
+  f.worker.state = "complete"; f.worker.proof = true;
+  run = await f.controller.tick(run.id, "session");
+  assert.equal(run.tasks?.["2"]?.state, "accepted", run.tasks?.["2"]?.reason ?? "B rejected");
+  assert.equal(run.tasks?.["1"]?.state, "waiting_external");
+  assert.equal(run.tasks?.["3"]?.state, "waiting_dependency");
+  if (!initialSnapshot) {
+    assert.notEqual(run.tasks?.["4"]?.state, "accepted");
+    f.worker.state = "running"; f.worker.proof = false;
+    run = await f.controller.tick((await due(f.registry, run)).id, "session");
+    assert.equal(run.activeOperation?.taskId, 4);
+    await writeFile(run.planPath, (await readFile(run.planPath, "utf8")).replace("[ ] Existing work", "[x] Existing work"));
+    for (const args of [["add", "plan.md"], ["commit", "-m", "verify uncertain legacy work"]])
+      assert.equal((await command("git", args, run.worktreeCwd)).code, 0);
+    f.worker.state = "complete"; f.worker.proof = true;
+    run = await f.controller.tick(run.id, "session");
+  }
+  assert.equal(run.tasks?.["4"]?.state, "accepted", run.tasks?.["4"]?.reason ?? "Existing work parked");
+  assert.equal(await readFile(f.planPath, "utf8"), partial);
+});
+}
+
+for (const occupied of [true, false]) {
+for (const subdirectory of ["", "packages/api"]) {
+test(`adoption and fresh lanes agree on renamed accepted items and new checked tasks with an ${occupied ? "occupied" : "unoccupied"} ${subdirectory ? "nested" : "root"} lane`, async (t) => {
+  const initial = `### Task 1: A\n- [x] Add API\n### Task 2: Blocked\n- [${occupied ? " " : "x"}] Blocked\n`;
+  const f = await fixture(t, initial, subdirectory);
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const baseline = await f.git("rev-parse", "HEAD");
+  const lanes = new Set<string>();
+  t.after(async () => { for (const lane of lanes) await rm(lane, { recursive: true, force: true }); });
+  let run = await f.registry.update({ ...f.run, status: "paused", acceptedHead: baseline, tasks: {
+    "1": { taskId: 1, dependsOn: [], state: "accepted", attempts: 1, lastScheduledAt: 1,
+      acceptedCommit: baseline, baselineCommit: baseline, laneCwd: f.run.worktreeCwd, laneBranch: "feature" },
+    "2": { taskId: 2, dependsOn: [1], state: occupied ? "waiting_external" : "accepted", attempts: 1, nextAttemptAt: Date.now() + 60_000,
+      laneCwd: f.run.worktreeCwd, laneBranch: "feature", baselineCommit: baseline },
+  } });
+  const approved = `${initial.replace("Add API", "Add REST API")}### Task 3: New\ndependsOn: []\n- [x] New work\n`;
+  await writeFile(f.planPath, approved);
+  if (occupied) await writeFile(join(f.root, "partial.txt"), "Blocked task partial code");
+  run = await f.controller.resume(run.id, "session", true, (await readPlan(f.planPath)).hash);
+  assert.notEqual(run.tasks?.["1"]?.state, "accepted");
+  assert.notEqual(run.tasks?.["3"]?.state, "accepted");
+  if (!occupied) assert.equal(run.tasks?.["2"]?.state, "accepted");
+  for (const taskId of [3, 1]) {
+    f.worker.state = "running"; f.worker.proof = false;
+    for (let step = 0; step < 12 && !run.activeOperation; step++) {
+      if (run.lanePreparation) lanes.add(run.lanePreparation.cwd);
+      run = await f.controller.tick((await due(f.registry, run)).id, "session");
+    }
+    assert.equal(run.activeOperation?.taskId, taskId, run.error ?? "Expected task did not launch");
+    assert.notEqual(run.worktreeCwd, f.run.worktreeCwd);
+    const item = taskId === 3 ? "New work" : "Add REST API";
+    assert.deepEqual((await readPlan(run.planPath)).tasks[taskId - 1]?.unchecked, [item]);
+    await writeFile(run.planPath, (await readFile(run.planPath, "utf8")).replace(`[ ] ${item}`, `[x] ${item}`));
+    for (const args of [["add", "plan.md"], ["commit", "-m", `complete task ${taskId}`]])
+      assert.equal((await command("git", args, run.worktreeCwd)).code, 0);
+    f.worker.state = "complete"; f.worker.proof = true;
+    run = await f.controller.tick(run.id, "session");
+    assert.equal(run.tasks?.[String(taskId)]?.state, "accepted", run.tasks?.[String(taskId)]?.reason ?? "Candidate rejected");
+  }
+  assert.equal(await readFile(f.planPath, "utf8"), approved);
+  if (occupied) assert.equal(await readFile(join(f.root, "partial.txt"), "utf8"), "Blocked task partial code");
+});
+}
+}
+
+test("initial untracked plan publication recovers a partial write with its original authorized checkbox facts", async (t) => {
+  const original = "### Task 1: Existing\n- [x] Existing\n### Task 2: A\n- [ ] A\n";
+  const f = await fixture(t, original, "", "", false);
+  await f.registry.update({ ...f.run, status: "cancelled" });
+  await f.git("branch", "main");
+  const lanes = new Set<string>();
+  t.after(async () => { for (const lane of lanes) await rm(lane, { recursive: true, force: true }); });
+  let damagedLane: string | undefined;
+  const publicationIds: string[] = [];
+  const executor: typeof runCommands = async (cwd, commands, options) => {
+    if (options.operationId.startsWith("plan:publish:") && (!damagedLane || cwd === damagedLane)) {
+      damagedLane = cwd;
+      publicationIds.push(options.operationId);
+      if (publicationIds.length === 1) {
+        await writeFile(join(cwd, "plan.md"), "### Task 1: Existing\n- [x] Existing\n");
+        throw new LocalOperationUnknownError("Initial publication ownership is unresolved.");
+      }
+      throw new LocalOperationFailedError("Initial publication exited after a partial write.");
+    }
+    return f.localExecutor(cwd, commands, options);
+  };
+  const controller = new PlanExecController(f.registry, f.worker, fusion, command, executor);
+  let run = await controller.start({ cwd: f.root, planPath: f.planPath, useWorktree: true, sessionId: "session" });
+  assert.deepEqual(run.initialPlan, { hash: run.planHash, content: original });
+  for (let step = 0; step < 10 && publicationIds.length === 0; step++) {
+    if (run.lanePreparation) lanes.add(run.lanePreparation.cwd);
+    run = await controller.tick((await due(f.registry, run)).id, "session");
+  }
+  assert.equal(publicationIds.length, 1);
+  assert.equal(f.worker.launches.length, 0);
+  for (let step = 0; step < 20 && !run.activeOperation; step++) {
+    if (run.lanePreparation) lanes.add(run.lanePreparation.cwd);
+    run = await controller.tick((await due(f.registry, run)).id, "session");
+  }
+  assert.deepEqual(publicationIds, [publicationIds[0], publicationIds[0]]);
+  assert.equal(run.activeOperation?.taskId, 2, run.error ?? "Initial plan recovery did not launch A");
+  assert.equal(await readFile(run.planPath, "utf8"), original);
+  assert.equal(await readFile(f.planPath, "utf8"), original);
+  assert.equal(await readFile(join(damagedLane!, "plan.md"), "utf8"), "### Task 1: Existing\n- [x] Existing\n");
+});
+
+test("independent B publishes normalized facts for a reopened A that is waiting on a prerequisite", async (t) => {
+  const original = "### Task 1: Prerequisite\n- [ ] Prerequisite\n### Task 2: A\ndependsOn: []\n- [x] Old work\n### Task 3: B\ndependsOn: []\n- [ ] B\n";
+  const f = await fixture(t, original);
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const baseline = await f.git("rev-parse", "HEAD");
+  const lanes = new Set<string>();
+  t.after(async () => { for (const lane of lanes) await rm(lane, { recursive: true, force: true }); });
+  let run = await f.registry.update({ ...f.run, status: "paused", acceptedHead: baseline, tasks: {
+    "1": { taskId: 1, dependsOn: [], state: "waiting_external", attempts: 1, nextAttemptAt: Date.now() + 60_000 },
+    "2": { taskId: 2, dependsOn: [], state: "accepted", attempts: 1, acceptedCommit: baseline },
+    "3": { taskId: 3, dependsOn: [], state: "ready", attempts: 0 },
+  } });
+  const approved = original.replace("dependsOn: []\n- [x] Old work", "dependsOn: [1]\n- [x] New work");
+  await writeFile(f.planPath, approved);
+  run = await f.controller.resume(run.id, "session", true, (await readPlan(f.planPath)).hash);
+  for (let step = 0; step < 12 && !run.activeOperation; step++) {
+    if (run.lanePreparation) lanes.add(run.lanePreparation.cwd);
+    run = await f.controller.tick((await due(f.registry, run)).id, "session");
+  }
+  assert.equal(run.activeOperation?.taskId, 3);
+  assert.notEqual(run.worktreeCwd, f.root);
+  assert.equal(run.tasks?.["2"]?.state, "waiting_dependency");
+  assert.deepEqual((await readPlan(run.planPath)).tasks[1]?.unchecked, ["New work"]);
+  await writeFile(run.planPath, (await readFile(run.planPath, "utf8")).replace("[ ] B", "[x] B"));
+  for (const args of [["add", "plan.md"], ["commit", "-m", "B keeps blocked A pending"]])
+    assert.equal((await command("git", args, run.worktreeCwd)).code, 0);
+  f.worker.state = "complete"; f.worker.proof = true;
+  run = await f.controller.tick(run.id, "session");
+  assert.equal(run.tasks?.["3"]?.state, "accepted", run.tasks?.["3"]?.reason ?? "B rejected");
+  assert.equal(run.tasks?.["2"]?.state, "waiting_dependency");
+  assert.equal(await readFile(f.planPath, "utf8"), approved);
+});
+
+for (const reapprove of [false, true]) {
+test(`tracked dirty initial checkbox facts survive independent B publication ${reapprove ? "after reapproval" : "without reapproval"}`, async (t) => {
+  const committed = "### Task 1: A\n- [ ] A\n### Task 2: Blocked\n- [ ] Blocked\n### Task 3: B\ndependsOn: []\n- [ ] B\n";
+  const f = await fixture(t, committed);
+  await f.registry.update({ ...f.run, status: "cancelled" });
+  await f.git("branch", "main");
+  const authorized = committed.replace("[ ] A", "[x] A");
+  await writeFile(f.planPath, authorized);
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const lanes = new Set<string>();
+  t.after(async () => { for (const lane of lanes) await rm(lane, { recursive: true, force: true }); });
+  let run = await f.controller.start({ cwd: f.root, planPath: f.planPath, useWorktree: false, sessionId: "session" });
+  for (let step = 0; step < 10 && !run.activeOperation; step++) run = await f.controller.tick(run.id, "session");
+  assert.equal(run.activeOperation?.taskId, 2);
+  assert.equal(run.tasks?.["1"]?.state, "accepted");
+  await writeFile(join(f.root, "blocked.txt"), "preserved partial code");
+  f.worker.state = "failed"; f.worker.proof = true;
+  f.worker.output = "<<<RALPHEX:TASK_FAILED>>>\nPrerequisite: credentials\nEvidence: provider returned HTTP 401";
+  run = await f.controller.tick(run.id, "session");
+  f.worker.state = "running"; f.worker.proof = false; f.worker.output = "";
+  if (reapprove) {
+    await writeFile(f.planPath, authorized.replace("Task 3: B", "Task 3: B renamed"));
+    run = await f.controller.resume(run.id, "session", true, (await readPlan(f.planPath)).hash);
+    assert.equal(run.tasks?.["1"]?.state, "accepted");
+  }
+  for (let step = 0; step < 12 && !run.activeOperation; step++) {
+    if (run.lanePreparation) lanes.add(run.lanePreparation.cwd);
+    run = await f.controller.tick((await due(f.registry, run)).id, "session");
+  }
+  assert.equal(run.activeOperation?.taskId, 3, run.error ?? "B did not launch");
+  assert.notEqual(run.worktreeCwd, f.root);
+  assert.equal((await readPlan(run.planPath)).tasks[0]?.unchecked.length, 0);
+  await writeFile(run.planPath, (await readFile(run.planPath, "utf8")).replace("- [ ] B\n", "- [x] B\n"));
+  for (const args of [["add", "plan.md"], ["commit", "-m", "B retains initially authorized A completion"]])
+    assert.equal((await command("git", args, run.worktreeCwd)).code, 0);
+  f.worker.state = "complete"; f.worker.proof = true;
+  run = await f.controller.tick(run.id, "session");
+  assert.equal(run.tasks?.["3"]?.state, "accepted", run.tasks?.["3"]?.reason ?? "B rejected");
+  assert.equal(run.tasks?.["1"]?.state, "accepted");
+  assert.notEqual(run.acceptedHead, run.outputTarget?.initialHead);
+  await writeFile(run.planPath, `${await readFile(run.planPath, "utf8")}### Task 4: Later\ndependsOn: []\n- [ ] Later\n`);
+  run = await f.controller.resume(run.id, "session", true, (await readPlan(run.planPath)).hash);
+  assert.equal(run.tasks?.["3"]?.state, "accepted");
+  assert.equal(await readFile(join(f.root, "blocked.txt"), "utf8"), "preserved partial code");
+});
+}
+
 test("approved new unchecked work reopens an accepted task without erasing its history", async (t) => {
   const f = await fixture(t, "### Task 1: A\n- [x] A\n");
   const baseline = await f.git("rev-parse", "HEAD");
@@ -407,7 +621,7 @@ test("unapproved structure drift in an alternate task lane still pauses", async 
   await f.git("worktree", "add", "-b", "drift", lane, baseline);
   const changed = "### Task 1: Unapproved change\n- [ ] A\n";
   await writeFile(join(lane, "plan.md"), changed);
-  let run = await f.registry.update({ ...f.run, tasks: {
+  let run = await f.registry.update({ ...f.run, initialPlan: { hash: f.run.planHash, content: await readFile(f.planPath, "utf8") }, tasks: {
     "1": { taskId: 1, dependsOn: [], state: "ready", attempts: 1, laneCwd: lane, laneBranch: "drift", baselineCommit: baseline },
   } });
   run = await f.controller.tick(run.id, "session");
@@ -668,9 +882,7 @@ test("external prerequisite A preserves its lane while B completes and C waits u
   assert.ok(run.lanePreparation);
   const lane = run.lanePreparation.cwd;
   t.after(() => rm(lane, { recursive: true, force: true }));
-  run = await f.controller.tick(run.id, "session");
-  run = await f.controller.tick(run.id, "session");
-  run = await f.controller.tick(run.id, "session");
+  for (let attempt = 0; attempt < 8 && !run.activeOperation; attempt++) run = await f.controller.tick(run.id, "session");
   assert.equal(run.activeOperation?.taskId, 2);
   assert.equal(run.worktreeCwd, lane);
   assert.equal(await readFile(join(f.root, "partial.txt"), "utf8"), "A private partial work");
@@ -695,9 +907,7 @@ test("external prerequisite A preserves its lane while B completes and C waits u
   t.after(() => rm(recoveryLane, { recursive: true, force: true }));
   assert.notEqual(recoveryLane, f.root);
   assert.notEqual(recoveryLane, lane);
-  run = await restarted.tick(run.id, "restored-session");
-  run = await restarted.tick(run.id, "restored-session");
-  run = await restarted.tick(run.id, "restored-session");
+  for (let attempt = 0; attempt < 8 && !run.activeOperation; attempt++) run = await restarted.tick(run.id, "restored-session");
   assert.equal(run.activeOperation?.taskId, 1);
   const oldPlan = await readFile(f.planPath, "utf8");
   const source = run.tasks!["1"]!.recoverySource!;
@@ -1853,7 +2063,12 @@ test("initial worktree creation records ownership before any Git mutation", asyn
     assert.equal(persisted?.id, createdRunId);
     assert.equal(persisted?.lanePreparation?.state, "create");
     assert.equal(persisted?.lanePreparation?.sourcePlanPath, f.planPath);
-    assert.equal(cwd, f.root);
+    assert.equal(persisted?.initialPlan?.hash, persisted?.planHash);
+    if (options.operationId.startsWith("git:worktree:")) assert.equal(cwd, f.root);
+    else {
+      assert.equal(cwd, persisted?.lanePreparation?.cwd);
+      assert.equal(persisted?.lanePreparation?.publication?.planHash, persisted?.planHash);
+    }
     await f.localExecutor(cwd, commands, options);
   };
   const controller = new PlanExecController(f.registry, f.worker, fusion, command, execute);
@@ -1868,7 +2083,8 @@ test("initial worktree creation records ownership before any Git mutation", asyn
     run = await controller.tick(run.id, "initial-session");
   }
   assert.equal(run.lanePreparation?.state, "bootstrap", run.error ?? "worktree creation did not settle");
-  assert.equal(new Set(invocations).size, 1);
+  assert.equal(new Set(invocations.filter((id) => id.startsWith("git:worktree:"))).size, 1);
+  assert.equal(new Set(invocations.filter((id) => id.startsWith("plan:publish:"))).size, 1);
   assert.match(await readFile(join(run.worktreeCwd, ".git"), "utf8"), /gitdir:/);
 });
 

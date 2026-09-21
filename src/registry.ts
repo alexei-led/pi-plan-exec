@@ -762,7 +762,7 @@ function assertRun(run: PlanExecRun): void {
     !Number.isFinite(run.updatedAt) ||
     !isFrozenConfig(run.config) ||
     !isAutonomousState(run) ||
-    !isApprovedPlan(run) ||
+    !isPlanSnapshots(run) ||
     (run.localOperationActive !== undefined && typeof run.localOperationActive !== "boolean") ||
     !Array.isArray(run.skippedStages) ||
     !run.skippedStages.every(
@@ -794,12 +794,14 @@ function assertRun(run: PlanExecRun): void {
   }
 }
 
-function isApprovedPlan(run: PlanExecRun): boolean {
-  if (run.approvedPlan === undefined) return true;
-  if (!isRecord(run.approvedPlan) || typeof run.approvedPlan.content !== "string" || run.approvedPlan.hash !== run.planHash)
-    return false;
-  try { return parsePlan(run.planPath, run.approvedPlan.content).hash === run.planHash; }
-  catch { return false; }
+function isPlanSnapshots(run: PlanExecRun): boolean {
+  for (const snapshot of [run.initialPlan, run.approvedPlan]) {
+    if (snapshot === undefined) continue;
+    if (!isRecord(snapshot) || typeof snapshot.content !== "string" || typeof snapshot.hash !== "string") return false;
+    try { if (parsePlan(run.planPath, snapshot.content).hash !== snapshot.hash) return false; }
+    catch { return false; }
+  }
+  return run.approvedPlan === undefined || run.approvedPlan.hash === run.planHash;
 }
 
 function isFrozenConfig(value: unknown): boolean {
