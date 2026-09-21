@@ -34,6 +34,7 @@ export async function appendProgress(
   message: string,
 ): Promise<void> {
   if (!run.progressPath) return;
+  await mkdir(dirname(run.progressPath), { recursive: true });
   await appendFile(
     run.progressPath,
     `[${new Date().toISOString()}] ${message}\n`,

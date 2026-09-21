@@ -33,6 +33,7 @@ import {
   execRead,
   execStatus,
   formatRunStatus,
+  formatRunWidget,
   getExecArgumentCompletions,
   hasBridgeOperationMethod,
   hasBridgeWorkflowScriptSpawnCapability,
@@ -308,10 +309,11 @@ const durableTerminalProbe: EvidenceProbe = async (candidate) => {
         ...evidence,
         bridgeState: "absent",
         durableOperationLookup: true,
+        replaySafe: true,
       };
 };
 
-test("bridge runtime compatibility requires recovery and workflow spawn capabilities", () => {
+test("bridge runtime compatibility requires direct owned-agent recovery rather than workflow scripting", () => {
   const v1 = {
     protocolVersion: 1 as const,
     healthy: true,
@@ -326,8 +328,13 @@ test("bridge runtime compatibility requires recovery and workflow spawn capabili
       },
       v1,
     ),
-    true,
+    false,
   );
+  assert.equal(bridgeRuntimeCompatible({}, { protocolVersion: 2, healthy: true,
+    workflowScriptSpawn: false, singleAgentSpawn: true, durableOperationLookup: true,
+    processTerminalProofVersion: 1, executionLifetimeVersion: 1, executionLifetimeModes: ["unbounded"],
+    processTreeOwnership: { version: 1, scope: "owned-process-tree", escapedDescendants: "contained" },
+  }), true);
   assert.equal(
     bridgeRuntimeCompatible(
       {
@@ -382,6 +389,7 @@ test("exec command completions explain the command family", () => {
 test("runtime prerequisite check identifies missing provider extensions", () => {
   assert.deepEqual(missingRuntimeTools(["TaskCreate"]), ["pi-subagents"]);
   assert.deepEqual(missingRuntimeTools(["subagent", "TaskCreate"]), []);
+  assert.deepEqual(missingRuntimeTools(["subagent"]), []);
   assert.equal(runtimeIntegrationProblem(true), undefined);
   assert.match(
     runtimeIntegrationProblem(false) ?? "",
@@ -460,22 +468,25 @@ test("help and setup explain the installed command surface", () => {
     assert.doesNotMatch(execHelp(), new RegExp(`/exec ${alias}`), alias);
   assert.match(
     execSetup(),
-    /pi install npm:@alexeiled\/pi-subagents-bridge$/m,
+    /pi install -l git:github\.com\/alexei-led\/pi-subagents-bridge@[a-f0-9]{40}$/m,
   );
-  assert.match(execSetup(), /pi install npm:@alexeiled\/pi-fusion$/m);
-  assert.match(execSetup(), /pi install npm:@alexeiled\/pi-plan-exec/);
+  assert.match(execSetup(), /pi install -l git:github\.com\/alexei-led\/pi-fusion@[a-f0-9]{40}$/m);
+  assert.match(execSetup(), /Keep this plan-exec source build installed/);
 });
 
-test("setup install commands always install the latest extension", () => {
+test("setup installs exact project-local source pins rather than obsolete published runtime APIs", () => {
   assert.doesNotMatch(execSetup(), /npm:[^\s]+@(?:\^|>=|<=|=|~)/);
-  assert.match(execSetup(), /^pi install npm:pi-subagents$/m);
-  assert.match(execSetup(), /^pi install npm:@alexeiled\/pi-plan-exec$/m);
+  assert.match(execSetup(), /^pi install -l git:github\.com\/alexei-led\/pi-subagents-codex-fix@[a-f0-9]{40}$/m);
+  assert.match(execSetup(), /^pi install -l git:github\.com\/alexei-led\/pi-subagents-bridge@[a-f0-9]{40}$/m);
+  assert.doesNotMatch(execSetup(), /^pi install npm:(?:pi-subagents|@alexeiled\/pi-plan-exec)$/m);
+  assert.match(execSetup(), /Optional task visibility \(not required for execution\)/);
 });
 
 test("cancel cannot bypass a pending force-skip", () => {
   const pending = run({
     status: "skip_pending",
     stage: "comprehensive_review",
+    config: { ...config, reviewRequired: false },
     pendingStageSkip: {
       stage: "comprehensive_review",
       reason: "operator waiver",
@@ -876,8 +887,10 @@ test("run status classifies recovery and gives one safe next action", () => {
 
 test("an overdue operation is classified without being called dead", () => {
   const MINUTE_MS = 60_000;
-  // Test config: workerMaxTurns 50 => 100m, reviewerMaxTurns 30 => 60m,
-  // statsMaxTurns 20 => 40m. Fusion and finalize fall back to the worker budget.
+  const BOUNDED_CONFIG = {
+    ...config,
+    executionLifetime: { mode: "bounded" as const, timeoutMs: 100 * MINUTE_MS },
+  };
   const active = (
     agoMinutes: number | undefined,
     overrides: Partial<PlanExecRun["activeOperation"]> = {},
@@ -894,8 +907,10 @@ test("an overdue operation is classified without being called dead", () => {
         ...(agoMinutes === undefined
           ? {}
           : { launchStartedAt: Date.now() - agoMinutes * MINUTE_MS }),
+        expectedLifetime: (runOverrides.config ?? BOUNDED_CONFIG).executionLifetime,
         ...overrides,
       },
+      config: BOUNDED_CONFIG,
       ...runOverrides,
     });
 
@@ -931,12 +946,12 @@ test("an overdue operation is classified without being called dead", () => {
     [
       "past the reviewer bound on a review operation",
       active(65, { kind: "review" }),
-      "running longer than its budget allows",
+      "running, but nothing proves the worker is alive",
     ],
     [
       "past the stats bound on a stats operation",
       active(45, { kind: "stats" }, { stage: "stats" }),
-      "running longer than its budget allows",
+      "running, but nothing proves the worker is alive",
     ],
     [
       "inside the worker bound on a stats-sized elapsed time",
@@ -1003,6 +1018,14 @@ test("an overdue operation is classified without being called dead", () => {
       name,
     );
 
+  const unbounded = active(180, {}, { config });
+  assert.equal(
+    recoveryGuidance(unbounded).classification,
+    "running, but nothing proves the worker is alive",
+    "unbounded silence has no synthetic deadline verdict",
+  );
+  assert.equal(longRunningOperation(unbounded), undefined);
+
   // Only `longRunningOperation` can be asked about the exact bound:
   // `recoveryGuidance` reads its own clock, so a run built to sit on the bound
   // is already past it by the time it runs.
@@ -1037,12 +1060,12 @@ test("an overdue operation is classified without being called dead", () => {
 
   const overdue = formatRunStatus(active(180), LIVE);
   assert.match(overdue, /recovery: running longer than its budget allows/);
-  assert.match(overdue, /past the 100m allowed for its 50-turn budget/);
+  assert.match(overdue, /past the explicit 100m compatibility deadline/);
   assert.match(overdue, /not proof the worker is stuck/);
   assert.match(overdue, /controller is still polling it/);
   assert.match(overdue, /\/exec status .* to look again later/);
   assert.match(overdue, /Do not resume or start another run/);
-  assert.doesNotMatch(overdue, /healthy|dead|stalled/);
+  assert.doesNotMatch(overdue, /\b(?:healthy|dead|stalled)\b/);
 
   // The same breach with nothing polling: waiting is not on offer.
   const unwatched = formatRunStatus(active(180), { leaseLive: false });
@@ -1674,7 +1697,7 @@ test("doctor groups every in-flight claim and mutates nothing", async () => {
   );
 });
 
-test("doctor --reconcile resets only provably abandoned runs", async () => {
+test("doctor --reconcile retains retired operations and leaves explicit stops intact", async () => {
   const abandoned = abandonedRun();
   const ambiguous = abandonedRun({
     id: "22222222-2222-4222-8222-222222222222",
@@ -1702,7 +1725,7 @@ test("doctor --reconcile resets only provably abandoned runs", async () => {
 
   const report = await execReconcile(registry, nativeTerminalProbe);
 
-  assert.match(report, /Reset 1 abandoned run to failed\./);
+  assert.match(report, /Reconciled 1 run with their existing operation identity\./);
   assert.match(report, /no task attempt was consumed/);
   assert.match(
     report,
@@ -1720,8 +1743,9 @@ test("doctor --reconcile resets only provably abandoned runs", async () => {
   );
 
   const reset = await registry.get(abandoned.id);
-  assert.equal(reset?.status, "failed");
-  assert.equal(reset?.activeOperation, undefined);
+  assert.equal(reset?.status, "running");
+  assert.equal(reset?.activeOperation?.operationId, abandoned.activeOperation?.operationId);
+  assert.equal(reset?.activeOperation?.processTreeExited, true);
   assert.deepEqual(reset?.taskAttempts, abandoned.taskAttempts);
   assert.ok(reset?.reconciledAt, "the reset is stamped for audit");
   assert.match(reset?.error ?? "", /lease was dead/);
@@ -1757,15 +1781,15 @@ test("doctor --reconcile skips a run reclaimed while the sweep ran", async () =>
 
   const report = await execReconcile(registry, probe);
 
-  assert.match(report, /Reset 1 abandoned run to failed\./);
+  assert.match(report, /Reconciled 1 run with their existing operation identity\./);
   assert.match(report, /Skipped 1 run reclaimed while the sweep ran/);
   assert.match(report, new RegExp(`- ${reclaimed.id} `));
   assert.equal((await registry.get(reclaimed.id))?.status, "running");
   assert.equal((await registry.get(reclaimed.id))?.reconciledAt, undefined);
-  assert.equal((await registry.get(stalled.id))?.status, "failed");
+  assert.equal((await registry.get(stalled.id))?.status, "running");
 });
 
-test("a reconciled run is an ordinary recoverable failure", async () => {
+test("a reconciled run preserves its terminal operation for result recovery", async () => {
   const abandoned = abandonedRun();
   const { registry } = await seedDirectory([abandoned]);
 
@@ -1774,14 +1798,14 @@ test("a reconciled run is an ordinary recoverable failure", async () => {
 
   assert.ok(reconciled);
   assert.equal(isActionAllowed("resume", reconciled), true);
-  assert.equal(isRecoverableFailure(reconciled), true);
+  assert.equal(isRecoverableFailure(reconciled), false);
   const guidance = recoveryGuidance(reconciled);
-  assert.equal(guidance.classification, "stopped, and you can continue it");
+  assert.equal(guidance.classification, "the worker has finished and its result is ready to read");
   assert.match(guidance.action, new RegExp(`/exec resume ${abandoned.id}`));
   assert.deepEqual(reconciled.taskAttempts, { "1": 2 });
 });
 
-test("reconcile records the reset in the run's own progress file", async () => {
+test("reconcile records the retained operation in the run's own progress file", async () => {
   const progressPath = join(
     await mkdtemp(join(tmpdir(), "pi-plan-exec-progress-")),
     "progress.txt",
@@ -1792,7 +1816,7 @@ test("reconcile records the reset in the run's own progress file", async () => {
   await execReconcile(registry, nativeTerminalProbe);
 
   const progress = await readFile(progressPath, "utf8");
-  assert.match(progress, /Reset by \/exec doctor/);
+  assert.match(progress, /Reconciled by \/exec doctor/);
   assert.match(progress, /operation directory is gone from disk/);
   assert.match(progress, /task attempt counter was left unchanged/);
 });
@@ -1845,7 +1869,7 @@ test("the bridge is asked even when the operation directory is missing", async (
     ["operation-1", "operation-surviving"],
     "directory absence is diagnostic; every bridge operation is still asked",
   );
-  assert.match(report, /Reset 2 abandoned runs to failed\./);
+  assert.match(report, /Reconciled 2 runs with their existing operation identity\./);
   assert.match(
     (await registry.get(surviving.id))?.error ?? "",
     /the bridge has no record of its operation/,
@@ -2036,7 +2060,7 @@ test("status reports a missing package with its install commands", async () => {
   });
 
   assert.match(report, /Plan-exec prerequisites — missing: pi-subagents\./);
-  assert.match(report, /^pi install npm:pi-subagents$/m);
+  assert.match(report, /^pi install -l git:github\.com\/alexei-led\/pi-subagents-codex-fix@[a-f0-9]{40}$/m);
   assert.doesNotMatch(report, /pi-fusion/);
   assert.match(report, /No plan execution runs\. Start one with \/exec\./);
   assert.equal(
@@ -2091,7 +2115,7 @@ test("the retired read verbs still work and name their replacement", async () =>
   assert.match(doctor ?? "", /\/exec doctor is now \/exec status/);
 
   const setup = await execRead(registry, "setup", []);
-  assert.match(setup ?? "", /^pi install npm:pi-subagents$/m);
+  assert.match(setup ?? "", /^pi install -l git:github\.com\/alexei-led\/pi-subagents-codex-fix@[a-f0-9]{40}$/m);
   assert.match(setup ?? "", /\/exec setup is now part of \/exec status/);
 
   assert.equal(await execRead(registry, "resume", []), undefined);
@@ -2108,8 +2132,8 @@ test("the doctor alias keeps --reconcile for scripted callers", async () => {
 
   const report = await execReconcile(registry, nativeTerminalProbe);
 
-  assert.match(report, /Reset 1 abandoned run to failed\./);
-  assert.equal((await registry.get(abandoned.id))?.status, "failed");
+  assert.match(report, /Reconciled 1 run with their existing operation identity\./);
+  assert.equal((await registry.get(abandoned.id))?.status, "running");
 });
 
 test("the start subcommand is gone", () => {
@@ -2241,21 +2265,21 @@ test("resume reconciles a provably abandoned run, then continues", async () => {
     nativeTerminalProbe,
   );
 
-  assert.equal(recovered.run.status, "failed");
-  assert.equal(recovered.run.activeOperation, undefined);
+  assert.equal(recovered.run.status, "running");
+  assert.equal(recovered.run.activeOperation?.operationId, abandoned.activeOperation?.operationId);
   assert.deepEqual(recovered.run.taskAttempts, abandoned.taskAttempts);
   assert.ok(recovered.run.reconciledAt, "the reset is stamped for audit");
-  assert.match(recovered.note ?? "", /was abandoned/);
+  assert.match(recovered.note ?? "", /existing operation and candidate were preserved/);
   assert.match(recovered.note ?? "", /No task attempt was consumed/);
   assert.match(
     (await registry.get(abandoned.id))?.error ?? "",
-    /Reset by \/exec resume/,
+    /Reconciled by \/exec resume/,
   );
   assert.match(
     await readFile(progressPath, "utf8"),
-    /Reset by \/exec resume[\s\S]*attempt counter was left unchanged/,
+    /Reconciled by \/exec resume[\s\S]*attempt counter was left unchanged/,
   );
-  assert.equal(isRecoverableFailure(recovered.run), true);
+  assert.equal(isRecoverableFailure(recovered.run), false);
   assert.equal(
     isActionAllowed("resume", recovered.run),
     true,
@@ -2488,6 +2512,9 @@ test("every surface names the same next command for one run", async () => {
               : "implementation",
           ...(lease ? { lease } : {}),
           ...(status === "skip_pending"
+            ? { config: { ...config, reviewRequired: false } }
+            : {}),
+          ...(status === "skip_pending"
             ? {
                 pendingStageSkip: {
                   stage: "comprehensive_review",
@@ -2594,6 +2621,7 @@ test("a waived stage nothing can observe names the waiver, not another read", as
     id: randomUUID(),
     status: "skip_pending",
     stage: "comprehensive_review",
+    config: { ...config, reviewRequired: false },
     lease: DEAD_LEASE,
     activeOperation: {
       operationId: "operation-1",
@@ -2630,10 +2658,10 @@ test("a waived stage nothing can observe names the waiver, not another read", as
   assert.equal(row?.split("Next: ")[1], guidance.command);
 });
 
-test("--same-machine cannot act on a lease that is still beating", async () => {
+test("--same-machine verifies local proof before taking a foreign lease", async () => {
   // A1: the machine was renamed and its worker died 5s ago. A2: the machine is
-  // genuinely remote and its worker is alive. No local probe can tell them
-  // apart, so the beating heartbeat decides both.
+  // genuinely remote and its worker is alive. A human assertion permits local
+  // evidence gathering, but stale heartbeat alone decides neither case.
   const beating = (sessionId: string, pid: number) => ({
     sessionId,
     pid,
@@ -2643,11 +2671,11 @@ test("--same-machine cannot act on a lease that is still beating", async () => {
   const cases: Array<[string, PlanExecRun]> = [
     [
       "A1 renamed machine, worker dead",
-      abandonedRun({ lease: beating("session-old", 4194303) }),
+      abandonedRun({ lease: beating("session-old", reapedPid()) }),
     ],
     [
       "A2 remote machine, worker alive",
-      abandonedRun({ lease: beating("session-remote", 12345) }),
+      abandonedRun({ lease: beating("session-remote", reapedPid()) }),
     ],
   ];
 
@@ -2655,20 +2683,12 @@ test("--same-machine cannot act on a lease that is still beating", async () => {
     const { registry, directory } = await seedDirectory([held]);
     const before = await snapshotRuns(directory);
 
-    assert.match(
-      sameMachineRefusal(held) ?? "",
-      /still has a beating lease/,
+    assert.equal(sameMachineRefusal(held), undefined, name);
+    await assert.rejects(
+      reconcileForResume(registry, held, abandonmentProbe(), true),
+      /evidence is incomplete/,
       name,
     );
-    // Even reached directly, the flag cannot turn a live lease into evidence.
-    const gated = await reconcileForResume(
-      registry,
-      held,
-      abandonmentProbe(),
-      true,
-    );
-    assert.equal(gated.run.status, held.status, name);
-    assert.equal(gated.note, undefined, name);
     assert.deepEqual(await snapshotRuns(directory), before, name);
     assert.equal((await runEvidence(held)).leaseLive, true, name);
   }
@@ -2846,6 +2866,7 @@ test("status hands a blocked stage its skip command with the run ID filled in", 
     stage: "critical_review",
     error: "reviewer could not pass the stage",
     updatedAt: Date.now() - HOUR_MS,
+    config: { ...config, reviewRequired: false },
   });
   delete blocked.activeOperation;
   const implementing = run({
@@ -2868,6 +2889,38 @@ test("status hands a blocked stage its skip command with the run ID filled in", 
   assert.doesNotMatch(report, new RegExp(`/exec skip ${implementing.id}`));
   assert.equal(isStageWaiverAvailable(blocked), true);
   assert.equal(isStageWaiverAvailable(implementing), false);
+});
+
+test("required review and finalize stages never suggest force-skip", () => {
+  for (const stage of ["comprehensive_review", "finalize"] as const) {
+    const required = run({
+      status: "failed",
+      stage,
+      error: "required stage is blocked",
+    });
+    delete required.activeOperation;
+    assert.equal(isStageWaiverAvailable(required), false, stage);
+    assert.doesNotMatch(recoveryGuidance(required).action, /\/exec skip/);
+    const invalidPending = run({
+      status: "skip_pending",
+      stage,
+      pendingStageSkip: {
+        stage,
+        reason: "legacy waiver",
+        requestedAt: 1,
+        requestedBy: "old-session",
+      },
+    });
+    assert.equal(recoveryGuidance(invalidPending).command, `/exec status ${invalidPending.id}`);
+    assert.doesNotMatch(recoveryGuidance(invalidPending).action, /\/exec skip/);
+  }
+  const optionalReview = run({
+    status: "failed",
+    stage: "comprehensive_review",
+    config: { ...config, reviewRequired: false },
+  });
+  delete optionalReview.activeOperation;
+  assert.equal(isStageWaiverAvailable(optionalReview), true);
 });
 
 test("help lists every primary verb and no retired alias", () => {
@@ -2984,8 +3037,8 @@ test("the two views judge a lease the same way, including this session's own", a
   );
   assert.equal(
     (await reconcileForResume(registry, mine, nativeTerminalProbe)).run.status,
-    "failed",
-    "the gate must reset what both views call abandoned",
+    "running",
+    "the gate must preserve the retired operation for result reconciliation",
   );
 });
 
@@ -3053,7 +3106,7 @@ test("decisive evidence outranks every claim that would say wait", async () => {
         ? `/exec stop ${gone.id}`
         : `/exec resume ${gone.id}`;
 
-    assert.match(guidance.classification, /^the worker is gone/, label);
+    assert.match(guidance.classification, gone.activeOperation?.externalRunId ? /^the worker is gone/ : /pending launch can be checked/, label);
     assert.doesNotMatch(
       guidance.action,
       /Do not resume|Do not start another|moves on by itself|until it reads cancelled|polling picks up/,
@@ -3081,7 +3134,13 @@ test("a live lease keeps every one of those claims exactly as it was", async () 
     /waiting for the stop you asked for/,
   ];
   for (const [index, [label, overrides]] of PREEMPTING_SHAPES.entries()) {
-    const held = abandonedRun({ ...overrides, lease: liveLease() });
+    const held = abandonedRun({
+      ...overrides,
+      ...(label === "a stage was waived"
+        ? { config: { ...config, reviewRequired: false } }
+        : {}),
+      lease: liveLease(),
+    });
     const guidance = recoveryGuidance(
       held,
       await runEvidence(held, abandonmentProbe()),
@@ -3135,7 +3194,7 @@ test("the abandoned group promises a reset only where one happens", async () => 
   });
   const resettable = abandonedRun();
   const footer =
-    /Each resets to a recoverable failure before it continues; no second worker is launched\./;
+    /Each retains its operation and saved result for reconciliation; no replacement worker is launched\./;
 
   // reconcileRun refuses a run already told to stop.
   const onlyStopping = await execStatus(await seedRegistry([stopping]), {
@@ -3164,19 +3223,36 @@ test("the abandoned group promises a reset only where one happens", async () => 
 test("the sweep reports how far past its budget a run has gone", async () => {
   const overdue = abandonedRun({
     lease: liveLease(),
+    config: {
+      ...config,
+      executionLifetime: { mode: "bounded", timeoutMs: 100 * 60_000 },
+    },
     activeOperation: {
       operationId: "operation-1",
       service: "bridge",
       kind: "implementation",
       externalRunId: "external-1",
       launchStartedAt: Date.now() - 180 * 60_000,
+      expectedLifetime: { mode: "bounded", timeoutMs: 100 * 60_000 },
     },
   });
   const registry = await seedRegistry([overdue]);
 
   const report = await execStatus(registry);
 
-  assert.match(report, /past the 100m allowed for its 50-turn budget/);
+  assert.match(report, /past the explicit 100m compatibility deadline/);
+});
+
+test("widget shows a grown active compatibility budget rather than the frozen base", () => {
+  const active = run({ config: { ...config, executionLifetime: { mode: "bounded", timeoutMs: 60_000 } },
+    activeOperation: { operationId: "grown", service: "bridge", kind: "implementation", taskId: 1,
+      expectedLifetime: { mode: "bounded", timeoutMs: 240_000 }, effectiveLifetime: { mode: "bounded", timeoutMs: 240_000 } },
+    tasks: { "1": { taskId: 1, dependsOn: [], state: "running", attempts: 3 } },
+  });
+  const widget = formatRunWidget(active).join("\n");
+  assert.match(widget, /deadline 4m compatibility mode/);
+  assert.match(widget, /Lifetime: 4m compatibility mode/);
+  assert.doesNotMatch(widget, /1m compatibility mode/);
 });
 
 test("a run on another host stays live until its owner releases it", async () => {
@@ -3237,12 +3313,18 @@ test("a renamed machine keeps the remote lease protected", async () => {
   );
 
   assert.equal(stillOwnedAfterOverride.run.status, "running");
-  assert.equal(stillOwnedAfterOverride.note, undefined);
+  assert.equal(stillOwnedAfterOverride.run.activeOperation?.operationId, renamed.activeOperation?.operationId);
+  assert.match(stillOwnedAfterOverride.note ?? "", /existing operation and candidate were preserved/);
   assert.equal(
     (await registry.get(renamed.id))?.lease?.hostname,
-    `${thisHost()}-corp-dhcp`,
-    "the local assertion is not written back while the remote lease is live",
+    hostname(),
+    "the proven local handoff rebinds the lease host before the next claim",
   );
+  const claimed = await registry.claim(
+    (await registry.get(renamed.id))!,
+    "session-after-same-machine-proof",
+  );
+  assert.equal(claimed.lease?.sessionId, "session-after-same-machine-proof");
 });
 
 test("a machine that shares this one's first label keeps its live worker", async () => {
@@ -3309,17 +3391,13 @@ test("a network rename cannot override a live remote lease", async () => {
   const { registry, directory } = await seedDirectory([churned]);
   const before = await snapshotRuns(directory);
 
-  // Indistinguishable by name from the colliding machine above, so it remains
-  // protected by the same live remote lease.
+  // Indistinguishable by name from the colliding machine above, so ordinary
+  // reconciliation remains protected by the remote lease.
   const kept = await reconcileForResume(registry, churned);
   assert.equal(kept.run.status, "running");
   assert.equal(kept.note, undefined);
   assert.deepEqual(await snapshotRuns(directory), before);
-  assert.equal(
-    sameMachineRefusal(churned)?.includes("beating lease"),
-    true,
-    "the override cannot outrank a live remote lease",
-  );
+  assert.equal(sameMachineRefusal(churned), undefined);
 
   const stillOwned = await reconcileForResume(
     registry,
@@ -3329,7 +3407,7 @@ test("a network rename cannot override a live remote lease", async () => {
   );
 
   assert.equal(stillOwned.run.status, "running");
-  assert.equal(stillOwned.note, undefined);
+  assert.equal(stillOwned.run.activeOperation?.operationId, churned.activeOperation?.operationId);
 });
 
 test("--same-machine supplies a machine, never a verdict", async () => {
@@ -3348,16 +3426,12 @@ test("--same-machine supplies a machine, never a verdict", async () => {
   const { registry, directory } = await seedDirectory([stillWriting]);
   const before = await snapshotRuns(directory);
 
-  // The assertion only changes where evidence may be gathered; it cannot
-  // override the live remote lease or prove ownership of the child.
-  const kept = await reconcileForResume(
-    registry,
-    stillWriting,
-    abandonmentProbe(),
-    true,
+  // The assertion only changes where evidence may be gathered; a live child
+  // or unknown child remains a hard stop.
+  await assert.rejects(
+    reconcileForResume(registry, stillWriting, abandonmentProbe(), true),
+    /evidence is incomplete/,
   );
-  assert.equal(kept.run.status, "running");
-  assert.equal(kept.note, undefined);
   assert.deepEqual(await snapshotRuns(directory), before);
 
   // The other half of the conjunction: a bridge that still knows the operation.
@@ -3372,14 +3446,15 @@ test("--same-machine supplies a machine, never a verdict", async () => {
   });
   const seeded = await seedDirectory([bridgeKnowsIt]);
 
-  const bridgeKept = await reconcileForResume(
-    seeded.registry,
-    bridgeKnowsIt,
-    abandonmentProbe(async () => "running"),
-    true,
+  await assert.rejects(
+    reconcileForResume(
+      seeded.registry,
+      bridgeKnowsIt,
+      abandonmentProbe(async () => "running"),
+      true,
+    ),
+    /evidence is incomplete/,
   );
-  assert.equal(bridgeKept.run.status, "running");
-  assert.equal(bridgeKept.note, undefined);
   assert.equal(
     (await seeded.registry.get(bridgeKnowsIt.id))?.status,
     "running",
@@ -3388,10 +3463,7 @@ test("--same-machine supplies a machine, never a verdict", async () => {
     sameMachineRefusal(abandonedRun()) ?? "",
     /only applies to a run whose lease names another host/,
   );
-  assert.match(
-    sameMachineRefusal(abandonedRun({ lease: foreignLease })) ?? "",
-    /still has a beating lease/,
-  );
+  assert.equal(sameMachineRefusal(abandonedRun({ lease: foreignLease })), undefined);
 });
 
 test("a live lease is decisive on its own and nothing else is probed", async () => {

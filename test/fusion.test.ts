@@ -122,13 +122,24 @@ test("Fusion start and replay preserve explicit no-deadline policy", async () =>
   } } });
   await preflight;
   for (const operationId of ["operation-1", "operation-1"]) {
-    const pending = client.start(operationId, "Review", undefined, { mode: "unbounded" });
+    const pending = client.start(operationId, "Review", undefined, { mode: "unbounded" }, "caller-digest",
+      { cwd: "/repo/worktree", reviewedCommit: "a".repeat(40) });
     const request = bus.last(FUSION_REQUEST_EVENT);
     assert.ok(isRecord(request) && isRecord(request.params));
     assert.deepEqual(request.params.executionLifetime, { mode: "unbounded" });
+    assert.equal(request.params.digest, "caller-digest");
+    assert.equal(request.params.cwd, "/repo/worktree");
+    assert.equal(request.params.reviewedCommit, "a".repeat(40));
     bus.emit(`${FUSION_REPLY_PREFIX}${request.requestId}`, { success: true, data: { runId: "fusion-1" } });
     assert.equal((await pending).success, true);
   }
+  const count = bus.count(FUSION_REQUEST_EVENT);
+  for (const context of [undefined, { cwd: "relative", reviewedCommit: "abc" }, { cwd: "/repo", reviewedCommit: "" }]) {
+    const result = await client.start("invalid", "Review", undefined, { mode: "unbounded" }, "caller-digest", context);
+    assert.ok(!result.success);
+    assert.equal(result.error.code, "invalid_request");
+  }
+  assert.equal(bus.count(FUSION_REQUEST_EVENT), count);
 });
 
 test("Fusion refuses group-only runtime before starting a strict review", async () => {

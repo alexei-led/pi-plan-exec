@@ -27,12 +27,27 @@ export interface BridgeCapabilities {
   protocolVersion: 1 | 2;
   healthy: boolean;
   workflowScriptSpawn: boolean;
+  singleAgentSpawn?: boolean;
   durableOperationLookup: boolean;
   processTerminalProofVersion?: number;
   workflowTerminalProofVersion?: 1;
   executionLifetimeVersion?: 1;
   executionLifetimeModes?: readonly ExecutionLifetime["mode"][];
   processTreeOwnership?: ProcessTreeOwnership;
+  diagnosticGuidance?: DiagnosticGuidanceCapability;
+}
+
+export interface DiagnosticGuidanceCapability {
+  version: 1;
+  idempotent: true;
+  mode: "follow_up";
+  confirmedToolFailure: true;
+}
+
+export interface DiagnosticGuidanceRequest {
+  diagnosticId: string;
+  toolCallId: string;
+  message: string;
 }
 
 export interface ProcessTreeOwnership {
@@ -56,6 +71,41 @@ export function supportsOwnedProcessTree(capabilities: Pick<BridgeCapabilities, 
     capabilities.processTreeOwnership.escapedDescendants === "contained";
 }
 
+const MAX_PID_VERSION = 0xffff_ffff;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+export interface CallerBinding { operationId: string; requestDigest: string; }
+
+export function hasKernelRetirementProof(observation: unknown, binding: unknown): boolean {
+  if (!isRecord(observation) || observation.status !== "retired" || !isRecord(observation.binding) ||
+    !isRecord(observation.identity)) return false;
+  const proof = observation.proof;
+  if (!isRecord(proof) || !isRecord(binding) || proof.kind !== "darwin-coalition-retired" ||
+    typeof proof.observedAt !== "string" || !Number.isFinite(Date.parse(proof.observedAt)) ||
+    new Date(proof.observedAt).toISOString() !== proof.observedAt ||
+    !isRecord(proof.identity) || proof.identity.version !== 1 ||
+    proof.identity.backend !== "darwin-resource-coalition-v1" ||
+    typeof proof.identity.coalitionId !== "string" || !/^[1-9]\d*$/.test(proof.identity.coalitionId) ||
+    !isRecord(proof.identity.leader)) return false;
+  for (const key of ["operationId", "requestDigest", "hostId", "bootId"]) {
+    if (typeof binding[key] !== "string" || !binding[key] || proof[key] !== binding[key] ||
+      proof.identity[key] !== binding[key] || observation.binding[key] !== binding[key] ||
+      observation.identity[key] !== binding[key]) return false;
+  }
+  if (typeof binding.hostId !== "string" || !UUID.test(binding.hostId) ||
+    typeof binding.bootId !== "string" || !UUID.test(binding.bootId)) return false;
+  const leader = proof.identity.leader;
+  const observedLeader = observation.identity.leader;
+  return observation.identity.version === proof.identity.version &&
+    observation.identity.backend === proof.identity.backend && observation.identity.coalitionId === proof.identity.coalitionId &&
+    isRecord(observedLeader) && observedLeader.pid === leader.pid && observedLeader.uniqueId === leader.uniqueId &&
+    observedLeader.pidVersion === leader.pidVersion &&
+    typeof leader.pid === "number" && Number.isSafeInteger(leader.pid) && leader.pid > 0 &&
+    typeof leader.uniqueId === "string" && /^[1-9]\d*$/.test(leader.uniqueId) &&
+    typeof leader.pidVersion === "number" && Number.isSafeInteger(leader.pidVersion) &&
+    leader.pidVersion >= 0 && leader.pidVersion <= MAX_PID_VERSION;
+}
+
 export interface WorkflowTerminalProof {
   version: 1;
   kind: "workflow";
@@ -72,7 +122,13 @@ const MAX_WORKFLOW_PROOF_DEPTH = 32;
 export function workflowTerminalProof(
   value: unknown,
   expectedRunId: string,
-  depth = 0,
+  expectedCaller?: CallerBinding,
+): WorkflowTerminalProof | undefined {
+  if (!hasCallerBinding(value, expectedCaller)) return undefined;
+  return parseWorkflowTerminalProof(value, expectedRunId, 0);
+}
+
+function parseWorkflowTerminalProof(value: unknown, expectedRunId: string, depth: number,
 ): WorkflowTerminalProof | undefined {
   if (depth > MAX_WORKFLOW_PROOF_DEPTH || !isRecord(value) || value.version !== 1 ||
     value.scope === "process-groups" || value.scope === "posix-process-group" ||
@@ -86,8 +142,8 @@ export function workflowTerminalProof(
   for (const child of value.children) {
     if (!isRecord(child) || typeof child.runId !== "string" || !child.runId) return undefined;
     const parsed = child.kind === "workflow"
-      ? workflowTerminalProof(child, child.runId, depth + 1)
-      : processTerminalProof(child, child.runId);
+      ? parseWorkflowTerminalProof(child, child.runId, depth + 1)
+      : parseProcessTerminalProof(child, child.runId);
     if (!parsed || parsed.state !== PROCESS_TERMINAL_STATE.OBSERVED) return undefined;
     children.push(parsed);
   }
@@ -95,15 +151,21 @@ export function workflowTerminalProof(
     dispatchClosed: true, observedAt: value.observedAt, children };
 }
 
-export function terminalProofObserved(value: unknown, expectedRunId: string): boolean {
-  return workflowTerminalProof(value, expectedRunId) !== undefined ||
-    processTerminalProof(value, expectedRunId)?.state === PROCESS_TERMINAL_STATE.OBSERVED;
+export function terminalProofObserved(value: unknown, expectedRunId: string, expectedCaller?: CallerBinding): boolean {
+  return workflowTerminalProof(value, expectedRunId, expectedCaller) !== undefined ||
+    processTerminalProof(value, expectedRunId, expectedCaller)?.state === PROCESS_TERMINAL_STATE.OBSERVED;
 }
 
-export function hasTerminalOwnershipProof(data: Record<string, unknown>, runId: string): boolean {
+export function hasTerminalOwnershipProof(data: Record<string, unknown>, runId: string, expectedCaller?: CallerBinding): boolean {
   if (data.workflowTerminalProof !== undefined)
-    return workflowTerminalProof(data.workflowTerminalProof, runId) !== undefined;
-  return terminalProofObserved(data.processTerminalProof, runId);
+    return workflowTerminalProof(data.workflowTerminalProof, runId, expectedCaller) !== undefined;
+  return terminalProofObserved(data.processTerminalProof, runId, expectedCaller);
+}
+
+function hasCallerBinding(value: unknown, expected: CallerBinding | undefined): boolean {
+  return expected !== undefined && !!expected.operationId && !!expected.requestDigest &&
+    isRecord(value) && isRecord(value.callerBinding) && value.callerBinding.operationId === expected.operationId &&
+    value.callerBinding.requestDigest === expected.requestDigest;
 }
 
 const V1_CAPABILITIES: BridgeCapabilities = {
@@ -129,6 +191,16 @@ export function bridgeRequestDigest(
 export function processTerminalProof(
   value: unknown,
   expectedRunId: string,
+  expectedCaller?: CallerBinding,
+): ProcessTerminalProof | undefined {
+  if (isRecord(value) && value.state === PROCESS_TERMINAL_STATE.OBSERVED && !hasCallerBinding(value, expectedCaller))
+    return undefined;
+  return parseProcessTerminalProof(value, expectedRunId);
+}
+
+function parseProcessTerminalProof(
+  value: unknown,
+  expectedRunId: string,
 ): ProcessTerminalProof | undefined {
   if (
     !isRecord(value) ||
@@ -152,11 +224,13 @@ export function processTerminalProof(
     (value.state === PROCESS_TERMINAL_STATE.OBSERVED &&
       (typeof value.observedAt !== "number" ||
         !Number.isFinite(value.observedAt) ||
-        !Array.isArray(value.instances) ||
         !supportsOwnedProcessTree(processTreeOwnershipCapabilities(value.processTreeOwnership)) ||
-        value.instances.some((instance: unknown) => !isRecord(instance) ||
+        !isRecord(value.nativeOperation) || typeof value.nativeOperation.operationId !== "string" || !value.nativeOperation.operationId ||
+        typeof value.nativeOperation.digest !== "string" || !value.nativeOperation.digest ||
+        !hasKernelRetirementProof(value.kernelProof, value.kernelBinding) ||
+        (Array.isArray(value.instances) && value.instances.some((instance: unknown) => !isRecord(instance) ||
           (isRecord(instance.processTree) && (instance.processTree.mechanism === "posix-process-group" ||
-            instance.processTree.containment === "unverified"))))) ||
+            instance.processTree.containment === "unverified")))))) ||
     (value.state === PROCESS_TERMINAL_STATE.UNKNOWN &&
       (typeof value.reason !== "string" || !value.reason.trim()))
   )
@@ -172,6 +246,9 @@ export function processTerminalProof(
     ...(Array.isArray(value.instances) ? { instances: value.instances } : {}),
     ...(typeof value.reason === "string" ? { reason: value.reason } : {}),
     ...processTreeOwnershipCapabilities(value.processTreeOwnership),
+    ...(value.kernelProof !== undefined ? { kernelProof: value.kernelProof, kernelBinding: value.kernelBinding } : {}),
+    ...(value.nativeOperation !== undefined ? { nativeOperation: value.nativeOperation } : {}),
+    ...(value.callerBinding !== undefined ? { callerBinding: value.callerBinding } : {}),
   };
 }
 
@@ -258,7 +335,7 @@ export class BridgeClient {
   ): Promise<BridgeResult> {
     if (params.executionLifetime !== undefined) {
       const lifetime = parseExecutionLifetime(params.executionLifetime);
-      if (!lifetime || this.negotiated?.healthy !== true ||
+      if (!lifetime || this.negotiated?.healthy !== true || this.negotiated.singleAgentSpawn !== true ||
         !this.negotiated.executionLifetimeModes?.includes(lifetime.mode) || !supportsOwnedProcessTree(this.negotiated))
         return Promise.resolve({ success: false, error: { code: "unsupported",
           message: "Bridge has not advertised the requested explicit execution lifetime and full owned-process-tree containment." } });
@@ -305,6 +382,14 @@ export class BridgeClient {
       operationId,
       ...(this.protocolVersion() === 2 && owner ? { owner } : {}),
     });
+  }
+
+  diagnoseOperation(operationId: string, owner: BridgeOperationOwner, params: DiagnosticGuidanceRequest): Promise<BridgeResult> {
+    if (this.negotiated?.healthy !== true || this.negotiated.protocolVersion !== 2 || !this.negotiated.diagnosticGuidance)
+      return Promise.resolve({ success: false, error: { code: "unsupported", message: "Bridge does not advertise confirmed-failure diagnostic guidance." } });
+    if (![params.diagnosticId, params.toolCallId, params.message].every((value) => typeof value === "string" && value.trim()))
+      return Promise.resolve({ success: false, error: { code: "invalid_request", message: "Diagnostic guidance requires a stable ID, confirmed tool call, and message." } });
+    return this.request(2, "diagnoseOperation", { operationId, owner, params });
   }
 
   status(runId: string, asyncDir?: string): Promise<BridgeResult> {
@@ -378,7 +463,7 @@ function parseV2Capabilities(
     reply.data.protocol !== "plan-exec-bridge" ||
     reply.data.version !== 2 ||
     !isRecord(capabilities) ||
-    capabilities.workflowScriptSpawn !== true ||
+    (capabilities.singleAgentSpawn !== true && capabilities.workflowScriptSpawn !== true) ||
     !hasDurableOperationLookup
   )
     return undefined;
@@ -391,13 +476,18 @@ function parseV2Capabilities(
   return {
     protocolVersion: 2,
     healthy: true,
-    workflowScriptSpawn: true,
+    workflowScriptSpawn: capabilities.workflowScriptSpawn === true,
+    singleAgentSpawn: capabilities.singleAgentSpawn === true,
     durableOperationLookup: true,
     processTerminalProofVersion: 1,
     ...(isRecord(capabilities.workflowTerminalProof) && capabilities.workflowTerminalProof.version === 1
       ? { workflowTerminalProofVersion: 1 as const } : {}),
     ...executionLifetimeCapabilities(capabilities.executionLifetime),
     ...processTreeOwnershipCapabilities(capabilities.processTreeOwnership),
+    ...(isRecord(capabilities.diagnosticGuidance) && capabilities.diagnosticGuidance.version === 1 &&
+      capabilities.diagnosticGuidance.idempotent === true && capabilities.diagnosticGuidance.mode === "follow_up" &&
+      capabilities.diagnosticGuidance.confirmedToolFailure === true
+      ? { diagnosticGuidance: { version: 1, idempotent: true, mode: "follow_up", confirmedToolFailure: true } as const } : {}),
   };
 }
 

@@ -6,7 +6,7 @@ import { basename, resolve } from "node:path";
 import test from "node:test";
 import {
   branchNameFromPlan,
-  createWorktree,
+  executionWorktreePath,
   isPathWithin,
   verifyExistingWorktree,
   worktreeIdentity,
@@ -73,18 +73,10 @@ test("rejects a directory that is not a registered worktree", async (t) => {
   );
 });
 
-test("creates plan-exec worktrees outside the source repository", async () => {
+test("plans execution worktree paths without running Git before durable intent exists", () => {
   const repositoryRoot = "/tmp/example-repository";
-  const calls: Array<{ command: string; args: string[]; cwd: string }> = [];
-  const run = async (command: string, args: string[], cwd: string) => {
-    calls.push({ command, args, cwd });
-    return { stdout: "", stderr: "", code: 0 };
-  };
-
-  const worktree = await createWorktree(
-    run,
+  const worktree = executionWorktreePath(
     repositoryRoot,
-    `${repositoryRoot}/docs/plans/20260712-example.md`,
     "example",
   );
 
@@ -101,9 +93,4 @@ test("creates plan-exec worktrees outside the source repository", async () => {
   );
   assert.equal(worktree, expected);
   assert.equal(worktree.startsWith(repositoryRoot), false);
-  assert.deepEqual(calls[1], {
-    command: "git",
-    args: ["worktree", "add", "-b", "example", expected],
-    cwd: repositoryRoot,
-  });
 });

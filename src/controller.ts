@@ -28,6 +28,7 @@ import {
   parseExecutionLifetime,
   type BridgeCapabilities,
   type BridgeOperationOwner,
+  type DiagnosticGuidanceRequest,
 } from "./bridge.js";
 import {
   FUSION_PHASE,
@@ -38,7 +39,7 @@ import {
 } from "./fusion.js";
 import {
   branchNameFromPlan,
-  createWorktree,
+  executionWorktreePath,
   currentBranch,
   defaultBranch,
   ensureCleanForWorktree,
@@ -48,6 +49,7 @@ import {
   verifyExecutionRepository,
   verifyExecutionTree,
   worktreePlanPath,
+  worktreeChanges,
   type RunCommand,
 } from "./git.js";
 import {
@@ -64,9 +66,10 @@ import {
   initializeProgress,
 } from "./progress.js";
 import { RunRegistry } from "./registry.js";
+import { diagnoseOperation } from "./diagnostics.js";
 import { resolveRunConfig } from "./config.js";
 import { RevmuxReviewClient, validateReviewResult } from "./review-backend.js";
-import { LocalOperationUnknownError, type LocalOperationOptions } from "./local-operation.js";
+import { cancelActiveLocalOperations, LocalOperationFailedError, LocalOperationUnknownError, type LocalOperationOptions } from "./local-operation.js";
 import { reconcileTasks, selectReadyTask, nextTaskWake } from "./scheduler.js";
 import { bootstrapCommands, gitValue, requiredChecks, runCommands } from "./lanes.js";
 import {
@@ -76,6 +79,8 @@ import {
 } from "./review.js";
 import {
   COMPLETED_PLANS_DIRECTORY,
+  CONTROLLER_POLL_INTERVAL_MS,
+  MAX_EXECUTION_TIMEOUT_MS,
   EXTERNAL_OPERATION_STATE,
   OPERATION_KIND,
   OPERATION_RECOVERY,
@@ -90,6 +95,10 @@ import {
   type RunStage,
   type WorkerSignal,
   type ExecutionLifetime,
+  type ParsedPlan,
+  type ExternalPrerequisite,
+  type DiagnosticAction,
+  type TaskRecoverySource,
 } from "./types.js";
 
 /** Attention threshold only; recovery continues beyond this count. */
@@ -109,10 +118,12 @@ const RECOVERY_REVIEWER_MAX_TURNS = 75;
 const MAX_TERMINAL_ERROR_LENGTH = 2_000;
 const GIT_MISSING_OBJECT_EXIT_CODE = 128;
 const LANE_TOKEN_LENGTH = 12;
-const PORCELAIN_PATH_OFFSET = 3;
 const MAX_AUTOMATIC_RETRY_DELAY_MS = 300_000;
 const MAX_BACKOFF_EXPONENT = 16;
 const REVIEW_DIAGNOSTIC_BURST = 2;
+const MAX_LIFETIME_GROWTH_EXPONENT = 31;
+const BUDGET_PROGRESS_WINDOW_MS = 60_000;
+const BUDGET_PROGRESS_WINDOW_DIVISOR = 10;
 export const PLAN_STRUCTURE_CHANGED_ERROR =
   "Plan task structure changed outside checkbox completion.";
 
@@ -131,6 +142,7 @@ interface BridgeLike {
     owner?: BridgeOperationOwner,
   ): Promise<ServiceReply>;
   cancelOperation?(operationId: string, owner?: BridgeOperationOwner): Promise<ServiceReply>;
+  diagnoseOperation?(operationId: string, owner: BridgeOperationOwner, params: DiagnosticGuidanceRequest): Promise<ServiceReply>;
   capabilities?(): Promise<BridgeCapabilities>;
   status(runId: string, asyncDir?: string): Promise<ServiceReply>;
   result(runId: string, asyncDir?: string): Promise<ServiceReply>;
@@ -145,6 +157,8 @@ interface FusionLike {
     prompt: string,
     profile?: string,
     executionLifetime?: ExecutionLifetime,
+    digest?: string,
+    context?: { cwd: string; reviewedCommit: string },
   ): Promise<ServiceReply>;
   status(runId?: string, operationId?: string): Promise<ServiceReply>;
   result(runId?: string, operationId?: string): Promise<ServiceReply>;
@@ -168,6 +182,7 @@ export class PlanExecController {
     private readonly bridge: BridgeLike,
     private readonly fusion: FusionLike,
     private readonly runCommand: RunCommand,
+    private readonly executeLocalCommands: typeof runCommands = runCommands,
   ) {}
 
   async start(options: StartRunOptions): Promise<PlanExecRun> {
@@ -210,23 +225,26 @@ export class PlanExecController {
           : `${current}-${planBranch}`
         : current;
       executionWorktreeCwd = options.useWorktree
-        ? await this.createExecutionWorktree(repositoryRoot, plan.path, branch)
+        ? executionWorktreePath(repositoryRoot, branch)
         : resolve(options.cwd);
       if (options.useWorktree) {
+        await ensureCleanForWorktree(this.runCommand, repositoryRoot, plan.path);
+        if (await pathExists(executionWorktreeCwd)) throw new Error(`Worktree already exists: ${executionWorktreeCwd}`);
         executionPlanPath = worktreePlanPath(
           executionWorktreeCwd,
           repositoryRoot,
           plan.path,
         );
-        await copyPlanIntoWorktree(plan.path, executionPlanPath);
       }
     }
 
     const configured = await resolveRunConfig(repositoryRoot);
+    const baselineCwd = options.useWorktree ? repositoryRoot : executionWorktreeCwd;
     const config: FrozenRunConfig = { ...configured,
-      requiredChecks: await requiredChecks(executionWorktreeCwd, configured.requiredChecks),
-      bootstrapCommands: await bootstrapCommands(executionWorktreeCwd, configured.bootstrapCommands),
+      requiredChecks: await requiredChecks(baselineCwd, configured.requiredChecks),
+      bootstrapCommands: await bootstrapCommands(baselineCwd, configured.bootstrapCommands),
     };
+    const initialHead = await gitValue(this.runCommand, baselineCwd, ["rev-parse", "HEAD"]);
     const run = await this.registry.create({
       schemaVersion: 1,
       repositoryRoot,
@@ -235,6 +253,8 @@ export class PlanExecController {
       worktreeCwd: executionWorktreeCwd,
       branch,
       defaultBranch: baseBranch,
+      outputTarget: { cwd: executionWorktreeCwd, branch, initialHead,
+        planRelativePath: relative(executionWorktreeCwd, executionPlanPath) },
       status: RUN_STATUS.STARTING,
       stage: RUN_STAGE.RESOLVE,
       taskAttempts: {},
@@ -245,8 +265,8 @@ export class PlanExecController {
       skippedStages: [],
       branchRebindings: [],
       ...(options.useWorktree ? { lanePreparation: { cwd: executionWorktreeCwd, branch,
-        baselineCommit: await gitValue(this.runCommand, executionWorktreeCwd, ["rev-parse", "HEAD"]),
-        taskId: 0, state: "bootstrap" as const } } : {}),
+        baselineCommit: initialHead,
+        taskId: 0, state: "create" as const, sourcePlanPath: plan.path } } : {}),
     }, { exclusive: true });
     return this.advance(await this.registry.claim(run, options.sessionId));
   }
@@ -269,7 +289,7 @@ export class PlanExecController {
     const coordinated = await this.registry.withControllerLock(runId, async () => {
       const run = await this.registry.get(runId);
       if (!run) throw new Error(`Plan execution run not found: ${runId}`);
-      if (isTerminalStatus(run.status) || (run.status === RUN_STATUS.PAUSED && !run.activeOperation)) return run;
+      if (isTerminalStatus(run.status) || (run.status === RUN_STATUS.PAUSED && !run.activeOperation && !run.localOperationActive)) return run;
       const claimed = await this.registry.claim(run, sessionId);
       try { return await this.advanceUnlocked(claimed); }
       catch (error) { return this.fail(claimed, error instanceof Error ? error.message : String(error), true); }
@@ -520,8 +540,11 @@ export class PlanExecController {
   }
 
   async advance(run: PlanExecRun): Promise<PlanExecRun> {
+    const current = (await this.registry.get(run.id)) ?? run;
+    if (current.status === RUN_STATUS.PAUSED) return this.observePausedOperation(current);
+    if (current.status === RUN_STATUS.CANCEL_PENDING) return this.cancel(current);
     const coordinated = await this.registry.withControllerLock(run.id, () =>
-      this.advanceUnlocked(run),
+      this.advanceUnlocked(current),
     );
     if (coordinated) return coordinated;
     return (await this.registry.get(run.id)) ?? run;
@@ -535,7 +558,7 @@ export class PlanExecController {
       return this.advanceStageSkip(run);
     if (run.status === RUN_STATUS.PAUSED) {
       if ((run.nextAttemptAt ?? 0) > Date.now()) return run;
-      return run.activeOperation ? this.observePausedOperation(run) : run;
+      return run.activeOperation || run.localOperationActive ? this.observePausedOperation(run) : run;
     }
     if (run.userStopped) return run;
     if ((run.nextAttemptAt ?? 0) > Date.now()) return run;
@@ -573,7 +596,8 @@ export class PlanExecController {
       case RUN_STAGE.PROGRESS: {
         const progressPath = await initializeProgress(run);
         return this.transition(
-          { ...run, progressPath },
+          { ...run, progressPath, ...(run.outputTarget ? { outputTarget: { ...run.outputTarget,
+            progressRelativePath: relative(run.worktreeCwd, progressPath) } } : {}) },
           RUN_STAGE.IMPLEMENTATION,
           "Progress log initialized.",
         );
@@ -618,17 +642,44 @@ export class PlanExecController {
         return this.fail(run, `Task ${execution.taskId} has unresolved operation ownership; no replacement writer is authorized.`, true);
       }
     }
-    if (Object.values(tasks).every((task) => task.state === "accepted"))
+    if (Object.values(tasks).every((task) => task.state === "accepted")) {
+      const committed = await gitValue(this.runCommand, run.worktreeCwd, ["show", `HEAD:${gitPath(relative(run.worktreeCwd, run.planPath))}`]);
+      assertAcceptedCheckboxes({ ...run, tasks }, parsePlan(run.planPath, committed));
       return this.transition(
         { ...run, tasks },
         RUN_STAGE.COMPREHENSIVE_REVIEW,
         "All plan checkboxes are complete.",
       );
+    }
     const selected = selectReadyTask(tasks);
     if (!selected) return (await this.registry.updateIfCurrent({ ...run, tasks,
       nextAttemptAt: nextTaskWake(tasks, Date.now()), wakeReason: "Waiting for task prerequisites or retry", }, run.updatedAt)).run;
     const task = plan.tasks.find((candidate) => candidate.id === selected.taskId)!;
     const acceptedHead = run.acceptedHead ?? await gitValue(this.runCommand, run.worktreeCwd, ["rev-parse", "HEAD"]);
+    if (!run.outputTarget) {
+      run = { ...run, tasks, acceptedHead,
+        outputTarget: { cwd: run.worktreeCwd, branch: run.branch, initialHead: acceptedHead,
+          planRelativePath: relative(run.worktreeCwd, run.planPath),
+          ...(run.progressPath ? { progressRelativePath: relative(run.worktreeCwd, run.progressPath) } : {}) },
+      };
+    }
+    if (selected.laneCwd && selected.baselineCommit && selected.baselineCommit !== acceptedHead && selected.state !== "accepted") {
+      const token = randomUUID().slice(0, LANE_TOKEN_LENGTH);
+      const nextTask = { ...selected,
+        recoveryHistory: [...(selected.recoveryHistory ?? []), ...(selected.recoverySource ? [selected.recoverySource] : [])],
+        recoverySource: {
+        cwd: selected.laneCwd, branch: selected.laneBranch!, baselineCommit: selected.baselineCommit,
+        headCommit: await gitValue(this.runCommand, selected.laneCwd, ["rev-parse", "HEAD"]),
+        checkpointRef: `refs/plan-exec/${run.id}/task-${selected.taskId}/checkpoint-${selected.attempts}`,
+      } };
+      delete nextTask.laneCwd;
+      delete nextTask.laneBranch;
+      delete nextTask.candidateCommit;
+      return this.registry.update({ ...run, tasks: { ...tasks, [String(selected.taskId)]: nextTask }, acceptedHead,
+        lanePreparation: { taskId: selected.taskId, cwd: join(dirname(run.worktreeCwd), `plan-exec-${run.id}-${token}`),
+          branch: `plan-exec/${run.id}/${token}`, baselineCommit: acceptedHead, state: "create" },
+      });
+    }
     if (selected.laneCwd && selected.laneCwd !== run.worktreeCwd) {
       const laneRun = await this.registry.updateIfCurrent({ ...run, tasks, acceptedHead,
         planPath: join(selected.laneCwd, relative(run.worktreeCwd, run.planPath)),
@@ -667,7 +718,6 @@ export class PlanExecController {
     const updated = {
       ...run,
       stageAttempts: { ...run.stageAttempts, [run.stage]: iteration },
-      reviewFindings: [],
     };
     return this.launchBridge(updated, {
       kind: OPERATION_KIND.REVIEW,
@@ -678,24 +728,63 @@ export class PlanExecController {
     });
   }
 
+  private async promoteAcceptedOutput(run: PlanExecRun, candidate: string): Promise<PlanExecRun | undefined> {
+    const target = run.outputTarget;
+    if (!target || target.cwd === run.worktreeCwd) return undefined;
+    if (run.config.reviewRequired && run.reviewedCommit !== candidate) return this.fail(run, "Output promotion requires review of the current candidate.");
+    if (!run.outputPromotion || run.outputPromotion.candidate !== candidate) {
+      return this.registry.update({ ...run, outputPromotion: { candidate, state: "pending" } });
+    }
+    try {
+      if (!run.outputPromotion?.commandStarted) {
+        await verifyExecutionTree(this.runCommand, target.cwd, run.repositoryRoot, target.branch);
+        const current = await gitValue(this.runCommand, target.cwd, ["rev-parse", "HEAD"]);
+        const knownHeads = new Set([target.initialHead, candidate,
+          ...Object.values(run.tasks ?? {}).flatMap((task) => [task.acceptedCommit, task.recoverySource?.checkpointCommit,
+            ...(task.recoveryHistory ?? []).map((source) => source.checkpointCommit)].filter((commit): commit is string => Boolean(commit)))]);
+        if (!knownHeads.has(current)) throw new Error("Original output branch changed outside accepted task commits; refusing to overwrite it.");
+        await gitValue(this.runCommand, target.cwd, ["merge-base", "--is-ancestor", current, candidate]);
+        const dirty = await worktreeChanges(this.runCommand, target.cwd);
+        if (dirty.some((path) => path !== target.progressRelativePath))
+          throw new Error("Original output worktree has preserved or user changes; waiting for a safe fast-forward without resetting them.");
+        const intended = await this.registry.updateIfCurrent({ ...run, outputPromotion: { ...run.outputPromotion!, commandStarted: true } }, run.updatedAt);
+        if (!intended.applied) return intended.run;
+        run = intended.run;
+      }
+      await this.executeLocalCommands(target.cwd, [["git", "merge", "--ff-only", "--no-edit", "--no-overwrite-ignore", candidate]],
+        await this.localOptions(run, `git:promote:${candidate}:${run.outputPromotion?.attempt ?? 0}`, candidate));
+      await verifyExecutionTree(this.runCommand, target.cwd, run.repositoryRoot, target.branch);
+      if (await gitValue(this.runCommand, target.cwd, ["rev-parse", "HEAD"]) !== candidate)
+        throw new Error("Original output branch does not match the retired promotion candidate.");
+      const promoted = await this.registry.updateIfCurrent({ ...run,
+        worktreeCwd: target.cwd, branch: target.branch, planPath: join(target.cwd, target.planRelativePath),
+        ...(target.progressRelativePath ? { progressPath: join(target.cwd, target.progressRelativePath) } : {}),
+        outputPromotion: { ...run.outputPromotion!, candidate, state: "complete" }, nextAttemptAt: 0,
+      }, run.updatedAt);
+      return promoted.run;
+    } catch (error) {
+      return this.fail(error instanceof LocalOperationFailedError ? { ...run, outputPromotion: { ...run.outputPromotion!,
+        attempt: (run.outputPromotion?.attempt ?? 0) + 1, commandStarted: false } } : run,
+      `Output promotion: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
   private async prepareLane(run: PlanExecRun): Promise<PlanExecRun> {
     if (run.status === RUN_STATUS.STARTING) return this.registry.update({ ...run, status: RUN_STATUS.RUNNING });
     const preparation = run.lanePreparation!;
     try {
       if (preparation.state === "create") {
-        const existing = await this.runCommand("git", ["rev-parse", "--show-toplevel"], preparation.cwd).catch(() => undefined);
-        if (existing?.code !== 0 || existing.stdout.trim() !== preparation.cwd) {
-          await gitValue(this.runCommand, run.repositoryRoot, ["worktree", "add", "-b", preparation.branch, preparation.cwd, preparation.baselineCommit]);
-        } else {
-          await verifyExecutionTree(this.runCommand, preparation.cwd, run.repositoryRoot, preparation.branch);
-          const head = await gitValue(this.runCommand, preparation.cwd, ["rev-parse", "HEAD"]);
-          if (head !== preparation.baselineCommit) throw new Error("Lane creation found an unexpected HEAD; refusing to reuse it.");
-        }
+        await this.executeLocalCommands(run.repositoryRoot,
+          [["git", "worktree", "add", "-b", preparation.branch, preparation.cwd, preparation.baselineCommit]],
+          await this.localOptions(run, `git:worktree:${preparation.cwd}`, preparation.baselineCommit));
+        await verifyExecutionTree(this.runCommand, preparation.cwd, run.repositoryRoot, preparation.branch);
+        const head = await gitValue(this.runCommand, preparation.cwd, ["rev-parse", "HEAD"]);
+        if (head !== preparation.baselineCommit) throw new Error("Lane creation found an unexpected HEAD; refusing to reuse it.");
         const planPath = join(preparation.cwd, relative(run.worktreeCwd, run.planPath));
-        if (!await pathExists(planPath)) await copyPlanIntoWorktree(run.planPath, planPath);
+        if (!await pathExists(planPath)) await copyPlanIntoWorktree(preparation.sourcePlanPath ?? run.planPath, planPath);
         return (await this.registry.updateIfCurrent({ ...run, lanePreparation: { ...preparation, state: "bootstrap" } }, run.updatedAt)).run;
       }
-      await runCommands(this.runCommand, preparation.cwd, await bootstrapCommands(preparation.cwd, run.config.bootstrapCommands),
+      await this.executeLocalCommands(preparation.cwd, await bootstrapCommands(preparation.cwd, run.config.bootstrapCommands),
         await this.localOptions(run, `bootstrap:${preparation.cwd}:${preparation.nextAttemptAt ?? 0}`));
       const task = run.tasks?.[String(preparation.taskId)];
       if (!task && preparation.taskId !== 0) throw new Error("Lane preparation lost its task.");
@@ -710,28 +799,40 @@ export class PlanExecController {
       delete prepared.lanePreparation;
       return (await this.registry.updateIfCurrent(prepared, run.updatedAt)).run;
     } catch (error) {
-      return this.fail(error instanceof LocalOperationUnknownError ? run : { ...run,
-        lanePreparation: { ...preparation, nextAttemptAt: Date.now() + run.config.retryDelayMs } },
+      if (error instanceof LocalOperationFailedError && preparation.state === "create") {
+        const token = randomUUID().slice(0, LANE_TOKEN_LENGTH);
+        const cwd = join(dirname(preparation.cwd), `plan-exec-${run.id}-${token}`);
+        const branch = `plan-exec/${run.id}/${token}`;
+        const initial = preparation.taskId === 0;
+        return this.fail({ ...run, lanePreparation: { ...preparation, cwd, branch },
+          ...(initial ? { worktreeCwd: cwd, branch, planPath: join(cwd, relative(run.worktreeCwd, run.planPath)),
+            ...(run.outputTarget ? { outputTarget: { ...run.outputTarget, cwd, branch } } : {}) } : {}),
+        }, `Worktree creation failed after confirmed exit; preserved ${preparation.cwd} and scheduled a fresh lane: ${error.message}`);
+      }
+      return this.fail(error instanceof LocalOperationFailedError ? { ...run,
+        lanePreparation: { ...preparation, nextAttemptAt: Math.max((preparation.nextAttemptAt ?? 0) + 1, Date.now() + run.config.retryDelayMs) } } : run,
       `Lane preparation: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
   private async verifyCandidate(run: PlanExecRun, candidate: string): Promise<void> {
     if (run.acceptedHead) await gitValue(this.runCommand, run.worktreeCwd, ["merge-base", "--is-ancestor", run.acceptedHead, candidate]);
-    await runCommands(this.runCommand, run.worktreeCwd, run.config.requiredChecks,
-      await this.localOptions(run, `verify:${candidate}:${run.activeOperation?.operationId ?? run.stage}`, candidate));
+    const finalizationAttempt = run.stage === RUN_STAGE.FINALIZE && !run.activeOperation ? run.stageAttempts[RUN_STAGE.FINALIZE] ?? 0 : 0;
+    const operationId = `verify:${candidate}:${run.activeOperation?.operationId ?? run.stage}${finalizationAttempt ? `:retry-${finalizationAttempt}` : ""}`;
+    await this.executeLocalCommands(run.worktreeCwd, run.config.requiredChecks,
+      await this.localOptions(run, operationId, candidate));
     const head = await gitValue(this.runCommand, run.worktreeCwd, ["rev-parse", "HEAD"]);
     if (head !== candidate) throw new Error("HEAD changed while verifying the candidate.");
-    const dirtyResult = await this.runCommand("git", ["status", "--porcelain", "-z", "--untracked-files=normal"], run.worktreeCwd);
-    if (dirtyResult.code !== 0) throw new Error(dirtyResult.stderr || "Cannot inspect candidate worktree.");
+    const dirty = await worktreeChanges(this.runCommand, run.worktreeCwd);
     const progress = run.progressPath ? relative(run.worktreeCwd, run.progressPath) : undefined;
-    if (dirtyResult.stdout.split("\0").some((line) => line && line.slice(PORCELAIN_PATH_OFFSET) !== progress))
+    if (dirty.some((path) => path !== progress))
       throw new Error("Candidate has uncommitted source changes after verification.");
   }
 
   private async localOptions(run: PlanExecRun, operationId: string, candidate?: string): Promise<LocalOperationOptions> {
-    const commonDir = await gitValue(this.runCommand, run.worktreeCwd, ["rev-parse", "--git-common-dir"]);
-    return { journalRoot: join(resolve(run.worktreeCwd, commonDir), "plan-exec-local"), runId: run.id, operationId,
+    const commonDir = await gitValue(this.runCommand, run.repositoryRoot, ["rev-parse", "--git-common-dir"]);
+    return { journalRoot: join(resolve(run.repositoryRoot, commonDir), "plan-exec-local"), runId: run.id, operationId,
+      activeDirectory: this.registry.localOperationsPath(run.id),
       authorization: { path: this.registry.authorizationPath(run.id), stopGeneration: run.stopGeneration ?? 0 },
       ...(candidate ? { candidate } : {}),
       isAuthorized: async () => {
@@ -743,14 +844,22 @@ export class PlanExecController {
   }
 
   private async launchFusion(run: PlanExecRun): Promise<PlanExecRun> {
+    const lifetime = attemptExecutionLifetime(run, OPERATION_KIND.FUSION);
     const client = await this.reviewClient(run);
     const capabilities = await client.capabilities?.();
-    if (!supportsExecution(capabilities, run.config.executionLifetime))
+    if (!supportsExecution(capabilities, lifetime))
       return this.reviewFailure(run, `${run.config.reviewBackend} runtime does not support the requested explicit execution lifetime, durable lookup and process-tree proof.`);
     const iteration = (run.stageAttempts[RUN_STAGE.FUSION_REVIEW] ?? 0) + 1;
     const profile = run.config.reviewBackend === "revmux" ? run.config.revmuxProfile : run.config.fusionProfile;
     const operationId = randomUUID();
     const launchStartedAt = Date.now();
+    const params = {
+      prompt: boundedContinuationPrompt(run, OPERATION_KIND.FUSION, fusionPrompt(run), lifetime), backend: run.config.reviewBackend,
+      cwd: run.worktreeCwd,
+      executionLifetime: lifetime,
+      reviewedCommit: await gitValue(this.runCommand, run.worktreeCwd, ["rev-parse", "HEAD"]),
+      ...(profile ? { profile } : {}),
+    };
     const persisted = await this.registry.updateIfCurrent(
       {
         ...run,
@@ -758,7 +867,6 @@ export class PlanExecController {
           ...run.stageAttempts,
           [RUN_STAGE.FUSION_REVIEW]: iteration,
         },
-        reviewFindings: [],
         activeOperation: {
           operationId,
           service: OPERATION_SERVICE.FUSION,
@@ -766,30 +874,28 @@ export class PlanExecController {
           reviewIteration: iteration,
           launchStartedAt,
           recovery: OPERATION_RECOVERY.REPLAY,
-          params: {
-            prompt: fusionPrompt(run),
-            backend: run.config.reviewBackend,
-            executionLifetime: run.config.executionLifetime,
-            reviewedCommit: await gitValue(this.runCommand, run.worktreeCwd, ["rev-parse", "HEAD"]),
-            ...(profile
-              ? { profile }
-              : {}),
-          },
+          expectedLifetime: lifetime,
+          params,
+          requestDigest: bridgeRequestDigest(params),
         },
       },
       run.updatedAt,
     );
     if (!persisted.applied) return persisted.run;
     const intended = persisted.run;
-    const reply = await client.start(
+    const reply = await (await this.reviewClient(intended)).start(
       operationId,
       text(intended.activeOperation?.params?.prompt) ?? fusionPrompt(intended),
       text(intended.activeOperation?.params?.profile),
-      intended.config.executionLifetime,
+      lifetime,
+      intended.activeOperation?.requestDigest,
+      { cwd: params.cwd, reviewedCommit: params.reviewedCommit },
     );
     if (!reply.success)
       return this.fail(intended, reply.error.message, true);
-    if (!sameLifetime(parseExecutionLifetime(reply.data.effectiveExecutionLifetime), run.config.executionLifetime))
+    if (reply.data.requestDigest !== intended.activeOperation?.requestDigest)
+      return this.failUnknownLaunch(intended, intended.activeOperation, "Review backend did not attest the immutable request digest.");
+    if (!sameLifetime(parseExecutionLifetime(reply.data.effectiveExecutionLifetime), lifetime))
       return this.failUnknownLaunch(intended, intended.activeOperation, "Fusion did not attest the effective execution lifetime.");
     const state = fusionState(reply.data);
     if (!state)
@@ -797,6 +903,7 @@ export class PlanExecController {
     return this.updateActiveOperation(intended, operationId, {
       externalRunId: state.runId,
       recovery: OPERATION_RECOVERY.OBSERVE,
+      effectiveLifetime: lifetime,
     });
   }
 
@@ -811,7 +918,7 @@ export class PlanExecController {
   private async reviewClient(run: PlanExecRun): Promise<FusionLike> {
     if ((run.activeOperation?.params?.backend ?? run.config.reviewBackend) !== "revmux") return this.fusion;
     const commonDir = await gitValue(this.runCommand, run.worktreeCwd, ["rev-parse", "--git-common-dir"]);
-    return new RevmuxReviewClient({ cwd: run.worktreeCwd,
+    return new RevmuxReviewClient({ cwd: text(run.activeOperation?.params?.cwd) ?? run.worktreeCwd,
       stateDirectory: join(resolve(run.worktreeCwd, commonDir), "plan-exec-review", run.id),
       reviewedCommit: text(run.activeOperation?.params?.reviewedCommit) ?? await gitValue(this.runCommand, run.worktreeCwd, ["rev-parse", "HEAD"]),
       ...(run.config.revmuxExecutable ? { executable: run.config.revmuxExecutable } : {}),
@@ -820,7 +927,15 @@ export class PlanExecController {
 
   private async launchFinalizer(run: PlanExecRun): Promise<PlanExecRun> {
     const candidate = await gitValue(this.runCommand, run.worktreeCwd, ["rev-parse", "HEAD"]);
-    await this.verifyCandidate(run, candidate);
+    const promoted = await this.promoteAcceptedOutput(run, candidate);
+    if (promoted) return promoted;
+    try { await this.verifyCandidate(run, candidate); }
+    catch (error) {
+      if (!(error instanceof LocalOperationFailedError)) throw error;
+      return this.fail({ ...run, stageAttempts: { ...run.stageAttempts,
+        [RUN_STAGE.FINALIZE]: (run.stageAttempts[RUN_STAGE.FINALIZE] ?? 0) + 1,
+      } }, `Final verification failed after confirmed command exit: ${error.message}`);
+    }
     return this.transition({ ...run, verifiedCommit: candidate }, RUN_STAGE.STATS, "Final verification passed for the reviewed candidate.");
   }
 
@@ -867,9 +982,20 @@ export class PlanExecController {
       task: string;
     },
   ): Promise<PlanExecRun> {
+    const lifetime = attemptExecutionLifetime(run, input.kind, input.taskId);
     const capabilities = await this.bridgeCapabilities();
-    if (!supportsExecution(capabilities, run.config.executionLifetime)) {
+    if (!supportsExecution(capabilities, lifetime) || capabilities?.singleAgentSpawn !== true) {
       const reason = "Bridge runtime does not support the requested explicit execution lifetime, durable lookup and process-tree proof.";
+      if (input.taskId && run.tasks?.[String(input.taskId)]) {
+        const prerequisite: ExternalPrerequisite = { kind: "runtime", source: "provider",
+          evidence: `${reason} Capability probe: ${JSON.stringify(capabilities ?? "unavailable")}` };
+        return this.registry.update({ ...run, nextAttemptAt: 0, needsAttention: true, wakeReason: prerequisite.evidence,
+          tasks: { ...run.tasks, [String(input.taskId)]: { ...run.tasks[String(input.taskId)]!,
+            state: "waiting_external", reason: prerequisite.evidence, externalPrerequisite: prerequisite,
+            nextAttemptAt: Date.now() + run.config.retryDelayMs,
+          } },
+        });
+      }
       return input.kind === OPERATION_KIND.STATS ? this.finishStats(run, reason) : this.fail(run, reason);
     }
     const operationId = input.operationId ?? randomUUID();
@@ -881,10 +1007,10 @@ export class PlanExecController {
     const params = {
       agent: input.agent,
       ...(model ? { model } : {}),
-      task: reviewedCommit ? `${input.task}\nReview exactly commit ${reviewedCommit}.` : input.task,
+      task: boundedContinuationPrompt(run, input.kind, reviewedCommit ? `${input.task}\nReview exactly commit ${reviewedCommit}.` : input.task, lifetime, input.taskId),
       cwd: run.worktreeCwd,
       context: "fresh",
-      executionLifetime: run.config.executionLifetime,
+      executionLifetime: lifetime,
       turnBudget: { maxTurns: input.maxTurns },
       acceptance: false,
       mission: false,
@@ -910,6 +1036,7 @@ export class PlanExecController {
           launchStartedAt,
           recovery: OPERATION_RECOVERY.REPLAY,
           stopGeneration: run.stopGeneration ?? 0,
+          expectedLifetime: lifetime,
           ...(input.taskId ? { taskId: input.taskId } : {}),
           ...(input.reviewIteration
             ? { reviewIteration: input.reviewIteration }
@@ -929,7 +1056,7 @@ export class PlanExecController {
     const owner = bridgeOperationOwner(intended, intended.activeOperation);
     const reply = await this.bridge.spawn(operationId, params, owner);
     if (!reply.success) return this.fail(intended, reply.error.message, true);
-    if (!sameLifetime(parseExecutionLifetime(reply.data.effectiveExecutionLifetime), run.config.executionLifetime))
+    if (!sameLifetime(parseExecutionLifetime(reply.data.effectiveExecutionLifetime), lifetime))
       return this.failUnknownLaunch(intended, intended.activeOperation, "Bridge did not attest the effective execution lifetime.");
     const replyDigest = text(reply.data.requestDigest);
     if (
@@ -953,7 +1080,7 @@ export class PlanExecController {
     const asyncDir = text(reply.data.asyncDir);
     return this.updateActiveOperation(intended, operationId, {
       externalRunId,
-      effectiveLifetime: run.config.executionLifetime,
+      effectiveLifetime: lifetime,
       recovery: OPERATION_RECOVERY.OBSERVE,
       ...(asyncDir ? { asyncDir } : {}),
     });
@@ -989,8 +1116,15 @@ export class PlanExecController {
           operation,
           "Bridge operation lookup did not match the persisted request digest.",
         );
+      if (isFencedCancellation(lookup.data, operation)) {
+        const fenced = await this.updateActiveOperation(run, operation.operationId, { launchFenced: true, stopRequested: true, stopAcknowledged: true });
+        if (fenced.status === RUN_STATUS.CANCEL_PENDING) return this.cancel(fenced);
+        if (fenced.status === RUN_STATUS.PAUSED || fenced.userStopped) return fenced;
+        return this.recoverFencedOperation(fenced);
+      }
       if (lookupState === EXTERNAL_OPERATION_STATE.FOUND) {
-        if (!sameLifetime(parseExecutionLifetime(lookup.data.effectiveExecutionLifetime), run.config.executionLifetime))
+        const expectedLifetime = operationExpectedLifetime(operation);
+        if (!expectedLifetime || !sameLifetime(parseExecutionLifetime(lookup.data.effectiveExecutionLifetime), expectedLifetime))
           return this.failUnknownLaunch(run, operation, "Recovered Bridge operation does not attest the requested execution lifetime.");
         const externalRunId = text(lookup.data.runId);
         if (!externalRunId)
@@ -1003,6 +1137,8 @@ export class PlanExecController {
         return this.updateActiveOperation(run, operation.operationId, {
           externalRunId,
           recovery: OPERATION_RECOVERY.OBSERVE,
+          expectedLifetime,
+          effectiveLifetime: expectedLifetime,
           ...(owner ? { requestDigest: owner.requestDigest } : {}),
           ...(asyncDir ? { asyncDir } : {}),
         });
@@ -1016,7 +1152,7 @@ export class PlanExecController {
           owner
         ) {
           if (run.status === RUN_STATUS.CANCEL_PENDING || run.status === RUN_STATUS.SKIP_PENDING) {
-            return this.registry.update(withoutOperation(run));
+            return this.failUnknownLaunch(run, operation, "An empty lookup does not fence delayed dispatch; the original cancellation must be confirmed.");
           }
           return this.replayAbsentBridgeOperation(
             run,
@@ -1043,15 +1179,52 @@ export class PlanExecController {
       );
     }
 
-    const reply = await (await this.reviewClient(run)).status(undefined, operation.operationId);
+    const client = await this.reviewClient(run);
+    const reply = await client.status(undefined, operation.operationId);
     if (!reply.success)
       return this.failUnknownLaunch(run, operation, reply.error.message);
+    if (isFencedReviewCancellation(reply.data, operation)) {
+      const cleared = withoutOperation(run);
+      return run.status === RUN_STATUS.CANCEL_PENDING
+        ? this.registry.update({ ...cleared, status: RUN_STATUS.CANCELLED })
+        : this.fail(cleared, "Review launch was durably fenced before dispatch; scheduling a fresh operation.");
+    }
+    if (reply.data.state === EXTERNAL_OPERATION_STATE.ABSENT && reply.data.replaySafe === true && reply.data.operationId === operation.operationId) {
+      if (run.status !== RUN_STATUS.RUNNING || run.userStopped)
+        return this.failUnknownLaunch(run, operation, "An undispatched review remains fenced by the user's stop or pause.");
+      const capabilities = await client.capabilities?.();
+      const params = operation.params;
+      const lifetime = parseExecutionLifetime(params?.executionLifetime);
+      const expectedLifetime = operationExpectedLifetime(operation);
+      if (!lifetime || !expectedLifetime || !sameLifetime(lifetime, expectedLifetime) || !supportsExecution(capabilities, lifetime) || !params ||
+        !operation.requestDigest || operation.requestDigest !== bridgeRequestDigest(params) || !text(params.prompt) ||
+        !text(params.cwd) || !isAbsolute(text(params.cwd)!) || !text(params.reviewedCommit))
+        return this.failUnknownLaunch(run, operation, "Review replay lacks a supported runtime or matching immutable intent.");
+      const latest = (await this.registry.get(run.id)) ?? run;
+      if (!sameOperationState(run, latest, operation) || latest.userStopped || (latest.stopGeneration ?? 0) !== (run.stopGeneration ?? 0)) return latest;
+      const replay = await client.start(operation.operationId, text(params.prompt)!, text(params.profile), lifetime, operation.requestDigest,
+        { cwd: text(params.cwd)!, reviewedCommit: text(params.reviewedCommit)! });
+      if (!replay.success) return this.failUnknownLaunch(latest, operation, replay.error.message);
+      if (replay.data.requestDigest !== operation.requestDigest || !sameLifetime(parseExecutionLifetime(replay.data.effectiveExecutionLifetime), lifetime))
+        return this.failUnknownLaunch(latest, operation, "Replayed review did not attest its original digest and lifetime.");
+      const replayed = fusionState(replay.data);
+      if (!replayed) return this.failUnknownLaunch(latest, operation, "Review replay returned no durable run identity.");
+      return this.updateActiveOperation(latest, operation.operationId, { externalRunId: replayed.runId, recovery: OPERATION_RECOVERY.OBSERVE,
+        expectedLifetime, effectiveLifetime: lifetime });
+    }
+    if (operation.requestDigest && reply.data.requestDigest !== operation.requestDigest)
+      return this.failUnknownLaunch(run, operation, "Review lookup returned a different request digest.");
+    const expectedLifetime = operationExpectedLifetime(operation);
+    if (!expectedLifetime || !sameLifetime(parseExecutionLifetime(reply.data.effectiveExecutionLifetime), expectedLifetime))
+      return this.failUnknownLaunch(run, operation, "Review lookup did not attest the original execution lifetime.");
     const state = fusionState(reply.data);
     if (!state)
       return this.failUnknownLaunch(run, operation, "Fusion lookup did not prove an adoptable operation; retaining ownership.");
     return this.updateActiveOperation(run, operation.operationId, {
       externalRunId: state.runId,
       recovery: OPERATION_RECOVERY.OBSERVE,
+      expectedLifetime,
+      effectiveLifetime: expectedLifetime,
     });
   }
 
@@ -1082,6 +1255,11 @@ export class PlanExecController {
         operation,
         "Bridge recovery parameters lack mission:false; refusing recovery launch.",
       );
+    const expectedLifetime = operationExpectedLifetime(operation);
+    const capabilities = await this.bridgeCapabilities();
+    if (!expectedLifetime || !sameLifetime(parseExecutionLifetime(operation.params.executionLifetime), expectedLifetime) ||
+      !supportsExecution(capabilities, expectedLifetime) || capabilities?.singleAgentSpawn !== true)
+      return this.failUnknownLaunch(run, operation, "Bridge recovery lacks its original supported execution lifetime.");
     const reply = await this.bridge.spawn(
       operation.operationId,
       operation.params,
@@ -1089,7 +1267,7 @@ export class PlanExecController {
     );
     if (!reply.success)
       return this.failUnknownLaunch(run, operation, reply.error.message);
-    if (!sameLifetime(parseExecutionLifetime(reply.data.effectiveExecutionLifetime), run.config.executionLifetime))
+    if (!sameLifetime(parseExecutionLifetime(reply.data.effectiveExecutionLifetime), expectedLifetime))
       return this.failUnknownLaunch(run, operation, "Bridge recovery did not attest the effective execution lifetime.");
     const replyDigest = text(reply.data.requestDigest);
     if (!replyDigest || replyDigest !== owner.requestDigest)
@@ -1110,6 +1288,8 @@ export class PlanExecController {
       externalRunId,
       requestDigest: owner.requestDigest,
       recovery: OPERATION_RECOVERY.OBSERVE,
+      expectedLifetime,
+      effectiveLifetime: expectedLifetime,
       ...(asyncDir ? { asyncDir } : {}),
     });
   }
@@ -1154,19 +1334,44 @@ export class PlanExecController {
     return current;
   }
 
+  private async reconcileLocalCancellation(run: PlanExecRun): Promise<PlanExecRun> {
+    if (!run.localOperationActive) return run;
+    const result = await cancelActiveLocalOperations(this.registry.localOperationsPath(run.id), run.id, run.stopGeneration ?? 0);
+    const current = (await this.registry.get(run.id)) ?? run;
+    if (current.status !== run.status || current.stopGeneration !== run.stopGeneration) return current;
+    const updated = { ...current };
+    if (result.pending) {
+      updated.localOperationActive = true;
+      updated.nextAttemptAt = Date.now() + CONTROLLER_POLL_INTERVAL_MS;
+      updated.wakeReason = result.reason ?? "Waiting for local command process-tree retirement.";
+    } else {
+      delete updated.localOperationActive;
+      updated.nextAttemptAt = 0;
+    }
+    return (await this.registry.updateIfCurrent(updated, current.updatedAt)).run;
+  }
+
   private async observePausedOperation(run: PlanExecRun): Promise<PlanExecRun> {
+    const original = run;
+    run = await this.reconcileLocalCancellation(run);
+    run = await this.requestOperationCancellation(run);
+    if (run.status !== RUN_STATUS.PAUSED || run.stopGeneration !== original.stopGeneration) return run;
     const operation = run.activeOperation;
     if (!operation) return run;
+    if (operation.launchFenced) return run;
     if (!operation.externalRunId) {
       const reply = operation.service === OPERATION_SERVICE.BRIDGE
         ? await this.bridge.operation(operation.operationId, bridgeOperationOwner(run, operation))
         : await (await this.reviewClient(run)).status(undefined, operation.operationId);
       if (!reply.success) return this.recordObservationFailure(run, operation, reply.error.message);
+      if (isFencedCancellation(reply.data, operation))
+        return this.updateActiveOperation(run, operation.operationId, { launchFenced: true, stopAcknowledged: true });
       const runId = operation.service === OPERATION_SERVICE.BRIDGE ? text(reply.data.runId) : fusionState(reply.data)?.runId;
       if (!runId || (operation.service === OPERATION_SERVICE.BRIDGE &&
         (reply.data.state !== EXTERNAL_OPERATION_STATE.FOUND || reply.data.requestDigest !== operation.requestDigest)))
         return this.recordObservationFailure(run, operation, "Paused operation launch remains unresolved; no replacement is authorized.");
-      return this.updateActiveOperation(run, operation.operationId, { externalRunId: runId, recovery: OPERATION_RECOVERY.OBSERVE });
+      const attached = await this.updateActiveOperation(run, operation.operationId, { externalRunId: runId, recovery: OPERATION_RECOVERY.OBSERVE });
+      return this.requestOperationCancellation(attached);
     }
     const status =
       operation.service === OPERATION_SERVICE.BRIDGE
@@ -1182,12 +1387,17 @@ export class PlanExecController {
       run,
       operation,
       status.data.text,
+      operation.service === OPERATION_SERVICE.BRIDGE ? text(status.data.state) : fusionState(status.data)?.phase,
+      status.data.activity,
+      status.data,
     );
     if (!sameOperationState(run, observed, operation)) return observed;
     const state =
       operation.service === OPERATION_SERVICE.BRIDGE
         ? text(status.data.state)
         : fusionState(status.data)?.phase;
+    if (state && hasProcessExit(status.data, operation))
+      return this.updateActiveOperation(observed, operation.operationId, { processTreeExited: true, lastObservedState: state });
     if (
       !state ||
       state === EXTERNAL_OPERATION_STATE.RUNNING ||
@@ -1206,6 +1416,11 @@ export class PlanExecController {
   }
 
   private async observeActiveOperation(run: PlanExecRun): Promise<PlanExecRun> {
+    if (run.activeOperation?.stopRequested) {
+      run = await this.requestOperationCancellation(run);
+      if (run.status !== RUN_STATUS.RUNNING || run.userStopped) return run;
+      if (run.activeOperation?.launchFenced) return this.recoverFencedOperation(run);
+    }
     const operation = run.activeOperation;
     if (!operation) return this.fail(run, "Active operation is missing.");
     if (!operation.externalRunId)
@@ -1213,6 +1428,43 @@ export class PlanExecController {
     if (operation.service === OPERATION_SERVICE.FUSION)
       return this.observeFusion(run, operation);
     return this.observeBridge(run, operation);
+  }
+
+  private async requestOperationCancellation(run: PlanExecRun): Promise<PlanExecRun> {
+    let operation = run.activeOperation;
+    if (!operation || operation.stopAcknowledged || operation.launchFenced || operation.processTreeExited) return run;
+    if (!operation.stopRequested) {
+      const intended = await this.registry.updateIfCurrent({ ...run, activeOperation: { ...operation, stopRequested: true } }, run.updatedAt);
+      if (!intended.applied) return intended.run;
+      run = intended.run;
+      operation = run.activeOperation!;
+    }
+    const latest = (await this.registry.get(run.id)) ?? run;
+    if (!sameOperationState(run, latest, operation) || (latest.stopGeneration ?? 0) !== (run.stopGeneration ?? 0)) return latest;
+    const owner = bridgeOperationOwner(run, operation);
+    const reply = operation.service === OPERATION_SERVICE.BRIDGE
+      ? this.bridge.cancelOperation && owner
+        ? await this.bridge.cancelOperation(operation.operationId, owner)
+        : operation.externalRunId ? await this.bridge.stop(operation.externalRunId, operation.asyncDir) : undefined
+      : await (await this.reviewClient(run)).cancel(operation.externalRunId, operation.externalRunId ? undefined : operation.operationId);
+    if (!reply?.success)
+      return this.recordCancellationFailure(run, operation, reply?.error.message ?? "Cancellation is awaiting the original provider operation identity.");
+    const fenced = isFencedCancellation(reply.data, operation);
+    const current = (await this.registry.get(run.id)) ?? run;
+    if (!sameOperationState(run, current, operation) || (current.stopGeneration ?? 0) !== (run.stopGeneration ?? 0)) return current;
+    return (await this.registry.updateIfCurrent({ ...current, activeOperation: { ...current.activeOperation!,
+      stopAcknowledged: true, ...(fenced ? { launchFenced: true } : {}),
+    } }, current.updatedAt)).run;
+  }
+
+  private async recoverFencedOperation(run: PlanExecRun): Promise<PlanExecRun> {
+    const operation = run.activeOperation;
+    if (!operation?.launchFenced) return run;
+    const task = operation.taskId ? run.tasks?.[String(operation.taskId)] : undefined;
+    return this.registry.update(withoutOperation({ ...run, nextAttemptAt: 0,
+      ...(task ? { tasks: { ...run.tasks, [String(task.taskId)]: { ...task, state: "retry_wait",
+        attempts: Math.max(task.attempts - 1, 0), nextAttemptAt: Date.now(), reason: "The original launch was fenced before dispatch; retrying the preserved task." } } } : {}),
+    }));
   }
 
   private async observeBridge(
@@ -1227,7 +1479,7 @@ export class PlanExecController {
         status.error.message,
       );
     const state = text(status.data.state);
-    const observed = await this.recordObservation(
+    let observed = await this.recordObservation(
       run,
       operation,
       status.data.text,
@@ -1241,11 +1493,15 @@ export class PlanExecController {
       state === EXTERNAL_OPERATION_STATE.RUNNING ||
       state === EXTERNAL_OPERATION_STATE.STOPPING
     )
-      return observed;
-    if (!hasProcessExit(status.data, operation.externalRunId!))
+      return state === EXTERNAL_OPERATION_STATE.RUNNING ? this.guideConfirmedToolFailure(observed) : observed;
+    if (!hasProcessExit(status.data, operation))
       return this.recordObservationFailure(observed, operation, "Terminal wrapper state has no confirmed process-tree exit; retaining ownership.");
-    operation = { ...operation, processTreeExited: true, lastObservedState: state };
-    const terminalError = bridgeTerminalError(status.data);
+    observed = await this.recordBudgetExhaustion(observed, operation, status.data);
+    if (!sameOperationState(run, observed, operation)) return observed;
+    operation = { ...(observed.activeOperation ?? operation), processTreeExited: true, lastObservedState: state };
+    const terminalError = operation.terminationReason === "execution_lifetime_expired"
+      ? "Explicit bounded execution lifetime expired; the checkpoint is preserved for automatic continuation."
+      : bridgeTerminalError(status.data);
     const settled =
       state === EXTERNAL_OPERATION_STATE.PAUSED ||
       state === EXTERNAL_OPERATION_STATE.FAILED
@@ -1284,6 +1540,58 @@ export class PlanExecController {
       if (state) return { success: true, data: { ...lookup.data, state } };
     }
     return this.bridge.status(operation.externalRunId!, operation.asyncDir);
+  }
+
+  private async guideConfirmedToolFailure(run: PlanExecRun): Promise<PlanExecRun> {
+    const operation = run.activeOperation;
+    const diagnosis = operation?.diagnostics;
+    const failure = diagnosis?.lastToolFailure;
+    const key = diagnosis?.failureKey;
+    if (run.status !== RUN_STATUS.RUNNING || run.userStopped || operation?.stopRequested || operation?.processTreeExited ||
+      !operation || operation.service !== OPERATION_SERVICE.BRIDGE || diagnosis?.assessment !== "tool_fault_reported" || !failure || !key || !this.bridge.diagnoseOperation)
+      return run;
+    const pending = Object.entries(operation.diagnosticActions ?? {}).find(([, action]) => action.state === EXTERNAL_OPERATION_STATE.PENDING);
+    const failureKey = pending?.[0] ?? key;
+    let action = pending?.[1] ?? operation.diagnosticActions?.[failureKey];
+    if (action && (action.state !== EXTERNAL_OPERATION_STATE.PENDING || action.nextAttemptAt > Date.now() || action.stopGeneration !== (run.stopGeneration ?? 0))) return run;
+    const capabilities = await this.bridgeCapabilities();
+    const capability = capabilities?.diagnosticGuidance;
+    const owner = bridgeOperationOwner(run, operation);
+    if (!owner || !capabilities?.healthy || capability?.version !== 1 || !capability.idempotent || capability.mode !== "follow_up" || !capability.confirmedToolFailure)
+      return run;
+    if (!action) {
+      action = { diagnosticId: `${operation.operationId}:${failureKey}`, toolCallId: failure.toolCallId,
+        message: `The runner confirmed a tool execution error for ${failure.toolName} (${failure.toolCallId}): ${failure.message}. Preserve this session and checkpoint. Diagnose that concrete error, repair or retry only the affected tool when justified, and continue the original task; do not restart already completed work.`,
+        state: "pending", stopGeneration: run.stopGeneration ?? 0, requestedAt: Date.now(), nextAttemptAt: 0 };
+      const intended = await this.registry.updateIfCurrent({ ...run, activeOperation: { ...operation,
+        diagnosticActions: { ...operation.diagnosticActions, [failureKey]: action },
+      } }, run.updatedAt);
+      if (!intended.applied) return intended.run;
+      run = intended.run;
+    }
+    const current = (await this.registry.get(run.id)) ?? run;
+    if (!sameOperationState(run, current, operation) || current.status !== RUN_STATUS.RUNNING || current.userStopped ||
+      current.activeOperation?.stopRequested || (current.stopGeneration ?? 0) !== action.stopGeneration) return current;
+    let reply: ServiceReply;
+    try {
+      reply = await this.bridge.diagnoseOperation(operation.operationId, owner,
+        { diagnosticId: action.diagnosticId, toolCallId: action.toolCallId, message: action.message });
+    } catch (error) {
+      reply = { success: false, error: { message: error instanceof Error ? error.message : String(error) } };
+    }
+    const latest = (await this.registry.get(run.id)) ?? current;
+    if (!sameOperationState(current, latest, operation) || latest.status !== RUN_STATUS.RUNNING || latest.userStopped ||
+      latest.activeOperation?.stopRequested || (latest.stopGeneration ?? 0) !== action.stopGeneration) return latest;
+    const valid = reply.success && reply.data.operationId === operation.operationId && reply.data.requestDigest === owner.requestDigest &&
+      reply.data.diagnosticId === action.diagnosticId && reply.data.toolCallId === action.toolCallId && reply.data.guidanceOnly === true &&
+      ["pending", "queued", "cancelled", "rejected"].includes(String(reply.data.state));
+    const state = valid && reply.success ? reply.data.state as DiagnosticAction["state"] : "pending";
+    const recorded: DiagnosticAction = { ...action, state, lastReplyAt: Date.now(), nextAttemptAt: Date.now() + run.config.retryDelayMs };
+    if (!valid) recorded.error = reply.success ? "Diagnostic reply was not bound to the requested operation and tool failure." : reply.error.message;
+    else delete recorded.error;
+    return (await this.registry.updateIfCurrent({ ...latest, activeOperation: { ...latest.activeOperation!,
+      diagnosticActions: { ...latest.activeOperation?.diagnosticActions, [failureKey]: recorded },
+    } }, latest.updatedAt)).run;
   }
 
   private async finishBridgeOperation(
@@ -1380,14 +1688,16 @@ export class PlanExecController {
         operation,
         status.error.message,
       );
-    const observed = await this.recordObservation(run, operation, status.data.text, undefined, status.data.activity, status.data);
+    let observed = await this.recordObservation(run, operation, status.data.text, undefined, status.data.activity, status.data);
     if (!sameOperationState(run, observed, operation)) return observed;
     const state = fusionState(status.data);
     if (!state || !state.terminal) return observed;
     if (state.runId !== operation.externalRunId)
       return this.recordObservationFailure(observed, operation, "Fusion status did not match the tracked run identity.");
-    if (!hasProcessExit(status.data, operation.externalRunId!))
+    if (!hasProcessExit(status.data, operation))
       return this.recordObservationFailure(observed, operation, "Fusion termination has no confirmed process-tree exit; retaining ownership.");
+    observed = await this.recordBudgetExhaustion(observed, operation, status.data);
+    if (!sameOperationState(run, observed, operation)) return observed;
     if (state.phase === FUSION_PHASE.FAILED || state.phase === FUSION_PHASE.CANCELLED)
       return this.reviewFailure(observed, fusionTerminalError(state));
     const result = await client.result(state.runId);
@@ -1448,6 +1758,14 @@ export class PlanExecController {
     delete observedOperation.statusFailures;
     delete observedOperation.lastStatusError;
     const native = parseNativeActivity(nativeActivity);
+    const diagnosis = diagnoseOperation(nativeActivity, nativeStatus, {
+      now: Date.now(), nextProbeAt: Date.now() + CONTROLLER_POLL_INTERVAL_MS,
+      treeExited: nativeStatus ? hasProcessExit(nativeStatus, operation) : false,
+      ...(operation.diagnostics ? { prior: operation.diagnostics } : {}),
+    });
+    observedOperation.diagnostics = diagnosis.action === "repair_tool" ? { ...diagnosis, action: "probe" } : diagnosis;
+    const prerequisite = parseExternalPrerequisite(nativeStatus?.externalPrerequisite, "provider");
+    if (prerequisite) observedOperation.externalPrerequisite = prerequisite;
     const usage = nativeUsage(nativeStatus);
     const previous = operation.reportedUsage ?? {};
     const accumulated = { ...previous };
@@ -1458,9 +1776,14 @@ export class PlanExecController {
       const value = usage[key];
       if (value === undefined) continue;
       const prior = previous[key] ?? 0;
+      const delta = Math.max(value - prior, 0);
+      const nextTaskTotal = (taskUsage[key] ?? 0) + delta;
+      const nextRunTotal = (runUsage[key] ?? 0) + delta;
+      const validTotal = key === "cost" ? finiteUsageAmount : safeTokenCount;
+      if (!validTotal(nextTaskTotal) || !validTotal(nextRunTotal)) continue;
       accumulated[key] = Math.max(prior, value);
-      taskUsage[key] = (taskUsage[key] ?? 0) + Math.max(value - prior, 0);
-      runUsage[key] = (runUsage[key] ?? 0) + Math.max(value - prior, 0);
+      taskUsage[key] = nextTaskTotal;
+      runUsage[key] = nextRunTotal;
     }
     if (Object.keys(accumulated).length) observedOperation.reportedUsage = accumulated;
     const signal = native.signal ?? parseWorkerSignal(statusText);
@@ -1479,21 +1802,41 @@ export class PlanExecController {
     });
   }
 
+  private async recordBudgetExhaustion(run: PlanExecRun, operation: ActiveOperation,
+    status: Record<string, unknown>): Promise<PlanExecRun> {
+    const lifetime = operationExpectedLifetime(operation);
+    if (status.terminationReason !== "execution_lifetime_expired" || lifetime?.mode !== "bounded" ||
+      run.activeOperation?.budgetExpiryRecorded) return run;
+    const key = budgetKey(run, operation.kind, operation.taskId);
+    const expiries = (run.budgetExhaustions?.[key] ?? 0) + 1;
+    const growth = usefulProgressAtRetirement(run.activeOperation ?? operation, status, lifetime.timeoutMs);
+    return (await this.registry.updateIfCurrent({ ...run,
+      budgetExhaustions: { ...run.budgetExhaustions, [key]: expiries },
+      ...(growth ? { budgetGrowths: { ...run.budgetGrowths, [key]: (run.budgetGrowths?.[key] ?? 0) + 1 } } : {}),
+      activeOperation: { ...(run.activeOperation ?? operation), expectedLifetime: lifetime,
+        processTreeExited: true, terminationReason: "execution_lifetime_expired", budgetExpiryRecorded: true, budgetGrowthGranted: growth },
+      wakeReason: `Confirmed bounded execution-lifetime expiry ${expiries}; ${growth ? "recent verified model/tool progress permits a larger next budget" : "no recent useful progress was confirmed, so the budget stays unchanged and the next continuation must change its diagnosis"}.`,
+    }, run.updatedAt)).run;
+  }
+
   private async recordObservationFailure(
     run: PlanExecRun,
     operation: ActiveOperation,
     error: string,
   ): Promise<PlanExecRun> {
     const failures = (operation.statusFailures ?? 0) + 1;
+    const nextProbeAt = Date.now() + retryDelay(run.config.retryDelayMs, failures);
     const failedRun = {
       ...run,
-      nextAttemptAt: Date.now() + retryDelay(run.config.retryDelayMs, failures),
+      nextAttemptAt: nextProbeAt,
       wakeReason: error,
       needsAttention: failures >= MAX_STATUS_FAILURES,
       activeOperation: {
         ...operation,
         statusFailures: failures,
         lastStatusError: error,
+        diagnostics: diagnoseOperation(undefined, undefined, { now: Date.now(), nextProbeAt, treeExited: false,
+          statusUnavailable: true, error, ...(operation.diagnostics ? { prior: operation.diagnostics } : {}) }),
       },
     };
     return this.registry.heartbeat(failedRun);
@@ -1700,16 +2043,27 @@ export class PlanExecController {
     if (!task)
       return this.fail(run, `Task ${taskId} disappeared from the plan.`);
     const blocker = taskFailureReason(output);
+    const prerequisite = operation.externalPrerequisite ?? workerExternalPrerequisite(output);
     const attempts = (run.taskAttempts[String(taskId)] ?? 0) + 1;
     const tasks = reconcileTasks(plan.tasks, run.tasks);
     const execution = tasks[String(taskId)]!;
     let reason = blocker ?? terminalError ?? `Worker ended as ${state} with incomplete task ${taskId}.`;
-    if (isSuccessfulOperationState(state) && !blocker && task.unchecked.length === 0) {
+    if (prerequisite) reason = `${reason}\nPrerequisite (${prerequisite.source}/${prerequisite.kind}): ${prerequisite.evidence}`;
+    if (isSuccessfulOperationState(state) && !blocker && !prerequisite && task.unchecked.length === 0) {
       try {
-        const candidate = execution.candidateCommit ?? await gitValue(this.runCommand, run.worktreeCwd, ["rev-parse", "HEAD"]);
+        const candidate = execution.state === "verifying" && execution.operationId === operation.operationId && execution.candidateCommit
+          ? execution.candidateCommit : await gitValue(this.runCommand, run.worktreeCwd, ["rev-parse", "HEAD"]);
         if (candidate === execution.baselineCommit) throw new Error("Task candidate did not advance its baseline commit.");
         const committedPlanText = await gitValue(this.runCommand, run.worktreeCwd, ["show", `${candidate}:${gitPath(relative(run.worktreeCwd, run.planPath))}`]);
         const committedPlan = parsePlan(run.planPath, committedPlanText);
+        assertAcceptedCheckboxes(run, committedPlan);
+        const checkpoints: TaskRecoverySource[] = [];
+        for (const source of [...(execution.recoveryHistory ?? []), ...(execution.recoverySource ? [execution.recoverySource] : [])]) {
+          const checkpointCommit = await gitValue(this.runCommand, run.worktreeCwd, ["rev-parse", "--verify", `${source.checkpointRef}^{commit}`]);
+          await gitValue(this.runCommand, run.worktreeCwd, ["merge-base", "--is-ancestor", source.headCommit, checkpointCommit]);
+          await gitValue(this.runCommand, run.worktreeCwd, ["merge-base", "--is-ancestor", checkpointCommit, candidate]);
+          checkpoints.push({ ...source, checkpointCommit });
+        }
         if (committedPlan.hash !== run.planHash || committedPlan.tasks.find((entry) => entry.id === taskId)?.unchecked.length !== 0)
           throw new Error("Task checkboxes must be complete in the committed candidate plan.");
         const verifying = await this.registry.updateIfCurrent({ ...run, tasks: { ...tasks,
@@ -1718,9 +2072,17 @@ export class PlanExecController {
         if (!verifying.applied) return verifying.run;
         run = verifying.run;
         await this.verifyCandidate(run, candidate);
+        const acceptedExecution = { ...execution, acceptedCommit: candidate, candidateCommit: candidate };
+        if (acceptedExecution.recoverySource && checkpoints.length)
+          acceptedExecution.recoverySource = checkpoints.at(-1)!;
+        if (acceptedExecution.recoveryHistory)
+          acceptedExecution.recoveryHistory = checkpoints.slice(0, acceptedExecution.recoveryHistory.length);
+        delete acceptedExecution.externalPrerequisite;
+        delete acceptedExecution.reason;
+        delete acceptedExecution.nextAttemptAt;
         const accepted = await this.registry.updateIfCurrent(withoutOperation({ ...run,
           acceptedHead: candidate, nextAttemptAt: 0, needsAttention: false,
-          tasks: { ...tasks, [String(taskId)]: { ...execution, state: "accepted", acceptedCommit: candidate, candidateCommit: candidate } },
+          tasks: { ...tasks, [String(taskId)]: { ...acceptedExecution, state: "accepted" } },
           taskAttempts: { ...run.taskAttempts, [String(taskId)]: attempts },
         }), run.updatedAt);
         if (accepted.applied) await appendProgressBestEffort(accepted.run, `Task ${taskId} accepted at ${candidate} after verification.`);
@@ -1731,10 +2093,14 @@ export class PlanExecController {
       }
     }
     const retryAt = Date.now() + retryDelay(run.config.retryDelayMs, attempts);
+    const retryExecution = { ...execution };
+    delete retryExecution.candidateCommit;
+    delete retryExecution.externalPrerequisite;
     const waiting = await this.registry.updateIfCurrent(withoutOperation({ ...run,
       status: RUN_STATUS.RUNNING, nextAttemptAt: 0,
-      tasks: { ...tasks, [String(taskId)]: { ...execution,
-        state: "retry_wait", reason, nextAttemptAt: retryAt,
+      tasks: { ...tasks, [String(taskId)]: { ...retryExecution,
+        state: prerequisite ? "waiting_external" : "retry_wait", reason, nextAttemptAt: retryAt,
+        ...(prerequisite ? { externalPrerequisite: prerequisite } : {}),
         laneCwd: run.worktreeCwd, laneBranch: run.branch,
       } },
       taskAttempts: { ...run.taskAttempts, [String(taskId)]: attempts },
@@ -1796,11 +2162,25 @@ export class PlanExecController {
         error instanceof Error ? error.message : String(error),
       );
     }
+    if (!hasBlockingFindings(findings) && findings.length && run.reviewRecovery?.lastReviewedCommit) {
+      const priorBlockers = run.reviewFindings.filter((finding) => finding.severity !== "MINOR");
+      const downgraded = findings.some((finding) => priorBlockers.some((previous) => normalizedSummary(previous.summary) === normalizedSummary(finding.summary)));
+      if (downgraded) {
+        const metadata = new Set([gitPath(relative(run.worktreeCwd, run.planPath)),
+          ...(run.progressPath ? [gitPath(relative(run.worktreeCwd, run.progressPath))] : [])]);
+        const changes = await this.runCommand("git", ["diff", "--name-only", "-z", run.reviewRecovery.lastReviewedCommit, "HEAD"], run.worktreeCwd);
+        if (changes.code !== 0) return this.reviewFailure(run, "Unable to verify the change supporting review adjudication.");
+        if (!changes.stdout.split("\0").some((path) => path && !metadata.has(path)))
+          return this.reviewFailure(run, "A previously blocking finding was relabeled MINOR without a changed tree or explicit adjudication; required review remains unmet.");
+      }
+    }
     const cleared = withoutOperation({ ...run, reviewFindings: findings });
-    if (findings.length === 0) {
+    if (!hasBlockingFindings(findings)) {
       delete cleared.reviewRecovery;
+      const known = new Set(run.unresolvedFindings.map((finding) => finding.id));
+      cleared.unresolvedFindings = [...run.unresolvedFindings, ...findings.filter((finding) => !known.has(finding.id))];
       cleared.reviewedCommit = await gitValue(this.runCommand, run.worktreeCwd, ["rev-parse", "HEAD"]);
-      await appendProgress(cleared, `${run.stage} found no issues.`);
+      await appendProgress(cleared, findings.length ? `${run.stage} passed with ${findings.length} reviewer-classified MINOR advisory finding(s).` : `${run.stage} found no issues.`);
       return this.advanceUnlocked(
         await this.transition(
           cleared,
@@ -1907,6 +2287,7 @@ export class PlanExecController {
   }
 
   private async archive(run: PlanExecRun): Promise<PlanExecRun> {
+    if (run.archiveOperation) return this.advanceArchiveOperation(run);
     const unmet = await this.completionPrerequisite(run);
     if (unmet) return this.fail(run, unmet);
     const destination = join(
@@ -1961,7 +2342,7 @@ export class PlanExecController {
       else if (!destinationExists)
         throw new Error(`Plan to archive is missing: ${run.planPath}.`);
       await appendProgressOnce(run, `Archived plan to ${destination}.`);
-      await appendProgressOnce(run, `Run completed as ${status}.`);
+      await appendProgressOnce(run, `Archival prepared for ${status}; waiting for owned Git commands to retire.`);
 
       if (!sourceExists) {
         const tracked = await this.runCommand(
@@ -2006,40 +2387,10 @@ export class PlanExecController {
           ? [`:(literal)${gitPath(progressRelative)}`]
           : []),
       ];
-      const add = await this.runCommand(
-        "git",
-        ["add", "-f", "-A", "--", ...addPaths],
-        run.worktreeCwd,
-      );
-      if (add.code !== 0)
-        throw new Error(add.stderr.trim() || "Could not stage archived plan.");
-      const pending = await this.runCommand(
-        "git",
-        ["status", "--porcelain", "--", ...literalPaths],
-        run.worktreeCwd,
-      );
-      if (pending.code !== 0)
-        throw new Error(
-          pending.stderr.trim() || "Could not verify archived plan state.",
-        );
-      if (pending.stdout.trim()) {
-        const commit = await this.runCommand(
-          "git",
-          [
-            "commit",
-            "--only",
-            "-m",
-            `chore: archive ${basename(destination)}`,
-            "--",
-            ...literalPaths,
-          ],
-          run.worktreeCwd,
-        );
-        if (commit.code !== 0)
-          throw new Error(
-            commit.stderr.trim() || "Could not commit archived plan.",
-          );
-      }
+      return (await this.registry.updateIfCurrent({ ...run, archiveOperation: {
+        phase: "stage", operationId: randomUUID(), commands: [["git", "add", "-f", "-A", "--", ...addPaths]],
+        paths: literalPaths, destination, attempt: 0,
+      } }, run.updatedAt)).run;
     } catch (error: unknown) {
       return this.fail(
         run,
@@ -2047,8 +2398,37 @@ export class PlanExecController {
       );
     }
 
-    // Git has durably completed. A registry failure must not turn that fact
-    // into a new archival failure; the next resume can reconcile this state.
+  }
+
+  private async advanceArchiveOperation(run: PlanExecRun): Promise<PlanExecRun> {
+    const operation = run.archiveOperation!;
+    if (operation.phase !== "retired") {
+      try {
+        await this.executeLocalCommands(run.worktreeCwd, operation.commands,
+          await this.localOptions(run, `git:archive:${operation.operationId}:${operation.attempt}`, run.verifiedCommit));
+        const current = (await this.registry.get(run.id)) ?? run;
+        if (current.updatedAt !== run.updatedAt || current.userStopped || current.status !== RUN_STATUS.RUNNING) return current;
+        const unmet = await this.completionPrerequisite(run);
+        if (unmet) return this.fail(run, unmet);
+        if (operation.phase === "stage") {
+          const pending = await this.runCommand("git", ["status", "--porcelain", "--", ...operation.paths], run.worktreeCwd);
+          if (pending.code !== 0) throw new Error(pending.stderr || "Cannot inspect staged archive paths.");
+          const next = pending.stdout.trim()
+            ? { ...operation, phase: "commit" as const, operationId: randomUUID(), attempt: 0,
+              commands: [["git", "commit", "--only", "-m", `chore: archive ${basename(operation.destination)}`, "--", ...operation.paths]] }
+            : { ...operation, phase: "retired" as const };
+          return (await this.registry.updateIfCurrent({ ...run, archiveOperation: next }, run.updatedAt)).run;
+        }
+        return (await this.registry.updateIfCurrent({ ...run, archiveOperation: { ...operation, phase: "retired" } }, run.updatedAt)).run;
+      } catch (error) {
+        return this.fail(error instanceof LocalOperationFailedError ? { ...run,
+          archiveOperation: { ...operation, attempt: operation.attempt + 1 },
+        } : run, `Plan archival ${operation.phase}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    const unmet = await this.completionPrerequisite(run);
+    if (unmet) return this.fail(run, unmet);
+    const status = completionStatus(run);
     try {
       const completed = await this.registry.updateIfCurrent({
         ...run,
@@ -2098,14 +2478,23 @@ export class PlanExecController {
       if (!archived || changes.code !== 0 || changes.stdout.split("\0").some((path) => path && !archivePaths.has(path)))
         return "Current code differs from the final verified and reviewed commit.";
     }
-    const dirty = await this.runCommand("git", ["status", "--porcelain", "-z", "--untracked-files=normal"], run.worktreeCwd);
-    if (dirty.code !== 0 || dirty.stdout.split("\0").some((entry) => entry && !archivePaths.has(entry.slice(PORCELAIN_PATH_OFFSET))))
+    const planPath = await pathExists(run.planPath) ? run.planPath : join(dirname(run.planPath), COMPLETED_PLANS_DIRECTORY, basename(run.planPath));
+    try {
+      assertAcceptedCheckboxes(run, await readPlan(planPath));
+      const committedPath = run.verifiedCommit === head ? run.planPath : planPath;
+      const committed = await gitValue(this.runCommand, run.worktreeCwd, ["show", `${head}:${gitPath(relative(run.worktreeCwd, committedPath))}`]);
+      assertAcceptedCheckboxes(run, parsePlan(committedPath, committed));
+    } catch (error) { return error instanceof Error ? error.message : String(error); }
+    const dirty = await worktreeChanges(this.runCommand, run.worktreeCwd);
+    if (dirty.some((path) => !archivePaths.has(path)))
       return "Uncommitted source changes prevent completion.";
     if (hasBlockingFindings(run.reviewFindings) || hasBlockingFindings(run.unresolvedFindings)) return "Blocking review findings remain unresolved.";
     return undefined;
   }
 
   private async advanceStageSkip(run: PlanExecRun): Promise<PlanExecRun> {
+    run = await this.requestOperationCancellation(run);
+    if (run.status !== RUN_STATUS.SKIP_PENDING) return run;
     const request = run.pendingStageSkip;
     if (!request || request.stage !== run.stage)
       return this.fail(
@@ -2114,6 +2503,7 @@ export class PlanExecController {
       );
     const operation = run.activeOperation;
     if (!operation) return this.finishStageSkip(run, "no active operation");
+    if (operation.launchFenced) return this.finishStageSkip(run, "launch durably fenced before dispatch");
 
     if (!operation.externalRunId) {
       if (operation.service === OPERATION_SERVICE.FUSION) {
@@ -2224,7 +2614,7 @@ export class PlanExecController {
       operation.service === OPERATION_SERVICE.BRIDGE
         ? isTerminalBridgeOperationState(state)
         : fusion?.terminal === true;
-    if (terminal && hasProcessExit(status.data, operation.externalRunId)) return this.finishStageSkip(observed, state);
+    if (terminal && hasProcessExit(status.data, operation)) return this.finishStageSkip(observed, state);
     if (operation.service === OPERATION_SERVICE.BRIDGE) {
       if (state === EXTERNAL_OPERATION_STATE.PENDING) return observed;
       if (!isActiveBridgeOperationState(state))
@@ -2234,24 +2624,7 @@ export class PlanExecController {
           `Bridge returned unrecognized non-terminal state during force-skip: ${state}`,
         );
     }
-    if (operation.stopRequested) return observed;
-
-    const stopped =
-      operation.service === OPERATION_SERVICE.BRIDGE
-        ? this.bridge.cancelOperation && operation.params
-          ? await this.bridge.cancelOperation(operation.operationId, bridgeOperationOwner(run, operation))
-          : await this.bridge.stop(operation.externalRunId, operation.asyncDir)
-        : await (await this.reviewClient(run)).cancel(operation.externalRunId);
-    if (!stopped.success)
-      return this.recordStageSkipFailure(
-        observed,
-        observed.activeOperation ?? operation,
-        `Unable to stop ${operation.service}/${operation.kind}: ${stopped.error.message}`,
-      );
-    return this.updateActiveOperation(observed, operation.operationId, {
-      stopRequested: true,
-      recovery: OPERATION_RECOVERY.CANCEL,
-    });
+    return observed;
   }
 
   private recordStageSkipFailure(
@@ -2329,6 +2702,12 @@ export class PlanExecController {
   }
 
   private async cancel(run: PlanExecRun): Promise<PlanExecRun> {
+    run = await this.reconcileLocalCancellation(run);
+    if (run.status !== RUN_STATUS.CANCEL_PENDING) return run;
+    if (run.activeOperation?.stopRequested && (run.nextAttemptAt ?? 0) > Date.now()) return run;
+    run = await this.requestOperationCancellation(run);
+    if (run.status !== RUN_STATUS.CANCEL_PENDING) return run;
+    if (run.localOperationActive) return run;
     const operation = run.activeOperation;
     if (!operation)
       return this.registry.release(
@@ -2337,36 +2716,8 @@ export class PlanExecController {
           status: RUN_STATUS.CANCELLED,
         }),
       );
-    if (!operation.externalRunId)
-      {
-        const owner = bridgeOperationOwner(run, operation);
-        const cancellation = operation.service === OPERATION_SERVICE.BRIDGE
-          ? await this.bridge.cancelOperation?.(operation.operationId, owner)
-          : await (await this.reviewClient(run)).cancel(undefined, operation.operationId);
-        if (cancellation?.success && cancellation.data.neverStarted === true &&
-          cancellation.data.cancellationRequested === true &&
-          (operation.service !== OPERATION_SERVICE.BRIDGE || cancellation.data.requestDigest === owner?.requestDigest))
-          return this.registry.update(withoutOperation({ ...run, status: RUN_STATUS.CANCELLED }));
-        return this.recoverActiveOperation(run, operation);
-      }
-    if (!operation.stopRequested) {
-      const stopped =
-        operation.service === OPERATION_SERVICE.BRIDGE
-          ? this.bridge.cancelOperation && operation.params
-            ? await this.bridge.cancelOperation(operation.operationId, bridgeOperationOwner(run, operation))
-            : await this.bridge.stop(operation.externalRunId, operation.asyncDir)
-          : await (await this.reviewClient(run)).cancel(operation.externalRunId);
-      if (!stopped.success)
-        return this.recordCancellationFailure(
-          run,
-          operation,
-          stopped.error.message,
-        );
-      return this.registry.update({
-        ...run,
-        activeOperation: { ...operation, stopRequested: true },
-      });
-    }
+    if (operation.launchFenced) return this.registry.release(await this.registry.update(withoutOperation({ ...run, status: RUN_STATUS.CANCELLED })));
+    if (!operation.externalRunId) return this.recoverActiveOperation(run, operation);
     const terminal =
       operation.service === OPERATION_SERVICE.BRIDGE
         ? await this.bridgeStatus(run, operation)
@@ -2386,7 +2737,7 @@ export class PlanExecController {
       operation.service === OPERATION_SERVICE.BRIDGE
         ? text(terminal.data.state)
         : fusionState(terminal.data)?.phase;
-    if (!bridgeState || isActiveExternalOperationState(bridgeState) || !hasProcessExit(terminal.data, operation.externalRunId)) {
+    if (!hasProcessExit(terminal.data, operation)) {
       return observed;
     }
     const cancelled = withoutOperation({
@@ -2395,7 +2746,7 @@ export class PlanExecController {
     });
     await appendProgress(
       cancelled,
-      `Cancellation completed after ${operation.kind} reached ${bridgeState}.`,
+      `Cancellation completed after owned process-tree retirement (${operation.kind}, wrapper state ${bridgeState ?? "unavailable"}).`,
     );
     return this.registry.release(await this.registry.update(cancelled));
   }
@@ -2446,6 +2797,8 @@ export class PlanExecController {
       return await readSubagentArtifact(
         result.success ? text(result.data.resultPath) : undefined,
         operation.asyncDir,
+        { runId: operation.externalRunId!, successful: operation.kind === OPERATION_KIND.REVIEW,
+          ...(text(operation.params?.agent) ? { agent: text(operation.params?.agent)! } : {}) },
       );
     } catch (error) {
       if (!result.success) throw new Error(result.error.message, { cause: error });
@@ -2469,15 +2822,6 @@ export class PlanExecController {
     return transitioned;
   }
 
-  private async createExecutionWorktree(
-    repositoryRoot: string,
-    planPath: string,
-    branch: string,
-  ): Promise<string> {
-    await ensureCleanForWorktree(this.runCommand, repositoryRoot, planPath);
-    return createWorktree(this.runCommand, repositoryRoot, planPath, branch);
-  }
-
   private async fail(
     run: PlanExecRun,
     error: string,
@@ -2493,7 +2837,8 @@ export class PlanExecController {
       ...(preserveOperation ? { activeOperation: run.activeOperation } : {}),
     });
     try {
-      await appendProgress(failed, `Automatic recovery scheduled at ${failed.stage}: ${error}`);
+      if (!run.archiveOperation && !(run.outputPromotion?.commandStarted && run.outputPromotion.state === EXTERNAL_OPERATION_STATE.PENDING) && run.lanePreparation?.state !== "create")
+        await appendProgress(failed, `Automatic recovery scheduled at ${failed.stage}: ${error}`);
     } catch {
       // The registry is authoritative if the optional progress file is unavailable.
     }
@@ -2510,8 +2855,24 @@ function bridgeTerminalError(
   return error.trim().slice(0, MAX_TERMINAL_ERROR_LENGTH);
 }
 
-function hasProcessExit(data: Record<string, unknown>, runId: string): boolean {
-  return hasTerminalOwnershipProof(data, runId);
+function hasProcessExit(data: Record<string, unknown>, operation: ActiveOperation): boolean {
+  if (!operation.externalRunId || !operation.requestDigest) return false;
+  return hasTerminalOwnershipProof(data, operation.externalRunId, {
+    operationId: operation.operationId, requestDigest: operation.requestDigest,
+  });
+}
+
+function isFencedReviewCancellation(data: Record<string, unknown>, operation: ActiveOperation): boolean {
+  return data.operationId === operation.operationId && data.state === RUN_STATUS.CANCELLED && data.replaySafe === false &&
+    data.neverStarted === true && data.cancellationRequested === true &&
+    (data.requestDigest === undefined || data.requestDigest === operation.requestDigest);
+}
+
+function isFencedCancellation(data: Record<string, unknown>, operation: ActiveOperation): boolean {
+  return operation.service === OPERATION_SERVICE.BRIDGE
+    ? data.operationId === operation.operationId && data.state === RUN_STATUS.CANCELLED && data.neverStarted === true &&
+      data.cancellationRequested === true && operation.requestDigest !== undefined && data.requestDigest === operation.requestDigest
+    : isFencedReviewCancellation(data, operation);
 }
 
 function supportsExecution(capabilities: FusionCapabilities | undefined, lifetime: ExecutionLifetime): boolean {
@@ -2524,6 +2885,46 @@ function supportsExecution(capabilities: FusionCapabilities | undefined, lifetim
 function sameLifetime(actual: ExecutionLifetime | undefined, expected: ExecutionLifetime): boolean {
   return actual?.mode === expected.mode && (actual.mode === "unbounded" ||
     (expected.mode === "bounded" && actual.timeoutMs === expected.timeoutMs));
+}
+
+function operationExpectedLifetime(operation: ActiveOperation): ExecutionLifetime | undefined {
+  return operation.expectedLifetime ?? parseExecutionLifetime(operation.params?.executionLifetime) ?? operation.effectiveLifetime;
+}
+
+function budgetKey(run: PlanExecRun, kind: ActiveOperation["kind"], taskId?: number): string {
+  return taskId === undefined ? `${run.stage}:${kind}` : `task:${taskId}`;
+}
+
+function attemptExecutionLifetime(run: PlanExecRun, kind: ActiveOperation["kind"], taskId?: number): ExecutionLifetime {
+  const base = run.config.executionLifetime;
+  if (base.mode === "unbounded") return base;
+  const growths = run.budgetGrowths?.[budgetKey(run, kind, taskId)] ?? 0;
+  return { mode: "bounded", timeoutMs: Math.min(MAX_EXECUTION_TIMEOUT_MS,
+    base.timeoutMs * 2 ** Math.min(growths, MAX_LIFETIME_GROWTH_EXPONENT)) };
+}
+
+function boundedContinuationPrompt(run: PlanExecRun, kind: ActiveOperation["kind"], prompt: string,
+  lifetime: ExecutionLifetime, taskId?: number): string {
+  const expiries = run.budgetExhaustions?.[budgetKey(run, kind, taskId)] ?? 0;
+  const growths = run.budgetGrowths?.[budgetKey(run, kind, taskId)] ?? 0;
+  if (lifetime.mode !== "bounded" || !expiries) return prompt;
+  return `${prompt}\nBounded compatibility continuation after ${expiries} confirmed execution-lifetime expiry event(s); ${growths} had recent verified model/tool progress qualifying for growth. This attempt explicitly allows ${lifetime.timeoutMs} ms; the frozen base policy is unchanged. Resume the preserved checkpoint and complete the smallest independently verifiable slice first. Change the previous approach instead of restarting completed work.${lifetime.timeoutMs === MAX_EXECUTION_TIMEOUT_MS ? " The supported timer maximum is reached; narrow the session's scope and checkpoint earlier rather than increasing the timer further." : ""}`;
+}
+
+function usefulProgressAtRetirement(operation: ActiveOperation, status: Record<string, unknown>, timeoutMs: number): boolean {
+  const proof = status.processTerminalProof ?? status.workflowTerminalProof;
+  if (!proof || typeof proof !== "object") return false;
+  const outer = proof as Record<string, unknown>;
+  const kernel = outer.kernelProof && typeof outer.kernelProof === "object" ? outer.kernelProof as Record<string, unknown> : undefined;
+  const retired = kernel?.proof && typeof kernel.proof === "object" ? kernel.proof as Record<string, unknown> : undefined;
+  const retiredAt = typeof retired?.observedAt === "string" ? Date.parse(retired.observedAt) : outer.observedAt;
+  if (typeof retiredAt !== "number" || !Number.isFinite(retiredAt) || retiredAt > Date.now()) return false;
+  const activity = operation.diagnostics;
+  const toolAt = activity?.lastToolActivityAt;
+  const candidates = [activity?.lastModelActivityAt,
+    toolAt && (!activity?.lastToolFailure || activity.lastToolFailure.observedAt < toolAt) ? toolAt : undefined];
+  const window = Math.min(BUDGET_PROGRESS_WINDOW_MS, Math.max(1, Math.floor(timeoutMs / BUDGET_PROGRESS_WINDOW_DIVISOR)));
+  return candidates.some((at) => at !== undefined && at >= (operation.launchStartedAt ?? retiredAt) && at <= retiredAt && retiredAt - at <= window);
 }
 
 function fusionTerminalError(
@@ -2577,15 +2978,6 @@ function isActiveBridgeOperationState(state: string): boolean {
 
 function isTerminalBridgeOperationState(state: string): boolean {
   return TERMINAL_BRIDGE_OPERATION_STATES.has(state);
-}
-
-function isActiveExternalOperationState(state: string): boolean {
-  return (
-    isActiveBridgeOperationState(state) ||
-    state === EXTERNAL_OPERATION_STATE.CHAIN ||
-    state === EXTERNAL_OPERATION_STATE.PANEL ||
-    state === EXTERNAL_OPERATION_STATE.JUDGE
-  );
 }
 
 function resetOperationFailures(
@@ -2735,8 +3127,14 @@ function workerPrompt(
     "Record verification in your response and progress artifacts, not by rewriting plan item text.",
     "Do not start later tasks. Do not report success until the checkboxes are updated and verification is complete.",
     `Accepted baseline: ${run.acceptedHead ?? "current HEAD"}. When resuming a preserved lane, checkpoint only known task source changes on its existing branch, then integrate this accepted baseline before implementing further. Preserve untracked and ignored artifacts; never stage secrets or generated output. Resolve integration conflicts and verify the combined candidate before committing.`,
+    ...(execution?.recoverySource ? [
+      `Recovery source working files are read-only: ${execution.recoverySource.cwd} (branch ${execution.recoverySource.branch}, recorded HEAD ${execution.recoverySource.headCommit}). Preserve their exact bytes and all unrelated untracked/ignored files.`,
+      `This new verification lane starts from the latest accepted baseline. Checkpoint only known task source on the original task branch without changing its working-file bytes, retain that commit at ${execution.recoverySource.checkpointRef}, then integrate the checkpoint here. Do not stage secret, generated, unrelated, or ambiguous user files; report a concrete prerequisite if a safe checkpoint is impossible. The checkpoint must descend from the recorded source HEAD and be an ancestor of the final candidate.`,
+    ] : []),
+    ...(execution?.recoveryHistory?.length ? [`Earlier preserved source checkpoints must remain recoverable and ancestral to the candidate: ${execution.recoveryHistory.map((source) => `${source.checkpointRef} (${source.cwd})`).join(", ")}.`] : []),
     `Already accepted tasks: ${Object.values(run.tasks ?? {}).filter((task) => task.state === "accepted").map((task) => task.taskId).join(", ") || "none"}. Preserve their implementation and reflect their accepted checkbox completion when integrating the plan.`,
     `If a required approval, external prerequisite, or verification cannot be satisfied, do not invent evidence, skip it, or make dummy edits. Leave incomplete checkboxes open and start your final response with ${TASK_FAILED_MARKER} on its own line, followed by Blocker: <exact reason> and Next step: <what is needed>. Partial work is preserved and recovery will be scheduled automatically.`,
+    "Only when you actually observed an external prerequisite failure, also include Prerequisite: credentials|permission|missing_executable|runtime and Evidence: <the exact observed provider error or failed command result>. Do not invent these fields from a guess, silence, elapsed time, or a generic failure. Recheck the prerequisite on the next automatically scheduled attempt.",
     "A supervisor stop decision is final for this attempt. Return the blocker; do not ask repeatedly or launch another worker.",
     "Remaining checkbox items:",
     ...unchecked.map((item) => `- [ ] ${item}`),
@@ -2767,11 +3165,18 @@ function nativeUsage(data: Record<string, unknown> | undefined): NonNullable<Act
   const status = data.statusPayload && typeof data.statusPayload === "object" ? data.statusPayload as Record<string, unknown> : data;
   const tokens = status.totalTokens && typeof status.totalTokens === "object" ? status.totalTokens as Record<string, unknown> : {};
   const cost = status.totalCost && typeof status.totalCost === "object" ? status.totalCost as Record<string, unknown> : {};
-  const finite = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && value >= 0;
-  const input = finite(tokens.input) ? tokens.input : cost.inputTokens;
-  const output = finite(tokens.output) ? tokens.output : cost.outputTokens;
-  return { ...(finite(input) ? { inputTokens: input } : {}), ...(finite(output) ? { outputTokens: output } : {}),
-    ...(finite(cost.costUsd) ? { cost: cost.costUsd } : {}) };
+  const input = safeTokenCount(tokens.input) ? tokens.input : cost.inputTokens;
+  const output = safeTokenCount(tokens.output) ? tokens.output : cost.outputTokens;
+  return { ...(safeTokenCount(input) ? { inputTokens: input } : {}), ...(safeTokenCount(output) ? { outputTokens: output } : {}),
+    ...(finiteUsageAmount(cost.costUsd) ? { cost: cost.costUsd } : {}) };
+}
+
+function finiteUsageAmount(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+function safeTokenCount(value: unknown): value is number {
+  return finiteUsageAmount(value) && Number.isSafeInteger(value);
 }
 
 function reviewerPrompt(run: PlanExecRun): string {
@@ -2832,8 +3237,21 @@ function fixerPrompt(
 
 function reviewFingerprint(findings: ReviewFinding[]): string {
   const normalized = [...new Set(findings.map((finding) =>
-    `${finding.severity}:${finding.summary.trim().replace(/\s+/g, " ").toLowerCase()}`))].sort();
+    `${finding.severity}:${normalizedSummary(finding.summary)}`))].sort();
   return createHash("sha256").update(JSON.stringify(normalized)).digest("hex");
+}
+
+function normalizedSummary(summary: string): string {
+  return summary.trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+function assertAcceptedCheckboxes(run: PlanExecRun, plan: ParsedPlan): void {
+  if (plan.hash !== run.planHash) throw new Error(PLAN_STRUCTURE_CHANGED_ERROR);
+  for (const task of Object.values(run.tasks ?? {})) {
+    if (task.state !== "accepted") continue;
+    if (plan.tasks.find((entry) => entry.id === task.taskId)?.unchecked.length !== 0)
+      throw new Error(`Previously accepted task ${task.taskId} has reopened or missing committed checkboxes.`);
+  }
 }
 
 function statsPrompt(run: PlanExecRun): string {
@@ -2887,6 +3305,22 @@ function taskFailureReason(output: string | undefined): string | undefined {
   const report = lines.slice(1).join("\n").trim();
   return (report || "Worker reported TASK_FAILED without a reason; inspect its output before retrying.")
     .slice(0, MAX_TERMINAL_ERROR_LENGTH);
+}
+
+function parseExternalPrerequisite(value: unknown, source: ExternalPrerequisite["source"]): ExternalPrerequisite | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const input = value as Record<string, unknown>;
+  const kind = input.kind;
+  if (kind !== "credentials" && kind !== "permission" && kind !== "missing_executable" && kind !== "runtime") return undefined;
+  const evidence = text(input.evidence);
+  return evidence ? { kind, source, evidence: evidence.slice(0, MAX_TERMINAL_ERROR_LENGTH) } : undefined;
+}
+
+function workerExternalPrerequisite(output: string | undefined): ExternalPrerequisite | undefined {
+  if (!taskFailureReason(output)) return undefined;
+  const kind = output?.match(/^Prerequisite:\s*(credentials|permission|missing_executable|runtime)\s*$/m)?.[1];
+  const evidence = output?.match(/^Evidence:\s*(.+)$/m)?.[1];
+  return parseExternalPrerequisite({ kind, evidence }, "worker");
 }
 
 export function isDetachedWorkflowFailure(run: PlanExecRun): boolean {

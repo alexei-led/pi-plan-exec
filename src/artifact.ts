@@ -11,25 +11,39 @@ export interface SettledWorkflowCompletion {
   output?: string;
 }
 
+export interface SubagentArtifactExpectation {
+  runId: string;
+  agent?: string;
+  successful?: boolean;
+}
+
+const SINGLE_MODE = "single";
+const TERMINAL_RESULT_STATES = new Set<string>([
+  EXTERNAL_OPERATION_STATE.COMPLETE, EXTERNAL_OPERATION_STATE.FAILED,
+  EXTERNAL_OPERATION_STATE.STOPPED, EXTERNAL_OPERATION_STATE.ABORTED,
+]);
+
 const COMPLETED_STEP_STATES = new Set<string>([
   EXTERNAL_OPERATION_STATE.COMPLETE,
   RUN_STATUS.COMPLETED,
 ]);
 
 /**
- * pi-subagents status exposes a result path only when output was configured.
- * For normal agent runs, its durable status artifact retains final recentOutput.
+ * Native single-agent results use the sole correlated child output.
+ * Bound callers never accept a potentially truncated recentOutput tail.
  */
 export async function readSubagentArtifact(
   resultPath: string | undefined,
   asyncDir: string | undefined,
+  expected?: SubagentArtifactExpectation | string,
 ): Promise<string> {
+  const expectation = typeof expected === "string" ? { runId: expected } : expected;
   if (resultPath) {
-    const output = await readOutputFile(resultPath);
+    const output = await readOutputFile(resultPath, expectation);
     if (output) return output;
   }
   if (asyncDir) {
-    const output = await readAsyncOutput(join(asyncDir, "status.json"));
+    const output = await readAsyncOutput(join(asyncDir, "status.json"), expectation);
     if (output) return output;
   }
   throw new Error("Subagent result output was unavailable.");
@@ -38,8 +52,8 @@ export async function readSubagentArtifact(
 /**
  * A child can detach while it waits for a supervisor reply. pi-subagents then
  * settles the child but cannot continue the in-memory JavaScript workflow. The
- * receipt is the durable proof that the sole child completed successfully; its
- * output may already have moved to the normal output archive.
+ * receipt identifies the sole completed result; process ownership still needs
+ * independent runtime proof. Output may have moved to the normal archive.
  */
 export async function readSettledWorkflowCompletion(
   resultPath: string | undefined,
@@ -76,22 +90,43 @@ export async function readSettledWorkflowCompletion(
       expectedRunId,
     );
   }
-  if (!output) output = await readAsyncOutput(join(asyncDir, "status.json"));
+  if (!output) output = await readAsyncOutput(join(asyncDir, "status.json"), expectedRunId ? { runId: expectedRunId } : undefined);
   return output ? { output } : {};
 }
 
-async function readOutputFile(path: string): Promise<string | undefined> {
+async function readOutputFile(path: string, expected?: SubagentArtifactExpectation): Promise<string | undefined> {
+  let raw: string;
+  try { raw = await readFile(path, "utf8"); }
+  catch { return undefined; }
+  let value: unknown;
+  try { value = JSON.parse(raw); }
+  catch (error) { if (error instanceof SyntaxError) return raw.trim() || undefined; throw error; }
+  if (isRecord(value) && value.mode === SINGLE_MODE)
+    return singleAgentOutput(value, expected);
+  if (isRecord(value) && (isRecord(value.details) && (value.details.runId !== undefined || value.details.asyncId !== undefined) ||
+    isRecord(value.data) && (value.data.runId !== undefined || value.data.asyncId !== undefined)))
+    throw new Error("Subagent launch/status receipt is not an authoritative worker outcome.");
   try {
-    const raw = await readFile(path, "utf8");
-    try {
-      return extractText(JSON.parse(raw));
-    } catch (error: unknown) {
-      if (error instanceof SyntaxError) return raw.trim() || undefined;
-      return undefined;
-    }
-  } catch {
-    return undefined;
-  }
+    return extractText(value);
+  } catch { return undefined; }
+}
+
+function singleAgentOutput(value: Record<string, unknown>, expected?: SubagentArtifactExpectation): string {
+  const result = Array.isArray(value.results) && value.results.length === 1 ? value.results[0] : undefined;
+  const runId = text(value.id);
+  const agent = text(value.agent);
+  if (!runId || !agent || (expected && runId !== expected.runId) ||
+    (expected?.agent !== undefined && agent !== expected.agent) ||
+    (value.runId !== undefined && value.runId !== runId) || !TERMINAL_RESULT_STATES.has(String(value.state)) ||
+    typeof value.success !== "boolean" || (value.success && value.state !== EXTERNAL_OPERATION_STATE.COMPLETE) ||
+    (expected?.successful && !value.success) || value.truncated === true ||
+    !isRecord(result) || result.agent !== agent || result.success !== value.success ||
+    (result.runId !== undefined && result.runId !== runId) || result.outputState !== "present" ||
+    (value.launchContractDigest !== undefined && result.launchContractDigest !== value.launchContractDigest))
+    throw new Error("Single-agent result artifact has mismatched identity, cardinality, or terminal outcome.");
+  const output = text(result.output);
+  if (!output) throw new Error("Single-agent result artifact has no authoritative child output.");
+  return output;
 }
 
 async function readJsonFile(path: string): Promise<unknown> {
@@ -181,22 +216,37 @@ function extractTextOptional(value: unknown): string | undefined {
   }
 }
 
-async function readAsyncOutput(path: string): Promise<string | undefined> {
+async function readAsyncOutput(path: string, expected?: SubagentArtifactExpectation): Promise<string | undefined> {
   try {
     const value: unknown = JSON.parse(await readFile(path, "utf8"));
     if (!isRecord(value)) return undefined;
+    if (expected && value.runId !== expected.runId) return undefined;
+    if (value.mode === SINGLE_MODE) {
+      const step = Array.isArray(value.steps) && value.steps.length === 1 ? value.steps[0] : undefined;
+      if (!TERMINAL_RESULT_STATES.has(String(value.state)) || !isRecord(step) ||
+        !TERMINAL_RESULT_STATES.has(String(step.status)) || !text(step.agent) ||
+        (expected?.agent !== undefined && step.agent !== expected.agent) ||
+        (expected?.successful && (value.state !== EXTERNAL_OPERATION_STATE.COMPLETE || step.status !== EXTERNAL_OPERATION_STATE.COMPLETE)))
+        return undefined;
+      if (typeof value.outputFile === "string") {
+        const output = await readFile(value.outputFile, "utf8").catch(() => undefined);
+        if (text(output)) return text(output);
+      }
+    }
     if (value.mode === WORKFLOW_MODE && isRecord(value.workflow) &&
       isRecord(value.workflow.value) && Array.isArray(value.steps) && value.steps.length === 1) {
       const step = value.steps[0];
       const result = value.workflow.value;
       if (isRecord(step) && typeof step.runId === "string" &&
-        result.runId === step.runId && result.key === step.workflowKey) {
+        result.runId === step.runId && result.key === step.workflowKey &&
+        (!expected?.successful || result.ok === true)) {
         const output = text(result.output);
         if (output) return output;
       }
     }
-    const durable = await readDurableOutput(value);
+    const durable = await readDurableOutput(value, expected);
     if (durable) return durable;
+    if (expected) return undefined;
     if (!Array.isArray(value.steps)) return undefined;
     const step = [...value.steps].reverse().find(isRecord);
     if (!step || !Array.isArray(step.recentOutput)) return undefined;
@@ -212,6 +262,7 @@ async function readAsyncOutput(path: string): Promise<string | undefined> {
 
 async function readDurableOutput(
   status: Record<string, unknown>,
+  expected?: SubagentArtifactExpectation,
 ): Promise<string | undefined> {
   if (
     typeof status.artifactsDir !== "string" ||
@@ -223,6 +274,10 @@ async function readDurableOutput(
     .filter((name) => name.startsWith(prefix) && name.endsWith("_output.md"))
     .sort();
   if (candidates.length === 0) return undefined;
+  if (expected) {
+    if (candidates.length !== 1) return undefined;
+    return text(await readFile(join(status.artifactsDir, candidates[0]!), "utf8"));
+  }
   return readOutputFile(join(status.artifactsDir, candidates.at(-1)!));
 }
 
@@ -241,7 +296,7 @@ function extractText(value: unknown): string {
       // Failed children can lack output while the workflow summary remains useful.
     }
   }
-  for (const key of ["output", "result", "text", "summary", "content"]) {
+  for (const key of ["output", "result", "text", "content"]) {
     const candidate = value[key];
     if (typeof candidate === "string" && candidate.trim())
       return candidate.trim();

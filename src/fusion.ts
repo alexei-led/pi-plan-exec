@@ -1,6 +1,7 @@
 import { requestRpc, type EventBus } from "./rpc.js";
 import { executionLifetimeCapabilities, processTreeOwnershipCapabilities, supportsOwnedProcessTree, type ProcessTreeOwnership } from "./bridge.js";
 import type { ExecutionLifetime } from "./types.js";
+import { isAbsolute } from "node:path";
 
 export const FUSION_REQUEST_EVENT = "fusion:rpc:v1:request";
 export const PLAN_REVIEW_OUTPUT_CONTRACT = "plan-review-v1" as const;
@@ -48,6 +49,11 @@ export interface FusionCapabilities {
   processTreeOwnership?: ProcessTreeOwnership;
 }
 
+export interface ReviewExecutionContext {
+  cwd: string;
+  reviewedCommit: string;
+}
+
 export class FusionClient {
   private negotiated?: FusionCapabilities;
   constructor(
@@ -85,17 +91,25 @@ export class FusionClient {
     prompt: string,
     profile?: string,
     executionLifetime?: ExecutionLifetime,
+    digest?: string,
+    context?: ReviewExecutionContext,
   ): Promise<FusionResult> {
     if (executionLifetime && (!supportsOwnedProcessTree(this.negotiated) ||
       !this.negotiated?.executionLifetimeModes?.includes(executionLifetime.mode)))
       return Promise.resolve({ success: false, error: { code: "unsupported",
         message: "Fusion has not advertised the requested explicit execution lifetime and full owned-process-tree containment." } });
+    if ((context !== undefined && !validReviewContext(context)) ||
+      (executionLifetime !== undefined && (!validReviewContext(context) || !digest?.trim())))
+      return Promise.resolve({ success: false, error: { code: "invalid_request",
+        message: "Strict Fusion review requires an immutable digest, absolute worktree cwd, and reviewed commit." } });
     return this.request("start", {
       params: {
         operationId,
         prompt,
         ...(profile ? { profile } : {}),
         ...(executionLifetime ? { executionLifetime } : {}),
+        ...(digest ? { digest } : {}),
+        ...(context ? { cwd: context.cwd, reviewedCommit: context.reviewedCommit } : {}),
         outputContract: PLAN_REVIEW_OUTPUT_CONTRACT,
       },
     });
@@ -158,6 +172,11 @@ export class FusionClient {
       }),
     });
   }
+}
+
+function validReviewContext(value: unknown): value is ReviewExecutionContext {
+  return isRecord(value) && typeof value.cwd === "string" && isAbsolute(value.cwd) &&
+    typeof value.reviewedCommit === "string" && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(value.reviewedCommit);
 }
 
 export function parseFusionCallerOutput(

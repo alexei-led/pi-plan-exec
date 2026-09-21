@@ -150,7 +150,13 @@ test("/goal uses the main session for read-only planning and finalizes without a
   ]);
   assert.deepEqual(await readdir(root), []);
   assert.deepEqual(harness.execCalls, [
-    { command: "git", args: ["rev-parse", "--show-toplevel"] },
+    {
+      command: "git",
+      args: [
+        "--no-pager", "--no-optional-locks", "-c", "core.fsmonitor=false",
+        "rev-parse", "--show-toplevel",
+      ],
+    },
   ]);
 
   const result = await finalizer.execute(

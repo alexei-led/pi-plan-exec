@@ -1,4 +1,5 @@
 import { access, readdir } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { basename, relative, resolve } from "node:path";
 import {
@@ -12,6 +13,8 @@ import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import {
   BridgeClient,
   processTerminalProof,
+  supportsOwnedProcessTree,
+  parseExecutionLifetime,
   type BridgeCapabilities,
 } from "./bridge.js";
 import {
@@ -33,14 +36,17 @@ import {
 } from "./goal.js";
 import { Type } from "typebox";
 import { isPathWithin, requireGitRepository } from "./git.js";
+import { workspaceCommand } from "./workspace-environment.js";
 import {
   ABANDONMENT,
   classifyAbandonment,
   isInFlightStatus,
   isRecoverableRun,
+  isReviewStage,
   isSkippableStage,
   isTerminalStatus,
   longRunningOperation,
+  activeExecutionLifetime,
   type Abandonment,
   type AbandonmentEvidence,
   type ProcessTerminalProof,
@@ -69,7 +75,9 @@ import {
   EXTERNAL_OPERATION_STATE,
   OPERATION_RECOVERY,
   OPERATION_SERVICE,
+  RUN_STAGE,
   RUN_STATUS,
+  CONTROLLER_POLL_INTERVAL_MS,
   WORKFLOW_MODE,
   type ActiveOperation,
   type ExecAliasAction,
@@ -80,7 +88,6 @@ import {
 const defaultRegistry = new RunRegistry();
 const STATUS_KEY = "plan-exec";
 const PROVIDER_PROBE_TIMEOUT_MS = 1_500;
-const CONTROLLER_POLL_INTERVAL_MS = 1_000;
 const PROJECTION_TIMEOUT_MS = 1_500;
 const COMMAND_CAS_RETRIES = 5;
 const MILLISECONDS_PER_SECOND = 1_000;
@@ -135,7 +142,7 @@ const STOP_OUTCOMES = [
   {
     action: EXEC_ACTION.PAUSE,
     label:
-      "Pause — stop after the active operation finishes; /exec resume continues this run.",
+      "Pause — stop the current attempt and keep its checkpoint; /exec resume continues after confirmed exit.",
   },
   {
     action: EXEC_ACTION.CANCEL,
@@ -145,7 +152,7 @@ const STOP_OUTCOMES = [
 ] as const;
 /** Stop asks a question, so with no human it names both scripted answers. */
 const STOP_REQUIRES_UI =
-  "/exec stop asks whether to pause or cancel and needs an interactive session. Use /exec pause <run-id> to stop after the active operation and keep the run resumable, or /exec cancel <run-id> to stop it for good with its worktree preserved.";
+  "/exec stop asks whether to pause or cancel and needs an interactive session. Use /exec pause <run-id> to stop the current attempt while keeping its checkpoint resumable, or /exec cancel <run-id> to stop it for good with its worktree preserved.";
 const RUN_LIST_TERMINAL_WINDOW_MS = MILLISECONDS_PER_DAY;
 /** Why a reconcile left a run alone. Each reason gets its own report line. */
 const RECONCILE_SKIP = {
@@ -161,16 +168,24 @@ const REMOVED_START_ACTION = "start";
 const DOCTOR_RECONCILE_OPTION = "--reconcile";
 const REQUIRED_RUNTIME_TOOLS: Record<string, string> = {
   subagent: "pi-subagents",
-  TaskCreate: "@tintinweb/pi-tasks",
 };
-const REQUIRED_SETUP_COMMANDS = [
-  "pi install npm:pi-subagents",
-  "pi install npm:@tintinweb/pi-tasks",
-  "pi install npm:@alexeiled/pi-subagents-bridge",
-];
-const OPTIONAL_SETUP_COMMANDS = [
-  "pi install npm:@alexeiled/pi-fusion",
-];
+function sourceInstallCommand(packageName: string): string {
+  try {
+    const manifest: unknown = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+    if (isRecord(manifest)) {
+      const dependencies = isRecord(manifest.dependencies) ? manifest.dependencies : {};
+      const development = isRecord(manifest.devDependencies) ? manifest.devDependencies : {};
+      const reference = dependencies[packageName] ?? development[packageName];
+      const match = typeof reference === "string" ? reference.match(/^git\+https:\/\/github\.com\/([\w.-]+\/[\w.-]+)\.git#([a-f0-9]{40})$/i) : undefined;
+      if (match) return `pi install -l git:github.com/${match[1]}@${match[2]}`;
+    }
+  } catch { /* A missing manifest must not imply that old published APIs suffice. */ }
+  return `Install ${packageName} from the matching source revision documented in docs/runtime-contracts.md.`;
+}
+
+function requiredSetupCommands(): string[] {
+  return [sourceInstallCommand("pi-subagents"), sourceInstallCommand("@alexeiled/pi-subagents-bridge")];
+}
 
 /** Primary verbs only: a retired name still dispatches, but is never taught. */
 const EXEC_COMMANDS: AutocompleteItem[] = [
@@ -257,11 +272,15 @@ export default function planExecExtension(pi: ExtensionAPI): void {
   const runtimeIntegration = loadPlanExecRuntimeIntegration().catch(
     () => undefined,
   );
-  const projectionQueues = new Map<string, Promise<PlanExecRun>>();
+  type ProjectionRequest = { run: PlanExecRun; options: Parameters<SyncProjection>[1] };
+  const projectionQueues = new Map<string, { work: Promise<PlanExecRun>; latest?: ProjectionRequest }>();
   const syncProjection: SyncProjection = (run, options) => {
-    const previous = projectionQueues.get(run.id) ?? Promise.resolve(run);
-    const next = previous
-      .catch(() => run)
+    const pending = projectionQueues.get(run.id);
+    if (pending) {
+      if (!pending.latest || run.updatedAt >= pending.latest.run.updatedAt) pending.latest = { run, options };
+      return Promise.resolve(run);
+    }
+    const next = Promise.resolve()
       .then(() => projector.sync(run, options))
       .then(async (projected) => {
         try {
@@ -279,23 +298,27 @@ export default function planExecExtension(pi: ExtensionAPI): void {
         }
         return projected;
       });
-    projectionQueues.set(run.id, next);
+    const entry: { work: Promise<PlanExecRun>; latest?: ProjectionRequest } = { work: next };
+    projectionQueues.set(run.id, entry);
     void next.then(() => undefined, () => undefined).finally(() => {
-      if (projectionQueues.get(run.id) === next)
+      if (projectionQueues.get(run.id) === entry) {
         projectionQueues.delete(run.id);
+        if (entry.latest) void syncProjection(entry.latest.run, entry.latest.options).catch(() => undefined);
+      }
     });
     // A broken pi-tasks/runtime integration must not hold controller progress.
-    // `next` remains the sole writer and is serialized with later projections;
-    // callers receive a bounded snapshot while a slow cache repair finishes.
+    // Keep one cache writer; later ticks use their current snapshot and coalesce
+    // missed updates until this write settles.
     return boundedPromise(next, PROJECTION_TIMEOUT_MS).then(
-      (projected) => projected ?? run,
-      () => run,
+      (projected) => entry.latest?.run ?? projected ?? run,
+      () => entry.latest?.run ?? run,
     );
   };
   const bridge = new BridgeClient(pi.events);
   const fusion = new FusionClient(pi.events);
   const runCommand = async (command: string, args: string[], cwd: string) => {
-    const result = await pi.exec(command, args, { cwd });
+    const invocation = workspaceCommand(command, args);
+    const result = await pi.exec(invocation.command, invocation.args, { cwd });
     return {
       stdout: result.stdout,
       stderr: result.stderr,
@@ -313,28 +336,28 @@ export default function planExecExtension(pi: ExtensionAPI): void {
   // up yet. No answer within the budget is simply no evidence.
   const probeBridge = new BridgeClient(pi.events, PROVIDER_PROBE_TIMEOUT_MS);
   const doctorProbe = abandonmentProbe(
-    async (operationId) => {
+    async (operationId, run) => {
+      const digest = run.activeOperation?.requestDigest;
+      if (!digest) return undefined;
       await probeBridge.capabilities();
-      const lookup = await probeBridge.operation(operationId);
-      return lookup.success ? bridgeOperationState(lookup.data) : undefined;
+      const lookup = await probeBridge.operation(operationId, { kind: "pi-plan-exec", runId: run.id, key: operationId, requestDigest: digest });
+      return lookup.success && lookup.data.requestDigest === digest ? bridgeOperationState(lookup.data) : undefined;
     },
-    async (operation) => {
+    async (operation, run) => {
       const capabilities = await probeBridge.capabilities();
       if (capabilities.protocolVersion !== 2 || !capabilities.healthy) return {};
+      if (!operation.requestDigest) return {};
+      const expectedCaller = { operationId: operation.operationId, requestDigest: operation.requestDigest };
+      const lookup = await probeBridge.operation(operation.operationId, { kind: "pi-plan-exec", runId: run.id, key: operation.operationId, requestDigest: operation.requestDigest });
+      const proofData = lookup.success && lookup.data.requestDigest === operation.requestDigest
+        ? lookup.data : undefined;
       const proof = operation.externalRunId
-        ? await probeBridge
-            .status(operation.externalRunId, operation.asyncDir)
-            .then((reply) =>
-              reply.success
-                ? processTerminalProof(
-                    processTerminalFromStatus(reply.data),
-                    operation.externalRunId ?? "",
-                  )
-                : undefined,
-            )
+        ? processTerminalProof(processTerminalFromStatus(proofData), operation.externalRunId, expectedCaller)
         : undefined;
       return {
         durableOperationLookup: capabilities.durableOperationLookup,
+        ...(proofData?.state === EXTERNAL_OPERATION_STATE.ABSENT && proofData.replaySafe === true ? { replaySafe: true } : {}),
+        ...(proofData?.state === RUN_STATUS.CANCELLED && proofData.neverStarted === true && proofData.cancellationRequested === true ? { neverStarted: true } : {}),
         ...(proof ? { processTerminalProof: proof } : {}),
       };
     },
@@ -379,20 +402,15 @@ export default function planExecExtension(pi: ExtensionAPI): void {
       pi.getAllTools().map((tool) => tool.name),
     );
     if (missingTools.length > 0) return [`missing: ${missingTools.join(", ")}`];
-    const runtimeVisibility = await runtimeIntegration;
     const bridgeReply = await bridge.ping();
     const missing: string[] = [];
     const incompatible: string[] = [];
-    const visibilityProblem = runtimeIntegrationProblem(
-      runtimeVisibility !== undefined,
-    );
-    if (visibilityProblem) incompatible.push(visibilityProblem);
     if (!bridgeReply.success) missing.push("@alexeiled/pi-subagents-bridge");
     else {
       const capabilities = await bridge.capabilities();
       if (!bridgeRuntimeCompatible(bridgeReply.data, capabilities))
         incompatible.push(
-          "@alexeiled/pi-subagents-bridge (operation lookup and workflow spawn required)",
+          "@alexeiled/pi-subagents-bridge (durable lookup, direct owned-agent spawn, and explicit lifetime support required)",
         );
     }
     return [
@@ -403,11 +421,9 @@ export default function planExecExtension(pi: ExtensionAPI): void {
     ];
   };
   const checkRuntime: RuntimeCheck = async () => {
-    const problems = await runtimeProblems();
-    if (problems.length > 0)
-      throw new Error(
-        `${prerequisiteProblem(problems)} Use /exec status for the install commands, then /reload.`,
-      );
+    // Dispatch admission belongs to the durable controller; cold probes must
+    // not discard an otherwise authorized plan or resume request.
+    void runtimeProblems().catch(() => undefined);
   };
   const startBackgroundController: StartBackgroundController = (
     initialRun,
@@ -632,11 +648,6 @@ export default function planExecExtension(pi: ExtensionAPI): void {
     const sessionId = ctx.sessionManager.getSessionId();
     const { runs, errors } = await defaultRegistry.listWithErrors();
     const contextualRuns = runs.filter((run) => matchesContext(run, ctx.cwd));
-    try {
-      (await runtimeIntegration)?.reconcile(contextualRuns, sessionId);
-    } catch {
-      // Runtime visibility is advisory; run.json remains authoritative.
-    }
     if (errors.length > 0)
       notify(
         ctx,
@@ -644,21 +655,22 @@ export default function planExecExtension(pi: ExtensionAPI): void {
         "warning",
       );
     for (const run of contextualRuns) {
-      const repaired = shouldRepairProjectionForSession(run, sessionId)
-        ? await syncProjection(run, { cwd: ctx.cwd, sessionId })
-        : run;
-      if (shouldAutoRestoreRun(repaired, sessionId))
-        startBackgroundController(repaired, sessionId, ctx.cwd, ctx);
+      if (shouldAutoRestoreRun(run, sessionId))
+        startBackgroundController(run, sessionId, ctx.cwd, ctx);
     }
-    // Advisory only: a failed diagnosis must not take the session down with it.
-    try {
-      const notice = abandonedRunsNotice(
-        await sweepAbandonment(defaultRegistry),
-      );
+    for (const run of contextualRuns) {
+      if (shouldRepairProjectionForSession(run, sessionId))
+        void syncProjection(run, { cwd: ctx.cwd, sessionId }).then((projected) => setStatus(projected, ctx)).catch(() => undefined);
+    }
+    void boundedPromise(runtimeIntegration, PROJECTION_TIMEOUT_MS).then(async (integration) => {
+      if (integration)
+        await boundedPromise(Promise.resolve(integration.reconcile(contextualRuns, sessionId)), PROJECTION_TIMEOUT_MS);
+    }).catch(() => undefined);
+    void boundedPromise(sweepAbandonment(defaultRegistry), PROJECTION_TIMEOUT_MS).then((sweep) => {
+      if (!sweep) return;
+      const notice = abandonedRunsNotice(sweep);
       if (notice) notify(ctx, notice, "warning");
-    } catch {
-      // The registry stays authoritative.
-    }
+    }).catch(() => undefined);
   });
 
   pi.on("session_shutdown", () => {
@@ -666,7 +678,9 @@ export default function planExecExtension(pi: ExtensionAPI): void {
     activeControllers.clear();
     inFlightControllers.clear();
     lastStates.clear();
-    void runtimeIntegration.then((integration) => integration?.dispose());
+    void boundedPromise(runtimeIntegration, PROJECTION_TIMEOUT_MS).then(async (integration) => {
+      if (integration) await boundedPromise(Promise.resolve(integration.dispose()), PROJECTION_TIMEOUT_MS);
+    }).catch(() => undefined);
     // Status is session-scoped in Pi, so the next session starts clean.
   });
 }
@@ -680,19 +694,19 @@ export function runtimeIntegrationProblem(
 }
 
 export function bridgeRuntimeCompatible(
-  pingData: unknown,
+  _pingData: unknown,
   capabilities: BridgeCapabilities,
 ): boolean {
-  if (!capabilities.healthy || !capabilities.workflowScriptSpawn) return false;
+  if (!capabilities.healthy || capabilities.singleAgentSpawn !== true) return false;
   if (capabilities.protocolVersion === 2)
     return (
       capabilities.durableOperationLookup &&
-      capabilities.processTerminalProofVersion === 1
+      capabilities.processTerminalProofVersion === 1 &&
+      capabilities.executionLifetimeVersion === 1 &&
+      (capabilities.executionLifetimeModes?.length ?? 0) > 0 &&
+      supportsOwnedProcessTree(capabilities)
     );
-  return (
-    hasBridgeOperationMethod(pingData) &&
-    hasBridgeWorkflowScriptSpawnCapability(pingData)
-  );
+  return false;
 }
 
 export function hasBridgeOperationMethod(data: unknown): boolean {
@@ -806,6 +820,12 @@ export function recoveryGuidance(
   // something still running, so a proven-gone worker falsifies them all.
   if (evidence && classifyAbandonment(run, evidence) === ABANDONMENT.ABANDONED)
     return abandonedGuidance(run, commands, evidence);
+  if (evidence && classifyAbandonment(run, evidence) === ABANDONMENT.RECONCILABLE)
+    return { classification: "the pending launch can be checked without replacing it",
+      action: `Run ${resume}; it preserves the same operation ID and immutable request. An empty lookup does not prove that an earlier request cannot still arrive.`, command: resume };
+  if (run.status === RUN_STATUS.RUNNING && run.activeOperation?.processTreeExited === true)
+    return { classification: "the worker has finished and its result is ready to read",
+      action: `Run ${resume}; it consumes the saved result and candidate under the existing operation ID without launching a replacement worker.`, command: resume };
   if (run.status === RUN_STATUS.CANCEL_PENDING)
     return polled
       ? {
@@ -819,6 +839,12 @@ export function recoveryGuidance(
           command: stop,
         };
   if (run.status === RUN_STATUS.SKIP_PENDING) {
+    if (!isStageWaiverAvailable(run))
+      return {
+        classification: "a required stage cannot be force-skipped",
+        action: `The recorded waiver for required ${run.stage} cannot be applied. Keep the stage required and run ${status} after correcting the durable request. Do not resume or start another run.`,
+        command: status,
+      };
     if (polled)
       return {
         classification: "waiting for the stage you waived to stop",
@@ -916,7 +942,7 @@ export function recoveryGuidance(
           commands,
           polled,
           "running longer than its budget allows",
-          `This run has claimed an active worker for ${elapsedLabel(overdue.elapsedMs)} since launch, past the ${minutesLabel(overdue.boundMs)} allowed for its ${overdue.maxTurns}-turn budget, and nothing reports what it is doing${workflow}. That is not proof the worker is stuck.`,
+          `This run has claimed an active worker for ${elapsedLabel(overdue.elapsedMs)} since launch, past the explicit ${minutesLabel(overdue.boundMs)} compatibility deadline, and nothing reports what it is doing${workflow}. That is not proof the worker is stuck.`,
         );
       if (!activity)
         return waitOrStop(
@@ -1043,28 +1069,24 @@ function abandonedGuidance(
   if (run.status === RUN_STATUS.SKIP_PENDING)
     return {
       classification: "the worker is gone, so the waived stage cannot finish",
-      action: `${checked}, so there is nothing left to stop and the run cannot move on by itself. Run ${commands.resume}; it clears the dead worker and continues, without starting a second one.`,
+      action: `${checked}. Run ${commands.resume}; it retains the operation identity and finishes the pending waiver without starting a second worker.`,
       command: commands.resume,
     };
   return {
     classification: "the worker is gone, so nothing is running",
-    action: `${checked}. Run ${commands.resume}; it clears the dead worker and continues, without starting a second one. Run ${commands.stop} instead to end the run and keep the worktree.`,
+    action: `${checked}. Run ${commands.resume}; it retains the operation and consumes its saved result or candidate before continuing. Run ${commands.stop} instead to end the run and keep the worktree.`,
     command: commands.resume,
   };
 }
 
 /**
  * Why `--same-machine` does not apply to this run, or undefined when it does.
- * Refusing where the flag would change nothing keeps it from widening into a
- * general force. A beating heartbeat is refused whatever host it names: the
- * flag asserts a machine, and no assertion about a machine can outrank a worker
- * that is still writing on it.
+ * The flag is a human hostname assertion only; local PID and process evidence
+ * still decide whether a foreign lease can be rebound.
  */
 export function sameMachineRefusal(run: PlanExecRun): string | undefined {
   if (isLocalRun(run))
     return `${SAME_MACHINE_OPTION} only applies to a run whose lease names another host; run ${shortRunId(run.id)} is already observable here.`;
-  if (run.lease && isLeaseLive(run.lease))
-    return `Run ${shortRunId(run.id)} still has a beating lease from session ${run.lease.sessionId}, so ${SAME_MACHINE_OPTION} cannot act on it. Wait ${elapsedLabel(LEASE_STALE_MS)} for the heartbeat to go stale, then resume.`;
   return undefined;
 }
 
@@ -1130,6 +1152,8 @@ export function formatRunStatus(
   if (operation) lines.push(`operation ID: ${operation.operationId}`);
   if (operation?.externalRunId)
     lines.push(`external run ID: ${operation.externalRunId}`);
+  if (run.archiveOperation) lines.push(`archive Git operation: ${run.archiveOperation.phase} · attempt ${run.archiveOperation.attempt + 1} · ${run.archiveOperation.operationId}`);
+  if (run.outputPromotion?.state === EXTERNAL_OPERATION_STATE.PENDING) lines.push(`output promotion: ${run.outputPromotion.commandStarted ? "waiting for owned Git command retirement" : "preparing safe fast-forward"}`);
   if (run.failedOperation) {
     lines.push(
       `failed operation: ${run.failedOperation.service}/${run.failedOperation.kind}`,
@@ -1162,6 +1186,14 @@ export function formatRunStatus(
       `last observation: ${new Date(operation.lastObservedAt).toISOString()}`,
     );
   lines.push(...workerSignalLines(run, evidence));
+  if (operation?.diagnostics) {
+    const diagnosis = operation.diagnostics;
+    lines.push(`runner diagnosis: ${diagnosis.assessment} · phase ${diagnosis.phase ?? "unavailable"}${diagnosis.currentTool ? ` · tool ${diagnosis.currentTool}` : ""}${diagnosis.runnerPid ? ` · runner PID ${diagnosis.runnerPid}` : ""}`,
+      `next diagnostic action: ${diagnosis.action} at ${new Date(diagnosis.nextProbeAt).toISOString()}`);
+    if (diagnosis.lastToolFailure) lines.push(`confirmed tool failure: ${diagnosis.lastToolFailure.toolName} (${diagnosis.lastToolFailure.toolCallId}) — ${diagnosis.lastToolFailure.message}`);
+  }
+  for (const action of Object.values(operation?.diagnosticActions ?? {}))
+    lines.push(`tool guidance: ${action.state} for ${action.toolCallId} — guidance only, not a repair confirmation${action.error ? `; ${action.error}` : ""}`);
   // The failure counts below are stored facts and print either way. Only an
   // observed live lease adds the claim that something is still trying.
   const polling = evidence?.leaseLive === true ? "; retrying" : "";
@@ -1609,12 +1641,15 @@ export interface AbandonmentSweep {
  * host yields none at all — see `isLocalRun`.
  */
 export function abandonmentProbe(
-  lookupOperationState?: (operationId: string) => Promise<string | undefined>,
+  lookupOperationState?: (operationId: string, run: PlanExecRun) => Promise<string | undefined>,
   lookupBridgeProof?: (
     operation: ActiveOperation,
+    run: PlanExecRun,
   ) => Promise<{
     durableOperationLookup?: boolean;
     processTerminalProof?: ProcessTerminalProof;
+    replaySafe?: boolean;
+    neverStarted?: boolean;
   }>,
 ): EvidenceProbe {
   return async (run) => {
@@ -1625,13 +1660,13 @@ export function abandonmentProbe(
       : undefined;
     const bridgeState =
       lookupOperationState && operation.service === OPERATION_SERVICE.BRIDGE
-        ? await lookupOperationState(operation.operationId).catch(
+        ? await lookupOperationState(operation.operationId, run).catch(
             () => undefined,
           )
         : undefined;
     const bridgeProof =
       lookupBridgeProof && operation.service === OPERATION_SERVICE.BRIDGE
-        ? await lookupBridgeProof(operation).catch(() => ({}))
+        ? await lookupBridgeProof(operation, run).catch(() => ({}))
         : {};
     return {
       ...(asyncDirPresent === undefined ? {} : { asyncDirPresent }),
@@ -1787,6 +1822,10 @@ export async function execStatus(
       abandonedFooter(abandoned),
     ),
     ...groupLines(
+      "reconcilable — the existing launch identity must be preserved",
+      diagnosisGroup(sweep, ABANDONMENT.RECONCILABLE),
+    ),
+    ...groupLines(
       "ambiguous — evidence is incomplete, so nothing was reset",
       diagnosisGroup(sweep, ABANDONMENT.AMBIGUOUS),
     ),
@@ -1804,7 +1843,7 @@ export async function execStatus(
 function prerequisiteLines(problems: string[]): string[] {
   return [
     `${prerequisiteProblem(problems)} Install them, then /reload:`,
-    ...REQUIRED_SETUP_COMMANDS,
+    ...requiredSetupCommands(),
     "",
   ];
 }
@@ -1826,18 +1865,15 @@ function unreadableLines(
   ];
 }
 
-/**
- * Worded for the rows the group actually holds. `reconcileRun` refuses every
- * run already told to stop, so promising that each one resets would be false.
- */
+/** Reconciliation preserves explicit stop requests as well as operation identity. */
 function abandonedFooter(diagnoses: RunDiagnosis[]): string | undefined {
   const resettable = diagnoses.filter(
     (diagnosis) => !isRecoverableRun(diagnosis.run),
   ).length;
   if (resettable === 0) return undefined;
   return resettable === diagnoses.length
-    ? "Each resets to a recoverable failure before it continues; no second worker is launched."
-    : "Each resets to a recoverable failure before it continues, except the ones already told to stop, which keep that request; no second worker is launched.";
+    ? "Each retains its operation and saved result for reconciliation; no replacement worker is launched."
+    : "Each retains its operation and saved result for reconciliation, except the ones already told to stop, which keep that request; no replacement worker is launched.";
 }
 
 function diagnosisGroup(
@@ -1850,13 +1886,9 @@ function diagnosisGroup(
 }
 
 /** The one line the retired writing flag adds to its own report. */
-const RECONCILE_ALIAS_NOTE = `/exec doctor ${DOCTOR_RECONCILE_OPTION} still works for scripted callers; /exec resume <run-id> resets one named run instead, and /exec status reports the same diagnosis without writing.`;
+const RECONCILE_ALIAS_NOTE = `/exec doctor ${DOCTOR_RECONCILE_OPTION} still works for scripted callers; /exec resume <run-id> reconciles one named operation instead, and /exec status reports the same diagnosis without writing.`;
 
-/**
- * The registry-wide write behind the retired `/exec doctor --reconcile`. It
- * resets every provably abandoned run — a wider blast radius than /exec
- * cleanup, which demands `--apply` — so only the write dispatch reaches it.
- */
+/** Record eligible handoffs without discarding a launch, result, or candidate. */
 export async function execReconcile(
   registry: RunRegistry,
   probe?: EvidenceProbe,
@@ -1871,7 +1903,7 @@ export async function execReconcile(
   lines.push(
     ...(await reconcileLines(
       registry,
-      diagnosisGroup(sweep, ABANDONMENT.ABANDONED),
+      [...diagnosisGroup(sweep, ABANDONMENT.ABANDONED), ...diagnosisGroup(sweep, ABANDONMENT.RECONCILABLE)],
     )),
     ...groupLines(
       "ambiguous — evidence is incomplete, so nothing was reset",
@@ -1922,10 +1954,10 @@ async function reconcileLines(
   const lines: string[] = [];
   if (reset.length > 0)
     lines.push(
-      `Reset ${reset.length} abandoned run${reset.length === 1 ? "" : "s"} to failed. No worker was launched and no task attempt was consumed.`,
+      `Reconciled ${reset.length} run${reset.length === 1 ? "" : "s"} with their existing operation identity. No worker was launched and no task attempt was consumed.`,
       ...reset.map(
         (diagnosis) =>
-          `- ${runClaim(diagnosis.run)} → failed. Next: ${nextCommand(diagnosis)}`,
+          `- ${runClaim(diagnosis.run)} → reconciliation pending. Next: ${nextCommand(diagnosis)}`,
       ),
     );
   if (stopping.length > 0)
@@ -1949,25 +1981,27 @@ async function reconcileLines(
 /**
  * The single writer behind every reconcile, so its exclusions cannot drift.
  * Compare-and-swap on the scanned `updatedAt` with no retry: a run reclaimed
- * since the scan is skipped. `taskAttempts` is untouched; the worker never ran.
+ * since the scan is skipped. Reconciliation itself launches no worker.
  */
 async function reconcileRun(
   registry: RunRegistry,
   diagnosis: RunDiagnosis,
   actor = `/exec ${EXEC_ACTION.DOCTOR}`,
 ): Promise<ReconcileOutcome> {
-  // Resetting a cancel-pending run to failed would erase the stop it carries,
-  // and the next resume would restart plan work instead of finishing it.
-  if (isRecoverableRun(diagnosis.run))
+  // A recovery observation must not revoke a user's stop.
+  if (isRecoverableRun(diagnosis.run) || diagnosis.run.userStopped || diagnosis.run.status === RUN_STATUS.PAUSED)
     return { skipped: RECONCILE_SKIP.STOP_REQUESTED };
   const reason = reconcileReason(diagnosis, actor);
-  const reset = { ...diagnosis.run };
-  delete reset.activeOperation;
+  const terminalObserved = diagnosis.evidence.processTerminalProof?.state === "observed" &&
+    diagnosis.evidence.processTerminalProof.runId === diagnosis.run.activeOperation?.externalRunId;
   const reconciled = await registry.updateIfCurrent(
     {
-      ...reset,
-      status: RUN_STATUS.FAILED,
+      ...diagnosis.run,
+      status: diagnosis.run.status === RUN_STATUS.SKIP_PENDING ? RUN_STATUS.SKIP_PENDING : RUN_STATUS.RUNNING,
+      ...(terminalObserved && diagnosis.run.activeOperation ? { activeOperation: { ...diagnosis.run.activeOperation, processTreeExited: true } } : {}),
       error: reason,
+      wakeReason: reason,
+      nextAttemptAt: 0,
       reconciledAt: Date.now(),
     },
     diagnosis.run.updatedAt,
@@ -1985,14 +2019,10 @@ async function reconcileRun(
   return { run: reconciled.run };
 }
 
-/**
- * Name the evidence in the stored error, so the reset is legible later.
- * Recovery classification reads `run.error` back, so a stray "provider" or
- * "external" in this text would reclassify the run.
- */
+/** Keep the evidence and identity-preservation decision visible in the audit record. */
 function reconcileReason(diagnosis: RunDiagnosis, actor: string): string {
   const operation = diagnosis.run.activeOperation;
-  return `Reset by ${actor}: its lease was dead and ${operationEvidence(diagnosis)}, so no worker was running${operation ? ` for ${operation.service}/${operation.kind}` : ""}.`;
+  return `Reconciled by ${actor}: its lease was dead and ${operationEvidence(diagnosis)}. The existing ${operation ? `${operation.service}/${operation.kind} ` : ""}operation, candidate, and result identity were preserved.`;
 }
 
 /**
@@ -2003,9 +2033,8 @@ function reconcileReason(diagnosis: RunDiagnosis, actor: string): string {
  *
  * `sameMachine` unblocks evidence gathering and nothing else, so it cannot
  * force a resume past a worker still writing: only the probe sees the rewritten
- * host, while `leaseLive` keeps reading the stored lease. A beating heartbeat
- * therefore still reads LIVE, whichever machine stamped it. The rewritten host
- * is never written back — the reset's own `claim` re-stamps the current host.
+ * host. A live local PID still reads LIVE; a proven local handoff records the
+ * asserted hostname before the subsequent claim.
  */
 export async function reconcileForResume(
   registry: RunRegistry,
@@ -2015,9 +2044,10 @@ export async function reconcileForResume(
 ): Promise<{ run: PlanExecRun; note?: string }> {
   if (!isInFlightStatus(run.status) || isRecoverableRun(run)) return { run };
   // The operator asserted the host, so every text below reads the run that way
-  // too; only the record written back keeps the stored lease.
+  // too. Evidence still has to prove local PID/process-tree termination before
+  // the old foreign lease is rebound to this host for the subsequent claim.
   const subject = sameMachine ? asLocalRun(run) : run;
-  const evidence = await runEvidence(run, () => probe(subject));
+  const evidence = await runEvidence(subject, () => probe(subject));
   const diagnosis: RunDiagnosis = {
     run,
     evidence,
@@ -2039,9 +2069,24 @@ export async function reconcileForResume(
     throw new Error(
       `Run ${shortRunId(run.id)} was reclaimed while it was being diagnosed, so nothing was changed. Use /exec status ${run.id}.`,
     );
+  let recovered = reconciled.run;
+  if (sameMachine && recovered.lease) {
+    const rebound = await registry.updateIfCurrent(
+      {
+        ...recovered,
+        lease: { ...recovered.lease, hostname: hostname() },
+      },
+      recovered.updatedAt,
+    );
+    if (!rebound.applied)
+      throw new Error(
+        `Run ${shortRunId(run.id)} changed while its asserted host was being recorded; nothing was changed. Use /exec status ${run.id}.`,
+      );
+    recovered = rebound.run;
+  }
   return {
-    run: reconciled.run,
-    note: `Run ${shortRunId(run.id)} was abandoned — ${evidenceText(diagnosis)} — so it was reset to failed before resuming. No task attempt was consumed.`,
+    run: recovered,
+    note: `Run ${shortRunId(run.id)} is ready for reconciliation — ${evidenceText(diagnosis)} — and its existing operation and candidate were preserved. No task attempt was consumed.`,
   };
 }
 
@@ -2069,13 +2114,16 @@ function overdueText(diagnosis: ObservedRun): string {
     ? undefined
     : longRunningOperation(run);
   return overdue
-    ? `; running ${elapsedLabel(overdue.elapsedMs)}, past the ${minutesLabel(overdue.boundMs)} allowed for its ${overdue.maxTurns}-turn budget`
+    ? `; running ${elapsedLabel(overdue.elapsedMs)}, past the explicit ${minutesLabel(overdue.boundMs)} compatibility deadline`
     : "";
 }
 
 function operationEvidence(diagnosis: ObservedRun): string {
   const operation = diagnosis.run.activeOperation;
   if (!operation) return "no operation is tracked";
+  if (diagnosis.evidence.neverStarted) return "the original launch was durably fenced before dispatch";
+  if (diagnosis.evidence.replaySafe && diagnosis.evidence.bridgeState === EXTERNAL_OPERATION_STATE.ABSENT)
+    return "the provider permits only same-ID replay; no worker-exit claim was made";
   if (diagnosis.evidence.asyncDirPresent === false)
     return "its operation directory is gone from disk";
   if (diagnosis.evidence.bridgeState === EXTERNAL_OPERATION_STATE.ABSENT)
@@ -2098,8 +2146,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function processTerminalFromStatus(
-  data: Record<string, unknown>,
+  data: unknown,
 ): unknown {
+  if (!isRecord(data)) return undefined;
+  if (isRecord(data.processTerminalProof)) return data.processTerminalProof;
   if (isRecord(data.processTerminal)) return data.processTerminal;
   const details = data.details;
   if (!isRecord(details)) return undefined;
@@ -2160,8 +2210,10 @@ export function shouldAutoRestoreRun(
   run: PlanExecRun,
   sessionId: string,
 ): boolean {
-  if (!isInFlightStatus(run.status) || isTerminal(run.status)) return false;
-  if (run.status !== RUN_STATUS.CANCEL_PENDING && run.userStopped === true)
+  const pausedCleanup = run.status === RUN_STATUS.PAUSED && (run.localOperationActive === true ||
+    Boolean(run.activeOperation && !run.activeOperation.processTreeExited && !run.activeOperation.launchFenced));
+  if ((!isInFlightStatus(run.status) && !pausedCleanup) || isTerminal(run.status)) return false;
+  if (run.status !== RUN_STATUS.CANCEL_PENDING && !pausedCleanup && run.userStopped === true)
     return false;
   const lease = run.lease;
   if (!lease) return true;
@@ -2172,7 +2224,8 @@ export function shouldAutoRestoreRun(
 /** Keep polling a paused tracked child until its exit is actually observed. */
 export function shouldStopBackgroundController(run: PlanExecRun): boolean {
   return isTerminal(run.status) ||
-    (run.status === RUN_STATUS.PAUSED && run.activeOperation === undefined);
+    (run.status === RUN_STATUS.PAUSED && !run.localOperationActive &&
+      (!run.activeOperation || run.activeOperation.processTreeExited === true || run.activeOperation.launchFenced === true));
 }
 
 async function repairProjectionForRead(
@@ -2359,7 +2412,7 @@ async function runAction(
       await requestStatus(claimed, EXEC_ACTION.PAUSE),
       { cwd: ctx.cwd, sessionId },
     );
-    return `Run ${shortRunId(paused.id)} paused after its active operation. Use /exec resume ${paused.id} to continue.`;
+    return `Run ${shortRunId(paused.id)} paused; its current attempt is stopping and its checkpoint is preserved. Use /exec resume ${paused.id} to continue after confirmed exit.`;
   }
   const cancelled = await syncProjection(
     await requestStatus(claimed, EXEC_ACTION.CANCEL),
@@ -2728,6 +2781,9 @@ export function isActionAllowed(
  * offer the waiver on the same terms `skip` will accept it.
  */
 export function isStageWaiverAvailable(run: PlanExecRun): boolean {
+  if (isReviewStage(run.stage) && run.config.reviewRequired) return false;
+  if (run.stage === RUN_STAGE.FINALIZE && run.config.finalizeEnabled)
+    return false;
   return (
     isSkippableStage(run.stage) &&
     (run.status === RUN_STATUS.FAILED ||
@@ -2930,6 +2986,7 @@ export async function requestStatus(
       {
         ...current,
         userStopped: true,
+        nextAttemptAt: 0,
         stopGeneration: (current.stopGeneration ?? 0) + 1,
         status:
           action === EXEC_ACTION.PAUSE
@@ -3080,6 +3137,8 @@ export function formatRunWidget(
       `Lane preparation: Task ${run.lanePreparation.taskId} · ${run.lanePreparation.state}${run.lanePreparation.error ? ` · ${run.lanePreparation.error}` : ""}`,
     );
   }
+  if (run.archiveOperation) lines.push(`Archive: ${run.archiveOperation.phase} · attempt ${run.archiveOperation.attempt + 1}${run.archiveOperation.phase === "retired" ? " · owned Git exit confirmed" : " · owned Git exit pending"}`);
+  if (run.outputPromotion?.state === EXTERNAL_OPERATION_STATE.PENDING) lines.push(`Output promotion: ${run.outputPromotion.commandStarted ? "owned Git exit pending" : "preparing"}`);
   if (dependencyWait) {
     lines.push(
       `Next automatic action: after task ${dependencyWait.dependsOn.join(", ") || "its prerequisite"} is accepted`,
@@ -3097,6 +3156,13 @@ export function formatRunWidget(
   if (run.lease)
     lines.push(`Owner: Pi/${run.lease.sessionId} · heartbeat ${relativeTimeAt(run.lease.heartbeatAt, now)}`);
   if (run.needsAttention) lines.push("Needs attention: yes; automatic recovery remains scheduled");
+  if (run.activeOperation?.diagnostics) {
+    const diagnosis = run.activeOperation.diagnostics;
+    lines.push(`Runner: ${diagnosis.phase ?? "unavailable"}${diagnosis.currentTool ? ` · ${diagnosis.currentTool}` : ""} · ${diagnosis.assessment}`,
+      `Next diagnostic action: ${diagnosis.action} ${relativeTimeAt(diagnosis.nextProbeAt, now)}`);
+  }
+  const guidance = Object.values(run.activeOperation?.diagnosticActions ?? {}).at(-1);
+  if (guidance) lines.push(`Tool guidance: ${guidance.state} · ${guidance.toolCallId} (not a repair confirmation)`);
   if (run.taskProjection?.state === "degraded")
     lines.push(`Projection: unavailable · ${run.taskProjection.error ?? "unknown error"}`);
   const usage = totalUsage(run);
@@ -3129,16 +3195,20 @@ function formatUsage(
 }
 
 function executionDeadlineLabel(run: PlanExecRun): string {
-  const lifetime = run.config?.executionLifetime;
+  const lifetime = activeExecutionLifetime(run);
+  if (!lifetime) return "unknown (awaiting lifetime evidence)";
   return lifetime?.mode !== "bounded"
     ? "none (unbounded)"
     : `${elapsedLabel(lifetime.timeoutMs)} compatibility mode`;
 }
 
 function executionLifetimeLabel(run: PlanExecRun): string {
-  const lifetime = run.config?.executionLifetime;
+  const lifetime = activeExecutionLifetime(run);
+  if (!lifetime) return "unknown (awaiting lifetime evidence)";
+  const operation = run.activeOperation;
+  const expected = operation?.expectedLifetime ?? parseExecutionLifetime(operation?.params?.executionLifetime);
   return lifetime?.mode !== "bounded"
-    ? "unbounded end-to-end verified"
+    ? operation?.effectiveLifetime?.mode === "unbounded" && expected?.mode === "unbounded" ? "unbounded end-to-end verified" : "unbounded requested"
     : `${elapsedLabel(lifetime.timeoutMs)} compatibility mode`;
 }
 
@@ -3196,7 +3266,7 @@ function boundedPromise<T>(
 export function pausedMessage(run: PlanExecRun): string {
   return run.blockedTask
     ? `Plan execution ${shortRunId(run.id)} paused at Task ${run.blockedTask.taskId}: ${run.blockedTask.reason}\nNo automatic retries. Worktree and checkboxes preserved. Resolve the blocker, then use /exec resume ${run.id}; it asks before retrying the same task.`
-    : `Plan execution ${shortRunId(run.id)} is paused. Use /exec resume ${run.id} to continue.`;
+    : `Plan execution ${shortRunId(run.id)} is paused; the current attempt is stopping and its checkpoint is preserved. Use /exec resume ${run.id} to continue after confirmed exit.`;
 }
 
 function terminalMessage(run: PlanExecRun): string {
@@ -3211,12 +3281,13 @@ function terminalMessage(run: PlanExecRun): string {
 
 export function execSetup(): string {
   return [
-    "Install the required plan-exec packages at compatible versions:",
-    ...REQUIRED_SETUP_COMMANDS,
-    "Optional preferred Fusion review provider:",
-    ...OPTIONAL_SETUP_COMMANDS,
-    "Install the plan-exec package:",
-    "pi install npm:@alexeiled/pi-plan-exec",
+    "Install the exact source runtimes pinned by this plan-exec build (project-local settings):",
+    ...requiredSetupCommands(),
+    "Optional Fusion review backend:",
+    sourceInstallCommand("@alexeiled/pi-fusion"),
+    "Optional task visibility (not required for execution):",
+    "pi install -l npm:@tintinweb/pi-tasks",
+    "Keep this plan-exec source build installed; published packages may not expose the required runtime contract yet.",
     "",
     "Then run /reload. Use /exec help for commands.",
   ].join("\n");
@@ -3229,7 +3300,7 @@ export function execHelp(): string {
     "/exec --worktree <path> <plan-path>  Execute a plan in an existing registered worktree.",
     "/exec status [run-id]   No run ID: every run grouped by what it needs, with any missing package and one next command per run. With a run ID: that run in detail.",
     `/exec resume [run-id] [${RECOVERY_MODEL_OPTION} current|provider/model]`,
-    "                        Continue a stuck run: it takes the lease over from a dead session, resets a run whose worker is provably gone, and asks before retrying a blocked task or rebinding the current branch. Model/provider failures use the current Pi model.",
+    "                        Continue a stuck run: take over a dead session's lease while retaining the existing operation and saved result. Explicit pauses require resume; automatic task retries preserve their checkpoints.",
     "/exec stop [run-id]     Stop a run: it asks whether to pause it (resumable) or cancel it (final, worktree preserved).",
     `/exec cleanup [full-run-id] [${CLEANUP_APPLY_OPTION}]`,
     `                        Preview retired runs older than ${CLEANUP_RETENTION_DAYS} days; ${CLEANUP_APPLY_OPTION} deletes their registry entries only.`,
