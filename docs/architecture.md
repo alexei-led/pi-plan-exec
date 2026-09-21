@@ -3,34 +3,43 @@
 <!-- markdownlint-disable MD013 -->
 
 `pi-plan-exec` is a deterministic controller around existing Pi extensions. It
-owns plan-specific policy and durable transitions, not model execution, task UI,
-or multi-model review.
+owns plan-specific policy, durable transitions, automatic recovery, commit
+acceptance, and provider reconciliation, not model execution or task UI.
+
+This branch is an incomplete implementation draft. The strict autonomous path
+requires an explicit lifetime and an owned-process-tree capability. The tested
+native, Bridge, Fusion, and Revmux runtimes expose only POSIX process-group
+ownership with escaped descendants unverified, so production preflight rejects
+them before dispatch. Local nonempty bootstrap and required-check commands are
+also refused. See [runtime contracts](runtime-contracts.md) for the exact
+limitation and dependency PR links.
 
 ## Design goals
 
-- deterministic stage order and retry limits;
-- one writer at a time in one execution worktree;
+- deterministic stage order and automatic recovery without a global retry cap;
+- one child at a time, with one writer per execution lane;
 - fresh model context for every implementation, review, and fix operation;
 - crash-safe replay without duplicate writer starts;
 - cross-session recovery and adoption;
+- explicit dependency scheduling, accepted commit ancestry, and frozen checks;
 - existing Pi extensions remain the owners of their domains.
 
 ## Component ownership
 
-| Component             | Owns                                                                                                            |
-| --------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `pi-plan-exec`        | Plan parsing, Git safety, stages, retries, leases, recovery, prompts, findings, archival                        |
+| Component | Owns |
+| --- | --- |
+| `pi-plan-exec` | Plan parsing, Git safety, stages, scheduled recovery, leases, accepted commits, frozen checks, lanes, prompts, findings, archival |
 | `pi-subagents-bridge` | Versioned execution RPC, `cwd` forwarding, spawn idempotency, durable operation lookup, native process-terminal proof, run observation, result normalization, stop/adopt |
-| `pi-subagents`        | Fresh child sessions, built-in `worker`/`reviewer`, model execution, artifacts, lifecycle, external-run/background-work visibility registries |
-| `pi-fusion`           | Optional panel, judge, profiles, machine-readable Fusion RPC (`>=0.7.0`), validated caller output, persistent operation identity |
-| `pi-tasks`            | Task file format, locking, dependencies, session widget                                                         |
+| `pi-subagents` | Fresh child sessions, built-in `worker`/`reviewer`, model execution, artifacts, lifecycle, external-run/background-work visibility registries |
+| `pi-fusion` | Explicitly selected panel, judge, profiles, machine-readable Fusion RPC, validated caller output, persistent operation identity |
+| `pi-tasks` | Task file format, locking, dependencies, session widget |
 
 The bridge and Fusion APIs are event-based, versioned RPC contracts. The
 controller does not import their runtime internals. Fusion review starts request
 `outputContract: "plan-review-v1"`; terminal approval uses only validated
-top-level `callerOutput.output` and fails closed when it is absent. If Fusion
-is unavailable before an external run is tracked, the controller uses the
-pi-subagents reviewer with the same operation ID.
+top-level `callerOutput.output` and fails closed when it is absent. An ambiguous
+Fusion start retains the same operation ID and does not fall back over an
+unknown child.
 
 The exception is the pi-tasks projection adapter. Pi-tasks has no cross-extension
 CRUD RPC, so `task-projection.ts` uses the shipped `TaskStore` contract. The
@@ -57,42 +66,51 @@ flowchart LR
     controller --> projection[pi-tasks projection]
     controller --> bridge[pi-subagents-bridge RPC]
     bridge --> agents["pi-subagents worker / reviewer"]
-    controller --> fusion[optional pi-fusion RPC]
+    controller --> fusion[selected Fusion or Revmux backend]
     fusion --> panel[panel and judge]
-    fusion -. launch fallback .-> bridge
     agents --> worktree[Git execution worktree]
     panel --> controller
     worktree --> plan[plan checkboxes]
     plan --> controller
+    controller --> lanes[accepted baseline + prepared task lanes]
+    lanes --> worktree
 ```
 
 The controller re-reads the plan after implementation. A child saying “done” is
-not completion evidence; checked plan items are. For an incomplete task, a leading
-`<<<RALPHEX:TASK_FAILED>>>` in the worker's retained output records a durable
-`blockedTask` reason and pauses the run without increasing `taskAttempts`.
-The implementation child has no separate mutation guard: an explicit blocker
-needs no source edit, and the controller still enforces checkbox completion.
-Confirmed resume clears that blocker and launches the same task. Concurrent
-stop/cancel changes take precedence over a late output lookup.
+not completion evidence; committed checked plan items are. Omitted task
+dependencies preserve legacy sequential ordering, while `dependsOn: []` marks
+an independent task. For an incomplete task, a leading
+`<<<RALPHEX:TASK_FAILED>>>` records the blocker and schedules automatic
+recovery while keeping the run owned. It does not create a global pause or
+terminal retry cap. Candidate acceptance requires ancestry from the accepted
+commit, the frozen required checks, and a clean tracked tree. Failed partial
+work stays in its lane; independent work starts from a prepared clean lane at
+the last accepted commit. Concurrent stop/cancel changes take precedence over a
+late output lookup.
 
 ## Source modules
 
-| Module                   | Responsibility                                                                    |
-| ------------------------ | --------------------------------------------------------------------------------- |
-| `src/index.ts`           | `/exec` and preparation-only `/goal` command surfaces, interactive selection, background controller loop |
-| `src/goal.ts`            | Goal-plan finalization, semantic metadata validation, atomic no-replace publication, safe retry/reuse |
-| `src/controller.ts`      | State transitions, operation launch/observation, retries, cancellation, recovery  |
-| `src/types.ts`           | Run, stage, operation, finding, and frozen configuration contracts                |
-| `src/registry.ts`        | Locked atomic run persistence, migration, leases, liveness, removal               |
-| `src/lifecycle.ts`       | Stage order and status classification predicates shared by command and controller |
-| `src/plan.ts`            | Strict Markdown plan parser and structure hash                                    |
-| `src/git.ts`             | Repository, branch, dirty-state, common-dir, and worktree safety                  |
-| `src/bridge.ts`          | Typed v1/v2 bridge client, capability negotiation, request digests, and proof validation |
-| `src/fusion.ts`          | Typed client for `fusion:rpc:v1`                                                  |
+| Module | Responsibility |
+| --- | --- |
+| `src/index.ts` | `/exec` and preparation-only `/goal` command surfaces, interactive selection, background controller loop |
+| `src/goal.ts` | Goal-plan finalization, semantic metadata validation, atomic no-replace publication, safe retry/reuse |
+| `src/controller.ts` | State transitions, operation launch/observation, automatic recovery, cancellation, acceptance |
+| `src/config.ts` | Run configuration parsing and frozen lifetime/review policy |
+| `src/types.ts` | Run, stage, operation, finding, and frozen configuration contracts |
+| `src/registry.ts` | Locked atomic run persistence, migration, leases, liveness, removal |
+| `src/lifecycle.ts` | Stage order and status classification predicates shared by command and controller |
+| `src/plan.ts` | Strict Markdown plan parser and structure hash |
+| `src/scheduler.ts` | Dependency reconciliation, ready-task selection, and wake scheduling |
+| `src/lanes.ts` | Frozen required checks/bootstrap resolution and local-operation dispatch |
+| `src/local-operation.ts` | Durable local command intent, authorization fence, and process-group diagnostics |
+| `src/git.ts` | Repository, branch, dirty-state, common-dir, and worktree safety |
+| `src/bridge.ts` | Typed v1/v2 bridge client, capability negotiation, request digests, and proof validation |
+| `src/fusion.ts` | Typed client for `fusion:rpc:v1` |
+| `src/review-backend.ts` | Explicit Revmux backend, report validation, and capability admission |
 | `src/task-projection.ts` | Rebuildable, owned pi-tasks cache with scope/version checks and degraded-state reporting |
-| `src/artifact.ts`        | Subagent output/result fallback extraction                                        |
-| `src/review.ts`          | Structured finding parsing and severity decisions                                 |
-| `src/progress.ts`        | `.ralphex/progress/` execution log                                                |
+| `src/artifact.ts` | Subagent output/result fallback extraction |
+| `src/review.ts` | Structured finding parsing and severity decisions |
+| `src/progress.ts` | `.ralphex/progress/` execution log |
 
 ## Authoritative state
 
@@ -109,14 +127,19 @@ includes:
 
 - repository, worktree, branch, and plan structure hash;
 - status and current stage;
-- task and stage attempt counters;
+- dependency-aware task states, attempts, lane paths, candidate and accepted commits;
+- stage attempt counters and scheduled next wake;
 - active operation ID, external run ID, parameters, and result location;
+- frozen execution lifetime, required checks, bootstrap commands, review backend,
+  fallback policy, and optional statistics setting;
 - review and unresolved findings;
 - pending and completed force-skip audit records;
 - explicit execution-branch rebindings;
 - frozen role/model limits;
 - session lease with pid, hostname, and heartbeat;
 - the last worker signal digest parsed from the provider status text;
+- cumulative reported usage and verified activity timestamps;
+- deterministic statistics summary, or an explicitly requested optional report;
 - retirement and reconciliation stamps.
 
 `lease.hostname`, `retiredAt`, `reconciledAt`, and `activeOperation.workerSignal`
@@ -246,7 +269,12 @@ External starts follow this order:
 
 1. Generate a durable operation ID and canonical request digest.
 2. Persist operation intent, replay parameters, digest, and `mission: false`.
-3. Call Bridge with the v2 owner DTO when advertised, or the v1-compatible DTO. V1 recovery fails closed when it cannot prove a launch outcome.
+3. Admit the selected runtime only when it advertises the frozen explicit
+   lifetime and full owned-process-tree capability. The tested native, Bridge,
+   Fusion, and Revmux POSIX group runtimes fail this preflight before spawn.
+   Once a compatible runtime exists, call Bridge with the v2 owner DTO when
+   advertised, or the v1-compatible DTO; v1 recovery fails closed when it
+   cannot prove a launch outcome.
 4. Persist the returned external run ID.
 
 Each plan run is also exposed as exactly one `pi-subagents` external-runs row and
@@ -257,14 +285,22 @@ key, revision, status, and projection version. Scope, path, and the installed
 `pi-tasks` 0.9.x version are checked exactly. A failed repair records visible
 degraded projection state while the controller continues.
 
+Startup restores an unfinished run when its lease is claimable, preserving an
+explicit user pause and refusing a live foreign lease. The native widget and
+status render durable task counts, dependency/retry waits, next automatic
+action, verified activity, usage, review backend, and lifetime. These are
+projections of `run.json`; optional pi-tasks/Fleet visibility cannot gate
+controller recovery. Statistics default to a deterministic usage/task summary;
+an optional report child is enabled only by frozen `statsEnabled`.
+
 If Pi stops between steps 2 and 4, or a start reply times out or is malformed,
-recovery reconciles the same operation ID. The latest Bridge reports an
-operation as `found`, `pending`, `unknown`, or `absent`; plan-exec uses v2
-durable lookup and terminal proof when advertised. The controller only
-attaches `found` work and refuses a blind replay for every other uncertain
-outcome. Fusion retries its persisted operation ID; an unavailable Fusion
-launch falls back to pi-subagents with that same operation ID. Active
-foreign-session runs are observed rather than replaced.
+recovery reconciles the same operation ID. The Bridge reports an operation as
+`found`, `pending`, `unknown`, or `absent`; plan-exec only attaches `found`
+work or a terminal ownership proof and refuses a blind replay for every other
+uncertain outcome. Fusion and Revmux retry their persisted operation ID; an
+unavailable or ambiguous launch remains recoverable under that operation ID.
+Fallback is explicit and defaults to none. Active foreign-session runs are
+observed rather than replaced.
 
 ## Stage pipeline
 
@@ -287,11 +323,15 @@ The controller uses these stages:
 Isolation is selected before the durable run is created. `isolation` remains in
 the schema for migration and explicit transition handling.
 
-Implementation repeatedly selects the first task with unchecked boxes and runs
-one worker. Comprehensive and Fusion review can loop through findings and a sole
-fixer. The Fusion review uses pi-subagents when the optional Fusion provider is
-unavailable. Smells and critical review are single-pass review/fix stages. Known
-findings that survive caps are retained and produce `completed_with_findings`.
+Implementation repeatedly selects ready tasks, preserving dependencies and
+accepted commit ancestry. Omitted dependencies retain sequential behavior;
+explicit empty dependencies are independent. The default configuration enables
+one required `subagent` reviewer with `reviewFallback: []` (`none`). Fusion and
+Revmux are explicit backend selections under the same review lifecycle. Review
+stage names remain in the schema for compatibility with older run records, but
+the selected backend controls the active review path. Blocking findings remain
+unmet and schedule recovery; only adjudicated advisory findings or an explicit
+waiver can produce `completed_with_findings`.
 
 ## Cancellation, pause, and force-skip
 
@@ -301,9 +341,10 @@ outcomes below are also the non-interactive entry points.
 
 - `pause` allows the active external operation to finish, then removes it without
   advancing the stage.
-- `cancel` requests Bridge/Fusion stop when possible, keeps polling through
-  `cancel_pending`, retries provider errors without discarding operation state,
-  and ends at `cancelled` only after the operation is terminal.
+- `cancel` requests Bridge, Fusion, Revmux, or local-operation stop when
+  possible, keeps polling through `cancel_pending`, retries provider errors
+  without discarding operation state, and ends at `cancelled` only after the
+  operation is terminal.
 - Both preserve the execution worktree.
 - A branch rebind verifies the same repository, requires no active operation, and
   is recorded explicitly before resuming. Interactive `resume` asks for it when
@@ -330,7 +371,14 @@ Untrusted boundaries are validated at entry:
 - Bridge/Fusion replies are parsed from `unknown`.
 - Fusion review requires validated top-level `callerOutput` for
   `plan-review-v1`; `run.report` is not an approval fallback.
+- Revmux reports require complete source coverage, non-degraded agents, and no
+  unresolved questions.
 - Reviewer output must be `NO_FINDINGS` or structured findings.
+- Runtime admission requires explicit lifetime support and
+  `scope: "owned-process-tree"` with `escapedDescendants: "contained"`.
+  POSIX process-group observations are diagnostic only. Local nonempty check or
+  bootstrap batches fail closed before launch until the same containment proof
+  is available.
 - Git common-directory and branch checks protect writer stages.
 - `src/types.ts` owns persisted run/status/stage/operation constants. ESLint
   rejects raw domain values in control-flow comparisons and non-trivial magic

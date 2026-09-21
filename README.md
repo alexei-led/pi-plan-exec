@@ -12,41 +12,56 @@
 
 `pi-plan-exec` solves the control problem of long-running AI implementation.
 A capable agent can lose context, repeat work, skip verification, or start a
-second writer after a restart. This extension moves task order, retry limits,
-worktree checks, and recovery out of prompt prose into durable controller state.
-It has been exercised in runs lasting a few hours; the controller keeps polling
-instead of asking one chat prompt to remember the whole job.
+second writer after a restart. This extension moves task order, automatic
+recovery, worktree checks, commit acceptance, and provider reconciliation out of
+prompt prose into durable controller state.
+The controller keeps polling instead of asking one chat prompt to remember the
+whole job, but the strict runtime contract is not yet satisfied by the tested
+providers.
 
-It executes one checked-list task at a time in a Git checkout you choose, then
-runs review and fix stages with fresh Pi subagents and optional Fusion. A worker saying
-“done” is not enough: the plan’s checked items are the implementation record.
+It executes ready checked-list tasks in a Git checkout you choose, then runs
+the required review and fix stages with fresh Pi subagents or an explicitly
+selected review backend. A worker saying “done” is not enough: the plan’s
+checked items, accepted commit, required checks, and clean tracked tree are the
+implementation record.
 
-> Experimental. Start with disposable repositories or reviewable worktrees.
+> Experimental implementation draft. The strict controller currently requires
+> an owned-process-tree runtime capability. The tested native, Bridge, Fusion,
+> and Revmux implementations provide only POSIX process-group ownership with
+> escaped descendants unverified, so strict production preflight rejects them
+> before dispatch. Do not treat the latest npm package as ready for autonomous
+> production runs; see [runtime contracts](docs/runtime-contracts.md).
+
+Nonempty local bootstrap and required-check batches are also refused before
+launch until the same containment proof exists.
 
 ## What it does
 
-- **Keeps one writer in one checkout.** `/exec` can create an isolated Git
+- **Keeps one writer per execution lane.** `/exec` can create an isolated Git
   worktree, work in place, or use an explicitly selected existing
   worktree. Existing-worktree runs keep that worktree and branch, and move the
   interactive Pi session there.
-- **Executes plans deterministically.** It selects the first incomplete task,
-  starts a fresh worker, and verifies completion from the plan checkboxes.
+- **Executes plans deterministically.** It selects the next dependency-ready
+  task, starts a fresh worker, and verifies completion from a committed plan
+  candidate.
 - **Recovers deliberately.** A reload reattaches a matching run owned by the
   returning session. `/exec resume` takes over a run whose owning session is
   proven dead, and resets a run whose worker is provably gone before continuing
   it. Compare-and-set records, operation IDs, controller locks, and leases avoid
   intentionally starting another writer or losing a pause or cancellation.
-- **Reviews before it finishes.** It runs comprehensive, smells, Fusion, and
-  critical review/fix phases. Fusion `>=0.7.0` validates the strict
-  `plan-review-v1` output contract; plan-exec consumes only top-level
-  `callerOutput.output` and fails closed when validation evidence is absent. If
-  Fusion is unavailable, the Fusion review stage falls back to the pi-subagents
-  reviewer without changing the persisted operation ID. Unresolved findings
-  remain visible in the final `completed_with_findings` state.
+- **Requires a valid candidate before completion.** A task is accepted only
+  after its committed plan checkboxes, ancestry, frozen required checks, and
+  clean tracked tree are verified. The default review is one required
+  subagent reviewer; blocking findings remain unmet and schedule recovery.
+- **Schedules dependencies and preserves partial work.** Omitted `dependsOn`
+  metadata keeps legacy sequential order. `dependsOn: []` declares an
+  independent task. A failed partial task stays in its lane while an eligible
+  independent task can use a clean lane from the last accepted commit.
 
 ## Install and run
 
-Install the required packages, then plan-exec. Fusion is optional; install it for the preferred Fusion review provider:
+Install the required packages, then plan-exec. Fusion and Revmux are optional
+explicit review backends; the default backend is one required subagent reviewer:
 
 ```bash
 pi install npm:pi-subagents
@@ -56,9 +71,15 @@ pi install npm:@alexeiled/pi-fusion
 pi install npm:@alexeiled/pi-plan-exec
 ```
 
-The providers remain independent Pi packages. Install the latest Bridge release. `pi-plan-exec` uses v2 durable lookup and terminal proof when advertised; v1 remains compatible but fails closed when recovery cannot prove a launch outcome.
-Fusion is optional: the controller falls back to the pi-subagents reviewer when
-Fusion is absent or its launch response is unusable.
+The providers remain independent Pi packages. This incomplete implementation
+draft is tested against the exact dependency commits and linked dependency PRs
+listed in [runtime contracts](docs/runtime-contracts.md); installing the latest
+npm releases does not provide the required ownership contract. The default
+review backend is `subagent` with an empty fallback list (`none`). An ambiguous
+Fusion or Revmux launch keeps its operation ID and remains recoverable instead
+of starting another reviewer over an unknown child. The development checkout
+and CI use npm 12.0.2, and `.npmrc`'s `allow-git=root` setting is required for
+those pinned git dependencies.
 
 Reload Pi. From an interactive session in a Git repository, prepare a short goal
 or run an existing executable plan:
@@ -113,18 +134,28 @@ Four verbs cover everything after the start:
   progress file — for terminal runs that finished more than 7 days ago.
   `failed` runs are excluded, because their record is what `/exec resume` needs.
 
-A worker that reports `<<<RALPHEX:TASK_FAILED>>>` with incomplete checkboxes
-pauses the plan with its blocker reason, without spending retries or launching
-another worker. Resolve the prerequisite, then use `/exec resume <full-run-id>`
-and confirm retrying the same task. The worktree and completed tasks are preserved;
-a successful workflow transport result does not mean the task succeeded.
+After Pi starts or reloads, the native controller restores unfinished runs when
+their lease is claimable and reattaches durable operations by ID. Its widget and
+`/exec status` show task counts, dependency/retry waits, the next automatic
+action, verified activity, cumulative usage, selected review backend, and
+lifetime. Optional task projections are visibility caches and cannot gate
+recovery. Statistics are deterministic usage/task bookkeeping by default;
+`statsEnabled: true` opts into an additional report child.
 
-Implementation checkboxes remain sequential and cannot be force-skipped. When a
-provider operation may still exist, plan-exec keeps its recorded operation ID and
-reconciles it before any retry. If a review, finalization, or statistics stage
-cannot recover, `/exec skip <full-run-id> --reason <text>` stops the tracked
-child before recording an explicit waiver and advancing. It never skips
-implementation or archival, and the run finishes as `completed_with_findings`.
+A worker that reports `<<<RALPHEX:TASK_FAILED>>>` with incomplete checkboxes
+keeps the run in automatic recovery with its blocker reason. The controller
+schedules another evidence-gathering attempt with backoff; diagnostic status
+failure counters do not become a terminal retry cap or a second writer. The
+worktree, accepted commits, and completed tasks are preserved; a successful
+workflow transport result does not mean the task succeeded.
+
+Task dependencies control eligibility, while plan-exec still runs one child at
+a time per controller and keeps one writer per lane. When a provider operation
+may still exist, plan-exec keeps its recorded operation ID and reconciles it
+before any retry. If a review, finalization, or statistics stage cannot recover,
+`/exec skip <full-run-id> --reason <text>` stops the tracked child before
+recording an explicit waiver and advancing. It never skips implementation or
+archival, and the run finishes as `completed_with_findings`.
 The installed `exec-plan` skill is also available as `/skill:exec-plan` for the
 plan format, the recovery rules, and the retired names and flags a scripted agent
 uses instead of a prompt.
@@ -143,8 +174,9 @@ flowchart LR
     worker --> worktree["Git worktree"]
     worktree --> checks["plan checkboxes"]
     checks --> controller
-    controller --> fusion["optional pi-fusion panel + judge"]
-    fusion -. unavailable .-> bridge
+    controller --> lanes["accepted baseline + task lanes"]
+    lanes --> worktree
+    controller --> fusion["selected Fusion or Revmux review backend"]
     fusion --> controller
     controller --> result["completed or completed_with_findings"]
 ```
