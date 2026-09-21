@@ -2,7 +2,7 @@
 
 <!-- markdownlint-disable MD013 -->
 
-Status: implemented and verified locally; final cumulative confirmation pending
+Status: round 07 corrections integrated; main gates passed; cumulative confirmation pending
 
 Baseline: `0f184ec80754683772b081ef41e6a22a6b8fdb27` (`origin/main`).
 
@@ -141,13 +141,13 @@ The scenario numbers below refer to section 13 of the approved autonomous execut
 
 ## Verification checkpoint
 
-- Main through `93d378315ab714403b3cbc5214a6b11f2c7e0fbf`: `npm run test:all` passed lint, TypeScript, all 514 tests (zero failures or skips), and package validation. Fresh Linux CI will verify the pushed revision. A partial-JSON race in the test-only controller-state fixture was fixed with atomic publication before the successful complete rerun.
-- Installed-runtime smoke: passed real controller, Bridge/native RPC, no-start recovery with zero model sessions, owned workers/checks, required review, promotion and archive. Model turns are scripted.
+- Main through `d74f236`: `npm run test:all` passed lint, TypeScript, all 519 tests (zero failures or skips), and package validation. Fresh Linux CI will verify the pushed revision. A partial-JSON race in the test-only controller-state fixture was fixed with atomic publication before the successful complete rerun.
+- Installed-runtime smoke: passed real controller, Bridge/native RPC, no-start recovery with zero model sessions, owned workers/checks, required review, promotion and archive on the current pins. Ambient native worktree isolation is enabled; explicit controller requests retain the exact candidate checkout. Model turns are scripted.
 - Saved-session handoff: real Git preparation and the installed SDK session fork preserve cwd, parent history and stop fences. SDK source inspection locates missing-cwd validation before session teardown.
 - Plan publication: actual SIGKILL and injected ENOSPC preserve the original plan. Tracked and untracked initial plans, lost publication replies, proven failure and repeated approval recover automatically under one operation identity; large content stays outside command arguments.
-- Native `0fde758ad54a245935b432e14447c02b03f2b052`: 3339 unit / 1091 integration passed, 14/7 skipped; typecheck, build, package and focused lint pass. Inherited legacy lint diagnostics are unchanged.
-- Bridge `1ef889db7ac6a6fa67618a711fbb60b9eb161f9d`: 72 tests, exact native boundary including missing-exit-receipt expiry and fresh-client lookup/cancellation, typecheck, lint, package and remote CI pass.
-- Fusion `a80ac608b2af5d357a59a96a6f78ea44b78e40fb`: 255 unit / 125 integration / one E2E, typecheck, lint, package and remote CI pass.
+- Native `689d9378c4526826813da4ccd2402a9cd1acd036`: 3341 unit passed, 14 skipped; seven real owned-worktree cases, setup-hook deadline checks, typecheck, build, package and focused lint pass. Full integration rerun is pending. Inherited legacy lint diagnostics are unchanged.
+- Bridge `3e99ec2752a25c88cc75475db524c44f3157f69d`: 72 tests, exact native boundary including missing-exit-receipt expiry, fresh-client lookup/cancellation and explicit checkout override under ambient isolation, typecheck, lint, package and remote CI pass.
+- Fusion `fc4c0ac4e29ec75a70a39489d08c1b3585dfc2f3`: 255 unit / 129 integration / one E2E, typecheck, lint, package and remote CI pass.
 - Revmux dependency `988904f30da351e76c29d5779c6833a6bf890b51`: formatting, build, race-enabled tests, lint and actual CLI lifetime/held-pipe smoke pass on Darwin. Linux tests crosscompile and the Windows package builds. Upstream Ubuntu CI awaits maintainer approval and has executed no jobs; no Linux runtime result is claimed.
 - Development review: rounds `02-after-fix`, `03-final` and `04-final` were complete and non-degraded; the corrections above need final cumulative confirmation.
 
@@ -159,8 +159,10 @@ Round `05-final` reviewed through main `7fa6469`, native `798b70d`, Bridge `c7ab
 
 Round `06-final` reviewed through main `b456dce`, native `798b70d`, Bridge `c7ab396`, Fusion `a29934f` and Revmux `988904f`. It completed with two of two sources, no degradation and three major findings. Main cold-client cancellation and owner-bound lookup now use v2 independently of capability-cache state; regressions reproduced the v1 failure, and the actual Bridge/native boundary confirms fresh clients recover and cancel the same worker without negotiation or another spawn. Native recovery descriptors and history retain ownership; actual ordinary-resume tests reproduce the former legacy-runner launch and now refuse owned or unknown revival before another lease/runner. Fusion shared admission serializes distinct run IDs across processes with recoverable immutable admission and terminal records. Independent-process barriers, publication crashes, loser retry and targeted cancellation pass. All corrected dependency pins have passed their local gates and bounded independent reviews.
 
+Round `07-final` reviewed through main `1efa988`, native `0fde758`, Bridge `1ef889d`, Fusion `a80ac60` and Revmux `988904f`. It completed with two of two sources, no degradation and three major findings. Explicit optional-stage skip now releases an earlier pause while preserving newer stops; continuation, retirement, restart and cancellation-lease regressions pass, and independent bounded review found no remaining major or critical defect. Shared Fusion reconciliation uses the adopted run's frozen profile and fences late predecessor callbacks. Native owned parallel execution honors requested/configured worktree isolation and its setup controls, including unbounded setup hooks unless an explicit hook budget is selected. Actual native cases cover separate child worktrees, unchanged source HEAD/index, explicit false overrides, nested groups and hook deadlines. Main and Fusion freeze `worktree: false` because the controller already owns the exact candidate checkout; actual Bridge/native and controller smoke checks verify this override with ambient isolation enabled. The corrected immutable dependency revisions are installed. The prior combined gate does not certify these follow-ups.
+
 Strict ownership currently requires supported macOS GUI launchd and compiler prerequisites. Strict Fusion early-agreement mode is explicitly refused. Source installation uses the documented project-local Git dependency policy. No release, global installation, persistent daemon or merge is included.
 
 ## Next step
 
-Push the verified revision, verify main CI, and run full cumulative confirmation `07-final`. Keep all PRs draft and this plan unarchived until that review passes. Preserve the explicit limitations that upstream Revmux Linux CI is waiting for maintainer approval and mixed/unknown legacy Fusion writers require reconciliation; process-group observations cannot be promoted to owned-tree proof.
+Push the verified main correction, verify CI, finish the native full integration rerun and perform full cumulative confirmation `08-final` on the frozen sources. Keep all PRs draft and this plan unarchived until that review passes. Preserve the explicit limitations that upstream Revmux Linux CI is waiting for maintainer approval and mixed/unknown legacy Fusion writers require reconciliation; process-group observations cannot be promoted to owned-tree proof.
