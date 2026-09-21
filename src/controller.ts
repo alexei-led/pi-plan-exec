@@ -537,6 +537,8 @@ export class PlanExecController {
         {
           ...claimed,
           status: RUN_STATUS.SKIP_PENDING,
+          userStopped: false,
+          nextAttemptAt: 0,
           pendingStageSkip: {
             stage: claimed.stage,
             reason: trimmedReason,
@@ -552,12 +554,14 @@ export class PlanExecController {
         requested,
         `Force-skip requested for ${requested.stage} by ${sessionId}: ${trimmedReason}`,
       );
-    } else if (claimed.status !== RUN_STATUS.SKIP_PENDING) {
+    } else if (claimed.status !== RUN_STATUS.SKIP_PENDING || claimed.userStopped) {
       const resetOperation = resetOperationFailures(claimed.activeOperation);
       const persisted = await this.registry.updateIfCurrent(
         clearError({
           ...claimed,
           status: RUN_STATUS.SKIP_PENDING,
+          userStopped: false,
+          nextAttemptAt: 0,
           ...(resetOperation ? { activeOperation: resetOperation } : {}),
         }),
         claimed.updatedAt,
@@ -1132,6 +1136,7 @@ export class PlanExecController {
       ...(model ? { model } : {}),
       task: boundedContinuationPrompt(run, input.kind, reviewedCommit ? `${input.task}\nReview exactly commit ${reviewedCommit}.` : input.task, lifetime, input.taskId),
       cwd: run.worktreeCwd,
+      worktree: false,
       context: "fresh",
       executionLifetime: lifetime,
       turnBudget: { maxTurns: input.maxTurns },
@@ -2835,6 +2840,8 @@ export class PlanExecController {
         ...run,
         status: RUN_STATUS.RUNNING,
         stage: next,
+        userStopped: false,
+        nextAttemptAt: 0,
         reviewFindings: [],
         unresolvedFindings,
         skippedStages: [
@@ -2856,7 +2863,9 @@ export class PlanExecController {
       }),
     );
     delete ready.pendingStageSkip;
-    const persisted = await this.registry.update(ready);
+    const completion = await this.registry.updateIfCurrent(ready, run.updatedAt);
+    if (!completion.applied) return completion.run;
+    const persisted = completion.run;
     await appendProgressBestEffort(
       persisted,
       `FORCE-SKIPPED ${request.stage} by ${request.requestedBy}: ${request.reason}\nOperation state: ${terminalOperationState}\nNext stage: ${next}`,

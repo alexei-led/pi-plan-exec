@@ -48,7 +48,7 @@ const { setChildSessionFactoryModule } = await jiti.import(join(nativeRoot, "src
 const { ASYNC_DIR, RESULTS_DIR } = await jiti.import(join(nativeRoot, "src/shared/types.ts"));
 const { registerPlanExecRpc } = await jiti.import(join(bridgeRoot, "src/plan-exec-rpc.ts"));
 const { BridgeClient, hasKernelRetirementProof, hasTerminalOwnershipProof } = await jiti.import(join(project, "src/bridge.ts"));
-const { cancelKernelOwnedProcess, observeKernelOwnedProcess } = await import("pi-subagents/kernel-owned-process");
+const { cancelKernelOwnedProcess, observeKernelOwnedProcess, preflightKernelOwnedProcess } = await import("pi-subagents/kernel-owned-process");
 const { PlanExecController } = await jiti.import(join(project, "src/controller.ts"));
 const { RunRegistry } = await jiti.import(join(project, "src/registry.ts"));
 const { readPlan } = await jiti.import(join(project, "src/plan.ts"));
@@ -88,7 +88,8 @@ test("scripted model completes real controller, Bridge, kernel-owned workers, ch
   const state = { baseCwd: lane, currentSessionId: sessionId, asyncJobs: new Map(), foregroundControls: new Map(), lastForegroundControlId: null, workflowControllers: new Map() };
   const agents = ["worker", "reviewer"].map((name) => ({ name, description: `Scripted smoke ${name}`, systemPrompt: "", systemPromptMode: "replace", inheritGlobalContext: false, inheritProjectContext: false, inheritSkills: false }));
   setChildSessionFactoryModule(join(project, "test/fixtures/autonomous-scripted-session.mjs"));
-  const executor = createSubagentExecutor({ pi: { events, getSessionName: () => undefined, sendMessage() {} }, state, config: {}, asyncByDefault: false,
+  const executor = createSubagentExecutor({ pi: { events, getSessionName: () => undefined, sendMessage() {} }, state,
+    config: { worktree: true, worktreeProvider: "native", worktreeBaseDir: join(sandbox, "native-worktrees") }, asyncByDefault: false,
     tempArtifactsDir: join(sandbox, "artifacts"), getSubagentSessionRoot: () => join(sandbox, "sessions"), expandTilde: (value) => value, discoverAgents: () => ({ agents }) });
   const nativeRpc = registerSubagentRpcBridge({ events, state, asyncDirRoot: ASYNC_DIR, resultsDir: RESULTS_DIR, getContext: () => ctx, execute: (...args) => executor.executePublic(...args) });
   const bridgeRpc = registerPlanExecRpc(events, { timeoutMs: 15_000, journalPath: join(sandbox, "bridge.sqlite") });
@@ -123,6 +124,7 @@ test("scripted model completes real controller, Bridge, kernel-owned workers, ch
       setChildSessionFactoryModule(undefined);
     }
   });
+  assert.equal((await preflightKernelOwnedProcess({ artifactDirectory: join(ASYNC_DIR, "kernel-cache") })).supported, true);
   const capabilities = await bridge.capabilities();
   assert.equal(capabilities.processTreeOwnership?.scope, "owned-process-tree");
   assert.equal(capabilities.processTreeOwnership?.escapedDescendants, "contained");
@@ -186,6 +188,7 @@ test("scripted model completes real controller, Bridge, kernel-owned workers, ch
   assert.ok(calls.every((call) => call.pid !== process.pid && call.executionLifetime.mode === "unbounded"));
   assert.equal(requests.length, 3);
   for (const request of requests) {
+    assert.equal(request.params.worktree, false);
     const operation = await bridge.operation(request.operationId, request.owner);
     const terminal = hasTerminalOwnershipProof(operation.data, operation.data.runId, { operationId: request.operationId, requestDigest: request.owner.requestDigest });
     if (request.operationId === rejectedOperationId) {
