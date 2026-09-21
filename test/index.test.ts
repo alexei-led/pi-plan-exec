@@ -107,6 +107,32 @@ function persistedSession(cwd: string, directory: string): SessionManager {
   return session;
 }
 
+function executionHarness(cwd: string, sessionId: string) {
+  type Handler = (event: unknown, ctx: ExtensionCommandContext) => Promise<unknown>;
+  const events = new Map<string, Handler[]>();
+  const commands = new Map<string, { handler(args: string, ctx: ExtensionCommandContext): Promise<void> }>();
+  const notifications: string[] = [];
+  const pi = { events: { on() {}, emit() {} },
+    on(name: string, handler: Handler) { events.set(name, [...events.get(name) ?? [], handler]); },
+    registerCommand(name: string, command: { handler(args: string, ctx: ExtensionCommandContext): Promise<void> }) { commands.set(name, command); },
+    registerTool() {}, getAllTools() { return []; }, getActiveTools() { return []; }, setActiveTools() {},
+    exec: async (program: string, args: string[], options: { cwd: string }) => {
+      const result = spawnSync(program, args, { cwd: options.cwd, encoding: "utf8" });
+      return { stdout: result.stdout ?? "", stderr: result.stderr ?? "", code: result.status ?? 1 };
+    },
+  } as unknown as ExtensionAPI;
+  const ctx = { cwd, hasUI: true,
+    sessionManager: { getSessionId: () => sessionId, getSessionFile: () => undefined },
+    ui: { select: async (_title: string, options: string[]) => options.includes("In-place") ? "In-place" : options[0],
+      confirm: async () => true, setStatus() {}, setWidget() {}, notify(message: string) { notifications.push(message); } },
+  } as unknown as ExtensionCommandContext;
+  planExecExtension(pi);
+  return { ctx, notifications, command: (args: string) => commands.get("exec")!.handler(args, ctx),
+    emit: async (name: string, details: Record<string, unknown> = {}) => {
+      for (const handler of events.get(name) ?? []) await handler({ type: name, reason: "new", ...details }, ctx);
+    } };
+}
+
 test("task blocker status and pause notification explain recovery without a crash", () => {
   const blocked = run({
     status: "paused", stage: "implementation",
@@ -3761,6 +3787,201 @@ test("explicit pause from an unrelated session polls a dead owner's worker until
   assert.equal(current.activeOperation?.operationId, "owned-operation");
   assert.equal(current.activeOperation?.processTreeExited, true);
   assert.deepEqual(current.taskAttempts, held.taskAttempts);
+});
+
+for (const phase of ["before-create", "published", "claimed-failure"] as const) {
+  test(`pending start retires its late allocation at ${phase} across session replacement`, { timeout: 10_000 }, async (t) => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "exec-pending-start-")));
+    const registry = new RunRegistry(join(root, "runs"));
+    const source = join(root, "repository");
+    await mkdir(source);
+    for (const args of [["init", "-b", "main"], ["-c", "user.name=Test", "-c", "user.email=test@example.org",
+      "-c", "commit.gpgSign=false", "-c", "core.hooksPath=/dev/null", "commit", "--allow-empty", "-m", "initial"],
+      ["checkout", "-b", "feature"]]) {
+      const result = spawnSync("git", args, { cwd: source, encoding: "utf8" });
+      assert.equal(result.status, 0, result.stderr);
+    }
+    await writeFile(join(source, "plan.md"), "### Task 1: Implement\n- [ ] Do the work\n");
+    const sessionA = "pending-start-source";
+    const sessionB = phase === "published" ? sessionA : "pending-start-replacement";
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let reached!: () => void;
+    const checkpoint = new Promise<void>((resolve) => { reached = resolve; });
+    const create = registry.create.bind(registry);
+    t.mock.method(RunRegistry.prototype, "create", async (candidate: Parameters<RunRegistry["create"]>[0], options?: Parameters<RunRegistry["create"]>[1]) => {
+      if (phase === "before-create") { reached(); await gate; }
+      return create(candidate, options);
+    });
+    if (phase === "published") {
+      const writer = registry as unknown as { write(run: PlanExecRun): Promise<void> };
+      const write = writer.write.bind(registry);
+      t.mock.method(writer, "write", async (candidate: PlanExecRun) => { await write(candidate); reached(); await gate; });
+    }
+    t.mock.method(RunRegistry.prototype, "get", registry.get.bind(registry));
+    t.mock.method(RunRegistry.prototype, "listWithErrors", registry.listWithErrors.bind(registry));
+    t.mock.method(RunRegistry.prototype, "withControllerLock", registry.withControllerLock.bind(registry));
+    const claim = registry.claim.bind(registry);
+    let failedClaim = false;
+    t.mock.method(RunRegistry.prototype, "claim", async (candidate: PlanExecRun, owner: string) => {
+      const claimed = await claim(candidate, owner);
+      if (phase === "claimed-failure" && owner === sessionA && !failedClaim) {
+        failedClaim = true;
+        reached();
+        await gate;
+        throw new Error("Start failed after durable allocation and claim.");
+      }
+      return claimed;
+    });
+    const update = registry.updateIfCurrent.bind(registry);
+    let failedRetirement = false;
+    t.mock.method(RunRegistry.prototype, "updateIfCurrent", async (candidate: PlanExecRun, revision: number, preserveRevision?: boolean) => {
+      if (!candidate.lease && !failedRetirement && phase === "before-create") {
+        failedRetirement = true;
+        throw new Error("Transient retirement write failure.");
+      }
+      return update(candidate, revision, preserveRevision);
+    });
+    t.mock.method(TaskProjector.prototype, "sync", async (current: PlanExecRun) => current);
+    const tick = PlanExecController.prototype.tick;
+    const owners: string[] = [];
+    t.mock.method(PlanExecController.prototype, "tick", async function (this: PlanExecController, runId: string, owner: string) {
+      owners.push(owner);
+      assert.equal(owner, sessionB);
+      if (phase === "claimed-failure") return tick.call(this, runId, owner);
+      return registry.claim((await registry.get(runId))!, owner);
+    });
+    t.mock.timers.enable({ apis: ["setInterval", "setTimeout"] });
+    const first = executionHarness(source, sessionA);
+    const start = first.command("plan.md");
+    await Promise.race([checkpoint, start.then(() => assert.fail(first.notifications.join("\n") || "Start returned before its fault checkpoint."))]);
+    const closing = first.emit("session_shutdown", { reason: phase === "published" ? "reload" : "new" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    t.mock.timers.tick(1_500);
+    await closing;
+    const notificationsBefore = first.notifications.length;
+    const second = executionHarness(phase === "claimed-failure" ? join(root, "unrelated") : source, sessionB);
+    t.after(async () => { release(); await start; await second.emit("session_shutdown"); await rm(root, { recursive: true, force: true }); });
+    await second.emit("session_start");
+    t.mock.timers.tick(1_000);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(owners, []);
+    if (phase !== "before-create") {
+      const current = (await registry.list())[0]!;
+      await second.command(`${phase === "published" ? "pause" : "cancel"} ${current.id}`);
+      assert.equal((await registry.get(current.id))?.userStopped, true);
+    }
+    release();
+    await start;
+    const deadline = Date.now() + 2_000;
+    let current: PlanExecRun | undefined;
+    while (Date.now() < deadline) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      t.mock.timers.tick(1_000);
+      current = (await registry.list())[0];
+      if (phase === "published" ? current?.status === "paused" && !current.lease
+        : phase === "claimed-failure" ? current?.status === "cancelled" && !current.lease : current?.lease?.sessionId === sessionB) break;
+    }
+    assert.ok(current);
+    assert.equal(first.notifications.length, notificationsBefore);
+    if (phase === "published") {
+      assert.equal(current.status, "paused");
+      assert.equal(current.userStopped, true);
+      assert.equal(current.lease, undefined);
+      assert.deepEqual(owners, []);
+    } else if (phase === "claimed-failure") {
+      assert.equal(current.status, "cancelled");
+      assert.equal(current.userStopped, true);
+      assert.equal(current.lease, undefined);
+      assert.ok(owners.length > 0);
+    } else {
+      assert.equal(failedRetirement, true);
+      assert.equal(current.lease?.sessionId, sessionB);
+      assert.ok(owners.length > 0);
+    }
+  });
+}
+
+test("a queued resume from another directory cannot override a replacement session's pause", { timeout: 5_000 }, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "exec-queued-resume-"));
+  const registry = new RunRegistry(join(root, "runs"));
+  const planPath = join(root, "plan.md");
+  await writeFile(planPath, "### Task 1: Implement\n- [ ] Do the work\n");
+  const initial = run({ repositoryRoot: root, worktreeCwd: root, planPath, stage: "resolve",
+    lease: { ...liveLease(), sessionId: "resume-source" } });
+  delete initial.activeOperation;
+  const held = await registry.create(initial);
+  t.mock.method(RunRegistry.prototype, "get", registry.get.bind(registry));
+  t.mock.method(RunRegistry.prototype, "listWithErrors", registry.listWithErrors.bind(registry));
+  t.mock.method(RunRegistry.prototype, "claim", registry.claim.bind(registry));
+  t.mock.method(RunRegistry.prototype, "updateIfCurrent", registry.updateIfCurrent.bind(registry));
+  t.mock.method(TaskProjector.prototype, "sync", async (current: PlanExecRun) => current);
+  let release!: () => void;
+  const lockBlocked = new Promise<void>((resolve) => { release = resolve; });
+  let waiting!: () => void;
+  const lockRequested = new Promise<void>((resolve) => { waiting = resolve; });
+  const withLock = registry.withControllerLock.bind(registry);
+  t.mock.method(RunRegistry.prototype, "withControllerLock", async <T>(runId: string, callback: () => Promise<T>) => {
+    waiting();
+    await lockBlocked;
+    return withLock(runId, callback);
+  });
+  t.mock.timers.enable({ apis: ["setInterval", "setTimeout"] });
+  const first = executionHarness(join(root, "unrelated"), "resume-source");
+  const pending = first.command(`resume ${held.id}`);
+  await lockRequested;
+  const closing = first.emit("session_shutdown");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  t.mock.timers.tick(1_500);
+  await closing;
+  const second = executionHarness(root, "resume-replacement");
+  await second.emit("session_start");
+  await second.command(`pause ${held.id}`);
+  assert.equal((await registry.get(held.id))?.userStopped, true);
+  release();
+  await pending;
+  const deadline = Date.now() + 1_000;
+  let current = await registry.get(held.id);
+  while (current?.lease && Date.now() < deadline) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    current = await registry.get(held.id);
+  }
+  assert.equal(current?.status, "paused");
+  assert.equal(current?.userStopped, true);
+  assert.equal(current?.stopGeneration, 1);
+  assert.equal(current?.lease, undefined);
+  await second.emit("session_shutdown");
+  await rm(root, { recursive: true, force: true });
+});
+
+test("a hanging stop dialog cannot delay retirement or mutate after session replacement", { timeout: 5_000 }, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "exec-pending-dialog-"));
+  const registry = new RunRegistry(join(root, "runs"));
+  const held = await registry.create(run({ repositoryRoot: root, worktreeCwd: root,
+    lease: { ...liveLease(), sessionId: "dialog-source" } }));
+  t.mock.method(RunRegistry.prototype, "get", registry.get.bind(registry));
+  t.mock.method(RunRegistry.prototype, "listWithErrors", registry.listWithErrors.bind(registry));
+  t.mock.method(RunRegistry.prototype, "updateIfCurrent", registry.updateIfCurrent.bind(registry));
+  t.mock.method(RunRegistry.prototype, "claim", registry.claim.bind(registry));
+  t.mock.method(TaskProjector.prototype, "sync", async (current: PlanExecRun) => current);
+  const first = executionHarness(root, "dialog-source");
+  let choose!: (label: string) => void;
+  let shown!: () => void;
+  const dialogShown = new Promise<void>((resolve) => { shown = resolve; });
+  let pauseLabel = "";
+  first.ctx.ui.select = async (_title, options) => { pauseLabel = options[0]!; shown(); return new Promise<string>((resolve) => { choose = resolve; }); };
+  const command = first.command(`stop ${held.id}`);
+  await dialogShown;
+  await first.emit("session_shutdown");
+  assert.equal((await registry.get(held.id))?.lease, undefined);
+  const replacement = await registry.claim((await registry.get(held.id))!, "dialog-replacement");
+  choose(pauseLabel);
+  await command;
+  const current = await registry.get(held.id);
+  assert.equal(current?.status, "running");
+  assert.equal(current?.userStopped, undefined);
+  assert.deepEqual(current?.lease, replacement.lease);
+  await rm(root, { recursive: true, force: true });
 });
 
 for (const interruption of ["shutdown", "new-owner", "own-switch"] as const) {

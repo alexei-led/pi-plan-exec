@@ -183,7 +183,7 @@ export class RunRegistry {
       skippedStages?: PlanExecRun["skippedStages"];
       branchRebindings?: PlanExecRun["branchRebindings"];
     },
-    options: { exclusive?: boolean } = {},
+    options: { exclusive?: boolean; onAllocated?: (run: PlanExecRun) => void } = {},
   ): Promise<PlanExecRun> {
     await mkdir(this.directory, { recursive: true });
     const registryLockPath = join(this.directory, "registry.lock");
@@ -200,6 +200,7 @@ export class RunRegistry {
         createdAt: now,
         updatedAt: now,
       };
+      options.onAllocated?.(created);
       await this.write(created);
       return created;
     } finally {
