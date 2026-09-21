@@ -78,6 +78,10 @@ class TestEvents implements EventBus {
   }> = [];
   throwOnEmit = false;
 
+  get listenerCount(): number {
+    return this.handlers.size;
+  }
+
   on(event: string, handler: (payload: unknown) => void): () => void {
     this.handlers.set(event, handler);
     return () => this.handlers.delete(event);
@@ -125,6 +129,65 @@ test("Bridge refuses explicit lifetime dispatch without a verified capability", 
   assert.ok(!result.success);
   assert.equal(result.error.code, "unsupported");
   assert.equal(events.emissions.length, 0);
+});
+
+test("a fresh Bridge client cancels an owned operation without capability negotiation", async () => {
+  const events = new TestEvents();
+  const bridge = new BridgeClient(events, 50);
+  const owner = { kind: "pi-plan-exec" as const, runId: "plan", key: "op", requestDigest: "caller-digest" };
+  const pending = bridge.cancelOperation("op", owner);
+  const request = events.emitted;
+  events.reply(request?.event === BRIDGE_V2_REQUEST_EVENT ? "plan-exec:bridge:v2:reply:" : "plan-exec:bridge:v1:reply:", {
+    success: true, data: { state: "stopping", operationId: "op", requestDigest: owner.requestDigest },
+  });
+  assert.equal((await pending).success, true);
+  assert.equal(events.emissions.length, 1);
+  assert.equal(request?.event, BRIDGE_V2_REQUEST_EVENT);
+  assert.equal(request?.payload.version, 2);
+  assert.equal(request?.payload.method, "cancelOperation");
+  assert.deepEqual(request?.payload.owner, owner);
+});
+
+test("a fresh Bridge client preserves ownership on durable lookup", async () => {
+  const events = new TestEvents();
+  const bridge = new BridgeClient(events, 50);
+  const owner = { kind: "pi-plan-exec" as const, runId: "plan", key: "op", requestDigest: "caller-digest" };
+  const pending = bridge.operation("op", owner);
+  const request = events.emitted;
+  events.reply(request?.event === BRIDGE_V2_REQUEST_EVENT ? "plan-exec:bridge:v2:reply:" : "plan-exec:bridge:v1:reply:", {
+    success: true, data: { state: "pending", operationId: "op", requestDigest: owner.requestDigest },
+  });
+  assert.equal((await pending).success, true);
+  assert.equal(request?.event, BRIDGE_V2_REQUEST_EVENT);
+  assert.equal(request?.payload.version, 2);
+  assert.equal(request?.payload.method, "operation");
+  assert.deepEqual(request?.payload.owner, owner);
+});
+
+test("cold cancellation remains bounded and retries the same owned operation", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const events = new TestEvents();
+  const owner = { kind: "pi-plan-exec" as const, runId: "plan", key: "op", requestDigest: "caller-digest" };
+  const first = new BridgeClient(events, 50).cancelOperation("op", owner);
+  t.mock.timers.tick(50);
+  const timedOut = await first;
+  assert.equal(timedOut.success, false);
+  assert.equal(timedOut.error.code, "timeout");
+  assert.equal(events.listenerCount, 0);
+  const retry = new BridgeClient(events, 50).cancelOperation("op", owner);
+  let retrySettled = false;
+  void retry.then(() => { retrySettled = true; });
+  events.replyAt(0, "plan-exec:bridge:v2:reply:", { success: true, data: { state: "cancelled" } });
+  await Promise.resolve();
+  assert.equal(retrySettled, false);
+  const request = events.emitted;
+  events.reply(request?.event === BRIDGE_V2_REQUEST_EVENT ? "plan-exec:bridge:v2:reply:" : "plan-exec:bridge:v1:reply:", {
+    success: true, data: { state: "stopping", operationId: "op", requestDigest: owner.requestDigest },
+  });
+  assert.equal((await retry).success, true);
+  assert.deepEqual(events.emissions.map(({ event, payload }) => ({ event, operationId: payload.operationId, owner: payload.owner })),
+    Array.from({ length: 2 }, () => ({ event: BRIDGE_V2_REQUEST_EVENT, operationId: "op", owner })));
+  assert.equal(events.listenerCount, 0);
 });
 
 test("diagnostic guidance stays bound to confirmed failure and durable operation identity", async () => {

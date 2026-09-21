@@ -371,16 +371,16 @@ export class BridgeClient {
     operationId: string,
     owner?: BridgeOperationOwner,
   ): Promise<BridgeResult> {
-    return this.request(this.protocolVersion(), "operation", {
+    return this.request(owner ? 2 : this.protocolVersion(), "operation", {
       operationId,
-      ...(this.protocolVersion() === 2 && owner ? { owner } : {}),
+      ...(owner ? { owner } : {}),
     });
   }
 
   cancelOperation(operationId: string, owner?: BridgeOperationOwner): Promise<BridgeResult> {
-    return this.request(this.protocolVersion(), "cancelOperation", {
+    return this.request(2, "cancelOperation", {
       operationId,
-      ...(this.protocolVersion() === 2 && owner ? { owner } : {}),
+      ...(owner ? { owner } : {}),
     });
   }
 
