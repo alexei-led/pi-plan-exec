@@ -162,8 +162,7 @@ resume.
 - If a fallback list is configured, it is an explicit ordered policy. A prior
   backend must be proven not to own a live child before another backend starts.
 - An unavailable or ambiguous provider keeps the durable operation ID and review
-  stage. Do not launch a second provider manually; use `/exec resume` for
-  recovery.
+  stage. Automatic probes continue; do not launch a second provider manually.
 
 ## Start safely
 

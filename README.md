@@ -25,10 +25,9 @@ selected review backend. A worker saying “done” is not enough: the plan’s
 checked items, accepted commit, required checks, and a clean worktree with no
 uncommitted or untracked non-ignored files are the implementation record.
 
-> Experimental implementation draft. The strict controller requires the new
+> Pre-release feature. The strict controller requires the pinned
 > `pi-subagents/kernel-owned-process` Darwin runtime and matching Bridge,
-> Fusion, and Revmux ownership contracts. Host smoke evidence exists, and the
-> native source pin is under review, but package publication is still pending;
+> Fusion, and Revmux ownership contracts. The installed-runtime smoke passes;
 > unsupported APIs and unknown ownership remain fenced. Do not treat the latest
 > npm package as ready for autonomous production runs; see [runtime contracts](docs/runtime-contracts.md).
 
@@ -60,7 +59,7 @@ They remain unavailable when the exact native dependency is missing.
   independent task. A failed partial task stays in its lane while an eligible
   independent task can use a clean lane from the last accepted commit.
   Completed lane work is promoted back to the original output branch by a
-  guarded fast-forward before review.
+  guarded fast-forward after required review and verification.
 
 ## Install and run
 
@@ -68,13 +67,13 @@ Use a project-local source checkout with the exact dependency Git refs listed
 in [runtime contracts](docs/runtime-contracts.md). This pre-release path is not
 provided by the published npm runtime; do not install the latest provider
 versions and assume that they expose the required native contract. The exact
-native pin is recorded in the runtime contract and remains under review until
-the linked dependency PR publishes the public API. Fusion and Revmux are optional explicit review backends; the
+native pin is recorded in the runtime contract and provides the public API
+without requiring a package release. Fusion and Revmux are optional explicit review backends; the
 default backend is one required subagent reviewer. `@tintinweb/pi-tasks` is an
 optional projection cache.
 
-The providers remain independent Pi packages. This incomplete implementation
-draft is tested against the exact dependency commits and linked dependency PRs
+The providers remain independent Pi packages. This feature
+is tested against the exact dependency commits and linked dependency PRs
 listed in [runtime contracts](docs/runtime-contracts.md). The default
 review backend is `subagent` with an empty fallback list (`none`). An ambiguous
 Fusion or Revmux launch keeps its operation ID and remains recoverable instead

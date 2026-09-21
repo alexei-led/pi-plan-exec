@@ -1,6 +1,6 @@
 # Autonomous runtime contracts
 
-This branch is an incomplete implementation draft. A production run is admitted
+A run is admitted
 only when the selected runtime advertises explicit lifetime support and full
 ownership of every operation-owned descendant. The current installed npm
 package does not provide the new public native contract. The pre-release source
@@ -123,9 +123,9 @@ ownership decisions.
 `npm run test:runtime-smoke` is the declared host-boundary smoke check. Its
 model turns are scripted; a passing smoke run is not a live-LLM guarantee. A
 Darwin host with the native GUI/compiler prerequisites is required for the
-supported path. One real full-pipeline execution has passed and must be
-repeated after the final dependency pins; the main full gate and cumulative
-Revmux review remain pending.
+supported path. The full pipeline passed on the final dependency pins. The
+main full gate passed all 444 tests, lint, TypeScript and package validation;
+the final cumulative Revmux review remains pending.
 
 ## Source and review tracking
 
@@ -143,13 +143,13 @@ The source pins currently under review are:
 - Revmux: `398d8f11c13737cb26354fa963e0b347abcc916d`;
 - Pi SDK: `0.86.1`.
 
-Reported dependency checks are native 3319 unit and 1080 integration tests,
+Reported dependency checks are native 3325 unit and 1080 integration tests,
 Bridge 72 tests plus delayed-admission/restart/cancel smoke, Fusion 250 unit,
 105 integration, and one E2E, and the Revmux full Go gates. These are dependency
 evidence, not a claim that the main product gate or full production pipeline is
 complete.
 
-The dependency scopes have reported their checks, but the main full gate and
-final cumulative Revmux review are still pending. The implementation remains
+The main and dependency scopes have passed their checks. The
+final cumulative Revmux review is still pending. The implementation remains
 draft; no release or production support claim follows from host smoke checks or
 dependency test results alone.
