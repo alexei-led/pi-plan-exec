@@ -1,4 +1,4 @@
-import { appendFile, writeFile } from "node:fs/promises";
+import { appendFile, rename, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
 import { execFile } from "node:child_process";
@@ -68,7 +68,11 @@ const executeLocalCommands = async (cwd, commands, options) => {
   return runCommands(cwd, commands, options);
 };
 const controller = new PlanExecController(registry, bridge, fusion, command, executeLocalCommands);
-const writeState = async (run) => writeFile(statePath, JSON.stringify({ id: run.id, lane: run.lanePreparation?.cwd, status: run.status, stage: run.stage, outputPromotion: run.outputPromotion, archiveOperation: run.archiveOperation }));
+const writeState = async (run) => {
+  const temporary = `${statePath}.${process.pid}.tmp`;
+  await writeFile(temporary, JSON.stringify({ id: run.id, lane: run.lanePreparation?.cwd, status: run.status, stage: run.stage, outputPromotion: run.outputPromotion, archiveOperation: run.archiveOperation }));
+  await rename(temporary, statePath);
+};
 await writeFile(readyPath, String(process.pid));
 
 if (mode === "start") {
