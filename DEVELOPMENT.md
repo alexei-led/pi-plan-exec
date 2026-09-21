@@ -17,9 +17,9 @@ Reload Pi after changing the extension:
 The draft runtime contracts are pinned to immutable Git commits in the lockfile.
 Use npm 12.0.2: the project permits only directly declared Git dependencies via
 `allow-git=root`; npm 11.12.1 misclassifies their normalized URLs during a clean
-install. No global npm configuration change is required. The current ownership
-limitation still blocks strict autonomous execution; see
-[runtime contracts](docs/runtime-contracts.md) before attempting an execution.
+install. No global npm configuration change is required. Strict execution uses
+the pinned macOS runtime and requires its GUI launchd/compiler prerequisites;
+see [runtime contracts](docs/runtime-contracts.md) before attempting an execution.
 
 ## Validation
 

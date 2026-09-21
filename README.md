@@ -15,9 +15,9 @@ A capable agent can lose context, repeat work, skip verification, or start a
 second writer after a restart. This extension moves task order, automatic
 recovery, worktree checks, commit acceptance, and provider reconciliation out of
 prompt prose into durable controller state.
-The controller keeps polling instead of asking one chat prompt to remember the
-whole job, but the strict runtime contract is not yet satisfied by the tested
-providers.
+The controller keeps polling and reconciles durable operations after a restart.
+The pinned providers implement the strict runtime contract on supported macOS
+hosts with the prerequisites documented below.
 
 It executes ready checked-list tasks in a Git checkout you choose, then runs
 the required review and fix stages with fresh Pi subagents or an explicitly
