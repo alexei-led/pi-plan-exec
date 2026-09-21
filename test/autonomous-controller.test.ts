@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { promisify } from "node:util";
@@ -10,9 +11,9 @@ import test, { type TestContext } from "node:test";
 import { PlanExecController } from "../src/controller.js";
 import { bridgeRequestDigest, processTerminalProof, type BridgeOperationOwner, type DiagnosticGuidanceRequest } from "../src/bridge.js";
 import { execReconcile, reconcileForResume } from "../src/index.js";
-import { readPlan } from "../src/plan.js";
+import { parsePlan, readPlan } from "../src/plan.js";
 import { RunRegistry } from "../src/registry.js";
-import { reconcileTasks, selectReadyTask } from "../src/scheduler.js";
+import { nextTaskWake, reconcileTasks, selectReadyTask } from "../src/scheduler.js";
 import { DEFAULT_FROZEN_RUN_CONFIG, MAX_EXECUTION_TIMEOUT_MS, type BridgeResult, type ExecutionLifetime, type PlanExecRun } from "../src/types.js";
 import type { RunCommand } from "../src/git.js";
 import { LocalOperationCancelledError, LocalOperationFailedError, LocalOperationUnknownError, runLocalOperation } from "../src/local-operation.js";
@@ -122,7 +123,7 @@ class DurableReviewBackend {
   adopt(runId: string) { return this.status(runId); }
 }
 
-async function fixture(t: TestContext, content = "### Task 1: A\n- [ ] A\n", subdirectory = "", planDirectory = subdirectory) {
+async function fixture(t: TestContext, content = "### Task 1: A\n- [ ] A\n", subdirectory = "", planDirectory = subdirectory, trackedPlan = true) {
   const root = await realpath(await mkdtemp(join(tmpdir(), "autonomous-controller-")));
   t.after(() => rm(root, { recursive: true, force: true }));
   const git = async (...args: string[]) => {
@@ -140,7 +141,8 @@ async function fixture(t: TestContext, content = "### Task 1: A\n- [ ] A\n", sub
   const planPath = join(root, planDirectory, "plan.md");
   await mkdir(dirname(planPath), { recursive: true });
   await writeFile(planPath, content);
-  await git("add", relative(root, planPath)); await git("commit", "-m", "baseline");
+  if (trackedPlan) await git("add", relative(root, planPath));
+  await git("commit", "--allow-empty", "-m", "baseline");
   const plan = await readPlan(planPath);
   const registry = new RunRegistry(join(root, ".git", "runs"));
   const worker = new Worker(join(root, ".git", "result.json"));
@@ -157,6 +159,281 @@ async function fixture(t: TestContext, content = "### Task 1: A\n- [ ] A\n", sub
 async function due(registry: RunRegistry, run: PlanExecRun) {
   return registry.update({ ...run, nextAttemptAt: 0, ...(run.activeOperation ? { activeOperation: { ...run.activeOperation, launchStartedAt: 0 } } : {}) });
 }
+
+for (const change of [
+  { before: [1], after: [], dispatched: true },
+  { before: [], after: [1], dispatched: false },
+]) {
+  test(`approved dependency change ${JSON.stringify(change.before)} to ${JSON.stringify(change.after)} recomputes readiness`, async (t) => {
+    const content = (dependencies: number[]) => `### Task 1: A\n- [ ] A\n### Task 2: B\ndependsOn: ${JSON.stringify(dependencies)}\n- [ ] B\n`;
+    const f = await fixture(t, content(change.before));
+    t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+    const baseline = await f.git("rev-parse", "HEAD");
+    let run = await f.registry.update({ ...f.run, status: "paused", userStopped: true, stopGeneration: 1,
+      taskAttempts: { "1": 1, "2": 3 }, tasks: {
+        "1": { taskId: 1, dependsOn: [], state: "waiting_external", attempts: 1,
+          nextAttemptAt: Date.now() + 60_000, reason: "Provider credentials remain unavailable" },
+        "2": { taskId: 2, dependsOn: change.before, state: change.before.length ? "waiting_dependency" : "ready",
+          attempts: 3, lastScheduledAt: 1, laneCwd: f.root, laneBranch: "feature", baselineCommit: baseline },
+      } });
+    await writeFile(f.planPath, content(change.after));
+    const approved = await readPlan(f.planPath);
+    run = await f.controller.resume(run.id, "session", true, approved.hash);
+    assert.equal(run.planHash, approved.hash);
+    assert.deepEqual(run.tasks?.["2"]?.dependsOn, change.after);
+    assert.equal(run.tasks?.["2"]?.baselineCommit, baseline);
+    assert.equal(run.taskAttempts["2"], 3);
+    assert.equal(f.worker.launches.length, change.dispatched ? 1 : 0);
+    if (change.dispatched) assert.equal(run.activeOperation?.taskId, 2);
+    else {
+      assert.equal(run.tasks?.["2"]?.state, "waiting_dependency");
+      assert.ok((run.nextAttemptAt ?? 0) > Date.now());
+    }
+  });
+}
+
+for (const trackedPlan of [true, false]) {
+test(`approved dependency removal completes in a fresh nested lane with ${trackedPlan ? "tracked" : "untracked"} baseline plan`, async (t) => {
+  const original = "### Task 1: A\n- [ ] A\n### Task 2: B\ndependsOn: [1]\n- [ ] B\n### Task 3: C\ndependsOn: [1]\n- [ ] C\n";
+  const f = await fixture(t, original, "packages/api", "docs/plans", trackedPlan);
+  await writeFile(join(f.run.worktreeCwd, "package.txt"), "nested package\n");
+  await f.git("add", "packages/api/package.txt"); await f.git("commit", "-m", "nested package");
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const lanes = new Set<string>();
+  t.after(async () => { for (const lane of lanes) await rm(lane, { recursive: true, force: true }); });
+  let run = await f.controller.tick(f.run.id, "session");
+  const sourceCwd = run.worktreeCwd;
+  await writeFile(join(sourceCwd, "partial.txt"), "A private partial work\n");
+  await writeFile(f.planPath, original.replace("[ ] A", "[x] A"));
+  f.worker.state = "failed"; f.worker.proof = true;
+  f.worker.output = "<<<RALPHEX:TASK_FAILED>>>\nPrerequisite: credentials\nEvidence: provider returned HTTP 401";
+  run = await f.controller.tick(run.id, "session");
+  const approvedContent = original.replace("dependsOn: [1]", "dependsOn: []").replace("[ ] A", "[x] A");
+  await writeFile(f.planPath, approvedContent);
+  run = await f.controller.tick(run.id, "session");
+  assert.equal(run.status, "paused");
+  f.worker.state = "running"; f.worker.proof = false; f.worker.output = "";
+  run = await f.controller.resume(run.id, "session", true, (await readPlan(f.planPath)).hash);
+  for (let step = 0; step < 12 && f.worker.launches.length < 2; step++) {
+    if (run.lanePreparation) lanes.add(run.lanePreparation.cwd);
+    run = await f.controller.tick((await due(f.registry, run)).id, "session");
+  }
+  assert.equal(run.activeOperation?.taskId, 2, run.error ?? "B did not launch");
+  assert.ok(run.worktreeCwd.endsWith("/packages/api"));
+  assert.equal((await readPlan(run.planPath)).tasks[0]?.unchecked.length, 1);
+  await assert.rejects(readFile(join(run.worktreeCwd, "partial.txt")), { code: "ENOENT" });
+  await writeFile(run.planPath, (await readFile(run.planPath, "utf8")).replace("[ ] B", "[x] B"));
+  assert.equal((await command("git", ["add", "--all"], run.worktreeCwd)).code, 0);
+  assert.equal((await command("git", ["commit", "-m", "B under approved dependencies"], run.worktreeCwd)).code, 0);
+  f.worker.state = "complete"; f.worker.proof = true;
+  run = await f.controller.tick(run.id, "session");
+  assert.equal(run.tasks?.["2"]?.state, "accepted", run.tasks?.["2"]?.reason ?? "B was not accepted");
+  assert.equal(run.tasks?.["1"]?.state, "waiting_external");
+  assert.equal(run.tasks?.["3"]?.state, "waiting_dependency");
+  assert.equal(await readFile(f.planPath, "utf8"), approvedContent);
+  assert.equal(await readFile(join(sourceCwd, "partial.txt"), "utf8"), "A private partial work\n");
+});
+}
+
+for (const outcome of ["failed", "complete", "superseded"]) {
+test(`interrupted approved plan publication reconciles its ${outcome} operation before inspecting its dirty lane`, async (t) => {
+  const original = "### Task 1: A\n- [ ] A\n### Task 2: B\n- [ ] B\n";
+  const f = await fixture(t, original);
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const baseline = await f.git("rev-parse", "HEAD");
+  let run = await f.registry.update({ ...f.run, status: "paused", acceptedHead: baseline, tasks: {
+    "1": { taskId: 1, dependsOn: [], state: "waiting_external", attempts: 1, nextAttemptAt: Date.now() + 60_000,
+      laneCwd: f.root, laneBranch: "feature", baselineCommit: baseline },
+    "2": { taskId: 2, dependsOn: [1], state: "waiting_dependency", attempts: 0 },
+  } });
+  await writeFile(f.planPath, original.replace("### Task 2: B\n", "### Task 2: B\ndependsOn: []\n"));
+  run = await f.controller.resume(run.id, "session", true, (await readPlan(f.planPath)).hash);
+  const damagedLane = run.lanePreparation!.cwd;
+  const lanes = new Set([damagedLane]);
+  t.after(async () => { for (const lane of lanes) await rm(lane, { recursive: true, force: true }); });
+  const publicationIds: string[] = [];
+  const executor: typeof runCommands = async (cwd, commands, options) => {
+    if (options.operationId.startsWith("plan:publish:") && cwd === damagedLane) {
+      publicationIds.push(options.operationId);
+      if (publicationIds.length === 1) {
+        if (outcome === "failed") await writeFile(join(cwd, "plan.md"), "partial publication");
+        else await f.localExecutor(cwd, commands, options);
+        throw new LocalOperationUnknownError("Publication process ownership remains unresolved.");
+      }
+      if (outcome === "failed") throw new LocalOperationFailedError("Publication failed after confirmed process-tree exit.");
+    }
+    return f.localExecutor(cwd, commands, options);
+  };
+  const controller = new PlanExecController(f.registry, f.worker, fusion, command, executor);
+  for (let step = 0; step < 3 && publicationIds.length === 0; step++) run = await controller.tick(run.id, "session");
+  assert.equal(publicationIds.length, 1);
+  assert.equal(run.lanePreparation?.cwd, damagedLane);
+  assert.equal(f.worker.launches.length, 0);
+  if (outcome === "superseded") {
+    await writeFile(f.planPath, (await readFile(f.planPath, "utf8")).replace("Task 2: B", "Task 2: B updated"));
+    run = await controller.resume(run.id, "session", true, (await readPlan(f.planPath)).hash);
+  } else run = await controller.tick((await due(f.registry, run)).id, "session");
+  assert.deepEqual(publicationIds, [publicationIds[0], publicationIds[0]]);
+  if (outcome !== "complete") assert.notEqual(run.lanePreparation?.cwd, damagedLane);
+  else assert.equal(run.lanePreparation?.cwd, damagedLane);
+  for (let step = 0; step < 8 && !run.activeOperation; step++) {
+    if (run.lanePreparation) lanes.add(run.lanePreparation.cwd);
+    run = await controller.tick((await due(f.registry, run)).id, "session");
+  }
+  assert.equal(run.activeOperation?.taskId, 2, run.error ?? "B did not launch after publication recovery");
+  if (outcome === "failed") assert.equal(await readFile(join(damagedLane, "plan.md"), "utf8"), "partial publication");
+  if (outcome === "superseded") {
+    assert.equal((await readPlan(join(damagedLane, "plan.md"))).tasks[1]?.title, "B");
+    assert.equal((await readPlan(run.planPath)).tasks[1]?.title, "B updated");
+  }
+  assert.equal((await readPlan(run.planPath)).hash, run.planHash);
+});
+}
+
+for (const fault of ["ENOSPC", "SIGKILL"]) {
+test(`atomic plan publisher preserves the baseline after ${fault} during its write`, async (t) => {
+  const f = await fixture(t);
+  const original = await readFile(f.planPath, "utf8");
+  const content = `${"Reviewed plan description.\n".repeat(20_000)}${original}`;
+  const payload = JSON.stringify({ cwd: f.root, path: f.planPath, expectedContent: original, content });
+  const digest = createHash("sha256").update(payload).digest("hex");
+  const payloadPath = join(f.root, ".git", "publication.json");
+  const injector = join(f.root, ".git", "publication-fault.mjs");
+  await writeFile(payloadPath, payload);
+  await writeFile(injector, `import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+const open = fs.promises.open;
+fs.promises.open = async (...args) => {
+  const file = await open(...args);
+  if (String(args[0]).includes(".plan-exec-")) {
+    const write = file.writeFile.bind(file);
+    file.writeFile = async (content) => {
+      await write(content.slice(0, 20));
+      ${fault === "SIGKILL" ? 'process.kill(process.pid, "SIGKILL");' : 'throw Object.assign(new Error("Injected disk full"), { code: "ENOSPC" });'}
+    };
+  }
+  return file;
+};
+syncBuiltinESMExports();
+`);
+  const publisher = new URL("../src/plan-publisher.mjs", import.meta.url).pathname;
+  const failed = await command(process.execPath, ["--import", injector, publisher, payloadPath, digest], f.root);
+  assert.notEqual(failed.code, 0);
+  assert.equal(await readFile(f.planPath, "utf8"), original);
+  const temporary = (await readdir(f.root)).find((name) => name.startsWith(".plan-exec-"));
+  assert.ok(temporary);
+  assert.equal(await readFile(join(f.root, temporary), "utf8"), content.slice(0, 20));
+});
+}
+
+test("approved dependency addition prevents acceptance of an already active B", async (t) => {
+  const original = "### Task 1: A\n- [ ] A\n### Task 2: B\ndependsOn: []\n- [ ] B\n";
+  const f = await fixture(t, original);
+  let run = await f.registry.update({ ...f.run, tasks: {
+    "1": { taskId: 1, dependsOn: [], state: "retry_wait", attempts: 1, nextAttemptAt: Date.now() + 60_000 },
+  } });
+  run = await f.controller.tick(run.id, "session");
+  assert.equal(run.activeOperation?.taskId, 2);
+  await writeFile(f.planPath, original.replace("dependsOn: []", "dependsOn: [1]").replace("[ ] B", "[x] B"));
+  await f.git("add", "plan.md"); await f.git("commit", "-m", "B with new dependency");
+  f.worker.state = "complete"; f.worker.proof = true;
+  run = await f.controller.resume(run.id, "session", true, (await readPlan(f.planPath)).hash);
+  assert.equal(run.tasks?.["2"]?.state, "waiting_dependency");
+  assert.equal(run.tasks?.["2"]?.acceptedCommit, undefined);
+  assert.equal(run.activeOperation, undefined);
+  assert.deepEqual(run.tasks?.["2"]?.dependsOn, [1]);
+  assert.ok(run.failedOperation?.processTreeExited);
+});
+
+test("approved new unchecked work reopens an accepted task without erasing its history", async (t) => {
+  const f = await fixture(t, "### Task 1: A\n- [x] A\n");
+  const baseline = await f.git("rev-parse", "HEAD");
+  let run = await f.registry.update({ ...f.run, status: "paused", acceptedHead: baseline, tasks: {
+    "1": { taskId: 1, dependsOn: [], state: "accepted", attempts: 2, acceptedCommit: baseline },
+  } });
+  const content = "### Task 1: A\n- [x] A\n- [ ] Additional work\n";
+  await writeFile(f.planPath, content);
+  run = await f.controller.resume(run.id, "session", true, (await readPlan(f.planPath)).hash);
+  assert.equal(run.activeOperation?.taskId, 1);
+  assert.equal(run.tasks?.["1"]?.state, "running");
+  assert.equal(run.tasks?.["1"]?.acceptedCommit, baseline);
+  assert.deepEqual((await f.registry.get(run.id))?.approvedPlan, { hash: run.planHash, content });
+  await assert.rejects(f.registry.update({ ...run, approvedPlan: { hash: run.planHash, content: "invalid plan" } }), /Invalid plan-exec run registry entry/);
+});
+
+test("explicit approval must match the current plan snapshot", async (t) => {
+  const f = await fixture(t);
+  await writeFile(f.planPath, "### Task 1: Changed\n- [ ] A\n");
+  const run = await f.controller.resume(f.run.id, "session", true, f.run.planHash);
+  assert.equal(run.status, "paused");
+  assert.equal(run.approvedPlan, undefined);
+  assert.equal(f.worker.launches.length, 0);
+});
+
+test("approved structure rotates a stale existing task lane without overwriting it", async (t) => {
+  const original = "### Task 1: A\n- [ ] A\n### Task 2: B\n- [ ] B\n";
+  const f = await fixture(t, original);
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const baseline = await f.git("rev-parse", "HEAD");
+  const oldLane = `${f.root}-old-b`;
+  const lanes = new Set([oldLane]);
+  t.after(async () => { for (const lane of lanes) await rm(lane, { recursive: true, force: true }); });
+  await f.git("worktree", "add", "-b", "old-b", oldLane, baseline);
+  await writeFile(join(oldLane, "partial-b.txt"), "B preserved work\n");
+  let run = await f.registry.update({ ...f.run, status: "paused", acceptedHead: baseline, tasks: {
+    "1": { taskId: 1, dependsOn: [], state: "waiting_external", attempts: 1, nextAttemptAt: Date.now() + 60_000 },
+    "2": { taskId: 2, dependsOn: [1], state: "waiting_dependency", attempts: 1,
+      laneCwd: oldLane, laneBranch: "old-b", baselineCommit: baseline },
+  } });
+  await writeFile(f.planPath, original.replace("### Task 2: B\n", "### Task 2: B\ndependsOn: []\n"));
+  run = await f.controller.resume(run.id, "session", true, (await readPlan(f.planPath)).hash);
+  for (let step = 0; step < 8 && !run.activeOperation; step++) {
+    if (run.lanePreparation) lanes.add(run.lanePreparation.cwd);
+    run = await f.controller.tick((await due(f.registry, run)).id, "session");
+  }
+  assert.equal(run.activeOperation?.taskId, 2);
+  assert.notEqual(run.worktreeCwd, oldLane);
+  assert.equal(run.tasks?.["2"]?.recoverySource?.cwd, oldLane);
+  assert.equal(await readFile(join(oldLane, "plan.md"), "utf8"), original);
+  assert.equal(await readFile(join(oldLane, "partial-b.txt"), "utf8"), "B preserved work\n");
+  await assert.rejects(readFile(join(run.worktreeCwd, "partial-b.txt")), { code: "ENOENT" });
+});
+
+test("unapproved structure drift in an alternate task lane still pauses", async (t) => {
+  const f = await fixture(t);
+  const baseline = await f.git("rev-parse", "HEAD");
+  const lane = `${f.root}-drift`;
+  t.after(() => rm(lane, { recursive: true, force: true }));
+  await f.git("worktree", "add", "-b", "drift", lane, baseline);
+  const changed = "### Task 1: Unapproved change\n- [ ] A\n";
+  await writeFile(join(lane, "plan.md"), changed);
+  let run = await f.registry.update({ ...f.run, tasks: {
+    "1": { taskId: 1, dependsOn: [], state: "ready", attempts: 1, laneCwd: lane, laneBranch: "drift", baselineCommit: baseline },
+  } });
+  run = await f.controller.tick(run.id, "session");
+  assert.equal(run.status, "paused");
+  assert.equal(f.worker.launches.length, 0);
+  assert.equal(run.lanePreparation, undefined);
+  assert.equal(await readFile(join(lane, "plan.md"), "utf8"), changed);
+});
+
+test("removing a dependency retains the task retry deadline and history", () => {
+  const plan = parsePlan("plan.md", "### Task 1: A\n- [ ] A\n### Task 2: B\ndependsOn: []\n- [ ] B\n");
+  for (const external of [false, true]) {
+    const existing: NonNullable<PlanExecRun["tasks"]> = {
+      "1": { taskId: 1, dependsOn: [], state: "retry_wait", attempts: 1, nextAttemptAt: 10_000 },
+      "2": { taskId: 2, dependsOn: [1], state: "waiting_dependency", attempts: 3, nextAttemptAt: 5_000,
+        ...(external ? { externalPrerequisite: { kind: "credentials", source: "worker", evidence: "HTTP 401" } } : {}) },
+    };
+    const reconciled = reconcileTasks(plan.tasks, existing, 1_000);
+    assert.equal(reconciled["2"]?.state, external ? "waiting_external" : "retry_wait");
+    assert.equal(reconciled["2"]?.attempts, 3);
+    assert.deepEqual(reconciled["2"]?.dependsOn, []);
+    assert.equal(nextTaskWake(reconciled, 1_000), 5_000);
+    assert.deepEqual(existing["2"]?.dependsOn, [1]);
+    assert.equal(existing["2"]?.state, "waiting_dependency");
+  }
+});
 
 for (const planDirectory of ["packages/api", "docs/plans"]) {
 test(`nested execution keeps the worker cwd with plan in ${planDirectory}`, async (t) => {

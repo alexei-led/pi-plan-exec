@@ -199,6 +199,16 @@ function readBinding(value: unknown): KernelOperationBinding {
   return value as unknown as KernelOperationBinding;
 }
 
+function generationStopMatches(value: unknown, runId: string, operationId: string, generation: number): boolean {
+  return record(value) && value.version === 1 && value.kind === "generation-cancelled" &&
+    value.runId === runId && value.operationId === operationId && value.generation === generation;
+}
+
+function stopMatches(value: unknown, intent: LocalOperationIntent): boolean {
+  return record(value) && value.digest === intent.digest ||
+    generationStopMatches(value, intent.runId, intent.operationId, intent.authorization?.stopGeneration ?? 0);
+}
+
 function kernelRequestFor(directory: string, intent: LocalOperationIntent, artifactDirectory: string): KernelOwnedProcessRequest {
   return {
     operationDirectory: join(directory, "owned-process"), artifactDirectory,
@@ -208,26 +218,57 @@ function kernelRequestFor(directory: string, intent: LocalOperationIntent, artif
 }
 
 async function runOwnedOperation(cwd: string, commands: string[][], options: LocalOperationOptions): Promise<void> {
-  if (!commands.length) return;
   if (commands.some(command => !command.length || !command[0] || command.some(arg => typeof arg !== "string"))) throw new Error("An empty verification/bootstrap command is invalid.");
   const directory = localOperationDirectory(options);
   await mkdir(dirname(directory), { recursive: true, mode: JOURNAL_DIRECTORY_MODE });
+  const generations = await readdir(dirname(directory), { withFileTypes: true });
+  if (!commands.length && !generations.length) return;
   const runtimeModule = options.runtimeModule ?? pathToFileURL(require.resolve("pi-subagents/kernel-owned-process")).href;
   const runtime: KernelRuntime = await bounded(import(runtimeModule));
-  for (const previous of await readdir(dirname(directory), { withFileTypes: true })) {
+  const generation = options.authorization?.stopGeneration ?? 0;
+  for (const previous of generations) {
     const prior = join(dirname(directory), previous.name);
-    if (prior === directory) continue;
+    if (prior === directory) {
+      if (!commands.length) throw new LocalOperationUnknownError("An empty batch cannot replace an existing local operation in the same generation.");
+      continue;
+    }
     if (!previous.isDirectory() || !/^generation-\d+$/.test(previous.name)) throw new LocalOperationUnknownError("Unrecognized local command generation journal.");
-    const priorIntent = readIntent(await json(join(prior, "intent.json")));
+    const priorGeneration = Number(previous.name.slice("generation-".length));
+    if (!Number.isSafeInteger(priorGeneration)) throw new LocalOperationUnknownError("Invalid local command generation.");
+    if (priorGeneration >= generation) throw new LocalOperationCancelledError("Local operation was superseded by a newer stop generation.");
+    // Publish the launch fence before deciding that an interrupted intent never started.
+    const priorStop = await immutableJson(join(prior, "stop.json"), {
+      version: 1, kind: "generation-cancelled", runId: options.runId, operationId: options.operationId, generation: priorGeneration,
+    });
+    let priorRaw = await json(join(prior, "intent.json"));
+    if (priorRaw === undefined) {
+      const artifacts = await readdir(prior);
+      priorRaw = await json(join(prior, "intent.json"));
+      if (priorRaw === undefined) {
+        const activeEntry = options.activeDirectory ? await json(join(options.activeDirectory, `${createHash("sha256").update(prior).digest("hex")}.json`)) : undefined;
+        if (!generationStopMatches(priorStop, options.runId, options.operationId, priorGeneration) ||
+            activeEntry !== undefined ||
+            artifacts.some(name => name !== "stop.json" && !/^(intent|stop)\.json\.[a-f0-9-]+\.tmp$/.test(name))) {
+          throw new LocalOperationUnknownError("Incomplete previous local command intent has unresolved launch evidence.");
+        }
+        continue;
+      }
+    }
+    const priorIntent = readIntent(priorRaw);
+    if (priorIntent.runId !== options.runId || priorIntent.operationId !== options.operationId ||
+        (priorIntent.authorization?.stopGeneration ?? 0) !== priorGeneration || !stopMatches(priorStop, priorIntent)) {
+      throw new LocalOperationUnknownError("Previous local command generation identity changed.");
+    }
     const priorPrepared = await bounded(runtime.prepareKernelOwnedProcess(kernelRequestFor(prior, priorIntent, join(options.journalRoot, "kernel-runtime"))));
     const priorBinding = readBinding(await immutableJson(join(prior, "binding.json"), priorPrepared));
     if (!bindingMatches(priorBinding, priorPrepared)) throw new LocalOperationUnknownError("Previous local command ownership binding changed.");
     const observation = await bounded(runtime.cancelKernelOwnedProcess(join(prior, "owned-process"), { deadlineMs: CANCEL_PROBE_MS }));
-    if (!terminal(observation, priorBinding) || priorIntent.runId !== options.runId || priorIntent.operationId !== options.operationId) {
+    if (!terminal(observation, priorBinding)) {
       throw new LocalOperationUnknownError("Previous local command generation has not proven exit; replacement remains fenced.");
     }
     if (options.activeDirectory) await removeActiveEntry(join(options.activeDirectory, `${createHash("sha256").update(prior).digest("hex")}.json`));
   }
+  if (!commands.length) return;
   await mkdir(directory, { recursive: true, mode: JOURNAL_DIRECTORY_MODE });
   const logical = { version: 2 as const, runId: options.runId, operationId: options.operationId, candidate: options.candidate ?? null, cwd: resolve(cwd), commands, authorization: options.authorization ?? null };
   let raw = await json(join(directory, "intent.json"));
@@ -263,13 +304,13 @@ async function runOwnedOperation(cwd: string, commands: string[][], options: Loc
   for (;;) {
     if (!(await bounded(options.isAuthorized()))) await stop();
     let stopped = await json(join(directory, "stop.json"));
-    if (stopped !== undefined && (!record(stopped) || stopped.digest !== intent.digest)) throw new LocalOperationUnknownError("Local command cancellation identity mismatch.");
+    if (stopped !== undefined && !stopMatches(stopped, intent)) throw new LocalOperationUnknownError("Local command cancellation identity mismatch.");
     let observation = stopped === undefined
       ? await bounded(runtime.observeKernelOwnedProcess(kernelRequest.operationDirectory))
       : await bounded(runtime.cancelKernelOwnedProcess(kernelRequest.operationDirectory, { deadlineMs: CANCEL_PROBE_MS }));
     if (stopped === undefined && observation.status === EXTERNAL_OPERATION_STATE.PENDING) {
       const lateStop = await json(join(directory, "stop.json"));
-      if (lateStop !== undefined && (!record(lateStop) || lateStop.digest !== intent.digest)) throw new LocalOperationUnknownError("Local command cancellation identity mismatch.");
+      if (lateStop !== undefined && !stopMatches(lateStop, intent)) throw new LocalOperationUnknownError("Local command cancellation identity mismatch.");
       if (!(await bounded(options.isAuthorized())) || lateStop !== undefined) {
         await stop();
         stopped = { digest: intent.digest };

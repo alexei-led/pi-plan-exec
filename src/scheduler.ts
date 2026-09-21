@@ -6,9 +6,11 @@ export function reconcileTasks(
   existing: Record<string, TaskExecution> = {},
   now = Date.now(),
 ): Record<string, TaskExecution> {
-  const tasks = Object.fromEntries(plan.map((task) => [String(task.id), existing[String(task.id)] ?? {
+  const tasks = Object.fromEntries(plan.map((task) => [String(task.id), existing[String(task.id)] ? {
+    ...existing[String(task.id)]!, dependsOn: [...task.dependsOn],
+  } : {
     taskId: task.id,
-    dependsOn: task.dependsOn,
+    dependsOn: [...task.dependsOn],
     state: task.unchecked.length === 0 ? "accepted" : "ready",
     attempts: 0,
   } satisfies TaskExecution]));
@@ -18,6 +20,8 @@ export function reconcileTasks(
       tasks[String(task.taskId)] = { ...task, state: "waiting_dependency" };
     } else if ((task.nextAttemptAt ?? 0) <= now) {
       tasks[String(task.taskId)] = { ...task, state: "ready" };
+    } else {
+      tasks[String(task.taskId)] = { ...task, state: task.externalPrerequisite ? "waiting_external" : "retry_wait" };
     }
   }
   return tasks;

@@ -3665,6 +3665,89 @@ test("a live lease is decisive on its own and nothing else is probed", async () 
   assert.deepEqual(await runEvidence(held, probe), { leaseLive: true });
 });
 
+test("explicit pause from an unrelated session polls a dead owner's worker until owned exit", { timeout: 5_000 }, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "exec-unrelated-pause-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const registry = new RunRegistry(join(root, "runs"));
+  const held = await registry.create(run({
+    repositoryRoot: join(root, "original"), worktreeCwd: join(root, "original"),
+    planPath: join(root, "original", "plan.md"), progressPath: join(root, "original", "progress.txt"),
+    lease: DEAD_LEASE,
+    activeOperation: { operationId: "owned-operation", externalRunId: "owned-worker", requestDigest: "owned-digest",
+      service: "bridge", kind: "implementation", taskId: 1,
+      expectedLifetime: { mode: "unbounded" }, effectiveLifetime: { mode: "unbounded" } },
+  }));
+  t.mock.method(RunRegistry.prototype, "get", registry.get.bind(registry));
+  t.mock.method(RunRegistry.prototype, "claim", registry.claim.bind(registry));
+  t.mock.method(RunRegistry.prototype, "updateIfCurrent", registry.updateIfCurrent.bind(registry));
+  const binding = { operationId: "kernel-operation", requestDigest: "kernel-digest",
+    hostId: "00000000-0000-0000-0000-000000000001", bootId: "00000000-0000-0000-0000-000000000002" };
+  const identity = { ...binding, version: 1, backend: "darwin-resource-coalition-v1", coalitionId: "2001",
+    leader: { pid: 4242, uniqueId: "1001", pidVersion: 1 } };
+  const proof = { version: 1, state: "observed", runId: "owned-worker", runnerProcessInstanceId: "fixture", observedAt: Date.now(),
+    processTreeOwnership: OWNED_PROCESS_TREE,
+    callerBinding: { operationId: "owned-operation", requestDigest: "owned-digest" },
+    nativeOperation: { operationId: "native-operation", digest: "native-digest" }, kernelBinding: binding,
+    kernelProof: { status: "retired", operationDirectory: join(root, "operation"), binding, identity,
+      proof: { ...binding, kind: "darwin-coalition-retired", identity, observedAt: new Date().toISOString() }, exitCode: 0, signal: null } };
+  let stopCalls = 0;
+  const unavailable = async (): Promise<never> => { throw new Error("Pause must not dispatch implementation or consume a result."); };
+  const bridge = {
+    spawn: unavailable, result: unavailable, adopt: unavailable, status: unavailable,
+    operation: async () => ({ success: true as const, data: { runId: "owned-worker", requestDigest: "owned-digest",
+      state: "found", status: stopCalls ? "stopped" : "running", ...(stopCalls ? { processTerminalProof: proof } : {}) } }),
+    stop: async (runId: string) => {
+      assert.equal(runId, "owned-worker");
+      stopCalls++;
+      return { success: true as const, data: { state: "stopping" } };
+    },
+  };
+  const controller = new PlanExecController(registry, bridge,
+    { start: unavailable, status: unavailable, result: unavailable, adopt: unavailable, cancel: unavailable }, unavailable);
+  assert.equal((await bridge.operation()).data.status, "running");
+  const cwd = join(root, "unrelated");
+  await mkdir(cwd);
+  const sessionId = "new-unrelated-session";
+  const ctx = { cwd, hasUI: false, sessionManager: { getSessionId: () => sessionId } } as unknown as ExtensionCommandContext;
+  let timer: ReturnType<typeof setInterval> | undefined;
+  t.after(() => { if (timer) clearInterval(timer); });
+  let finish!: (run: PlanExecRun) => void;
+  let fail!: (error: unknown) => void;
+  const exited = new Promise<PlanExecRun>((resolve, reject) => { finish = resolve; fail = reject; });
+  const response = await handleCommand(`pause ${held.id}`, ctx, {
+    controller, syncProjection: async (run) => run, checkRuntime: async () => undefined,
+    runtimeProblems: async () => [], doctorProbe: async () => ({}),
+    startBackgroundController: (paused, owner, controllerCwd) => {
+      assert.equal(paused.status, "paused");
+      assert.equal(paused.userStopped, true);
+      assert.equal(paused.lease?.sessionId, sessionId);
+      assert.equal(owner, sessionId);
+      assert.equal(controllerCwd, cwd);
+      let ticking = false;
+      timer = setInterval(() => {
+        if (ticking) return;
+        ticking = true;
+        void controller.tick(paused.id, owner).then((current) => {
+          if (shouldStopBackgroundController(current)) {
+            clearInterval(timer);
+            finish(current);
+          }
+        }).catch(fail).finally(() => { ticking = false; });
+      }, 5);
+    },
+  });
+  assert.match(response ?? "", /paused; its current attempt is stopping/);
+  assert.ok(timer, "Pause must attach a controller before returning, even outside the run's repository.");
+  const current = await exited;
+  assert.equal(stopCalls, 1);
+  assert.equal(current.status, "paused");
+  assert.equal(current.userStopped, true);
+  assert.equal(current.stopGeneration, 1);
+  assert.equal(current.activeOperation?.operationId, "owned-operation");
+  assert.equal(current.activeOperation?.processTreeExited, true);
+  assert.deepEqual(current.taskAttempts, held.taskAttempts);
+});
+
 test("cleanup reports every outcome instead of stopping at the first refusal", async () => {
   const first = retiredRun({ id: "33333333-3333-4333-8333-333333333333" });
   const second = retiredRun({ id: "44444444-4444-4444-8444-444444444444" });

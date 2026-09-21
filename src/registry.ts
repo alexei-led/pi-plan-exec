@@ -15,6 +15,7 @@ import { worktreeIdentity } from "./git.js";
 import { isSkippableStage, isTerminalStatus } from "./lifecycle.js";
 import { parseOperationActivity } from "./diagnostics.js";
 import { hasActiveLocalOperations } from "./local-operation.js";
+import { parsePlan } from "./plan.js";
 import {
   DEFAULT_FROZEN_RUN_CONFIG,
   MAX_EXECUTION_TIMEOUT_MS,
@@ -61,7 +62,6 @@ async function reservedCheckouts(run: RunReservations): Promise<Set<string>> {
     run.worktreeCwd,
     run.outputTarget?.cwd,
     run.lanePreparation?.cwd,
-    ...(run.lanePreparation?.sourcePlanPath ? [dirname(run.lanePreparation.sourcePlanPath)] : []),
     ...Object.values(run.tasks ?? {}).flatMap(task => [
       task.laneCwd,
       task.recoverySource?.cwd,
@@ -762,6 +762,7 @@ function assertRun(run: PlanExecRun): void {
     !Number.isFinite(run.updatedAt) ||
     !isFrozenConfig(run.config) ||
     !isAutonomousState(run) ||
+    !isApprovedPlan(run) ||
     (run.localOperationActive !== undefined && typeof run.localOperationActive !== "boolean") ||
     !Array.isArray(run.skippedStages) ||
     !run.skippedStages.every(
@@ -791,6 +792,14 @@ function assertRun(run: PlanExecRun): void {
   ) {
     throw new Error(`${INVALID_RUN_ENTRY}: ${run.id}`);
   }
+}
+
+function isApprovedPlan(run: PlanExecRun): boolean {
+  if (run.approvedPlan === undefined) return true;
+  if (!isRecord(run.approvedPlan) || typeof run.approvedPlan.content !== "string" || run.approvedPlan.hash !== run.planHash)
+    return false;
+  try { return parsePlan(run.planPath, run.approvedPlan.content).hash === run.planHash; }
+  catch { return false; }
 }
 
 function isFrozenConfig(value: unknown): boolean {
@@ -871,6 +880,9 @@ function isAutonomousState(run: PlanExecRun): boolean {
     !Number.isSafeInteger(run.lanePreparation.taskId) || run.lanePreparation.taskId < 0 ||
     !["create", "bootstrap"].includes(run.lanePreparation.state) || !timestamp(run.lanePreparation.nextAttemptAt) ||
     (run.lanePreparation.sourcePlanPath !== undefined && (typeof run.lanePreparation.sourcePlanPath !== "string" || !run.lanePreparation.sourcePlanPath)) ||
+    (run.lanePreparation.publication !== undefined && (!isRecord(run.lanePreparation.publication) ||
+      typeof run.lanePreparation.publication.planHash !== "string" || !/^[a-f0-9]{64}$/.test(run.lanePreparation.publication.planHash) ||
+      typeof run.lanePreparation.publication.digest !== "string" || !/^[a-f0-9]{64}$/.test(run.lanePreparation.publication.digest))) ||
     (run.lanePreparation.error !== undefined && typeof run.lanePreparation.error !== "string"))) return false;
   if (run.outputTarget !== undefined &&
     (!isRecord(run.outputTarget) || typeof run.outputTarget.cwd !== "string" || !run.outputTarget.cwd ||
