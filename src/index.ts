@@ -2439,6 +2439,7 @@ async function runAction(
       await requestStatus(claimed, EXEC_ACTION.PAUSE),
       { cwd: ctx.cwd, sessionId },
     );
+    startBackgroundController(paused, sessionId, ctx.cwd, ctx);
     return `Run ${shortRunId(paused.id)} paused; its current attempt is stopping and its checkpoint is preserved. Use /exec resume ${paused.id} to continue after confirmed exit.`;
   }
   const cancelled = await syncProjection(

@@ -363,6 +363,7 @@ export interface PlanExecRun {
   repositoryRoot: string;
   planPath: string;
   planHash: string;
+  approvedPlan?: { hash: string; content: string };
   worktreeCwd: string;
   branch: string;
   defaultBranch: string;
@@ -405,6 +406,7 @@ export interface PlanExecRun {
     nextAttemptAt?: number;
     error?: string;
     sourcePlanPath?: string;
+    publication?: { planHash: string; digest: string };
   };
   stageAttempts: Partial<Record<RunStage, number>>;
   reviewFindings: ReviewFinding[];

@@ -28,6 +28,7 @@ import {
   takeoverRefusal,
 } from "../src/registry.js";
 import { DEFAULT_FROZEN_RUN_CONFIG, type PlanExecRun } from "../src/types.js";
+import { workspaceEnvironment } from "../src/workspace-environment.js";
 
 type RunLease = NonNullable<PlanExecRun["lease"]>;
 
@@ -152,12 +153,12 @@ test("lane changes retain output, preparation, task and recovery checkouts acros
   for (const status of ["running", "paused", "failed", "cancelled"] as const) {
     const { registry, directory } = await seedRegistry();
     t.after(() => rm(directory, { recursive: true, force: true }));
-    const paths = Object.fromEntries(["current", "output", "preparing", "source-plan", "task", "recovery", "history"].map(name => [name, join(directory, name)]));
+    const paths = Object.fromEntries(["current", "output", "preparing", "task", "recovery", "history"].map(name => [name, join(directory, name)]));
     const recovery = (cwd: string) => ({ cwd, branch: "preserved", baselineCommit: "a".repeat(40), headCommit: "b".repeat(40), checkpointRef: "refs/plan-exec/checkpoint" });
     const existing = await registry.create(runSeed({
       status, worktreeCwd: paths.current!, planPath: join(paths.current!, "plan.md"),
       outputTarget: { cwd: paths.output!, branch: "feature", initialHead: "a".repeat(40), planRelativePath: "plan.md" },
-      lanePreparation: { cwd: paths.preparing!, branch: "new-lane", baselineCommit: "a".repeat(40), taskId: 1, state: "create", sourcePlanPath: join(paths["source-plan"]!, "plan.md") },
+      lanePreparation: { cwd: paths.preparing!, branch: "new-lane", baselineCommit: "a".repeat(40), taskId: 1, state: "create", sourcePlanPath: join(directory, "source-plan", "plan.md") },
       tasks: { "1": { taskId: 1, dependsOn: [], state: "retry_wait", attempts: 1, laneCwd: paths.task!, laneBranch: "task-a", recoverySource: recovery(paths.recovery!), recoveryHistory: [recovery(paths.history!)] } },
       ...(status === "cancelled" ? { activeOperation: { operationId: "unknown-writer", service: "bridge" as const, kind: "implementation" as const, recovery: "recovery_required" as const } } : {}),
     }), { exclusive: true });
@@ -185,6 +186,43 @@ test("prospective reservations cannot overlap an existing run through noncurrent
   ];
   for (const reservation of reservations) {
     await assert.rejects(registry.create(runSeed({ worktreeCwd: join(directory, "new"), planPath: join(directory, "new", "plan.md"), ...reservation }), { exclusive: true }), new RegExp(existing.id));
+  }
+});
+
+test("independent new-worktree runs can share a read-only source repository during creation and bootstrap recovery", async (t) => {
+  for (const state of ["create", "bootstrap"] as const) {
+    const { registry, directory } = await seedRegistry();
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const repository = join(directory, "repository");
+    const firstLane = join(directory, "lane-a");
+    const secondLane = join(directory, "lane-b");
+    await mkdir(join(repository, "plans"), { recursive: true });
+    const git = (args: string[]) => {
+      const result = spawnSync("git", args, { cwd: repository, env: workspaceEnvironment(), encoding: "utf8" });
+      assert.equal(result.status, 0, result.stderr);
+      return result.stdout.trim();
+    };
+    git(["init", "-q"]);
+    await writeFile(join(repository, "plans", "a.md"), "# A\n");
+    await writeFile(join(repository, "plans", "b.md"), "# B\n");
+    git(["add", "plans"]);
+    git(["-c", "user.name=Registry Test", "-c", "user.email=registry@example.invalid", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "commit", "-qm", "fixture"]);
+    const baseline = git(["rev-parse", "HEAD"]);
+    assert.equal(git(["status", "--porcelain"]), "");
+    if (state === "bootstrap") git(["worktree", "add", "-q", "-b", "lane-a", firstLane]);
+    const prepared = (cwd: string, plan: string, status: RunSeed["status"], phase: "create" | "bootstrap"): RunSeed => runSeed({
+      repositoryRoot: repository, worktreeCwd: cwd, planPath: join(cwd, "plans", plan), status,
+      outputTarget: { cwd, branch: "lane", initialHead: baseline, planRelativePath: `plans/${plan}` },
+      lanePreparation: { cwd, branch: "lane", baselineCommit: baseline, taskId: 1, state: phase, sourcePlanPath: join(repository, "plans", plan), nextAttemptAt: Date.now() + 1_000 },
+    });
+    const first = await registry.create(prepared(firstLane, "a.md", state === "bootstrap" ? "failed" : "starting", state), { exclusive: true });
+    const second = await registry.create(prepared(secondLane, "b.md", "starting", "create"), { exclusive: true });
+    assert.notEqual(first.id, second.id);
+    await assert.rejects(registry.create(runSeed({ worktreeCwd: firstLane, planPath: join(firstLane, "other.md") }), { exclusive: true }), new RegExp(first.id));
+    await registry.update({ ...first, tasks: { "1": { taskId: 1, dependsOn: [], state: "retry_wait", attempts: 1,
+      recoverySource: { cwd: repository, branch: "preserved", baselineCommit: baseline, headCommit: baseline, checkpointRef: "refs/plan-exec/checkpoint" } } } });
+    await assert.rejects(registry.create(runSeed({ worktreeCwd: repository, planPath: join(repository, "plans", "other.md") }), { exclusive: true }), new RegExp(first.id));
+    await registry.assertExclusive(second);
   }
 });
 

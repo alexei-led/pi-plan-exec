@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { parsePlan } from "../src/plan.js";
+import { materializeApprovedPlan, parsePlan } from "../src/plan.js";
+
+test("approved structure carries only matching committed checkbox facts", () => {
+  const baseline = "### Task 1: A\n- [x] repeated\n- [ ] repeated\n### Task 2: B\n- [ ] B\n";
+  const approved = "# Reviewed description\n### Task 1: A\n- [ ] repeated\n- [x] repeated\n- [x] newly added\n```md\n- [x] example\n```\n### Task 2: B\ndependsOn: []\n- [x] B\n";
+  const result = materializeApprovedPlan("plan.md", approved, baseline);
+  assert.equal(result, "# Reviewed description\n### Task 1: A\n- [x] repeated\n- [ ] repeated\n- [ ] newly added\n```md\n- [x] example\n```\n### Task 2: B\ndependsOn: []\n- [ ] B\n");
+  assert.equal(parsePlan("plan.md", result).hash, parsePlan("plan.md", approved).hash);
+});
 
 test("parses ordered tasks and keeps structure hash stable across checkbox completion", () => {
   const pending = parsePlan(

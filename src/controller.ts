@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import {
   access,
   lstat,
@@ -60,7 +61,7 @@ import {
   isTerminalStatus,
   nextStage,
 } from "./lifecycle.js";
-import { readPlan, parsePlan } from "./plan.js";
+import { readPlan, parsePlan, materializeApprovedPlan } from "./plan.js";
 import {
   appendProgress,
   appendProgressOnce,
@@ -70,7 +71,7 @@ import { RunRegistry } from "./registry.js";
 import { diagnoseOperation } from "./diagnostics.js";
 import { resolveRunConfig } from "./config.js";
 import { RevmuxReviewClient, validateReviewResult } from "./review-backend.js";
-import { cancelActiveLocalOperations, LocalOperationFailedError, LocalOperationUnknownError, type LocalOperationOptions } from "./local-operation.js";
+import { cancelActiveLocalOperations, durableJson, LocalOperationFailedError, LocalOperationUnknownError, type LocalOperationOptions } from "./local-operation.js";
 import { reconcileTasks, selectReadyTask, nextTaskWake } from "./scheduler.js";
 import { bootstrapCommands, gitValue, requiredChecks, runCommands } from "./lanes.js";
 import {
@@ -119,6 +120,7 @@ const RECOVERY_REVIEWER_MAX_TURNS = 75;
 const MAX_TERMINAL_ERROR_LENGTH = 2_000;
 const GIT_MISSING_OBJECT_EXIT_CODE = 128;
 const LANE_TOKEN_LENGTH = 12;
+const PRIVATE_DIRECTORY_MODE = 0o700;
 const MAX_AUTOMATIC_RETRY_DELAY_MS = 300_000;
 const MAX_BACKOFF_EXPONENT = 16;
 const REVIEW_DIAGNOSTIC_BURST = 2;
@@ -357,10 +359,22 @@ export class PlanExecController {
       }
     }
     if (reviewedPlanHash !== undefined) {
+      if (!explicit) throw new Error("Adopting a changed plan requires explicit resume.");
+      const content = await readFile(prepared.planPath, "utf8");
+      const approved = parsePlan(prepared.planPath, content);
+      if (approved.hash !== reviewedPlanHash) return this.pauseForReview(prepared, PLAN_STRUCTURE_CHANGED_ERROR);
+      const tasks = reconcileTasks(approved.tasks, prepared.tasks);
+      for (const task of approved.tasks) {
+        const execution = tasks[String(task.id)]!;
+        if (execution.state === "accepted" && task.unchecked.length > 0)
+          tasks[String(task.id)] = { ...execution, state: "ready" };
+      }
       const adopted = await this.registry.updateIfCurrent(
         {
           ...prepared,
           planHash: reviewedPlanHash,
+          approvedPlan: { hash: reviewedPlanHash, content },
+          tasks: reconcileTasks(approved.tasks, tasks),
           status: RUN_STATUS.PAUSED,
         },
         prepared.updatedAt,
@@ -665,7 +679,11 @@ export class PlanExecController {
           ...(run.progressPath ? { progressRelativePath: relative(run.worktreeCwd, run.progressPath) } : {}) },
       };
     }
-    if (selected.laneCwd && selected.baselineCommit && selected.baselineCommit !== acceptedHead && selected.state !== "accepted") {
+    const selectedPlanPath = selected.laneCwd
+      ? join(await gitCheckoutRoot(this.runCommand, selected.laneCwd), relative(checkoutRoot, run.planPath)) : undefined;
+    const staleLane = selectedPlanPath && (await readPlan(selectedPlanPath)).hash !== run.planHash;
+    if (staleLane && !run.approvedPlan) return this.pauseForReview(run, PLAN_STRUCTURE_CHANGED_ERROR);
+    if (selected.laneCwd && selected.baselineCommit && (selected.baselineCommit !== acceptedHead || staleLane) && selected.state !== "accepted") {
       const token = randomUUID().slice(0, LANE_TOKEN_LENGTH);
       const nextTask = { ...selected,
         recoveryHistory: [...(selected.recoveryHistory ?? []), ...(selected.recoverySource ? [selected.recoverySource] : [])],
@@ -790,7 +808,12 @@ export class PlanExecController {
         await verifyExecutionTree(this.runCommand, preparation.cwd, run.repositoryRoot, preparation.branch);
         const head = await gitValue(this.runCommand, preparation.cwd, ["rev-parse", "HEAD"]);
         if (head !== preparation.baselineCommit) throw new Error("Lane creation found an unexpected HEAD; refusing to reuse it.");
-        if (!await pathExists(planPath)) await copyPlanIntoWorktree(preparation.sourcePlanPath ?? run.planPath, planPath);
+        if (preparation.publication || (run.approvedPlan && preparation.taskId !== 0)) {
+          const pending = await this.publishApprovedPlan(run, preparation.cwd, preparation.baselineCommit, planPath);
+          if (pending) return pending;
+          if (preparation.publication?.planHash !== run.planHash)
+            throw new LocalOperationFailedError("Plan publication retired under an earlier approval; a fresh lane is required.");
+        } else if (!await pathExists(planPath)) await copyPlanIntoWorktree(preparation.sourcePlanPath ?? run.planPath, planPath);
         return (await this.registry.updateIfCurrent({ ...run, lanePreparation: { ...preparation, state: "bootstrap" } }, run.updatedAt)).run;
       }
       await this.executeLocalCommands(workerCwd, await bootstrapCommands(workerCwd, run.config.bootstrapCommands),
@@ -813,15 +836,51 @@ export class PlanExecController {
         const cwd = join(dirname(preparation.cwd), `plan-exec-${run.id}-${token}`);
         const branch = `plan-exec/${run.id}/${token}`;
         const initial = preparation.taskId === 0;
-        return this.fail({ ...run, lanePreparation: { ...preparation, cwd, branch },
+        const fresh = { ...preparation, cwd, branch };
+        delete fresh.publication;
+        return this.fail({ ...run, lanePreparation: fresh,
           ...(initial ? { worktreeCwd: cwd, branch, planPath: join(cwd, relative(run.worktreeCwd, run.planPath)),
             ...(run.outputTarget ? { outputTarget: { ...run.outputTarget, cwd, branch } } : {}) } : {}),
-        }, `Worktree creation failed after confirmed exit; preserved ${preparation.cwd} and scheduled a fresh lane: ${error.message}`);
+        }, `Lane preparation failed after confirmed exit; preserved ${preparation.cwd} and scheduled a fresh lane: ${error.message}`);
       }
       return this.fail(error instanceof LocalOperationFailedError ? { ...run,
         lanePreparation: { ...preparation, nextAttemptAt: Math.max((preparation.nextAttemptAt ?? 0) + 1, Date.now() + run.config.retryDelayMs) } } : run,
       `Lane preparation: ${error instanceof Error ? error.message : String(error)}`);
     }
+  }
+
+  private async publishApprovedPlan(run: PlanExecRun, cwd: string, baselineCommit: string, planPath: string): Promise<PlanExecRun | undefined> {
+    const options = await this.localOptions(run, `plan:publish:${cwd}`, baselineCommit);
+    const directory = join(options.journalRoot, "plan-payloads", run.id);
+    const publication = run.lanePreparation!.publication;
+    if (publication) {
+      await this.executeLocalCommands(cwd,
+        [[process.execPath, fileURLToPath(new URL("./plan-publisher.mjs", import.meta.url)),
+          join(directory, `${publication.digest}.json`), publication.digest]], options);
+      return undefined;
+    }
+    const approved = run.approvedPlan!;
+    if (approved.hash !== run.planHash || parsePlan(planPath, approved.content).hash !== run.planHash)
+      throw new Error("Approved plan snapshot does not match the authorized structure.");
+    const relativePlanPath = gitPath(relative(cwd, planPath));
+    const tracked = await gitValue(this.runCommand, cwd, ["ls-tree", "--name-only", baselineCommit, "--", relativePlanPath]);
+    const baseline = tracked ? await this.runCommand("git", ["show", `${baselineCommit}:${relativePlanPath}`], cwd) : undefined;
+    if (baseline && baseline.code !== 0) throw new Error(baseline.stderr.trim() || "Unable to read the committed baseline plan.");
+    const payload = { cwd, path: planPath, expectedContent: baseline?.stdout ?? null,
+      content: materializeApprovedPlan(planPath, approved.content, baseline?.stdout) };
+    const serialized = JSON.stringify(payload);
+    const digest = createHash("sha256").update(serialized).digest("hex");
+    await mkdir(directory, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
+    const payloadPath = join(directory, `${digest}.json`);
+    try {
+      if (await readFile(payloadPath, "utf8") !== serialized) throw new Error("Approved plan publication payload changed.");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      await durableJson(payloadPath, payload);
+    }
+    return (await this.registry.updateIfCurrent({ ...run,
+      lanePreparation: { ...run.lanePreparation!, publication: { planHash: approved.hash, digest } },
+    }, run.updatedAt)).run;
   }
 
   private async verifyCandidate(run: PlanExecRun, candidate: string): Promise<void> {
@@ -2091,9 +2150,11 @@ export class PlanExecController {
     const attempts = (run.taskAttempts[String(taskId)] ?? 0) + 1;
     const tasks = reconcileTasks(plan.tasks, run.tasks);
     const execution = tasks[String(taskId)]!;
+    const waitingDependency = execution.dependsOn.some((id) => tasks[String(id)]?.state !== "accepted");
     let reason = blocker ?? terminalError ?? `Worker ended as ${state} with incomplete task ${taskId}.`;
+    if (waitingDependency) reason = `Task ${taskId} is waiting for its approved dependencies; preserving the worker result for recovery.`;
     if (prerequisite) reason = `${reason}\nPrerequisite (${prerequisite.source}/${prerequisite.kind}): ${prerequisite.evidence}`;
-    if (isSuccessfulOperationState(state) && !blocker && !prerequisite && task.unchecked.length === 0) {
+    if (isSuccessfulOperationState(state) && !blocker && !prerequisite && !waitingDependency && task.unchecked.length === 0) {
       try {
         const candidate = execution.state === "verifying" && execution.operationId === operation.operationId && execution.candidateCommit
           ? execution.candidateCommit : await gitValue(this.runCommand, run.worktreeCwd, ["rev-parse", "HEAD"]);
@@ -2144,7 +2205,7 @@ export class PlanExecController {
     const waiting = await this.registry.updateIfCurrent(withoutOperation({ ...run,
       status: RUN_STATUS.RUNNING, nextAttemptAt: 0,
       tasks: { ...tasks, [String(taskId)]: { ...retryExecution,
-        state: prerequisite ? "waiting_external" : "retry_wait", reason, nextAttemptAt: retryAt,
+        state: waitingDependency ? "waiting_dependency" : prerequisite ? "waiting_external" : "retry_wait", reason, nextAttemptAt: retryAt,
         ...(prerequisite ? { externalPrerequisite: prerequisite } : {}),
         laneCwd: run.worktreeCwd, laneBranch: run.branch,
       } },

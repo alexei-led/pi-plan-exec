@@ -96,6 +96,31 @@ export function parsePlan(path: string, content: string): ParsedPlan {
   return { path, hash: structureHash(tasks), tasks };
 }
 
+/** Carry committed checkbox facts into explicitly approved structure, never partial lane claims. */
+export function materializeApprovedPlan(path: string, approved: string, baseline: string | undefined): string {
+  const plan = parsePlan(path, approved);
+  const committed = baseline === undefined ? undefined : parsePlan(path, baseline);
+  const lines = approved.split(/\r?\n/);
+  const baselineLines = baseline?.split(/\r?\n/) ?? [];
+  const ignored = fencedLines(lines);
+  const baselineIgnored = fencedLines(baselineLines);
+  for (const task of plan.tasks) {
+    const prior = committed?.tasks.find((entry) => entry.id === task.id && entry.title === task.title);
+    const facts = new Map<string, boolean[]>();
+    if (prior) for (let line = prior.startLine; line < prior.endLine; line++) {
+      const box = baselineIgnored[line] ? undefined : CHECKBOX.exec(baselineLines[line] ?? "");
+      if (box) facts.set(box[2]!, [...(facts.get(box[2]!) ?? []), box[1]?.toLowerCase() === "x"]);
+    }
+    for (let line = task.startLine; line < task.endLine; line++) {
+      const box = ignored[line] ? undefined : CHECKBOX.exec(lines[line] ?? "");
+      if (!box) continue;
+      const checked = facts.get(box[2]!)?.shift() ?? false;
+      lines[line] = lines[line]!.replace(/\[[ xX]\]/, checked ? "[x]" : "[ ]");
+    }
+  }
+  return lines.join(approved.includes("\r\n") ? "\r\n" : "\n");
+}
+
 function parseDependencies(value: string | undefined, taskId: number): number[] {
   if (value === undefined) return taskId > 1 ? [taskId - 1] : [];
   let parsed: unknown;
