@@ -6,10 +6,10 @@
 owns plan-specific policy, durable transitions, automatic recovery, commit
 acceptance, and provider reconciliation, not model execution or task UI.
 
-This branch is an incomplete implementation draft. The strict autonomous path
+The strict autonomous path
 requires the public `pi-subagents/kernel-owned-process` Darwin dependency and
-matching Bridge, Fusion, and Revmux ownership contracts. Host smoke evidence
-exists, and the native source pin is under review, but package publication is pending;
+matching Bridge, Fusion, and Revmux ownership contracts. Exact source pins and
+installed-runtime smoke evidence are available;
 unsupported APIs and unknown ownership remain fenced. Local bootstrap and
 required checks use the same unbounded kernel-owned executor. See [runtime
 contracts](runtime-contracts.md) for API boundaries, prerequisites, and links.
@@ -98,11 +98,12 @@ evidence and schedules an automatic wake. Generic blocker text does not infer
 an external prerequisite.
 
 For isolated runs, `outputTarget` records the original worktree, branch, initial
-head, plan path, and progress path. Once every task is accepted, the controller
-validates the accepted plan and fast-forwards that output branch from a known
+head, plan path, and progress path. After every task is accepted and the candidate
+passes required review and verification, the controller validates the accepted
+plan and fast-forwards that output branch from a known
 accepted ancestor only when its current head and worktree are safe. The
 promotion is durable (`pending`/`complete`), preserves user changes, and moves
-the run back to the output target before review, final verification, and
+the run back to the output target after required review and verification, before
 archive. The final reviewed fast-forward is guarded against overwriting ignored
 or preserved user files.
 

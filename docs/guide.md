@@ -31,11 +31,11 @@ refs.
 `pi-plan-exec` uses pi-subagents’ built-in `worker` and `reviewer` agents. It
 does not require cc-thingz agents.
 
-This branch is an incomplete implementation draft. Strict autonomous execution
+Strict autonomous execution
 requires the public `pi-subagents/kernel-owned-process` Darwin dependency plus
-matching Bridge, Fusion, and Revmux ownership contracts. Host smoke evidence
-exists, and the native source pin is under review, but package publication is
-still pending; unsupported APIs and unknown ownership remain fenced. Local bootstrap
+matching Bridge, Fusion, and Revmux ownership contracts. The exact source pins
+pass installed-runtime smoke checks; unsupported APIs and unknown ownership
+remain fenced. Local bootstrap
 and required checks use the same unbounded kernel-owned executor and remain
 unavailable when that dependency is missing. See [runtime contracts](runtime-contracts.md)
 for prerequisites, API boundaries, and linked dependency PRs.
@@ -464,15 +464,15 @@ permits recovery and lets the subsequent claim stamp the current host.
 After repeated provider-observation failures, plan-exec records the failure
 without discarding the external operation ID and schedules another probe with
 backoff. A failed run preserves its worktree and remains visible in `/exec
-status` and the projected task description. `/exec resume` reconciles that
-known operation before retrying the stage; it does not create a duplicate
-worker. If the provider has no record of an operation whose launch outcome is
-unknown, plan-exec stops rather than guessing and creating a duplicate worker.
+status` and the projected task description. Automatic recovery reconciles that
+known operation before retrying the stage. If the provider has no record of an
+operation whose launch outcome is unknown, automatic probes continue while
+replacement remains fenced.
 Legacy runs stopped by a plan structure mismatch can be resumed interactively
 after confirming the current structure. The first resume may only transition a
 legacy mismatch to `paused`; status explains that a second interactive resume
-is required after review. An explicit `/exec resume` retries a no-progress
-implementation task in the preserved worktree.
+is required after that explicit structural review. Ordinary no-progress
+implementation attempts retry automatically, preserving their partial work.
 
 When a worker returns `<<<RALPHEX:TASK_FAILED>>>` with incomplete checkboxes,
 the controller keeps the run in automatic recovery with the reported reason and
@@ -527,8 +527,7 @@ same question in advance.
 
 The controller polls an active worker or review operation every second. Under
 the default unbounded lifetime it does not impose a wall-clock limit of its own.
-This branch remains an incomplete implementation draft and strict runtime
-preflight refuses actual runtimes until owned-tree containment is available. You
+Strict runtime preflight requires verified owned-tree containment. You
 do not need to keep reissuing `/exec` while a supported run works.
 Use this sequence instead:
 
@@ -694,10 +693,10 @@ Safety limits:
   default, with an optional report child. Plan archival must succeed before the
   run becomes terminal.
 
-The package is an incomplete implementation draft. The strict path now uses a
+The strict path uses a
 kernel-owned Darwin boundary for native workers, local commands, Bridge, Fusion,
-and Revmux, but the exact public native dependency pin and package publication
-are still pending. Host smoke evidence does not establish release readiness;
+and Revmux through exact public source pins. Package publication is not required
+for this source installation;
 unknown kernel/API ownership remains fenced. Use [runtime contracts](runtime-contracts.md)
 for the exact prerequisites and dependency PR links; do not treat the latest
 npm package as a fully working autonomous runtime.
@@ -707,5 +706,4 @@ For local setup, validation, and tag-driven releases, see
 
 The declared host-boundary check is `npm run test:runtime-smoke`. It uses
 scripted model turns and does not prove a live-LLM run. Supported Darwin
-prerequisites are required; the real full pipeline has passed once and is still
-scheduled for repetition after the final pins.
+prerequisites are required; the full pipeline passed on the final source pins.

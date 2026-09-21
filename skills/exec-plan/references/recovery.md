@@ -477,19 +477,19 @@ pi-subagents:
    supported backend. A missing pi-tasks projection is advisory.
 3. Run `/reload`.
 4. Run `/exec status` and `/exec status <full-run-id>`.
-5. Run `/exec resume <full-run-id>`. It takes over a lease left by a session
-   that is provably gone; nothing else is needed for that.
+5. Use `/exec resume <full-run-id>` only to resume an explicitly paused run or
+   follow a specific interactive recovery instruction in status.
 
-Installation and reload do not advance the run.
+Reload automatically restores authorized unfinished work and pending cancellation
+cleanup. Explicit pause and stop remain in force.
 
 The current implementation draft is validated against exact dependency feature
 commits and linked PRs recorded in [runtime contracts](../../../docs/runtime-contracts.md)
 and the [active implementation plan](../../../docs/plans/2026-09-21-autonomous-execution.md).
-The native kernel-owned dependency and its Darwin GUI/compiler prerequisites are
-still pending as a public exact pin. Local checks/bootstrap and selected
+The public native dependency is pinned; its Darwin GUI/compiler prerequisites
+must also be available. Local checks/bootstrap and selected
 provider operations remain fenced when that dependency or its retirement proof
-is unavailable. Do not treat the latest npm release or pending pins as a fully
-working production runtime.
+is unavailable. The latest npm release alone does not supply this source contract.
 
 If `/exec` itself is missing after reload, inspect `pi list` and the Pi package
 configuration. Restore the package before touching the preserved run.

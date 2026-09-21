@@ -1,5 +1,7 @@
 # Autonomous plan execution
 
+<!-- markdownlint-disable MD013 -->
+
 Status: implementation and integration checks complete; cumulative review in progress
 
 Baseline: `0f184ec80754683772b081ef41e6a22a6b8fdb27` (`origin/main`).
@@ -70,7 +72,9 @@ dependsOn: [5]
 - [ ] Commit logical changes, push the new branch, and create a new PR with linked dependencies.
 - [ ] Only after every required gate passes, archive this plan under `docs/plans/completed/` and mark the PR ready.
 
-## Checkpoints
+## Historical checkpoints
+
+These record intermediate findings. The final verification and next-step section below supersedes their earlier blocker and pending-work statements.
 
 - Research: accepted design and summary read. Current main and origin main both resolve to the recorded baseline. Original untracked `.revmux/` preserved.
 - Baseline: Node 24.15.0 / npm 12.0.2; `npm ci`, typecheck, lint, all 287 tests and package validation passed. These results precede implementation.
@@ -86,7 +90,7 @@ dependsOn: [5]
 - Independent review reproduced the same escaped-descendant gap in local checks and the native runtime process-group tracker. Production admission must require explicit owned-tree containment; group-only observations are diagnostic. Local nonempty check/bootstrap batches are refused before launch. See [runtime contracts](../runtime-contracts.md).
 - Independent review also identified artifact-only recovery bypass, candidate-controlled check discovery, a cancellation-journal crash window and cross-session stop routing. Fixes are being tested, not assumed complete.
 - First integrated main test run: 350 tests, 285 passed and 65 failed. Failures are in legacy controller and UI expectations after ownership/acceptance changes; owners are updating fixtures and investigating real regressions. Typecheck and npm package validation passed at this checkpoint. A fresh final run is still mandatory.
-- Main draft PR: https://github.com/alexei-led/pi-plan-exec/pull/8. Revmux dependency draft: https://github.com/umputun/revmux/pull/35. No PR is ready and no plan archival is authorized by these checkpoints.
+- Main draft PR: [pi-plan-exec #8](https://github.com/alexei-led/pi-plan-exec/pull/8). Revmux dependency draft: [revmux #35](https://github.com/umputun/revmux/pull/35). No PR is ready and no plan archival is authorized by these checkpoints.
 - Dependency pins: native `7a9f03a97c19468f92a9ec78551955da9ef580a7` ([PR 2376](https://github.com/nicobailon/pi-subagents/pull/2376)); Bridge `544f911571ec4552dcc71d5ce548175f1ad7f612` ([PR 2](https://github.com/alexei-led/pi-subagents-bridge/pull/2)); Fusion `766f8bc3c2d39a8e440c11d6e806bd8a45a54887` ([PR 12](https://github.com/alexei-led/pi-fusion/pull/12)). Main package and lockfile use immutable Git refs and Pi SDK 0.86.1.
 - Native final checks: 3287 unit tests passed / 12 skipped; 1067 integration tests passed / 7 skipped; typecheck and package build passed. New lint diagnostics are zero; existing legacy lint diagnostics remain and are not reported as a clean global lint run.
 - Bridge final checks: 61 tests, typecheck, lint, pack, actual native boundary smoke, actionlint, zizmor and remote CI passed. Fusion final checks: 233 unit + 90 integration + 1 E2E, typecheck, lint and pack passed.
