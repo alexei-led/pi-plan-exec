@@ -1,6 +1,6 @@
 # Planless `/goal`
 
-Status: implemented on `feat/autonomous-execution`; local gates and runtime smoke pass; validation and review pending.
+Status: implemented and live-validated on `feat/autonomous-execution`; local gates, runtime smoke, and a real `/goal Fix the failing tests` run pass; revmux review pending.
 
 ## Purpose
 
@@ -53,6 +53,22 @@ Covered by `test/autonomous-goal.test.ts`: intermediate-answer continuation,
 false done with failing checks, start refusal without checks, three-turn stall
 pause, blocker resume, restart mid-turn without relaunch, deleted-test
 completion guard, command parsing, and goal status/widget output.
+
+## Live validation
+
+`/goal Fix the failing tests` was driven headlessly (Pi RPC, pinned local
+extension plus the pinned Bridge/pi-subagents runtimes, `router/openai-work`
+worker) in a scratch Git repository whose `math.js` failed `npm run test`. The
+run completed without a plan file:
+
+- one worker turn fixed `add()` and committed `c504234`;
+- the controller ran `npm run test` on the committed work, then finalize, stats,
+  and archive;
+- the run reached `completed` with `verifiedCommit: c504234` and `checks:
+  passing`, and `npm run test` passes in the repository.
+
+Review was disabled in the scratch `.pi/plan-exec.json` to isolate the goal
+loop; the review stage is covered by the existing pipeline tests.
 
 ## Explicitly excluded
 
