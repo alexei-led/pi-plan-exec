@@ -32,24 +32,19 @@ refs.
 does not require cc-thingz agents.
 
 Strict autonomous execution
-requires the public `pi-subagents/kernel-owned-process` Darwin dependency plus
-matching Bridge and Fusion ownership contracts. Bridge and Fusion are released
-npm packages; the native runtime is pinned to a revision until its change lands
-upstream. The pinned revisions pass installed-runtime smoke checks; unsupported
-APIs and unknown ownership
-remain fenced. Local bootstrap
-and required checks use the same unbounded kernel-owned executor and remain
-unavailable when that dependency is missing. See [runtime contracts](runtime-contracts.md)
+requires the released `pi-subagents` runtime plus matching Bridge and Fusion
+ownership contracts, all installed from npm. Unsupported APIs and unknown
+ownership remain fenced. Local bootstrap
+and required checks use plan-exec's unbounded owned POSIX process-group runner.
+See [runtime contracts](runtime-contracts.md)
 for prerequisites, API boundaries, and linked dependency PRs.
 
 ## Install
 
-Use a project-local source checkout with the exact Git refs listed in
-[runtime contracts](runtime-contracts.md). The public native dependency is not
-available as a published npm runtime yet, and pi-tasks is an optional projection
-cache. Do not install the latest packages and assume that they expose the
-required ownership APIs. Preserve the project-local `.npmrc` policy; do not
-change global npm configuration.
+Install the released packages listed in
+[runtime contracts](runtime-contracts.md). pi-tasks is an optional projection
+cache. The setup commands below pin the exact released ranges; do not change
+global npm configuration.
 
 Reload Pi after installing:
 
@@ -73,14 +68,13 @@ The selection is frozen into `run.json` when the run starts.
 }
 ```
 
-Production admission still requires an owned-process-tree capability from the
-selected runtime. The exact native dependency and Darwin prerequisites are not
-yet published as a supported npm installation; see [runtime contracts](runtime-contracts.md).
+Production admission requires a healthy released runtime and Bridge with
+explicit lifetime support; see [runtime contracts](runtime-contracts.md).
 
 Local bootstrap and required checks always use an unbounded, user-stoppable
-kernel-owned operation. A run configured with bounded compatibility lifetime
+owned-process group. A run configured with bounded compatibility lifetime
 does not impose that bounded timer on local commands. Success or failure is
-accepted only after the kernel reports retirement for the matching durable
+accepted only after the process group retires for the matching durable
 binding; unknown or malformed ownership remains fenced.
 
 For a bounded worker or review operation, the controller adapts only after
@@ -651,8 +645,8 @@ requests the `plan-review-v1` output contract and consumes only Fusion's
 validated top-level `callerOutput.output`; its production path uses a structured
 panel with one judge. Strict early-agreement profiles are rejected before
 dispatch. Revmux reports must prove complete source coverage and contain no unresolved questions;
-its explicit `--execution-lifetime` flag is wrapped by the outer kernel-owned
-runtime. Missing, blank,
+its explicit `--execution-lifetime` flag is wrapped by the outer owned process
+group. Missing, blank,
 malformed, or mismatched output fails closed; a partial `run.report` is never
 an approval fallback. The default fallback list is empty, so an unavailable or
 ambiguous provider operation stays recoverable under its original operation ID.
@@ -723,13 +717,11 @@ Safety limits:
   default, with an optional report child. Plan archival must succeed before the
   run becomes terminal.
 
-The strict path uses a
-kernel-owned Darwin boundary for native workers, local commands, Bridge, Fusion,
-and Revmux. Bridge and Fusion are released npm packages pinned by version;
-the native runtime is pinned to an upstream revision until its change lands
-upstream. Unknown kernel/API ownership remains fenced. Use [runtime contracts](runtime-contracts.md)
-for the exact prerequisites and dependency PR links; do not treat the latest
-npm package as a fully working autonomous runtime.
+The strict path uses plan-exec's owned POSIX process group for local commands,
+Bridge/native workers, Fusion, and Revmux. The runtime, Bridge, and Fusion are
+released npm packages pinned by version. Unknown or unproven ownership remains
+fenced. Use [runtime contracts](runtime-contracts.md)
+for the exact prerequisites and dependency PR links.
 
 For local setup, validation, and tag-driven releases, see
 [DEVELOPMENT.md](../DEVELOPMENT.md).

@@ -7,11 +7,11 @@ owns plan-specific policy, durable transitions, automatic recovery, commit
 acceptance, and provider reconciliation, not model execution or task UI.
 
 The strict autonomous path
-requires the public `pi-subagents/kernel-owned-process` Darwin dependency and
-matching Bridge, Fusion, and Revmux ownership contracts. Exact source pins and
+requires the released `pi-subagents` runtime and matching Bridge, Fusion, and
+Revmux ownership contracts. Released pins and
 installed-runtime smoke evidence are available;
 unsupported APIs and unknown ownership remain fenced. Local bootstrap and
-required checks use the same unbounded kernel-owned executor. See [runtime
+required checks use plan-exec's unbounded owned process group. See [runtime
 contracts](runtime-contracts.md) for API boundaries, prerequisites, and links.
 
 ## Design goals
@@ -65,7 +65,7 @@ flowchart LR
     controller --> registry["global run registry"]
     controller --> projection[pi-tasks projection]
     controller --> bridge[pi-subagents-bridge direct owned single-agent RPC]
-    bridge --> agents["kernel-owned pi-subagents worker / reviewer"]
+    bridge --> agents["owned pi-subagents worker / reviewer"]
     controller --> fusion[selected Fusion or Revmux backend]
     fusion --> panel[structured panel and single judge]
     agents --> worktree[Git execution worktree]
@@ -123,7 +123,8 @@ or preserved user files.
 | `src/plan.ts` | Strict Markdown plan parser and structure hash |
 | `src/scheduler.ts` | Dependency reconciliation, ready-task selection, and wake scheduling |
 | `src/lanes.ts` | Frozen required checks/bootstrap resolution and local-operation dispatch |
-| `src/local-operation.ts` | Durable local command intent, authorization fence, kernel-owned command execution, and retirement proof |
+| `src/local-operation.ts` | Durable local command intent, authorization fence, and owned-process command execution |
+| `src/owned-process.ts` | POSIX process-group runner: binding, detached launch, ps-based liveness, cancellation, writer-exit retirement proof |
 | `src/git.ts` | Repository, branch, dirty-state, common-dir, and worktree safety |
 | `src/bridge.ts` | Typed v1/v2 bridge client, capability negotiation, request digests, and proof validation |
 | `src/fusion.ts` | Typed client for `fusion:rpc:v1` |
@@ -141,12 +142,12 @@ Run records live at:
 ~/.pi/plan-exec/runs/<run-id>/run.json
 ```
 
-Writes use compare-and-set updates under kernel `flock` locks plus temporary-file
+Writes use compare-and-set updates under OS `flock` locks plus temporary-file
 rename. Lock files live at stable paths — the registry-wide lock at
 `<runs>/registry.lock` and the per-run controller and record locks under
 `<runs>/.locks/` — and are never
 unlinked, so a lock's lifetime is the open file description's lifetime: a dead
-owner releases it when the kernel closes the descriptor. Controller transitions
+owner releases it when the OS closes the descriptor. Controller transitions
 use a per-run lock; stale reload instances cannot
 blindly overwrite newer pause, cancellation, or operation state. Each record
 includes:
@@ -296,17 +297,18 @@ External starts follow this order:
 1. Generate a durable operation ID and canonical request digest.
 2. Persist operation intent, replay parameters, digest, and `mission: false`.
 3. Admit the selected runtime only when it advertises the frozen explicit
-   lifetime and full owned-process-tree capability. Native, Bridge, Fusion, and
-   Revmux paths use the kernel-owned boundary; missing public APIs, unsupported
+   lifetime and a healthy owned-process capability. Native, Bridge, Fusion, and
+   Revmux paths use the boundary they own; missing public APIs, unsupported
    capabilities, or unknown ownership fail closed before spawn. Once a
    compatible Bridge exists, call it with the v2 owner DTO; v1 recovery fails
    closed when it cannot prove a launch outcome.
 4. Persist the returned external run ID.
 
-The plan-exec caller digest, provider/native operation digest, and kernel binding
-digest are separate namespaces. Terminal evidence must bind all required layers
-to the same operation; no caller digest is accepted as a kernel retirement proof.
-Local checks and bootstrap use the kernel-owned operation directly with an
+The plan-exec caller digest, provider/native operation digest, and owned-process
+binding digest are separate namespaces. Terminal evidence must bind all required
+layers to the same operation; no caller digest is accepted as a process
+retirement proof.
+Local checks and bootstrap use the owned process group directly with an
 unbounded lifetime, durable grants, and user stop generation.
 
 Each plan run is also exposed as exactly one `pi-subagents` external-runs row and
@@ -411,11 +413,12 @@ Untrusted boundaries are validated at entry:
 - Revmux reports require complete source coverage, non-degraded agents, and no
   unresolved questions.
 - Reviewer output must be `NO_FINDINGS` or structured findings.
-- Runtime admission requires explicit lifetime support and
-  `scope: "owned-process-tree"` with `escapedDescendants: "contained"`.
-  POSIX process-group observations are diagnostic only. Unknown native module,
-  kernel binding, or retirement evidence fails closed. Local checks and
-  bootstrap use the kernel-owned path with unbounded user-stoppable lifetime.
+- Runtime admission requires explicit lifetime support and a healthy
+  `scope: "owned-process-tree"` capability; released Bridge advertises
+  `escapedDescendants: "best-effort"`. Unknown process binding or retirement
+  evidence fails closed. Local checks and
+  bootstrap use the owned POSIX process group with unbounded user-stoppable
+  lifetime, and detached descendants that leave the group are best-effort.
 - Git common-directory and branch checks protect writer stages.
 - Controller Git writes for worktree creation, task checkpoints, output
   promotion, and archive use durable owned commands with workspace-safe
