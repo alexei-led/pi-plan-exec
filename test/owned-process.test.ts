@@ -89,6 +89,49 @@ test('an unresolved launch claim is fenced instead of never-started', async () =
   assert.match(String(fenced.reason), /unresolved/);
 });
 
+test('a synchronous spawn throw releases the claim and stays retryable', async () => {
+  const root = await workdir();
+  const directory = join(root, 'operation');
+  const fileCwd = join(root, 'file-cwd');
+  await writeFile(fileCwd, 'not a directory');
+
+  const failed = await launchOwnedProcess(request(directory, fileCwd));
+  assert.equal(failed.status, 'unknown');
+  await readFile(join(directory, 'launch-failed.json'), 'utf8');
+  await assert.rejects(
+    readFile(join(directory, 'launching.json'), 'utf8'),
+    /ENOENT/,
+  );
+  const retried = await launchOwnedProcess(request(directory, fileCwd));
+  assert.equal(retried.status, 'unknown');
+});
+
+test('a retired operation with a stale claim still cancels as retired', async () => {
+  const root = await workdir();
+  const directory = join(root, 'operation');
+  await launchOwnedProcess(request(directory, root));
+
+  let observation = await observeOwnedProcess(directory);
+  const deadline = Date.now() + 10_000;
+  while (observation.status === 'running' && Date.now() < deadline) {
+    await delay(20);
+    observation = await observeOwnedProcess(directory);
+  }
+  assert.equal(observation.status, 'retired');
+
+  // Recreate a stale claim to simulate a launcher that never released it.
+  await writeFile(
+    join(directory, 'launching.json'),
+    JSON.stringify({ version: 1, claimedAt: Date.now() - 10 * 60_000 }),
+  );
+  const cancelled = await cancelOwnedProcess(directory, {
+    deadlineMs: 100,
+    cancelled: true,
+  });
+  assert.equal(cancelled.status, 'retired');
+  assert.deepEqual(cancelled.proof, observation.proof);
+});
+
 test('retirement is persisted and repeated cancellation stops signalling', async () => {
   const root = await workdir();
   const directory = join(root, 'operation');
