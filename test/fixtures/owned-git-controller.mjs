@@ -173,6 +173,15 @@ if (mode === 'start') {
   const run = await controller.tick(value, sessionId);
   await writeState(run);
 } else if (mode === 'until-spawn') {
+  // Readiness means "about to tick". Wait for the parent's proceed lease so a
+  // test can observe the pre-tick state deterministically on every platform.
+  const proceedPath = `${readyPath}.proceed`;
+  const proceedDeadline = Date.now() + 15_000;
+  while (!existsSync(proceedPath)) {
+    if (Date.now() > proceedDeadline)
+      throw new Error('until-spawn proceed lease timed out');
+    await delay(10);
+  }
   for (;;) {
     const run = await controller.tick(value, sessionId);
     await writeState(run);
