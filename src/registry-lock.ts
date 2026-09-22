@@ -1,12 +1,21 @@
-import { execFile } from "node:child_process";
-import { createHash } from "node:crypto";
-import { constants } from "node:fs";
-import { chmod, lstat, mkdir, mkdtemp, open, rename, rm, writeFile } from "node:fs/promises";
-import { createRequire } from "node:module";
-import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { setTimeout as delay } from "node:timers/promises";
-import { getSystemErrorName, promisify } from "node:util";
+import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { constants } from 'node:fs';
+import {
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  open,
+  rename,
+  rm,
+  writeFile,
+} from 'node:fs/promises';
+import { createRequire } from 'node:module';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
+import { getSystemErrorName, promisify } from 'node:util';
 
 const RETRY_MS = 50;
 const MAX_RETRIES = 100;
@@ -61,41 +70,67 @@ type TryLock = (fd: number) => number;
 let nativeBinding: Promise<TryLock> | undefined;
 
 async function loadNativeBinding(): Promise<TryLock> {
-  if (process.platform !== "darwin" && process.platform !== "linux")
-    throw new Error("Registry locking requires Darwin or Linux with a C compiler.");
-  const uid = process.getuid!();
+  if (process.platform !== 'darwin' && process.platform !== 'linux')
+    throw new Error(
+      'Registry locking requires Darwin or Linux with a C compiler.',
+    );
+  const uid = process.getuid?.();
   const cache = join(tmpdir(), `pi-plan-exec-registry-lock-${uid}`);
   await mkdir(cache, { mode: PRIVATE_DIRECTORY_MODE, recursive: true });
   const metadata = await lstat(cache);
-  if (!metadata.isDirectory() || metadata.uid !== uid || (metadata.mode & OTHER_PERMISSION_BITS) !== 0)
+  if (
+    !metadata.isDirectory() ||
+    metadata.uid !== uid ||
+    (metadata.mode & OTHER_PERMISSION_BITS) !== 0
+  )
     throw new Error(`Registry lock compiler cache is not private: ${cache}`);
-  const digest = createHash("sha256").update(NATIVE_SOURCE).digest("hex");
-  const binary = join(cache, `${process.platform}-${process.arch}-${digest}.node`);
-  try { await lstat(binary); }
-  catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    const build = await mkdtemp(join(cache, "build-"));
+  const digest = createHash('sha256').update(NATIVE_SOURCE).digest('hex');
+  const binary = join(
+    cache,
+    `${process.platform}-${process.arch}-${digest}.node`,
+  );
+  try {
+    await lstat(binary);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    const build = await mkdtemp(join(cache, 'build-'));
     try {
-      const source = join(build, "lock.c");
-      const output = join(build, "lock.node");
+      const source = join(build, 'lock.c');
+      const output = join(build, 'lock.node');
       await writeFile(source, NATIVE_SOURCE, { mode: PRIVATE_FILE_MODE });
-      const args = ["-std=c11", "-Wall", "-Wextra", "-Werror", "-shared", "-fPIC"];
-      if (process.platform === "darwin") args.push("-undefined", "dynamic_lookup");
-      args.push(source, "-o", output);
-      await promisify(execFile)(process.platform === "darwin" ? "/usr/bin/clang" : "/usr/bin/cc", args, {
-        timeout: COMPILE_TIMEOUT_MS,
-        killSignal: "SIGKILL",
-      });
+      const args = [
+        '-std=c11',
+        '-Wall',
+        '-Wextra',
+        '-Werror',
+        '-shared',
+        '-fPIC',
+      ];
+      if (process.platform === 'darwin')
+        args.push('-undefined', 'dynamic_lookup');
+      args.push(source, '-o', output);
+      await promisify(execFile)(
+        process.platform === 'darwin' ? '/usr/bin/clang' : '/usr/bin/cc',
+        args,
+        {
+          timeout: COMPILE_TIMEOUT_MS,
+          killSignal: 'SIGKILL',
+        },
+      );
       await chmod(output, PRIVATE_FILE_MODE);
       await rename(output, binary);
     } catch (error) {
-      throw new Error("Cannot build registry kernel lock binding; install the platform C compiler.", { cause: error });
+      throw new Error(
+        'Cannot build registry kernel lock binding; install the platform C compiler.',
+        { cause: error },
+      );
     } finally {
       await rm(build, { recursive: true, force: true });
     }
   }
   const binding: unknown = createRequire(import.meta.url)(binary);
-  if (typeof binding !== "function") throw new Error("Invalid registry kernel lock binding.");
+  if (typeof binding !== 'function')
+    throw new Error('Invalid registry kernel lock binding.');
   return binding as TryLock;
 }
 
@@ -111,21 +146,31 @@ export interface RegistryLock {
 }
 
 /** Lock files must stay at stable paths and must never be unlinked or replaced. */
-export async function acquireLock(path: string, maxRetries = MAX_RETRIES): Promise<RegistryLock> {
-  nativeBinding ??= loadNativeBinding().catch(error => {
+export async function acquireLock(
+  path: string,
+  maxRetries = MAX_RETRIES,
+): Promise<RegistryLock> {
+  nativeBinding ??= loadNativeBinding().catch((error) => {
     nativeBinding = undefined;
     throw error;
   });
   const tryLock = await nativeBinding;
   await mkdir(dirname(path), { recursive: true });
-  const handle = await open(path, constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW, PRIVATE_FILE_MODE);
+  const handle = await open(
+    path,
+    constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW,
+    PRIVATE_FILE_MODE,
+  );
   try {
     for (let attempt = 0; attempt < maxRetries; attempt += 1) {
       const errno = tryLock(handle.fd);
       if (errno === 0) return { release: () => handle.close() };
       const code = getSystemErrorName(-errno);
-      if (code !== "EAGAIN" && code !== "EWOULDBLOCK" && code !== "EINTR")
-        throw Object.assign(new Error(`Cannot acquire registry lock ${path}: ${code}`), { code });
+      if (code !== 'EAGAIN' && code !== 'EWOULDBLOCK' && code !== 'EINTR')
+        throw Object.assign(
+          new Error(`Cannot acquire registry lock ${path}: ${code}`),
+          { code },
+        );
       await delay(RETRY_MS);
     }
     throw new LockTimeoutError(path);

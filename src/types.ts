@@ -1,21 +1,21 @@
-import type { OperationDiagnostics } from "./diagnostics.js";
+import type { OperationDiagnostics } from './diagnostics.js';
 
-export const COMPLETED_PLANS_DIRECTORY = "completed";
+export const COMPLETED_PLANS_DIRECTORY = 'completed';
 export const CONTROLLER_POLL_INTERVAL_MS = 1_000;
 
 export const EXEC_ACTION = {
-  HELP: "help",
-  SETUP: "setup",
-  RUNS: "runs",
-  CLEANUP: "cleanup",
-  DOCTOR: "doctor",
-  STATUS: "status",
-  STOP: "stop",
-  PAUSE: "pause",
-  RESUME: "resume",
-  ADOPT: "adopt",
-  SKIP: "skip",
-  CANCEL: "cancel",
+  HELP: 'help',
+  SETUP: 'setup',
+  RUNS: 'runs',
+  CLEANUP: 'cleanup',
+  DOCTOR: 'doctor',
+  STATUS: 'status',
+  STOP: 'stop',
+  PAUSE: 'pause',
+  RESUME: 'resume',
+  ADOPT: 'adopt',
+  SKIP: 'skip',
+  CANCEL: 'cancel',
 } as const;
 
 /**
@@ -36,24 +36,24 @@ export type ExecAliasAction = (typeof EXEC_ALIAS_ACTIONS)[number];
 
 export type RunAction = (typeof EXEC_ACTION)[Exclude<
   keyof typeof EXEC_ACTION,
-  "HELP" | "SETUP" | "RUNS" | "CLEANUP" | "DOCTOR" | "ADOPT"
+  'HELP' | 'SETUP' | 'RUNS' | 'CLEANUP' | 'DOCTOR' | 'ADOPT'
 >];
 
 export const RUN_STAGE = {
-  RESOLVE: "resolve",
-  ISOLATION: "isolation",
-  PROJECT_TASKS: "project_tasks",
-  BRANCH: "branch",
-  PROGRESS: "progress",
-  IMPLEMENTATION: "implementation",
-  COMPREHENSIVE_REVIEW: "comprehensive_review",
-  SMELLS_REVIEW: "smells_review",
-  FUSION_REVIEW: "fusion_review",
-  CRITICAL_REVIEW: "critical_review",
-  FINALIZE: "finalize",
-  STATS: "stats",
-  ARCHIVE: "archive",
-  COMPLETE: "complete",
+  RESOLVE: 'resolve',
+  ISOLATION: 'isolation',
+  PROJECT_TASKS: 'project_tasks',
+  BRANCH: 'branch',
+  PROGRESS: 'progress',
+  IMPLEMENTATION: 'implementation',
+  COMPREHENSIVE_REVIEW: 'comprehensive_review',
+  SMELLS_REVIEW: 'smells_review',
+  FUSION_REVIEW: 'fusion_review',
+  CRITICAL_REVIEW: 'critical_review',
+  FINALIZE: 'finalize',
+  STATS: 'stats',
+  ARCHIVE: 'archive',
+  COMPLETE: 'complete',
 } as const;
 
 export type RunStage = (typeof RUN_STAGE)[keyof typeof RUN_STAGE];
@@ -62,15 +62,15 @@ export const RUN_STAGES: readonly RunStage[] = Object.freeze(
 );
 
 export const RUN_STATUS = {
-  STARTING: "starting",
-  RUNNING: "running",
-  PAUSED: "paused",
-  SKIP_PENDING: "skip_pending",
-  CANCEL_PENDING: "cancel_pending",
-  CANCELLED: "cancelled",
-  FAILED: "failed",
-  COMPLETED: "completed",
-  COMPLETED_WITH_FINDINGS: "completed_with_findings",
+  STARTING: 'starting',
+  RUNNING: 'running',
+  PAUSED: 'paused',
+  SKIP_PENDING: 'skip_pending',
+  CANCEL_PENDING: 'cancel_pending',
+  CANCELLED: 'cancelled',
+  FAILED: 'failed',
+  COMPLETED: 'completed',
+  COMPLETED_WITH_FINDINGS: 'completed_with_findings',
 } as const;
 
 export type RunStatus = (typeof RUN_STATUS)[keyof typeof RUN_STATUS];
@@ -79,12 +79,12 @@ export const RUN_STATUSES: readonly RunStatus[] = Object.freeze(
 );
 
 export type ExecutionLifetime =
-  | { mode: "unbounded" }
-  | { mode: "bounded"; timeoutMs: number };
+  | { mode: 'unbounded' }
+  | { mode: 'bounded'; timeoutMs: number };
 
 export const MAX_EXECUTION_TIMEOUT_MS = 2_147_483_647;
 
-export type ReviewBackend = "subagent" | "fusion" | "revmux";
+export type ReviewBackend = 'subagent' | 'fusion' | 'revmux';
 
 export interface FrozenRunConfig {
   executionLifetime: ExecutionLifetime;
@@ -116,13 +116,13 @@ export interface FrozenRunConfig {
 }
 
 export const DEFAULT_FROZEN_RUN_CONFIG = {
-  executionLifetime: { mode: "unbounded" },
+  executionLifetime: { mode: 'unbounded' },
   retryDelayMs: 5_000,
   requiredChecks: [],
   bootstrapCommands: [],
   reviewEnabled: true,
   reviewRequired: true,
-  reviewBackend: "subagent",
+  reviewBackend: 'subagent',
   reviewFallback: [],
   statsEnabled: false,
   taskRetries: 1,
@@ -130,61 +130,61 @@ export const DEFAULT_FROZEN_RUN_CONFIG = {
   reviewIterations: 5,
   fusionIterations: 10,
   finalizeEnabled: true,
-  workerAgent: "worker",
+  workerAgent: 'worker',
   workerMaxTurns: 75,
-  reviewerAgent: "reviewer",
+  reviewerAgent: 'reviewer',
   reviewerMaxTurns: 30,
-  statsAgent: "reviewer",
+  statsAgent: 'reviewer',
   statsMaxTurns: 30,
 } as const satisfies FrozenRunConfig;
 
 export const OPERATION_SERVICE = {
-  BRIDGE: "bridge",
-  FUSION: "fusion",
+  BRIDGE: 'bridge',
+  FUSION: 'fusion',
 } as const;
 
 export type OperationService =
   (typeof OPERATION_SERVICE)[keyof typeof OPERATION_SERVICE];
 
 export const OPERATION_KIND = {
-  IMPLEMENTATION: "implementation",
-  REVIEW: "review",
-  FIX: "fix",
-  FUSION: "fusion",
-  FINALIZE: "finalize",
-  STATS: "stats",
+  IMPLEMENTATION: 'implementation',
+  REVIEW: 'review',
+  FIX: 'fix',
+  FUSION: 'fusion',
+  FINALIZE: 'finalize',
+  STATS: 'stats',
 } as const;
 
 export type OperationKind =
   (typeof OPERATION_KIND)[keyof typeof OPERATION_KIND];
 
 export const OPERATION_RECOVERY = {
-  OBSERVE: "observe",
-  REPLAY: "replay",
-  CANCEL: "cancel",
-  REQUIRED: "recovery_required",
+  OBSERVE: 'observe',
+  REPLAY: 'replay',
+  CANCEL: 'cancel',
+  REQUIRED: 'recovery_required',
 } as const;
 
 export type OperationRecovery =
   (typeof OPERATION_RECOVERY)[keyof typeof OPERATION_RECOVERY];
 
 export const EXTERNAL_OPERATION_STATE = {
-  RUNNING: "running",
-  STOPPING: "stopping",
-  COMPLETE: "complete",
-  DONE: "done",
-  FAILED: "failed",
-  STOPPED: "stopped",
-  PAUSED: "paused",
-  ABORTED: "aborted",
-  PENDING: "pending",
-  FOUND: "found",
-  UNKNOWN: "unknown",
-  UNKNOWN_LAUNCH: "unknown_launch",
-  ABSENT: "absent",
-  CHAIN: "chain",
-  PANEL: "panel",
-  JUDGE: "judge",
+  RUNNING: 'running',
+  STOPPING: 'stopping',
+  COMPLETE: 'complete',
+  DONE: 'done',
+  FAILED: 'failed',
+  STOPPED: 'stopped',
+  PAUSED: 'paused',
+  ABORTED: 'aborted',
+  PENDING: 'pending',
+  FOUND: 'found',
+  UNKNOWN: 'unknown',
+  UNKNOWN_LAUNCH: 'unknown_launch',
+  ABSENT: 'absent',
+  CHAIN: 'chain',
+  PANEL: 'panel',
+  JUDGE: 'judge',
 } as const;
 
 export interface PlanTask {
@@ -205,7 +205,7 @@ export interface ParsedPlan {
 
 export interface ReviewFinding {
   id: string;
-  severity: "CRITICAL" | "MAJOR" | "MINOR";
+  severity: 'CRITICAL' | 'MAJOR' | 'MINOR';
   summary: string;
   evidence?: string;
   suggestion?: string;
@@ -233,10 +233,10 @@ export interface BranchRebinding {
 }
 
 /** `status.mode` value the bridge spawns; its activity fields are untrustworthy. */
-export const WORKFLOW_MODE = "workflow";
+export const WORKFLOW_MODE = 'workflow';
 
 export const WORKFLOW_RESOLUTION = {
-  SETTLED_AWAITING_RESUME: "settled-awaiting-resume",
+  SETTLED_AWAITING_RESUME: 'settled-awaiting-resume',
 } as const;
 
 /**
@@ -289,20 +289,24 @@ export interface ActiveOperation {
   nextAttemptAt?: number;
   effectiveLifetime?: ExecutionLifetime;
   expectedLifetime?: ExecutionLifetime;
-  terminationReason?: "execution_lifetime_expired";
+  terminationReason?: 'execution_lifetime_expired';
   budgetExpiryRecorded?: boolean;
   budgetGrowthGranted?: boolean;
   externalPrerequisite?: ExternalPrerequisite;
   diagnostics?: OperationDiagnostics;
   diagnosticActions?: Record<string, DiagnosticAction>;
-  reportedUsage?: { inputTokens?: number; outputTokens?: number; cost?: number };
+  reportedUsage?: {
+    inputTokens?: number;
+    outputTokens?: number;
+    cost?: number;
+  };
 }
 
 export interface DiagnosticAction {
   diagnosticId: string;
   toolCallId: string;
   message: string;
-  state: "pending" | "queued" | "cancelled" | "rejected";
+  state: 'pending' | 'queued' | 'cancelled' | 'rejected';
   stopGeneration: number;
   requestedAt: number;
   nextAttemptAt: number;
@@ -311,17 +315,17 @@ export interface DiagnosticAction {
 }
 
 export type TaskExecutionState =
-  | "ready"
-  | "running"
-  | "verifying"
-  | "retry_wait"
-  | "waiting_dependency"
-  | "waiting_external"
-  | "accepted";
+  | 'ready'
+  | 'running'
+  | 'verifying'
+  | 'retry_wait'
+  | 'waiting_dependency'
+  | 'waiting_external'
+  | 'accepted';
 
 export interface ExternalPrerequisite {
-  kind: "credentials" | "permission" | "missing_executable" | "runtime";
-  source: "provider" | "worker";
+  kind: 'credentials' | 'permission' | 'missing_executable' | 'runtime';
+  source: 'provider' | 'worker';
   evidence: string;
 }
 
@@ -405,12 +409,32 @@ export interface PlanExecRun {
   wakeReason?: string;
   recoveryAttempts?: number;
   usage?: { inputTokens?: number; outputTokens?: number; cost?: number };
-  statsReport?: { state: "summary" | "reported" | "unavailable"; summary: string; error?: string };
-  reviewRecovery?: { fingerprint: string; repeats: number; pendingFix: boolean; lastReviewedCommit?: string };
-  outputTarget?: { cwd: string; branch: string; initialHead: string; planRelativePath: string; progressRelativePath?: string };
-  outputPromotion?: { candidate: string; state: "pending" | "complete"; attempt?: number; commandStarted?: boolean };
+  statsReport?: {
+    state: 'summary' | 'reported' | 'unavailable';
+    summary: string;
+    error?: string;
+  };
+  reviewRecovery?: {
+    fingerprint: string;
+    repeats: number;
+    pendingFix: boolean;
+    lastReviewedCommit?: string;
+  };
+  outputTarget?: {
+    cwd: string;
+    branch: string;
+    initialHead: string;
+    planRelativePath: string;
+    progressRelativePath?: string;
+  };
+  outputPromotion?: {
+    candidate: string;
+    state: 'pending' | 'complete';
+    attempt?: number;
+    commandStarted?: boolean;
+  };
   archiveOperation?: {
-    phase: "stage" | "commit" | "retired";
+    phase: 'stage' | 'commit' | 'retired';
     operationId: string;
     commands: string[][];
     paths: string[];
@@ -425,7 +449,7 @@ export interface PlanExecRun {
     branch: string;
     baselineCommit: string;
     taskId: number;
-    state: "create" | "bootstrap";
+    state: 'create' | 'bootstrap';
     nextAttemptAt?: number;
     error?: string;
     sourcePlanPath?: string;
@@ -439,10 +463,10 @@ export interface PlanExecRun {
   progressPath?: string;
   taskProjection?: {
     version?: 1;
-    state?: "ready" | "degraded";
-    owner?: "pi-plan-exec";
+    state?: 'ready' | 'degraded';
+    owner?: 'pi-plan-exec';
     sessionId: string;
-    scope?: "session";
+    scope?: 'session';
     listPath?: string;
     packageVersion?: string;
     revision?: number;

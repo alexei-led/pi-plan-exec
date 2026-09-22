@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { randomUUID } from 'node:crypto';
 import {
   mkdir,
   readFile,
@@ -6,55 +6,68 @@ import {
   rename,
   rm,
   writeFile,
-} from "node:fs/promises";
-import { homedir, hostname } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
-import { acquireLock, LockTimeoutError } from "./registry-lock.js";
-import { worktreeIdentity } from "./git.js";
-import { isSkippableStage, isTerminalStatus } from "./lifecycle.js";
-import { parseOperationActivity } from "./diagnostics.js";
-import { hasActiveLocalOperations } from "./local-operation.js";
-import { parsePlan } from "./plan.js";
+} from 'node:fs/promises';
+import { homedir, hostname } from 'node:os';
+import { basename, dirname, join, resolve } from 'node:path';
+import { parseOperationActivity } from './diagnostics.js';
+import { worktreeIdentity } from './git.js';
+import { isSkippableStage, isTerminalStatus } from './lifecycle.js';
+import { hasActiveLocalOperations } from './local-operation.js';
+import { parsePlan } from './plan.js';
+import { acquireLock, LockTimeoutError } from './registry-lock.js';
 import {
+  type ActiveOperation,
   DEFAULT_FROZEN_RUN_CONFIG,
   MAX_EXECUTION_TIMEOUT_MS,
-  OPERATION_SERVICE,
   OPERATION_KIND,
-  RUN_STAGE,
-  RUN_STATUS,
-  RUN_STAGES,
-  RUN_STATUSES,
-  type ActiveOperation,
+  OPERATION_SERVICE,
   type PlanExecRun,
+  RUN_STAGE,
+  RUN_STAGES,
+  RUN_STATUS,
+  RUN_STATUSES,
   type RunStage,
-} from "./types.js";
+} from './types.js';
 
-const RUNS_DIRECTORY = join(homedir(), ".pi", "plan-exec", "runs");
-const INVALID_RUN_ENTRY = "Invalid plan-exec run registry entry";
+const RUNS_DIRECTORY = join(homedir(), '.pi', 'plan-exec', 'runs');
+const INVALID_RUN_ENTRY = 'Invalid plan-exec run registry entry';
 export const LEASE_STALE_MS = 30_000;
 const CONTROLLER_LOCK_MAX_RETRIES = 20;
 const CLAIM_CAS_RETRIES = 5;
 const RUN_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-type RunLease = NonNullable<PlanExecRun["lease"]>;
-type RunReservations = Pick<PlanExecRun, "worktreeCwd" | "repositoryRoot"> &
-  Partial<Pick<PlanExecRun, "id" | "planPath" | "goal" | "outputTarget" | "lanePreparation" | "tasks">>;
+type RunLease = NonNullable<PlanExecRun['lease']>;
+type RunReservations = Pick<PlanExecRun, 'worktreeCwd' | 'repositoryRoot'> &
+  Partial<
+    Pick<
+      PlanExecRun,
+      'id' | 'planPath' | 'goal' | 'outputTarget' | 'lanePreparation' | 'tasks'
+    >
+  >;
 
 /** A goal reserves its hash inside one repository; a plan reserves its plan file. */
-async function reservationKey(run: RunReservations): Promise<string | undefined> {
-  if (run.goal) return `goal:${await canonicalReservationPath(run.repositoryRoot)}:${run.goal.hash}`;
-  return run.planPath === undefined ? undefined : canonicalReservationPath(run.planPath);
+async function reservationKey(
+  run: RunReservations,
+): Promise<string | undefined> {
+  if (run.goal)
+    return `goal:${await canonicalReservationPath(run.repositoryRoot)}:${run.goal.hash}`;
+  return run.planPath === undefined
+    ? undefined
+    : canonicalReservationPath(run.planPath);
 }
 
 /** Pending lanes retain their own identity while resolving existing parent aliases. */
 async function canonicalReservationPath(path: string): Promise<string> {
   const absolute = resolve(path);
-  try { return await realpath(absolute); }
-  catch (error) {
-    if (!isNodeError(error, "ENOENT")) throw error;
+  try {
+    return await realpath(absolute);
+  } catch (error) {
+    if (!isNodeError(error, 'ENOENT')) throw error;
     const parent = dirname(absolute);
-    return parent === absolute ? absolute : join(await canonicalReservationPath(parent), basename(absolute));
+    return parent === absolute
+      ? absolute
+      : join(await canonicalReservationPath(parent), basename(absolute));
   }
 }
 
@@ -63,14 +76,22 @@ async function reservedCheckouts(run: RunReservations): Promise<Set<string>> {
     run.worktreeCwd,
     run.outputTarget?.cwd,
     run.lanePreparation?.cwd,
-    ...Object.values(run.tasks ?? {}).flatMap(task => [
+    ...Object.values(run.tasks ?? {}).flatMap((task) => [
       task.laneCwd,
       task.recoverySource?.cwd,
-      ...(task.recoveryHistory ?? []).map(source => source.cwd),
+      ...(task.recoveryHistory ?? []).map((source) => source.cwd),
     ]),
   ];
-  const unique = new Set(paths.filter((path): path is string => path !== undefined));
-  return new Set(await Promise.all([...unique].map(async path => canonicalReservationPath(await worktreeIdentity(path)))));
+  const unique = new Set(
+    paths.filter((path): path is string => path !== undefined),
+  );
+  return new Set(
+    await Promise.all(
+      [...unique].map(async (path) =>
+        canonicalReservationPath(await worktreeIdentity(path)),
+      ),
+    ),
+  );
 }
 
 /**
@@ -134,7 +155,9 @@ export function takeoverRefusal(
   sessionId: string,
 ): string | undefined {
   const lease = run.lease;
-  const sameLocalOwner = lease?.sessionId === sessionId && lease.pid === process.pid &&
+  const sameLocalOwner =
+    lease?.sessionId === sessionId &&
+    lease.pid === process.pid &&
     (lease.hostname === undefined || isThisHost(lease.hostname));
   return lease && !sameLocalOwner && isLeaseLive(lease)
     ? `Run ${run.id} is controlled by another active Pi session.`
@@ -147,7 +170,8 @@ export function takeoverRefusal(
  * would refuse.
  */
 export function removalRefusal(run: PlanExecRun): string | undefined {
-  if (run.localOperationActive) return `Run ${run.id} still has unconfirmed local command ownership.`;
+  if (run.localOperationActive)
+    return `Run ${run.id} still has unconfirmed local command ownership.`;
   if (!isTerminalStatus(run.status))
     return `Run ${run.id} is ${run.status}; only a terminal run can be removed.`;
   if (run.lease && isLeaseLive(run.lease))
@@ -168,26 +192,29 @@ export class RunRegistry {
   }
 
   localOperationsPath(runId: string): string {
-    return join(dirname(this.pathFor(runId)), "local-operations");
+    return join(dirname(this.pathFor(runId)), 'local-operations');
   }
 
   async create(
     run: Omit<
       PlanExecRun,
-      | "id"
-      | "revision"
-      | "createdAt"
-      | "updatedAt"
-      | "skippedStages"
-      | "branchRebindings"
+      | 'id'
+      | 'revision'
+      | 'createdAt'
+      | 'updatedAt'
+      | 'skippedStages'
+      | 'branchRebindings'
     > & {
-      skippedStages?: PlanExecRun["skippedStages"];
-      branchRebindings?: PlanExecRun["branchRebindings"];
+      skippedStages?: PlanExecRun['skippedStages'];
+      branchRebindings?: PlanExecRun['branchRebindings'];
     },
-    options: { exclusive?: boolean; onAllocated?: (run: PlanExecRun) => void } = {},
+    options: {
+      exclusive?: boolean;
+      onAllocated?: (run: PlanExecRun) => void;
+    } = {},
   ): Promise<PlanExecRun> {
     await mkdir(this.directory, { recursive: true });
-    const registryLockPath = join(this.directory, "registry.lock");
+    const registryLockPath = join(this.directory, 'registry.lock');
     const registryLock = await acquireLock(registryLockPath);
     try {
       if (options.exclusive) await this.assertExclusive(run);
@@ -210,26 +237,32 @@ export class RunRegistry {
   }
 
   /** Create holds the registry lock; resume already owns a reserved run. */
-  async assertExclusive(
-    run: RunReservations,
-  ): Promise<void> {
+  async assertExclusive(run: RunReservations): Promise<void> {
     const { runs, errors } = await this.listWithErrors();
     if (errors.length)
-      throw new Error(`Cannot verify execution ownership: unreadable run ${errors[0]!.runId}. Use /exec status.`);
+      throw new Error(
+        `Cannot verify execution ownership: unreadable run ${errors[0]?.runId}. Use /exec status.`,
+      );
     const worktrees = await reservedCheckouts(run);
     const key = await reservationKey(run);
     for (const existing of runs) {
       if (existing.id === run.id) continue;
-      if (isTerminalStatus(existing.status) &&
-          existing.status !== RUN_STATUS.FAILED &&
-          !existing.activeOperation &&
-          !existing.localOperationActive &&
-          !(existing.lease && isLeaseLive(existing.lease))) continue;
-      const sameWorktree = [...await reservedCheckouts(existing)].some(path => worktrees.has(path));
-      const sameSubject = key !== undefined && key === await reservationKey(existing);
+      if (
+        isTerminalStatus(existing.status) &&
+        existing.status !== RUN_STATUS.FAILED &&
+        !existing.activeOperation &&
+        !existing.localOperationActive &&
+        !(existing.lease && isLeaseLive(existing.lease))
+      )
+        continue;
+      const sameWorktree = [...(await reservedCheckouts(existing))].some(
+        (path) => worktrees.has(path),
+      );
+      const sameSubject =
+        key !== undefined && key === (await reservationKey(existing));
       if (sameWorktree || sameSubject)
         throw new Error(
-          `Plan execution already exists for ${sameWorktree ? "worktree" : run.goal ? "goal" : "plan"}: ${existing.id}. Use /exec status ${existing.id} or /exec resume ${existing.id}.`,
+          `Plan execution already exists for ${sameWorktree ? 'worktree' : run.goal ? 'goal' : 'plan'}: ${existing.id}. Use /exec status ${existing.id} or /exec resume ${existing.id}.`,
         );
     }
   }
@@ -237,12 +270,13 @@ export class RunRegistry {
   async get(runId: string): Promise<PlanExecRun | undefined> {
     assertRunId(runId);
     try {
-      const run = parseRun(await readFile(this.pathFor(runId), "utf8"), runId);
-      if (await hasActiveLocalOperations(this.localOperationsPath(runId))) return { ...run, localOperationActive: true };
+      const run = parseRun(await readFile(this.pathFor(runId), 'utf8'), runId);
+      if (await hasActiveLocalOperations(this.localOperationsPath(runId)))
+        return { ...run, localOperationActive: true };
       delete run.localOperationActive;
       return run;
     } catch (error: unknown) {
-      if (isNodeError(error, "ENOENT")) return undefined;
+      if (isNodeError(error, 'ENOENT')) return undefined;
       throw error;
     }
   }
@@ -256,7 +290,7 @@ export class RunRegistry {
     errors: Array<{ runId: string; message: string }>;
   }> {
     try {
-      const { readdir } = await import("node:fs/promises");
+      const { readdir } = await import('node:fs/promises');
       const entries = await readdir(this.directory, { withFileTypes: true });
       const loaded = await Promise.all(
         entries
@@ -282,7 +316,7 @@ export class RunRegistry {
         errors: loaded.flatMap((item) => (item.error ? [item.error] : [])),
       };
     } catch (error: unknown) {
-      if (isNodeError(error, "ENOENT")) return { runs: [], errors: [] };
+      if (isNodeError(error, 'ENOENT')) return { runs: [], errors: [] };
       throw error;
     }
   }
@@ -331,9 +365,9 @@ export class RunRegistry {
     try {
       let current: PlanExecRun;
       try {
-        current = parseRun(await readFile(path, "utf8"), run.id);
+        current = parseRun(await readFile(path, 'utf8'), run.id);
       } catch (error: unknown) {
-        if (isNodeError(error, "ENOENT"))
+        if (isNodeError(error, 'ENOENT'))
           throw new Error(`Plan execution run not found: ${run.id}`, {
             cause: error,
           });
@@ -357,7 +391,7 @@ export class RunRegistry {
 
   async updateTaskProjection(
     run: PlanExecRun,
-    taskProjection: NonNullable<PlanExecRun["taskProjection"]>,
+    taskProjection: NonNullable<PlanExecRun['taskProjection']>,
   ): Promise<PlanExecRun> {
     let current = run;
     for (let attempt = 0; attempt < CLAIM_CAS_RETRIES; attempt += 1) {
@@ -376,10 +410,14 @@ export class RunRegistry {
 
   async claim(run: PlanExecRun, sessionId: string): Promise<PlanExecRun> {
     if (!sessionId.trim())
-      throw new Error("A Pi session ID is required to claim a run.");
+      throw new Error('A Pi session ID is required to claim a run.');
     let current = run;
     for (let attempt = 0; attempt < CLAIM_CAS_RETRIES; attempt += 1) {
-      if (isTerminalStatus(current.status) && current.status !== RUN_STATUS.FAILED) return current;
+      if (
+        isTerminalStatus(current.status) &&
+        current.status !== RUN_STATUS.FAILED
+      )
+        return current;
       const now = Date.now();
       const refusal = takeoverRefusal(current, sessionId);
       if (refusal) throw new Error(refusal);
@@ -406,12 +444,9 @@ export class RunRegistry {
     callback: () => Promise<T>,
   ): Promise<T | undefined> {
     const path = this.controllerLockPath(runId);
-    let lock;
+    let lock: Awaited<ReturnType<typeof acquireLock>>;
     try {
-      lock = await acquireLock(
-        path,
-        CONTROLLER_LOCK_MAX_RETRIES,
-      );
+      lock = await acquireLock(path, CONTROLLER_LOCK_MAX_RETRIES);
     } catch (error: unknown) {
       if (error instanceof LockTimeoutError) return undefined;
       throw error;
@@ -456,7 +491,7 @@ export class RunRegistry {
   async remove(runId: string): Promise<boolean> {
     assertRunId(runId);
     const controllerPath = this.controllerLockPath(runId);
-    let controllerLock;
+    let controllerLock: Awaited<ReturnType<typeof acquireLock>>;
     try {
       controllerLock = await acquireLock(
         controllerPath,
@@ -483,7 +518,9 @@ export class RunRegistry {
     const lock = await acquireLock(lockPath);
     try {
       if (await hasActiveLocalOperations(this.localOperationsPath(runId)))
-        throw new Error(`Run ${runId} still has unconfirmed local command ownership.`);
+        throw new Error(
+          `Run ${runId} still has unconfirmed local command ownership.`,
+        );
       const run = await this.readForRemoval(runId);
       if (run === undefined) return false;
       const refusal = run === null ? undefined : removalRefusal(run);
@@ -521,17 +558,17 @@ export class RunRegistry {
 
   private pathFor(runId: string): string {
     assertRunId(runId);
-    return join(this.directory, runId, "run.json");
+    return join(this.directory, runId, 'run.json');
   }
 
   private controllerLockPath(runId: string): string {
     assertRunId(runId);
-    return join(this.directory, ".locks", `${runId}.controller.lock`);
+    return join(this.directory, '.locks', `${runId}.controller.lock`);
   }
 
   private recordLockPath(runId: string): string {
     assertRunId(runId);
-    return join(this.directory, ".locks", `${runId}.record.lock`);
+    return join(this.directory, '.locks', `${runId}.record.lock`);
   }
 
   private async write(run: PlanExecRun): Promise<void> {
@@ -550,7 +587,7 @@ export class RunRegistry {
 async function writeLocked(path: string, run: PlanExecRun): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
   const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
-  await writeFile(temporary, `${JSON.stringify(run, null, 2)}\n`, "utf8");
+  await writeFile(temporary, `${JSON.stringify(run, null, 2)}\n`, 'utf8');
   await rename(temporary, path);
 }
 
@@ -559,7 +596,7 @@ function isProcessRunning(pid: number): boolean {
     process.kill(pid, 0);
     return true;
   } catch (error: unknown) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
   }
 }
 
@@ -574,19 +611,23 @@ function parseRun(raw: string, runId: string): PlanExecRun {
 }
 
 function migrateLegacyRun(value: Record<string, unknown>): PlanExecRun {
-  const stage = value.stage === "tasks" ? RUN_STAGE.PROJECT_TASKS : value.stage;
+  const stage = value.stage === 'tasks' ? RUN_STAGE.PROJECT_TASKS : value.stage;
   const config = isRecord(value.config) ? value.config : {};
   const legacy = value as unknown as PlanExecRun & { blockedTask?: unknown };
-  const blocked = legacy.blocked ?? (isRecord(legacy.blockedTask)
-    ? {
-        reason: stringOr(legacy.blockedTask.reason, ""),
-        ...(typeof legacy.blockedTask.taskId === "number" ? { taskId: legacy.blockedTask.taskId } : {}),
-      }
-    : undefined);
+  const blocked =
+    legacy.blocked ??
+    (isRecord(legacy.blockedTask)
+      ? {
+          reason: stringOr(legacy.blockedTask.reason, ''),
+          ...(typeof legacy.blockedTask.taskId === 'number'
+            ? { taskId: legacy.blockedTask.taskId }
+            : {}),
+        }
+      : undefined);
   const migrated: PlanExecRun = {
     ...legacy,
     revision:
-      typeof value.revision === "number" && Number.isInteger(value.revision)
+      typeof value.revision === 'number' && Number.isInteger(value.revision)
         ? value.revision
         : 1,
     stage: stage as RunStage,
@@ -594,28 +635,30 @@ function migrateLegacyRun(value: Record<string, unknown>): PlanExecRun {
       ? (value.stageAttempts as Record<string, number>)
       : {},
     reviewFindings: Array.isArray(value.reviewFindings)
-      ? (value.reviewFindings as PlanExecRun["reviewFindings"])
+      ? (value.reviewFindings as PlanExecRun['reviewFindings'])
       : [],
     unresolvedFindings: Array.isArray(value.unresolvedFindings)
-      ? (value.unresolvedFindings as PlanExecRun["unresolvedFindings"])
+      ? (value.unresolvedFindings as PlanExecRun['unresolvedFindings'])
       : [],
     skippedStages:
       value.skippedStages === undefined
         ? []
-        : (value.skippedStages as PlanExecRun["skippedStages"]),
+        : (value.skippedStages as PlanExecRun['skippedStages']),
     branchRebindings:
       value.branchRebindings === undefined
         ? []
-        : (value.branchRebindings as PlanExecRun["branchRebindings"]),
+        : (value.branchRebindings as PlanExecRun['branchRebindings']),
     config: {
       ...config,
-      executionLifetime: config.executionLifetime ?? DEFAULT_FROZEN_RUN_CONFIG.executionLifetime,
-      retryDelayMs: config.retryDelayMs ?? DEFAULT_FROZEN_RUN_CONFIG.retryDelayMs,
+      executionLifetime:
+        config.executionLifetime ?? DEFAULT_FROZEN_RUN_CONFIG.executionLifetime,
+      retryDelayMs:
+        config.retryDelayMs ?? DEFAULT_FROZEN_RUN_CONFIG.retryDelayMs,
       requiredChecks: config.requiredChecks ?? [],
       bootstrapCommands: config.bootstrapCommands ?? [],
       reviewEnabled: config.reviewEnabled ?? true,
       reviewRequired: config.reviewRequired ?? true,
-      reviewBackend: config.reviewBackend ?? "subagent",
+      reviewBackend: config.reviewBackend ?? 'subagent',
       reviewFallback: config.reviewFallback ?? [],
       statsEnabled: config.statsEnabled ?? false,
       taskRetries: numberOr(
@@ -662,12 +705,15 @@ function migrateLegacyRun(value: Record<string, unknown>): PlanExecRun {
         config.statsMaxTurns,
         DEFAULT_FROZEN_RUN_CONFIG.statsMaxTurns,
       ),
-    } as PlanExecRun["config"],
+    } as PlanExecRun['config'],
     ...(blocked === undefined ? {} : { blocked }),
   };
   delete (migrated as { blockedTask?: unknown }).blockedTask;
   if (migrated.goal !== undefined && !Number.isInteger(migrated.goal.maxTurns))
-    migrated.goal = { ...migrated.goal, maxTurns: migrated.config.maxTaskIterations };
+    migrated.goal = {
+      ...migrated.goal,
+      maxTurns: migrated.config.maxTaskIterations,
+    };
   return migrated;
 }
 
@@ -684,7 +730,8 @@ function assertRun(run: PlanExecRun): void {
     !isAutonomousState(run) ||
     !isRunSubject(run) ||
     !isPlanSnapshots(run) ||
-    (run.localOperationActive !== undefined && typeof run.localOperationActive !== "boolean") ||
+    (run.localOperationActive !== undefined &&
+      typeof run.localOperationActive !== 'boolean') ||
     !Array.isArray(run.skippedStages) ||
     !run.skippedStages.every(
       (skip) =>
@@ -706,7 +753,7 @@ function assertRun(run: PlanExecRun): void {
       (!isRecord(run.blocked) ||
         (run.blocked.taskId !== undefined &&
           (!Number.isInteger(run.blocked.taskId) || run.blocked.taskId < 1)) ||
-        typeof run.blocked.reason !== "string" ||
+        typeof run.blocked.reason !== 'string' ||
         !run.blocked.reason.trim())) ||
     !isValidOperationForStage(run.activeOperation, run.stage) ||
     !isValidOperationForStage(run.failedOperation, run.stage)
@@ -720,22 +767,30 @@ function isRunSubject(run: PlanExecRun): boolean {
     return (
       run.planPath === undefined &&
       run.planHash === undefined &&
-      typeof run.goal.text === "string" && Boolean(run.goal.text.trim()) &&
-      typeof run.goal.hash === "string" && /^[a-f0-9]{12}$/.test(run.goal.hash) &&
-      Number.isInteger(run.goal.iteration) && run.goal.iteration >= 0 &&
-      Number.isInteger(run.goal.maxTurns) && run.goal.maxTurns >= 1 &&
-      Number.isInteger(run.goal.noProgress) && run.goal.noProgress >= 0 &&
-      (run.goal.lastOutcome === undefined || typeof run.goal.lastOutcome === "string") &&
+      typeof run.goal.text === 'string' &&
+      Boolean(run.goal.text.trim()) &&
+      typeof run.goal.hash === 'string' &&
+      /^[a-f0-9]{12}$/.test(run.goal.hash) &&
+      Number.isInteger(run.goal.iteration) &&
+      run.goal.iteration >= 0 &&
+      Number.isInteger(run.goal.maxTurns) &&
+      run.goal.maxTurns >= 1 &&
+      Number.isInteger(run.goal.noProgress) &&
+      run.goal.noProgress >= 0 &&
+      (run.goal.lastOutcome === undefined ||
+        typeof run.goal.lastOutcome === 'string') &&
       (run.goal.lastCheck === undefined ||
         (isRecord(run.goal.lastCheck) &&
-          typeof run.goal.lastCheck.fingerprint === "string" &&
-          typeof run.goal.lastCheck.failures === "string" &&
-          typeof run.goal.lastCheck.head === "string" &&
-          typeof run.goal.lastCheck.at === "number"))
+          typeof run.goal.lastCheck.fingerprint === 'string' &&
+          typeof run.goal.lastCheck.failures === 'string' &&
+          typeof run.goal.lastCheck.head === 'string' &&
+          typeof run.goal.lastCheck.at === 'number'))
     );
   return (
-    typeof run.planPath === "string" && run.planPath.length > 0 &&
-    typeof run.planHash === "string" && run.planHash.length > 0
+    typeof run.planPath === 'string' &&
+    run.planPath.length > 0 &&
+    typeof run.planHash === 'string' &&
+    run.planHash.length > 0
   );
 }
 
@@ -744,169 +799,430 @@ function isPlanSnapshots(run: PlanExecRun): boolean {
     return run.initialPlan === undefined && run.approvedPlan === undefined;
   for (const snapshot of [run.initialPlan, run.approvedPlan]) {
     if (snapshot === undefined) continue;
-    if (!isRecord(snapshot) || typeof snapshot.content !== "string" || typeof snapshot.hash !== "string") return false;
-    try { if (parsePlan(run.planPath, snapshot.content).hash !== snapshot.hash) return false; }
-    catch { return false; }
+    if (
+      !isRecord(snapshot) ||
+      typeof snapshot.content !== 'string' ||
+      typeof snapshot.hash !== 'string'
+    )
+      return false;
+    try {
+      if (parsePlan(run.planPath, snapshot.content).hash !== snapshot.hash)
+        return false;
+    } catch {
+      return false;
+    }
   }
-  return run.approvedPlan === undefined || run.approvedPlan.hash === run.planHash;
+  return (
+    run.approvedPlan === undefined || run.approvedPlan.hash === run.planHash
+  );
 }
 
 function isFrozenConfig(value: unknown): boolean {
   if (!isRecord(value)) return false;
   return (
     isExecutionLifetime(value.executionLifetime) &&
-    typeof value.retryDelayMs === "number" && Number.isFinite(value.retryDelayMs) && value.retryDelayMs > 0 &&
-    isCommands(value.requiredChecks) && isCommands(value.bootstrapCommands) &&
-    typeof value.reviewEnabled === "boolean" && typeof value.reviewRequired === "boolean" &&
-    typeof value.statsEnabled === "boolean" &&
+    typeof value.retryDelayMs === 'number' &&
+    Number.isFinite(value.retryDelayMs) &&
+    value.retryDelayMs > 0 &&
+    isCommands(value.requiredChecks) &&
+    isCommands(value.bootstrapCommands) &&
+    typeof value.reviewEnabled === 'boolean' &&
+    typeof value.reviewRequired === 'boolean' &&
+    typeof value.statsEnabled === 'boolean' &&
     !(value.reviewRequired && !value.reviewEnabled) &&
-    isReviewBackend(value.reviewBackend) && Array.isArray(value.reviewFallback) && value.reviewFallback.every(isReviewBackend) &&
-    typeof value.taskRetries === "number" &&
-    typeof value.maxTaskIterations === "number" &&
-    typeof value.reviewIterations === "number" &&
-    typeof value.fusionIterations === "number" &&
-    typeof value.finalizeEnabled === "boolean" &&
-    typeof value.workerAgent === "string" &&
-    typeof value.workerMaxTurns === "number" &&
-    typeof value.reviewerAgent === "string" &&
-    typeof value.reviewerMaxTurns === "number" &&
-    typeof value.statsAgent === "string" &&
-    typeof value.statsMaxTurns === "number"
+    isReviewBackend(value.reviewBackend) &&
+    Array.isArray(value.reviewFallback) &&
+    value.reviewFallback.every(isReviewBackend) &&
+    typeof value.taskRetries === 'number' &&
+    typeof value.maxTaskIterations === 'number' &&
+    typeof value.reviewIterations === 'number' &&
+    typeof value.fusionIterations === 'number' &&
+    typeof value.finalizeEnabled === 'boolean' &&
+    typeof value.workerAgent === 'string' &&
+    typeof value.workerMaxTurns === 'number' &&
+    typeof value.reviewerAgent === 'string' &&
+    typeof value.reviewerMaxTurns === 'number' &&
+    typeof value.statsAgent === 'string' &&
+    typeof value.statsMaxTurns === 'number'
   );
 }
 
 function isExecutionLifetime(value: unknown): boolean {
-  return isRecord(value) && (value.mode === "unbounded" ||
-    (value.mode === "bounded" && typeof value.timeoutMs === "number" &&
-      Number.isSafeInteger(value.timeoutMs) && value.timeoutMs > 0 && value.timeoutMs <= MAX_EXECUTION_TIMEOUT_MS));
+  return (
+    isRecord(value) &&
+    (value.mode === 'unbounded' ||
+      (value.mode === 'bounded' &&
+        typeof value.timeoutMs === 'number' &&
+        Number.isSafeInteger(value.timeoutMs) &&
+        value.timeoutMs > 0 &&
+        value.timeoutMs <= MAX_EXECUTION_TIMEOUT_MS))
+  );
 }
 
 function isReviewBackend(value: unknown): boolean {
-  return value === "subagent" || value === OPERATION_SERVICE.FUSION || value === "revmux";
+  return (
+    value === 'subagent' ||
+    value === OPERATION_SERVICE.FUSION ||
+    value === 'revmux'
+  );
 }
 
 function isCommands(value: unknown): boolean {
-  return Array.isArray(value) && value.every((command: unknown) =>
-    Array.isArray(command) && command.length > 0 && command.every((part: unknown) => typeof part === "string" && part.length > 0));
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (command: unknown) =>
+        Array.isArray(command) &&
+        command.length > 0 &&
+        command.every(
+          (part: unknown) => typeof part === 'string' && part.length > 0,
+        ),
+    )
+  );
 }
 
 function isAutonomousState(run: PlanExecRun): boolean {
-  const timestamp = (value: unknown) => value === undefined || (typeof value === "number" && Number.isFinite(value) && value >= 0);
-  for (const commit of [run.acceptedHead, run.reviewedCommit, run.verifiedCommit])
-    if (commit !== undefined && (typeof commit !== "string" || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(commit))) return false;
+  const timestamp = (value: unknown) =>
+    value === undefined ||
+    (typeof value === 'number' && Number.isFinite(value) && value >= 0);
+  for (const commit of [
+    run.acceptedHead,
+    run.reviewedCommit,
+    run.verifiedCommit,
+  ])
+    if (
+      commit !== undefined &&
+      (typeof commit !== 'string' ||
+        !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(commit))
+    )
+      return false;
   for (const operation of [run.activeOperation, run.failedOperation]) {
     const commit = operation?.reviewedCommit;
-    if (commit !== undefined && (typeof commit !== "string" || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(commit))) return false;
+    if (
+      commit !== undefined &&
+      (typeof commit !== 'string' ||
+        !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(commit))
+    )
+      return false;
     if (!isUsage(operation?.reportedUsage)) return false;
-    if (operation?.expectedLifetime !== undefined && !isExecutionLifetime(operation.expectedLifetime)) return false;
-    if (operation?.effectiveLifetime !== undefined && !isExecutionLifetime(operation.effectiveLifetime)) return false;
-    if (operation?.terminationReason !== undefined && operation.terminationReason !== "execution_lifetime_expired") return false;
-    if (operation?.budgetExpiryRecorded !== undefined && typeof operation.budgetExpiryRecorded !== "boolean") return false;
-    if (operation?.budgetGrowthGranted !== undefined && typeof operation.budgetGrowthGranted !== "boolean") return false;
+    if (
+      operation?.expectedLifetime !== undefined &&
+      !isExecutionLifetime(operation.expectedLifetime)
+    )
+      return false;
+    if (
+      operation?.effectiveLifetime !== undefined &&
+      !isExecutionLifetime(operation.effectiveLifetime)
+    )
+      return false;
+    if (
+      operation?.terminationReason !== undefined &&
+      operation.terminationReason !== 'execution_lifetime_expired'
+    )
+      return false;
+    if (
+      operation?.budgetExpiryRecorded !== undefined &&
+      typeof operation.budgetExpiryRecorded !== 'boolean'
+    )
+      return false;
+    if (
+      operation?.budgetGrowthGranted !== undefined &&
+      typeof operation.budgetGrowthGranted !== 'boolean'
+    )
+      return false;
     if (!isExternalPrerequisite(operation?.externalPrerequisite)) return false;
     if (!isOperationDiagnostics(operation?.diagnostics)) return false;
-    if (operation?.diagnosticActions !== undefined && (!isRecord(operation.diagnosticActions) ||
-      !Object.entries(operation.diagnosticActions).every(([key, action]) => /^[a-f0-9]{64}$/.test(key) && isRecord(action) &&
-        ["diagnosticId", "toolCallId", "message"].every((field) => typeof action[field] === "string" && action[field].trim().length > 0) &&
-        ["pending", "queued", "cancelled", "rejected"].includes(String(action.state)) &&
-        [action.stopGeneration, action.requestedAt, action.nextAttemptAt].every((value) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0) &&
-        (action.lastReplyAt === undefined || (typeof action.lastReplyAt === "number" && Number.isSafeInteger(action.lastReplyAt) && action.lastReplyAt >= 0)) &&
-        (action.error === undefined || typeof action.error === "string")))) return false;
-    if (operation?.stopAcknowledged !== undefined && typeof operation.stopAcknowledged !== "boolean") return false;
-    if (operation?.launchFenced !== undefined && typeof operation.launchFenced !== "boolean") return false;
+    if (
+      operation?.diagnosticActions !== undefined &&
+      (!isRecord(operation.diagnosticActions) ||
+        !Object.entries(operation.diagnosticActions).every(
+          ([key, action]) =>
+            /^[a-f0-9]{64}$/.test(key) &&
+            isRecord(action) &&
+            ['diagnosticId', 'toolCallId', 'message'].every(
+              (field) =>
+                typeof action[field] === 'string' &&
+                action[field].trim().length > 0,
+            ) &&
+            ['pending', 'queued', 'cancelled', 'rejected'].includes(
+              String(action.state),
+            ) &&
+            [
+              action.stopGeneration,
+              action.requestedAt,
+              action.nextAttemptAt,
+            ].every(
+              (value) =>
+                typeof value === 'number' &&
+                Number.isSafeInteger(value) &&
+                value >= 0,
+            ) &&
+            (action.lastReplyAt === undefined ||
+              (typeof action.lastReplyAt === 'number' &&
+                Number.isSafeInteger(action.lastReplyAt) &&
+                action.lastReplyAt >= 0)) &&
+            (action.error === undefined || typeof action.error === 'string'),
+        ))
+    )
+      return false;
+    if (
+      operation?.stopAcknowledged !== undefined &&
+      typeof operation.stopAcknowledged !== 'boolean'
+    )
+      return false;
+    if (
+      operation?.launchFenced !== undefined &&
+      typeof operation.launchFenced !== 'boolean'
+    )
+      return false;
   }
-  if (run.budgetExhaustions !== undefined && (!isRecord(run.budgetExhaustions) ||
-    !Object.entries(run.budgetExhaustions).every(([key, value]) => key.length > 0 &&
-      typeof value === "number" && Number.isSafeInteger(value) && value >= 0))) return false;
-  if (run.budgetGrowths !== undefined && (!isRecord(run.budgetGrowths) ||
-    !Object.entries(run.budgetGrowths).every(([key, value]) => key.length > 0 &&
-      typeof value === "number" && Number.isSafeInteger(value) && value >= 0))) return false;
+  if (
+    run.budgetExhaustions !== undefined &&
+    (!isRecord(run.budgetExhaustions) ||
+      !Object.entries(run.budgetExhaustions).every(
+        ([key, value]) =>
+          key.length > 0 &&
+          typeof value === 'number' &&
+          Number.isSafeInteger(value) &&
+          value >= 0,
+      ))
+  )
+    return false;
+  if (
+    run.budgetGrowths !== undefined &&
+    (!isRecord(run.budgetGrowths) ||
+      !Object.entries(run.budgetGrowths).every(
+        ([key, value]) =>
+          key.length > 0 &&
+          typeof value === 'number' &&
+          Number.isSafeInteger(value) &&
+          value >= 0,
+      ))
+  )
+    return false;
   if (!isUsage(run.usage)) return false;
-  if (run.lanePreparation !== undefined && (!isRecord(run.lanePreparation) ||
-    typeof run.lanePreparation.cwd !== "string" || !run.lanePreparation.cwd ||
-    typeof run.lanePreparation.branch !== "string" || !run.lanePreparation.branch ||
-    typeof run.lanePreparation.baselineCommit !== "string" || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(run.lanePreparation.baselineCommit) ||
-    !Number.isSafeInteger(run.lanePreparation.taskId) || run.lanePreparation.taskId < 0 ||
-    !["create", "bootstrap"].includes(run.lanePreparation.state) || !timestamp(run.lanePreparation.nextAttemptAt) ||
-    (run.lanePreparation.sourcePlanPath !== undefined && (typeof run.lanePreparation.sourcePlanPath !== "string" || !run.lanePreparation.sourcePlanPath)) ||
-    (run.lanePreparation.publication !== undefined && (!isRecord(run.lanePreparation.publication) ||
-      typeof run.lanePreparation.publication.planHash !== "string" || !/^[a-f0-9]{64}$/.test(run.lanePreparation.publication.planHash) ||
-      typeof run.lanePreparation.publication.digest !== "string" || !/^[a-f0-9]{64}$/.test(run.lanePreparation.publication.digest))) ||
-    (run.lanePreparation.error !== undefined && typeof run.lanePreparation.error !== "string"))) return false;
-  if (run.outputTarget !== undefined &&
-    (!isRecord(run.outputTarget) || typeof run.outputTarget.cwd !== "string" || !run.outputTarget.cwd ||
-      typeof run.outputTarget.branch !== "string" || !run.outputTarget.branch ||
-      typeof run.outputTarget.initialHead !== "string" || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(run.outputTarget.initialHead) ||
-      typeof run.outputTarget.planRelativePath !== "string" ||
+  if (
+    run.lanePreparation !== undefined &&
+    (!isRecord(run.lanePreparation) ||
+      typeof run.lanePreparation.cwd !== 'string' ||
+      !run.lanePreparation.cwd ||
+      typeof run.lanePreparation.branch !== 'string' ||
+      !run.lanePreparation.branch ||
+      typeof run.lanePreparation.baselineCommit !== 'string' ||
+      !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(
+        run.lanePreparation.baselineCommit,
+      ) ||
+      !Number.isSafeInteger(run.lanePreparation.taskId) ||
+      run.lanePreparation.taskId < 0 ||
+      !['create', 'bootstrap'].includes(run.lanePreparation.state) ||
+      !timestamp(run.lanePreparation.nextAttemptAt) ||
+      (run.lanePreparation.sourcePlanPath !== undefined &&
+        (typeof run.lanePreparation.sourcePlanPath !== 'string' ||
+          !run.lanePreparation.sourcePlanPath)) ||
+      (run.lanePreparation.publication !== undefined &&
+        (!isRecord(run.lanePreparation.publication) ||
+          typeof run.lanePreparation.publication.planHash !== 'string' ||
+          !/^[a-f0-9]{64}$/.test(run.lanePreparation.publication.planHash) ||
+          typeof run.lanePreparation.publication.digest !== 'string' ||
+          !/^[a-f0-9]{64}$/.test(run.lanePreparation.publication.digest))) ||
+      (run.lanePreparation.error !== undefined &&
+        typeof run.lanePreparation.error !== 'string'))
+  )
+    return false;
+  if (
+    run.outputTarget !== undefined &&
+    (!isRecord(run.outputTarget) ||
+      typeof run.outputTarget.cwd !== 'string' ||
+      !run.outputTarget.cwd ||
+      typeof run.outputTarget.branch !== 'string' ||
+      !run.outputTarget.branch ||
+      typeof run.outputTarget.initialHead !== 'string' ||
+      !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(run.outputTarget.initialHead) ||
+      typeof run.outputTarget.planRelativePath !== 'string' ||
       (run.goal === undefined && !run.outputTarget.planRelativePath) ||
-      (run.outputTarget.progressRelativePath !== undefined && typeof run.outputTarget.progressRelativePath !== "string"))) return false;
-  if (run.outputPromotion !== undefined &&
-    (!isRecord(run.outputPromotion) || typeof run.outputPromotion.candidate !== "string" ||
+      (run.outputTarget.progressRelativePath !== undefined &&
+        typeof run.outputTarget.progressRelativePath !== 'string'))
+  )
+    return false;
+  if (
+    run.outputPromotion !== undefined &&
+    (!isRecord(run.outputPromotion) ||
+      typeof run.outputPromotion.candidate !== 'string' ||
       !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(run.outputPromotion.candidate) ||
-      !["pending", "complete"].includes(run.outputPromotion.state) ||
-      (run.outputPromotion.commandStarted !== undefined && typeof run.outputPromotion.commandStarted !== "boolean") ||
-      (run.outputPromotion.attempt !== undefined && (!Number.isSafeInteger(run.outputPromotion.attempt) || run.outputPromotion.attempt < 0)))) return false;
-  if (run.archiveOperation !== undefined && (!isRecord(run.archiveOperation) ||
-    !["stage", "commit", "retired"].includes(run.archiveOperation.phase) ||
-    typeof run.archiveOperation.operationId !== "string" || !run.archiveOperation.operationId ||
-    !isCommands(run.archiveOperation.commands) || run.archiveOperation.commands.length === 0 || !Array.isArray(run.archiveOperation.paths) || run.archiveOperation.paths.length === 0 ||
-    !run.archiveOperation.paths.every((path) => typeof path === "string" && path.length > 0) ||
-    typeof run.archiveOperation.destination !== "string" || !run.archiveOperation.destination ||
-    !Number.isSafeInteger(run.archiveOperation.attempt) || run.archiveOperation.attempt < 0)) return false;
-  if (run.statsReport !== undefined &&
-    (!isRecord(run.statsReport) || !["summary", "reported", "unavailable"].includes(run.statsReport.state) ||
-      typeof run.statsReport.summary !== "string" ||
-      (run.statsReport.error !== undefined && typeof run.statsReport.error !== "string"))) return false;
-  if (run.reviewRecovery !== undefined &&
-    (!isRecord(run.reviewRecovery) || typeof run.reviewRecovery.fingerprint !== "string" || !run.reviewRecovery.fingerprint ||
-      !Number.isSafeInteger(run.reviewRecovery.repeats) || run.reviewRecovery.repeats < 0 ||
-      typeof run.reviewRecovery.pendingFix !== "boolean" ||
+      !['pending', 'complete'].includes(run.outputPromotion.state) ||
+      (run.outputPromotion.commandStarted !== undefined &&
+        typeof run.outputPromotion.commandStarted !== 'boolean') ||
+      (run.outputPromotion.attempt !== undefined &&
+        (!Number.isSafeInteger(run.outputPromotion.attempt) ||
+          run.outputPromotion.attempt < 0)))
+  )
+    return false;
+  if (
+    run.archiveOperation !== undefined &&
+    (!isRecord(run.archiveOperation) ||
+      !['stage', 'commit', 'retired'].includes(run.archiveOperation.phase) ||
+      typeof run.archiveOperation.operationId !== 'string' ||
+      !run.archiveOperation.operationId ||
+      !isCommands(run.archiveOperation.commands) ||
+      run.archiveOperation.commands.length === 0 ||
+      !Array.isArray(run.archiveOperation.paths) ||
+      run.archiveOperation.paths.length === 0 ||
+      !run.archiveOperation.paths.every(
+        (path) => typeof path === 'string' && path.length > 0,
+      ) ||
+      typeof run.archiveOperation.destination !== 'string' ||
+      !run.archiveOperation.destination ||
+      !Number.isSafeInteger(run.archiveOperation.attempt) ||
+      run.archiveOperation.attempt < 0)
+  )
+    return false;
+  if (
+    run.statsReport !== undefined &&
+    (!isRecord(run.statsReport) ||
+      !['summary', 'reported', 'unavailable'].includes(run.statsReport.state) ||
+      typeof run.statsReport.summary !== 'string' ||
+      (run.statsReport.error !== undefined &&
+        typeof run.statsReport.error !== 'string'))
+  )
+    return false;
+  if (
+    run.reviewRecovery !== undefined &&
+    (!isRecord(run.reviewRecovery) ||
+      typeof run.reviewRecovery.fingerprint !== 'string' ||
+      !run.reviewRecovery.fingerprint ||
+      !Number.isSafeInteger(run.reviewRecovery.repeats) ||
+      run.reviewRecovery.repeats < 0 ||
+      typeof run.reviewRecovery.pendingFix !== 'boolean' ||
       (run.reviewRecovery.lastReviewedCommit !== undefined &&
-        !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(run.reviewRecovery.lastReviewedCommit)))) return false;
-  if (!timestamp(run.nextAttemptAt) || !timestamp(run.stopGeneration)) return false;
-  if (run.recoveryAttempts !== undefined &&
-    (!Number.isSafeInteger(run.recoveryAttempts) || run.recoveryAttempts < 0)) return false;
-  if (run.userStopped !== undefined && typeof run.userStopped !== "boolean") return false;
+        !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(
+          run.reviewRecovery.lastReviewedCommit,
+        )))
+  )
+    return false;
+  if (!timestamp(run.nextAttemptAt) || !timestamp(run.stopGeneration))
+    return false;
+  if (
+    run.recoveryAttempts !== undefined &&
+    (!Number.isSafeInteger(run.recoveryAttempts) || run.recoveryAttempts < 0)
+  )
+    return false;
+  if (run.userStopped !== undefined && typeof run.userStopped !== 'boolean')
+    return false;
   if (run.tasks === undefined) return true;
   if (!isRecord(run.tasks)) return false;
-  const states = new Set(["ready", "running", "verifying", "retry_wait", "waiting_dependency", "waiting_external", "accepted"]);
-  return Object.entries(run.tasks).every(([id, task]) =>
-    isRecord(task) && String(task.taskId) === id && Number.isSafeInteger(task.taskId) &&
-    typeof task.taskId === "number" && task.taskId > 0 &&
-    typeof task.state === "string" && states.has(task.state) &&
-    typeof task.attempts === "number" && Number.isSafeInteger(task.attempts) && task.attempts >= 0 &&
-    isRecoverySource(task.recoverySource) &&
-    (task.recoveryHistory === undefined || (Array.isArray(task.recoveryHistory) && task.recoveryHistory.every(isRecoverySource))) &&
-    Array.isArray(task.dependsOn) && task.dependsOn.every((dependency: unknown) =>
-      typeof dependency === "number" && Number.isSafeInteger(dependency) && dependency > 0 && dependency < Number(task.taskId)) &&
-    new Set(task.dependsOn).size === task.dependsOn.length && timestamp(task.nextAttemptAt) && isUsage(task.usage) &&
-    isExternalPrerequisite(task.externalPrerequisite));
+  const states = new Set([
+    'ready',
+    'running',
+    'verifying',
+    'retry_wait',
+    'waiting_dependency',
+    'waiting_external',
+    'accepted',
+  ]);
+  return Object.entries(run.tasks).every(
+    ([id, task]) =>
+      isRecord(task) &&
+      String(task.taskId) === id &&
+      Number.isSafeInteger(task.taskId) &&
+      typeof task.taskId === 'number' &&
+      task.taskId > 0 &&
+      typeof task.state === 'string' &&
+      states.has(task.state) &&
+      typeof task.attempts === 'number' &&
+      Number.isSafeInteger(task.attempts) &&
+      task.attempts >= 0 &&
+      isRecoverySource(task.recoverySource) &&
+      (task.recoveryHistory === undefined ||
+        (Array.isArray(task.recoveryHistory) &&
+          task.recoveryHistory.every(isRecoverySource))) &&
+      Array.isArray(task.dependsOn) &&
+      task.dependsOn.every(
+        (dependency: unknown) =>
+          typeof dependency === 'number' &&
+          Number.isSafeInteger(dependency) &&
+          dependency > 0 &&
+          dependency < Number(task.taskId),
+      ) &&
+      new Set(task.dependsOn).size === task.dependsOn.length &&
+      timestamp(task.nextAttemptAt) &&
+      isUsage(task.usage) &&
+      isExternalPrerequisite(task.externalPrerequisite),
+  );
 }
 
 function isRecoverySource(value: unknown): boolean {
   if (value === undefined) return true;
   if (!isRecord(value)) return false;
-  return ["cwd", "branch", "checkpointRef"].every((key) => typeof value[key] === "string" && value[key].length > 0) &&
-    ["baselineCommit", "headCommit"].every((key) => typeof value[key] === "string" && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(value[key])) &&
-    (value.checkpointCommit === undefined || (typeof value.checkpointCommit === "string" && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(value.checkpointCommit)));
+  return (
+    ['cwd', 'branch', 'checkpointRef'].every(
+      (key) => typeof value[key] === 'string' && value[key].length > 0,
+    ) &&
+    ['baselineCommit', 'headCommit'].every(
+      (key) =>
+        typeof value[key] === 'string' &&
+        /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(value[key]),
+    ) &&
+    (value.checkpointCommit === undefined ||
+      (typeof value.checkpointCommit === 'string' &&
+        /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(value.checkpointCommit)))
+  );
 }
 
 function isExternalPrerequisite(value: unknown): boolean {
-  return value === undefined || (isRecord(value) &&
-    ["credentials", "permission", "missing_executable", "runtime"].includes(String(value.kind)) &&
-    (value.source === "provider" || value.source === "worker") && typeof value.evidence === "string" && value.evidence.trim().length > 0);
+  return (
+    value === undefined ||
+    (isRecord(value) &&
+      ['credentials', 'permission', 'missing_executable', 'runtime'].includes(
+        String(value.kind),
+      ) &&
+      (value.source === 'provider' || value.source === 'worker') &&
+      typeof value.evidence === 'string' &&
+      value.evidence.trim().length > 0)
+  );
 }
 
 function isOperationDiagnostics(value: unknown): boolean {
   if (value === undefined) return true;
-  if (!isRecord(value) || !["observing", "tool_fault_reported", "exit_confirmed", "status_unavailable"].includes(String(value.assessment)) ||
-    !["probe", "repair_tool", "reconcile"].includes(String(value.action)) ||
-    ![value.observedAt, value.nextProbeAt].every((timestamp) => typeof timestamp === "number" && Number.isSafeInteger(timestamp) && timestamp >= 0) ||
-    (value.failureKey !== undefined && (typeof value.failureKey !== "string" || !/^[a-f0-9]{64}$/.test(value.failureKey))) ||
-    (value.error !== undefined && typeof value.error !== "string")) return false;
+  if (
+    !isRecord(value) ||
+    ![
+      'observing',
+      'tool_fault_reported',
+      'exit_confirmed',
+      'status_unavailable',
+    ].includes(String(value.assessment)) ||
+    !['probe', 'repair_tool', 'reconcile'].includes(String(value.action)) ||
+    ![value.observedAt, value.nextProbeAt].every(
+      (timestamp) =>
+        typeof timestamp === 'number' &&
+        Number.isSafeInteger(timestamp) &&
+        timestamp >= 0,
+    ) ||
+    (value.failureKey !== undefined &&
+      (typeof value.failureKey !== 'string' ||
+        !/^[a-f0-9]{64}$/.test(value.failureKey))) ||
+    (value.error !== undefined && typeof value.error !== 'string')
+  )
+    return false;
   const activity = parseOperationActivity(value);
-  for (const key of ["phase", "state", "currentTool", "toolCallId", "currentToolStartedAt", "lastActivityAt", "lastModelActivityAt", "lastToolActivityAt", "runnerPid", "recentFailureSummary", "lastToolFailure"] as const) {
-    if (value[key] !== undefined && JSON.stringify(value[key]) !== JSON.stringify(activity[key])) return false;
+  for (const key of [
+    'phase',
+    'state',
+    'currentTool',
+    'toolCallId',
+    'currentToolStartedAt',
+    'lastActivityAt',
+    'lastModelActivityAt',
+    'lastToolActivityAt',
+    'runnerPid',
+    'recentFailureSummary',
+    'lastToolFailure',
+  ] as const) {
+    if (
+      value[key] !== undefined &&
+      JSON.stringify(value[key]) !== JSON.stringify(activity[key])
+    )
+      return false;
   }
   return true;
 }
@@ -914,24 +1230,29 @@ function isOperationDiagnostics(value: unknown): boolean {
 function isUsage(value: unknown): boolean {
   if (value === undefined) return true;
   if (!isRecord(value)) return false;
-  return ["inputTokens", "outputTokens", "cost"].every((key) => {
+  return ['inputTokens', 'outputTokens', 'cost'].every((key) => {
     const amount = value[key];
-    return amount === undefined || (typeof amount === "number" && Number.isFinite(amount) && amount >= 0 &&
-      (key === "cost" || Number.isSafeInteger(amount)));
+    return (
+      amount === undefined ||
+      (typeof amount === 'number' &&
+        Number.isFinite(amount) &&
+        amount >= 0 &&
+        (key === 'cost' || Number.isSafeInteger(amount)))
+    );
   });
 }
 
 function isValidBranchRebinding(value: unknown): boolean {
   if (!isRecord(value)) return false;
   return (
-    typeof value.from === "string" &&
+    typeof value.from === 'string' &&
     value.from.trim().length > 0 &&
-    typeof value.to === "string" &&
+    typeof value.to === 'string' &&
     value.to.trim().length > 0 &&
     value.from !== value.to &&
-    typeof value.requestedBy === "string" &&
+    typeof value.requestedBy === 'string' &&
     value.requestedBy.trim().length > 0 &&
-    typeof value.requestedAt === "number" &&
+    typeof value.requestedAt === 'number' &&
     Number.isFinite(value.requestedAt)
   );
 }
@@ -940,14 +1261,14 @@ function isValidStageSkip(value: unknown, completed: boolean): boolean {
   if (!isRecord(value)) return false;
   return (
     RUN_STAGES.includes(value.stage as RunStage) &&
-    typeof value.reason === "string" &&
+    typeof value.reason === 'string' &&
     value.reason.trim().length > 0 &&
-    typeof value.requestedBy === "string" &&
+    typeof value.requestedBy === 'string' &&
     value.requestedBy.trim().length > 0 &&
-    typeof value.requestedAt === "number" &&
+    typeof value.requestedAt === 'number' &&
     Number.isFinite(value.requestedAt) &&
     (!completed ||
-      (typeof value.completedAt === "number" &&
+      (typeof value.completedAt === 'number' &&
         Number.isFinite(value.completedAt)))
   );
 }
@@ -957,7 +1278,7 @@ function isValidOperationForStage(
   stage: RunStage,
 ): boolean {
   if (!operation) return true;
-  const stages: Record<ActiveOperation["kind"], readonly RunStage[]> = {
+  const stages: Record<ActiveOperation['kind'], readonly RunStage[]> = {
     [OPERATION_KIND.IMPLEMENTATION]: [RUN_STAGE.IMPLEMENTATION],
     [OPERATION_KIND.REVIEW]: [
       RUN_STAGE.COMPREHENSIVE_REVIEW,
@@ -988,11 +1309,11 @@ function nextUpdatedAt(previous: number): number {
 }
 
 function assertRunId(runId: string): void {
-  if (!RUN_ID.test(runId)) throw new Error("Invalid plan-exec run ID.");
+  if (!RUN_ID.test(runId)) throw new Error('Invalid plan-exec run ID.');
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function isNodeError(error: unknown, code: string): boolean {
@@ -1000,13 +1321,13 @@ function isNodeError(error: unknown, code: string): boolean {
 }
 
 function numberOr(value: unknown, fallback: number): number {
-  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
 }
 
 function booleanOr(value: unknown, fallback: boolean): boolean {
-  return typeof value === "boolean" ? value : fallback;
+  return typeof value === 'boolean' ? value : fallback;
 }
 
 function stringOr(value: unknown, fallback: string): string {
-  return typeof value === "string" && value.trim() ? value : fallback;
+  return typeof value === 'string' && value.trim() ? value : fallback;
 }

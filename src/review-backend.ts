@@ -1,23 +1,43 @@
-import { createHash, randomUUID } from "node:crypto";
-import { execFile } from "node:child_process";
-import { link, mkdir, open, readFile, stat, unlink } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
-import { promisify } from "node:util";
-import { executionLifetimeCapabilities, hasOwnedProcessRetirementProof, parseExecutionLifetime, supportsOwnedProcessTree } from "./bridge.js";
-import { FUSION_PHASE, PLAN_REVIEW_OUTPUT_CONTRACT, type FusionCapabilities, type FusionResult, type ReviewExecutionContext } from "./fusion.js";
-import { formatFindings, hasBlockingFindings, parseReviewFindings } from "./review.js";
-import { workspaceEnvironment } from "./workspace-environment.js";
-import { EXTERNAL_OPERATION_STATE, type ExecutionLifetime, type ReviewBackend, type ReviewFinding } from "./types.js";
+import { execFile } from 'node:child_process';
+import { createHash, randomUUID } from 'node:crypto';
+import { link, mkdir, open, readFile, stat, unlink } from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
+import { promisify } from 'node:util';
+import {
+  executionLifetimeCapabilities,
+  hasOwnedProcessRetirementProof,
+  parseExecutionLifetime,
+  supportsOwnedProcessTree,
+} from './bridge.js';
+import {
+  FUSION_PHASE,
+  type FusionCapabilities,
+  type FusionResult,
+  PLAN_REVIEW_OUTPUT_CONTRACT,
+  type ReviewExecutionContext,
+} from './fusion.js';
 import {
   cancelOwnedProcess,
   launchOwnedProcess,
-  observeOwnedProcess,
-  ownedProcessBindingMatches,
-  prepareOwnedProcess,
   type OwnedProcessBinding,
   type OwnedProcessObservation,
   type OwnedProcessRequest,
-} from "./owned-process.js";
+  observeOwnedProcess,
+  ownedProcessBindingMatches,
+  prepareOwnedProcess,
+} from './owned-process.js';
+import {
+  formatFindings,
+  hasBlockingFindings,
+  parseReviewFindings,
+} from './review.js';
+import {
+  EXTERNAL_OPERATION_STATE,
+  type ExecutionLifetime,
+  type ReviewBackend,
+  type ReviewFinding,
+} from './types.js';
+import { workspaceEnvironment } from './workspace-environment.js';
 
 export interface ReviewRequest {
   operationId: string;
@@ -35,17 +55,27 @@ export interface ValidatedReviewResult {
   blocking: boolean;
 }
 
-const UNAVAILABLE_REVMUX_FIX = "Unavailable: reviewer supplied no suggested fix.";
+const UNAVAILABLE_REVMUX_FIX =
+  'Unavailable: reviewer supplied no suggested fix.';
 
 /** Persist alongside the launch intent; replay cannot change the scope or lifetime. */
 export function reviewRequestDigest(request: ReviewRequest): string {
-  return `sha256:${createHash("sha256").update(JSON.stringify([
-    request.operationId, request.backend, request.reviewedCommit,
-    request.cwd, request.prompt, request.profile ?? null,
-    request.executionLifetime.mode,
-    request.executionLifetime.mode === "bounded"
-      ? request.executionLifetime.timeoutMs : null,
-  ])).digest("hex")}`;
+  return `sha256:${createHash('sha256')
+    .update(
+      JSON.stringify([
+        request.operationId,
+        request.backend,
+        request.reviewedCommit,
+        request.cwd,
+        request.prompt,
+        request.profile ?? null,
+        request.executionLifetime.mode,
+        request.executionLifetime.mode === 'bounded'
+          ? request.executionLifetime.timeoutMs
+          : null,
+      ]),
+    )
+    .digest('hex')}`;
 }
 
 /** A completed transport is not a completed review until its exact scope is validated. */
@@ -55,71 +85,118 @@ export function validateReviewResult(
   expectedCommit: string,
 ): ValidatedReviewResult {
   if (!reviewedCommit || reviewedCommit !== expectedCommit)
-    throw new Error("Review result does not cover the expected commit.");
+    throw new Error('Review result does not cover the expected commit.');
   const findings = parseReviewFindings(output);
   return { reviewedCommit, findings, blocking: hasBlockingFindings(findings) };
 }
 
 /** Parse the documented Revmux JSON report without treating a partial panel as clean. */
 export function parseRevmuxReport(value: unknown): ReviewFinding[] {
-  if (!isRecord(value) || !isRecord(value.sources) ||
+  if (
+    !isRecord(value) ||
+    !isRecord(value.sources) ||
     !Number.isInteger(value.sources.expected) ||
-    typeof value.sources.expected !== "number" || value.sources.expected <= 0 ||
+    typeof value.sources.expected !== 'number' ||
+    value.sources.expected <= 0 ||
     value.sources.reported !== value.sources.expected ||
-    !Array.isArray(value.sources.degraded) || value.sources.degraded.length > 0 ||
+    !Array.isArray(value.sources.degraded) ||
+    value.sources.degraded.length > 0 ||
     !Array.isArray(value.sources.agents) ||
     value.sources.agents.length !== value.sources.expected ||
-    value.sources.agents.some((agent: unknown) => !isRecord(agent) || agent.degraded !== false) ||
-    !Array.isArray(value.findings) || !Array.isArray(value.open_questions) ||
-    value.open_questions.length > 0 || !Array.isArray(value.pre_existing) ||
-    !Array.isArray(value.immaterial))
-    throw new Error("Revmux report is malformed, partial, or has unresolved questions.");
+    value.sources.agents.some(
+      (agent: unknown) => !isRecord(agent) || agent.degraded !== false,
+    ) ||
+    !Array.isArray(value.findings) ||
+    !Array.isArray(value.open_questions) ||
+    value.open_questions.length > 0 ||
+    !Array.isArray(value.pre_existing) ||
+    !Array.isArray(value.immaterial)
+  )
+    throw new Error(
+      'Revmux report is malformed, partial, or has unresolved questions.',
+    );
   const findings: ReviewFinding[] = [];
   const ids = new Set<string>();
-  if (value.immaterial.some((entry: unknown) =>
-    !isRecord(entry) || entry.severity !== "minor" || entry.verdict !== "immaterial"))
-    throw new Error("Revmux report cannot dismiss blocking findings as immaterial.");
+  if (
+    value.immaterial.some(
+      (entry: unknown) =>
+        !isRecord(entry) ||
+        entry.severity !== 'minor' ||
+        entry.verdict !== 'immaterial',
+    )
+  )
+    throw new Error(
+      'Revmux report cannot dismiss blocking findings as immaterial.',
+    );
   for (const entry of [...value.findings, ...value.immaterial]) {
-    if (!isRecord(entry) || !nonempty(entry.id) || ids.has(entry.id) ||
-      !nonempty(entry.title) || !nonempty(entry.body) ||
-      (entry.fix !== undefined && typeof entry.fix !== "string") ||
-      !nonempty(entry.file) || !Number.isInteger(entry.line) ||
-      typeof entry.line !== "number" || entry.line < 0 ||
-      (entry.verdict !== "confirmed" && entry.verdict !== "refined" &&
-        !(entry.verdict === "immaterial" && entry.severity === "minor")))
-      throw new Error("Revmux report contains an incomplete or unverified finding.");
-    const severity = typeof entry.severity === "string" ? entry.severity.toUpperCase() : "";
-    if (severity !== "CRITICAL" && severity !== "MAJOR" && severity !== "MINOR")
-      throw new Error("Revmux report contains an invalid finding severity.");
+    if (
+      !isRecord(entry) ||
+      !nonempty(entry.id) ||
+      ids.has(entry.id) ||
+      !nonempty(entry.title) ||
+      !nonempty(entry.body) ||
+      (entry.fix !== undefined && typeof entry.fix !== 'string') ||
+      !nonempty(entry.file) ||
+      !Number.isInteger(entry.line) ||
+      typeof entry.line !== 'number' ||
+      entry.line < 0 ||
+      (entry.verdict !== 'confirmed' &&
+        entry.verdict !== 'refined' &&
+        !(entry.verdict === 'immaterial' && entry.severity === 'minor'))
+    )
+      throw new Error(
+        'Revmux report contains an incomplete or unverified finding.',
+      );
+    const severity =
+      typeof entry.severity === 'string' ? entry.severity.toUpperCase() : '';
+    if (severity !== 'CRITICAL' && severity !== 'MAJOR' && severity !== 'MINOR')
+      throw new Error('Revmux report contains an invalid finding severity.');
     ids.add(entry.id);
-    findings.push({ id: entry.id, severity, summary: singleLine(entry.title),
+    findings.push({
+      id: entry.id,
+      severity,
+      summary: singleLine(entry.title),
       evidence: singleLine(`${entry.file}:${entry.line} ${entry.body}`),
-      ...(nonempty(entry.fix) ? { suggestion: singleLine(entry.fix) } : {}) });
+      ...(nonempty(entry.fix) ? { suggestion: singleLine(entry.fix) } : {}),
+    });
   }
   return findings;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function nonempty(value: unknown): value is string {
-  return typeof value === "string" && value.trim().length > 0;
+  return typeof value === 'string' && value.trim().length > 0;
 }
 
 function singleLine(value: string): string {
-  return value.replace(/\s+/g, " ").trim();
+  return value.replace(/\s+/g, ' ').trim();
 }
 
 function storedReviewRequest(value: unknown): ReviewRequest | undefined {
-  if (!isRecord(value) || value.backend !== "revmux" || !nonempty(value.operationId) ||
-    !nonempty(value.reviewedCommit) || !nonempty(value.cwd) || !nonempty(value.prompt) ||
-    (value.profile !== undefined && !nonempty(value.profile))) return undefined;
+  if (
+    !isRecord(value) ||
+    value.backend !== 'revmux' ||
+    !nonempty(value.operationId) ||
+    !nonempty(value.reviewedCommit) ||
+    !nonempty(value.cwd) ||
+    !nonempty(value.prompt) ||
+    (value.profile !== undefined && !nonempty(value.profile))
+  )
+    return undefined;
   const executionLifetime = parseExecutionLifetime(value.executionLifetime);
   if (!executionLifetime) return undefined;
-  return { operationId: value.operationId, backend: "revmux", reviewedCommit: value.reviewedCommit,
-    cwd: value.cwd, prompt: value.prompt, executionLifetime,
-    ...(typeof value.profile === "string" ? { profile: value.profile } : {}) };
+  return {
+    operationId: value.operationId,
+    backend: 'revmux',
+    reviewedCommit: value.reviewedCommit,
+    cwd: value.cwd,
+    prompt: value.prompt,
+    executionLifetime,
+    ...(typeof value.profile === 'string' ? { profile: value.profile } : {}),
+  };
 }
 
 export interface RevmuxReviewOptions {
@@ -133,7 +210,11 @@ const execFileAsync = promisify(execFile);
 const REVMUX_PREFLIGHT_TIMEOUT_MS = 5_000;
 const PRIVATE_DIRECTORY_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
-const OWNED_TREE = { version: 1, scope: "owned-process-tree", escapedDescendants: "best-effort" } as const;
+const OWNED_TREE = {
+  version: 1,
+  scope: 'owned-process-tree',
+  escapedDescendants: 'best-effort',
+} as const;
 
 /** The monitor owns the CLI handle across Pi restarts; an intent is never relaunched after claiming it. */
 export class RevmuxReviewClient {
@@ -141,91 +222,179 @@ export class RevmuxReviewClient {
 
   async capabilities(): Promise<FusionCapabilities> {
     try {
-      const { stdout } = await execFileAsync(this.options.executable ?? "revmux", ["--capabilities"], {
-        cwd: this.options.cwd, timeout: REVMUX_PREFLIGHT_TIMEOUT_MS,
-      });
+      const { stdout } = await execFileAsync(
+        this.options.executable ?? 'revmux',
+        ['--capabilities'],
+        {
+          cwd: this.options.cwd,
+          timeout: REVMUX_PREFLIGHT_TIMEOUT_MS,
+        },
+      );
       const value: unknown = JSON.parse(stdout);
-      if (!isRecord(value) || value.protocol !== "plan-exec-revmux" || value.version !== 1 || value.supported === false)
+      if (
+        !isRecord(value) ||
+        value.protocol !== 'plan-exec-revmux' ||
+        value.version !== 1 ||
+        value.supported === false
+      )
         return { healthy: false, durableOperationLookup: true };
-      return { healthy: true, durableOperationLookup: true, processTerminalProofVersion: 1,
-        ...(isRecord(value.executionLifetime) && value.executionLifetime.flag === "--execution-lifetime"
-          ? executionLifetimeCapabilities(value.executionLifetime) : {}),
-        processTreeOwnership: OWNED_TREE };
+      return {
+        healthy: true,
+        durableOperationLookup: true,
+        processTerminalProofVersion: 1,
+        ...(isRecord(value.executionLifetime) &&
+        value.executionLifetime.flag === '--execution-lifetime'
+          ? executionLifetimeCapabilities(value.executionLifetime)
+          : {}),
+        processTreeOwnership: OWNED_TREE,
+      };
     } catch {
       return { healthy: false, durableOperationLookup: true };
     }
   }
 
-  async start(operationId: string, prompt: string, profile?: string,
-    executionLifetime: ExecutionLifetime = { mode: "unbounded" }, callerDigest?: string,
-    context?: ReviewExecutionContext): Promise<FusionResult> {
+  async start(
+    operationId: string,
+    prompt: string,
+    profile?: string,
+    executionLifetime: ExecutionLifetime = { mode: 'unbounded' },
+    callerDigest?: string,
+    context?: ReviewExecutionContext,
+  ): Promise<FusionResult> {
     if (callerDigest !== undefined && !callerDigest.trim())
-      return failure("invalid_request", "Review request digest must be nonempty.");
-    if (context && (resolve(context.cwd) !== resolve(this.options.cwd) || context.reviewedCommit !== this.options.reviewedCommit))
-      return failure("conflict", "Review execution context differs from the frozen worktree and commit.");
-    const request: ReviewRequest = { operationId, prompt, backend: "revmux",
-      reviewedCommit: this.options.reviewedCommit, cwd: resolve(this.options.cwd),
-      executionLifetime, ...(profile ? { profile } : {}) };
+      return failure(
+        'invalid_request',
+        'Review request digest must be nonempty.',
+      );
+    if (
+      context &&
+      (resolve(context.cwd) !== resolve(this.options.cwd) ||
+        context.reviewedCommit !== this.options.reviewedCommit)
+    )
+      return failure(
+        'conflict',
+        'Review execution context differs from the frozen worktree and commit.',
+      );
+    const request: ReviewRequest = {
+      operationId,
+      prompt,
+      backend: 'revmux',
+      reviewedCommit: this.options.reviewedCommit,
+      cwd: resolve(this.options.cwd),
+      executionLifetime,
+      ...(profile ? { profile } : {}),
+    };
     const directory = this.directory(operationId);
     const digest = reviewRequestDigest(request);
     await this.reserve(operationId);
     try {
-      const existing = await readJson(join(directory, "request.json"));
-      if (!isRecord(existing) || existing.digest !== digest || existing.callerDigest !== callerDigest)
-        return failure("conflict", "Review operation identity already belongs to a different request.");
+      const existing = await readJson(join(directory, 'request.json'));
+      if (
+        !isRecord(existing) ||
+        existing.digest !== digest ||
+        existing.callerDigest !== callerDigest
+      )
+        return failure(
+          'conflict',
+          'Review operation identity already belongs to a different request.',
+        );
       return this.observe(operationId);
     } catch (error) {
-      if (!missingFile(error)) return failure("malformed", String(error));
+      if (!missingFile(error)) return failure('malformed', String(error));
     }
     const lifetime = parseExecutionLifetime(executionLifetime);
-    if (!lifetime) return failure("invalid_request", "Invalid review execution lifetime.");
-    const admission = await optionalJson(join(directory, "admission.json"));
-    if (!isRecord(admission) || admission.state !== "never-started") {
+    if (!lifetime)
+      return failure('invalid_request', 'Invalid review execution lifetime.');
+    const admission = await optionalJson(join(directory, 'admission.json'));
+    if (!isRecord(admission) || admission.state !== 'never-started') {
       const capabilities = await this.capabilities();
-      if (!capabilities.healthy || !capabilities.executionLifetimeModes?.includes(executionLifetime.mode) ||
-        !supportsOwnedProcessTree(capabilities))
-        return failure("unsupported", "Revmux requires explicit execution-lifetime and observed process-tree proof capabilities.");
+      if (
+        !capabilities.healthy ||
+        !capabilities.executionLifetimeModes?.includes(
+          executionLifetime.mode,
+        ) ||
+        !supportsOwnedProcessTree(capabilities)
+      )
+        return failure(
+          'unsupported',
+          'Revmux requires explicit execution-lifetime and observed process-tree proof capabilities.',
+        );
     }
-    const inserted = await insertJson(join(directory, "request.json"), { request, digest,
-      ...(callerDigest ? { callerDigest } : {}), executable: this.options.executable ?? "revmux",
-      argv: [process.execPath, "-e", REVMUX_PAYLOAD, directory],
-      env: workspaceEnvironment() });
-    if (!inserted) return this.start(operationId, prompt, profile, lifetime, callerDigest, context);
+    const inserted = await insertJson(join(directory, 'request.json'), {
+      request,
+      digest,
+      ...(callerDigest ? { callerDigest } : {}),
+      executable: this.options.executable ?? 'revmux',
+      argv: [process.execPath, '-e', REVMUX_PAYLOAD, directory],
+      env: workspaceEnvironment(),
+    });
+    if (!inserted)
+      return this.start(
+        operationId,
+        prompt,
+        profile,
+        lifetime,
+        callerDigest,
+        context,
+      );
     return this.observe(operationId);
   }
 
   private async reserve(operationId: string): Promise<string> {
     const directory = this.directory(operationId);
     await mkdir(directory, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
-    await insertJson(join(directory, "identity.json"), { version: 1, operationId });
-    const identity = await readJson(join(directory, "identity.json"));
-    if (!isRecord(identity) || identity.version !== 1 || identity.operationId !== operationId)
-      throw new Error("Review admission identity is malformed.");
+    await insertJson(join(directory, 'identity.json'), {
+      version: 1,
+      operationId,
+    });
+    const identity = await readJson(join(directory, 'identity.json'));
+    if (
+      !isRecord(identity) ||
+      identity.version !== 1 ||
+      identity.operationId !== operationId
+    )
+      throw new Error('Review admission identity is malformed.');
     return directory;
   }
 
-  private async prepareExecution(directory: string, stored: Record<string, unknown>): Promise<{
-    request: OwnedProcessRequest; prepared: OwnedProcessBinding;
+  private async prepareExecution(
+    directory: string,
+    stored: Record<string, unknown>,
+  ): Promise<{
+    request: OwnedProcessRequest;
+    prepared: OwnedProcessBinding;
   }> {
     const argv = stored.argv ?? stored.kernelArgv;
-    if (!isRecord(stored.request) || typeof stored.request.cwd !== "string" || !isRecord(stored.env) ||
-      Object.values(stored.env).some((value) => typeof value !== "string") ||
-      !Array.isArray(argv) || !argv.length ||
-      argv.some((value: unknown) => typeof value !== "string"))
-      throw new Error("Review command environment is missing; refusing to reconstruct a dispatched request.");
+    if (
+      !isRecord(stored.request) ||
+      typeof stored.request.cwd !== 'string' ||
+      !isRecord(stored.env) ||
+      Object.values(stored.env).some((value) => typeof value !== 'string') ||
+      !Array.isArray(argv) ||
+      !argv.length ||
+      argv.some((value: unknown) => typeof value !== 'string')
+    )
+      throw new Error(
+        'Review command environment is missing; refusing to reconstruct a dispatched request.',
+      );
     const lifetime = parseExecutionLifetime(stored.request.executionLifetime);
-    if (!lifetime) throw new Error("Review execution lifetime is missing.");
+    if (!lifetime) throw new Error('Review execution lifetime is missing.');
     const request: OwnedProcessRequest = {
-      operationDirectory: join(directory, "owned-process"),
-      argv: argv as [string, ...string[]], cwd: stored.request.cwd,
-      env: stored.env as Record<string, string>, lifetime: lifetime.mode === "unbounded"
-        ? { kind: "unbounded" } : { kind: "bounded", timeoutMs: lifetime.timeoutMs },
+      operationDirectory: join(directory, 'owned-process'),
+      argv: argv as [string, ...string[]],
+      cwd: stored.request.cwd,
+      env: stored.env as Record<string, string>,
+      lifetime:
+        lifetime.mode === 'unbounded'
+          ? { kind: 'unbounded' }
+          : { kind: 'bounded', timeoutMs: lifetime.timeoutMs },
     };
     const prepared = await controlDeadline(prepareOwnedProcess(request));
-    const receiptPath = join(directory, "process-binding.json");
+    const receiptPath = join(directory, 'process-binding.json');
     await insertJson(receiptPath, prepared);
     const receipt = await readJson(receiptPath);
-    if (!sameProcessBinding(receipt, prepared)) throw new Error("Review process ownership binding changed.");
+    if (!sameProcessBinding(receipt, prepared))
+      throw new Error('Review process ownership binding changed.');
     return { request, prepared };
   }
 
@@ -243,25 +412,46 @@ export class RevmuxReviewClient {
 
   async cancel(runId?: string, operationId?: string): Promise<FusionResult> {
     const id = selectId(runId, operationId);
-    if (!id) return failure("invalid_request", "Specify exactly one review operation selector.");
+    if (!id)
+      return failure(
+        'invalid_request',
+        'Specify exactly one review operation selector.',
+      );
     const directory = await this.reserve(id);
-    await insertJson(join(directory, "admission.json"), { operationId: id, state: "never-started" });
-    await insertJson(join(directory, "cancel"), { operationId: id });
-    const admission = await readJson(join(directory, "admission.json"));
-    if (isRecord(admission) && admission.state === "dispatching") {
-      await controlDeadline(cancelOwnedProcess(join(directory, "owned-process"),
-        { deadlineMs: REVMUX_PREFLIGHT_TIMEOUT_MS, cancelled: true }));
+    await insertJson(join(directory, 'admission.json'), {
+      operationId: id,
+      state: 'never-started',
+    });
+    await insertJson(join(directory, 'cancel'), { operationId: id });
+    const admission = await readJson(join(directory, 'admission.json'));
+    if (isRecord(admission) && admission.state === 'dispatching') {
+      await controlDeadline(
+        cancelOwnedProcess(join(directory, 'owned-process'), {
+          deadlineMs: REVMUX_PREFLIGHT_TIMEOUT_MS,
+          cancelled: true,
+        }),
+      );
     }
     return this.observe(id);
   }
 
   private select(runId?: string, operationId?: string): Promise<FusionResult> {
     const id = selectId(runId, operationId);
-    return id ? this.observe(id) : Promise.resolve(failure("invalid_request", "Specify exactly one review operation selector."));
+    return id
+      ? this.observe(id)
+      : Promise.resolve(
+          failure(
+            'invalid_request',
+            'Specify exactly one review operation selector.',
+          ),
+        );
   }
 
   private directory(operationId: string): string {
-    return join(resolve(this.options.stateDirectory), createHash("sha256").update(operationId).digest("hex"));
+    return join(
+      resolve(this.options.stateDirectory),
+      createHash('sha256').update(operationId).digest('hex'),
+    );
   }
 
   private async observe(operationId: string): Promise<FusionResult> {
@@ -269,89 +459,233 @@ export class RevmuxReviewClient {
     let stored: unknown;
     let admission: unknown;
     try {
-      stored = await optionalJson(join(directory, "request.json"));
-      admission = await optionalJson(join(directory, "admission.json"));
-    } catch { return failure("malformed", "Review admission journal is unreadable."); }
-    const requestDigest = isRecord(stored)
-      ? typeof stored.callerDigest === "string" ? stored.callerDigest : stored.digest : undefined;
-    if (admission !== undefined && (!isRecord(admission) || admission.operationId !== operationId ||
-      (admission.state !== "never-started" && admission.state !== "dispatching")))
-      return failure("launch_unknown", "Review admission winner is malformed; replay is not safe.");
-    if (isRecord(admission) && admission.operationId === operationId && admission.state === "never-started")
-      return { success: true, data: { operationId, state: FUSION_PHASE.CANCELLED,
-        cancellationRequested: true, neverStarted: true, replaySafe: false,
-        ...(typeof requestDigest === "string" ? { requestDigest } : {}) } };
-    if (stored === undefined) {
-      for (const artifact of ["admission.json", "claimed", "outcome.json", "process-proof.json", "cancel", "process-binding.json", "kernel-binding.json", "kernel-operation", "owned-process"])
-        if (await filePresent(join(directory, artifact)))
-          return failure("launch_unknown", "Review execution evidence exists without its immutable request; replay is not safe.");
-      return { success: true, data: { operationId, state: "absent", replaySafe: true } };
+      stored = await optionalJson(join(directory, 'request.json'));
+      admission = await optionalJson(join(directory, 'admission.json'));
+    } catch {
+      return failure('malformed', 'Review admission journal is unreadable.');
     }
-    const registeredRequest = isRecord(stored) ? storedReviewRequest(stored.request) : undefined;
-    if (!isRecord(stored) || !registeredRequest || registeredRequest.operationId !== operationId ||
-      stored.digest !== reviewRequestDigest(registeredRequest))
-      return failure("malformed", "Review launch identity is malformed.");
-    if (await filePresent(join(directory, "claimed")) && !await filePresent(join(directory, "process-binding.json")) && !await filePresent(join(directory, "kernel-binding.json")))
-      return failure("launch_unknown", "Legacy reviewer monitor has no process ownership receipt; retaining ownership.");
+    const requestDigest = isRecord(stored)
+      ? typeof stored.callerDigest === 'string'
+        ? stored.callerDigest
+        : stored.digest
+      : undefined;
+    if (
+      admission !== undefined &&
+      (!isRecord(admission) ||
+        admission.operationId !== operationId ||
+        (admission.state !== 'never-started' &&
+          admission.state !== 'dispatching'))
+    )
+      return failure(
+        'launch_unknown',
+        'Review admission winner is malformed; replay is not safe.',
+      );
+    if (
+      isRecord(admission) &&
+      admission.operationId === operationId &&
+      admission.state === 'never-started'
+    )
+      return {
+        success: true,
+        data: {
+          operationId,
+          state: FUSION_PHASE.CANCELLED,
+          cancellationRequested: true,
+          neverStarted: true,
+          replaySafe: false,
+          ...(typeof requestDigest === 'string' ? { requestDigest } : {}),
+        },
+      };
+    if (stored === undefined) {
+      for (const artifact of [
+        'admission.json',
+        'claimed',
+        'outcome.json',
+        'process-proof.json',
+        'cancel',
+        'process-binding.json',
+        'kernel-binding.json',
+        'kernel-operation',
+        'owned-process',
+      ])
+        if (await filePresent(join(directory, artifact)))
+          return failure(
+            'launch_unknown',
+            'Review execution evidence exists without its immutable request; replay is not safe.',
+          );
+      return {
+        success: true,
+        data: { operationId, state: 'absent', replaySafe: true },
+      };
+    }
+    const registeredRequest = isRecord(stored)
+      ? storedReviewRequest(stored.request)
+      : undefined;
+    if (
+      !isRecord(stored) ||
+      !registeredRequest ||
+      registeredRequest.operationId !== operationId ||
+      stored.digest !== reviewRequestDigest(registeredRequest)
+    )
+      return failure('malformed', 'Review launch identity is malformed.');
+    if (
+      (await filePresent(join(directory, 'claimed'))) &&
+      !(await filePresent(join(directory, 'process-binding.json'))) &&
+      !(await filePresent(join(directory, 'kernel-binding.json')))
+    )
+      return failure(
+        'launch_unknown',
+        'Legacy reviewer monitor has no process ownership receipt; retaining ownership.',
+      );
     let prepared: OwnedProcessBinding;
     let observation: OwnedProcessObservation;
     try {
       const execution = await this.prepareExecution(directory, stored);
       prepared = execution.prepared;
-      await insertJson(join(directory, "admission.json"), { operationId, state: "dispatching" });
-      const admitted = await readJson(join(directory, "admission.json"));
-      if (!isRecord(admitted) || admitted.state !== "dispatching") return this.observe(operationId);
-      const cancelled = await filePresent(join(directory, "cancel"));
+      await insertJson(join(directory, 'admission.json'), {
+        operationId,
+        state: 'dispatching',
+      });
+      const admitted = await readJson(join(directory, 'admission.json'));
+      if (!isRecord(admitted) || admitted.state !== 'dispatching')
+        return this.observe(operationId);
+      const cancelled = await filePresent(join(directory, 'cancel'));
       if (cancelled) {
-        observation = await controlDeadline(cancelOwnedProcess(execution.request.operationDirectory,
-          { deadlineMs: REVMUX_PREFLIGHT_TIMEOUT_MS }));
+        observation = await controlDeadline(
+          cancelOwnedProcess(execution.request.operationDirectory, {
+            deadlineMs: REVMUX_PREFLIGHT_TIMEOUT_MS,
+          }),
+        );
       } else {
-        observation = await controlDeadline(observeOwnedProcess(execution.request.operationDirectory));
+        observation = await controlDeadline(
+          observeOwnedProcess(execution.request.operationDirectory),
+        );
         if (observation.status === EXTERNAL_OPERATION_STATE.PENDING)
-          observation = await controlDeadline(launchOwnedProcess(execution.request));
+          observation = await controlDeadline(
+            launchOwnedProcess(execution.request),
+          );
       }
-    } catch (error) { return failure("launch_unknown", `Review process operation needs reconciliation: ${String(error)}`); }
+    } catch (error) {
+      return failure(
+        'launch_unknown',
+        `Review process operation needs reconciliation: ${String(error)}`,
+      );
+    }
     const lifetime = registeredRequest.executionLifetime;
-    const data: Record<string, unknown> = { operationId,
-      ...(typeof requestDigest === "string" ? { requestDigest } : {}),
-      replaySafe: false, neverStarted: false,
-      cancellationRequested: await filePresent(join(directory, "cancel")),
+    const data: Record<string, unknown> = {
+      operationId,
+      ...(typeof requestDigest === 'string' ? { requestDigest } : {}),
+      replaySafe: false,
+      neverStarted: false,
+      cancellationRequested: await filePresent(join(directory, 'cancel')),
       reviewedCommit: registeredRequest.reviewedCommit,
       ...(lifetime ? { effectiveExecutionLifetime: lifetime } : {}),
-      run: { runId: operationId, operationId, phase: FUSION_PHASE.PANEL, terminal: false } };
-    if (observation.status === "never-started" && sameProcessBinding(observation.proof, prepared) &&
-      observation.proof?.kind === "never-started" && data.cancellationRequested === true)
-      return { success: true, data: { operationId, requestDigest, state: FUSION_PHASE.CANCELLED,
-        cancellationRequested: true, neverStarted: true, replaySafe: false } };
-    if (observation.status !== "retired" || !hasOwnedProcessRetirementProof(observation, prepared))
-      return { success: true, data: { ...data,
-        ...(observation.reason ? { error: observation.reason } : {}) } };
+      run: {
+        runId: operationId,
+        operationId,
+        phase: FUSION_PHASE.PANEL,
+        terminal: false,
+      },
+    };
+    if (
+      observation.status === 'never-started' &&
+      sameProcessBinding(observation.proof, prepared) &&
+      observation.proof?.kind === 'never-started' &&
+      data.cancellationRequested === true
+    )
+      return {
+        success: true,
+        data: {
+          operationId,
+          requestDigest,
+          state: FUSION_PHASE.CANCELLED,
+          cancellationRequested: true,
+          neverStarted: true,
+          replaySafe: false,
+        },
+      };
+    if (
+      observation.status !== 'retired' ||
+      !hasOwnedProcessRetirementProof(observation, prepared)
+    )
+      return {
+        success: true,
+        data: {
+          ...data,
+          ...(observation.reason ? { error: observation.reason } : {}),
+        },
+      };
     const proof = observation.proof;
-    if (!proof || proof.kind !== "process-group-retired" || !proof.identity)
-      return failure("malformed", "Review process retirement proof is missing.");
+    if (proof?.kind !== 'process-group-retired' || !proof.identity)
+      return failure(
+        'malformed',
+        'Review process retirement proof is missing.',
+      );
     const observedAt = Date.parse(proof.observedAt);
-    data.processTerminalProof = { version: 1, state: "observed", runId: operationId,
+    data.processTerminalProof = {
+      version: 1,
+      state: 'observed',
+      runId: operationId,
       runnerProcessInstanceId: `${proof.identity.pgid}:${proof.identity.leader.pid}`,
-      observedAt, processTreeOwnership: OWNED_TREE,
-      instances: [{ pgid: proof.identity.pgid, leaderPid: proof.identity.leader.pid,
-        backend: proof.identity.backend, exitedAt: observedAt }],
-      callerBinding: { operationId, requestDigest }, nativeOperation: { operationId, digest: stored.digest } };
-    const outcome = await optionalJson(join(directory, "outcome.json"));
-    const success = isRecord(outcome) && (outcome.code === 0 || outcome.code === 1) &&
+      observedAt,
+      processTreeOwnership: OWNED_TREE,
+      instances: [
+        {
+          pgid: proof.identity.pgid,
+          leaderPid: proof.identity.leader.pid,
+          backend: proof.identity.backend,
+          exitedAt: observedAt,
+        },
+      ],
+      callerBinding: { operationId, requestDigest },
+      nativeOperation: { operationId, digest: stored.digest },
+    };
+    const outcome = await optionalJson(join(directory, 'outcome.json'));
+    const success =
+      isRecord(outcome) &&
+      (outcome.code === 0 || outcome.code === 1) &&
       (observation.exitCode === 0 || observation.exitCode === 1);
     const cancelled = data.cancellationRequested === true;
-    data.run = { runId: operationId, operationId,
-      phase: cancelled ? FUSION_PHASE.CANCELLED : success ? FUSION_PHASE.DONE : FUSION_PHASE.FAILED,
-      terminal: true, ...(!success && !cancelled ? { error: "Review CLI failed or its complete outcome receipt is missing." } : {}) };
+    data.run = {
+      runId: operationId,
+      operationId,
+      phase: cancelled
+        ? FUSION_PHASE.CANCELLED
+        : success
+          ? FUSION_PHASE.DONE
+          : FUSION_PHASE.FAILED,
+      terminal: true,
+      ...(!success && !cancelled
+        ? {
+            error:
+              'Review CLI failed or its complete outcome receipt is missing.',
+          }
+        : {}),
+    };
     if (success && !cancelled) {
       try {
-        const findings = parseRevmuxReport(await readJson(join(directory, "report.json")));
-        data.callerOutput = { contract: PLAN_REVIEW_OUTPUT_CONTRACT,
-          output: findings.length ? formatFindings(findings.map((finding) => ({
-            ...finding, suggestion: finding.suggestion ?? UNAVAILABLE_REVMUX_FIX,
-          }))) : "NO_FINDINGS" };
+        const findings = parseRevmuxReport(
+          await readJson(join(directory, 'report.json')),
+        );
+        data.callerOutput = {
+          contract: PLAN_REVIEW_OUTPUT_CONTRACT,
+          output: findings.length
+            ? formatFindings(
+                findings.map((finding) => ({
+                  ...finding,
+                  suggestion: finding.suggestion ?? UNAVAILABLE_REVMUX_FIX,
+                })),
+              )
+            : 'NO_FINDINGS',
+        };
       } catch (error) {
-        data.run = { runId: operationId, operationId, phase: FUSION_PHASE.FAILED, terminal: true, error: String(error) };
+        data.run = {
+          runId: operationId,
+          operationId,
+          phase: FUSION_PHASE.FAILED,
+          terminal: true,
+          error: String(error),
+        };
       }
     }
     return { success: true, data };
@@ -359,66 +693,109 @@ export class RevmuxReviewClient {
 }
 
 function selectId(runId?: string, operationId?: string): string | undefined {
-  return runId && !operationId ? runId : operationId && !runId ? operationId : undefined;
+  return runId && !operationId
+    ? runId
+    : operationId && !runId
+      ? operationId
+      : undefined;
 }
 
 async function readJson(path: string): Promise<unknown> {
-  return JSON.parse(await readFile(path, "utf8"));
+  return JSON.parse(await readFile(path, 'utf8'));
 }
 
 async function optionalJson(path: string): Promise<unknown> {
-  try { return await readJson(path); }
-  catch (error) { if (missingFile(error)) return undefined; throw error; }
+  try {
+    return await readJson(path);
+  } catch (error) {
+    if (missingFile(error)) return undefined;
+    throw error;
+  }
 }
 
 async function filePresent(path: string): Promise<boolean> {
-  try { await stat(path); return true; }
-  catch (error) { if (missingFile(error)) return false; throw error; }
+  try {
+    await stat(path);
+    return true;
+  } catch (error) {
+    if (missingFile(error)) return false;
+    throw error;
+  }
 }
 
 /** Publish fully written immutable records; readers never see a partially written admission. */
 async function insertJson(path: string, value: unknown): Promise<boolean> {
   const temporary = `${path}.${randomUUID()}.tmp`;
-  const file = await open(temporary, "wx", PRIVATE_FILE_MODE);
-  try { await file.writeFile(JSON.stringify(value)); await file.sync(); }
-  finally { await file.close(); }
+  const file = await open(temporary, 'wx', PRIVATE_FILE_MODE);
+  try {
+    await file.writeFile(JSON.stringify(value));
+    await file.sync();
+  } finally {
+    await file.close();
+  }
   try {
     await link(temporary, path);
-    const directory = await open(dirname(path), "r");
-    try { await directory.sync(); } finally { await directory.close(); }
+    const directory = await open(dirname(path), 'r');
+    try {
+      await directory.sync();
+    } finally {
+      await directory.close();
+    }
     return true;
   } catch (error) {
-    if (isRecord(error) && error.code === "EEXIST") return false;
+    if (isRecord(error) && error.code === 'EEXIST') return false;
     throw error;
-  } finally { await unlink(temporary); }
+  } finally {
+    await unlink(temporary);
+  }
 }
 
 function missingFile(error: unknown): boolean {
-  return isRecord(error) && error.code === "ENOENT";
+  return isRecord(error) && error.code === 'ENOENT';
 }
 
 function failure(code: string, message: string): FusionResult {
   return { success: false, error: { code, message } };
 }
 
-function sameProcessBinding(value: unknown, expected: OwnedProcessBinding): boolean {
+function sameProcessBinding(
+  value: unknown,
+  expected: OwnedProcessBinding,
+): boolean {
   if (!isRecord(value)) return false;
-  return ownedProcessBindingMatches({
-    operationId: typeof value.operationId === "string" ? value.operationId : "",
-    requestDigest: typeof value.requestDigest === "string" ? value.requestDigest : "",
-    hostId: typeof value.hostId === "string" ? value.hostId : "",
-    bootId: typeof value.bootId === "string" ? value.bootId : "",
-  }, expected);
+  return ownedProcessBindingMatches(
+    {
+      operationId:
+        typeof value.operationId === 'string' ? value.operationId : '',
+      requestDigest:
+        typeof value.requestDigest === 'string' ? value.requestDigest : '',
+      hostId: typeof value.hostId === 'string' ? value.hostId : '',
+      bootId: typeof value.bootId === 'string' ? value.bootId : '',
+    },
+    expected,
+  );
 }
 
 async function controlDeadline<T>(operation: Promise<T>): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    return await Promise.race([operation, new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error("Owned process control request timed out; reconcile the same operation.")),
-        REVMUX_PREFLIGHT_TIMEOUT_MS);
-    })]);
-  } finally { if (timer) clearTimeout(timer); }
+    return await Promise.race([
+      operation,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () =>
+            reject(
+              new Error(
+                'Owned process control request timed out; reconcile the same operation.',
+              ),
+            ),
+          REVMUX_PREFLIGHT_TIMEOUT_MS,
+        );
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 const REVMUX_PAYLOAD = String.raw`

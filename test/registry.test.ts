@@ -1,5 +1,5 @@
-import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import {
   mkdir,
   mkdtemp,
@@ -9,29 +9,30 @@ import {
   stat,
   symlink,
   writeFile,
-} from "node:fs/promises";
-import { hostname, tmpdir } from "node:os";
-import { join } from "node:path";
-import test from "node:test";
+} from 'node:fs/promises';
+import { hostname, tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { onTestFinished, test } from 'vitest';
 import {
-  classifyAbandonment,
   type Abandonment,
   type AbandonmentEvidence,
-} from "../src/lifecycle.js";
+  classifyAbandonment,
+} from '../src/lifecycle.js';
 import {
   asLocalRun,
   isLeaseLive,
   isLocalRun,
   LEASE_STALE_MS,
-  removalRefusal,
   RunRegistry,
+  removalRefusal,
   takeoverRefusal,
-} from "../src/registry.js";
-import { DEFAULT_FROZEN_RUN_CONFIG, type PlanExecRun } from "../src/types.js";
-import { acquireLock } from "../src/registry-lock.js";
-import { workspaceEnvironment } from "../src/workspace-environment.js";
+} from '../src/registry.js';
+import { acquireLock } from '../src/registry-lock.js';
+import { required } from '../src/required.js';
+import { DEFAULT_FROZEN_RUN_CONFIG, type PlanExecRun } from '../src/types.js';
+import { workspaceEnvironment } from '../src/workspace-environment.js';
 
-type RunLease = NonNullable<PlanExecRun["lease"]>;
+type RunLease = NonNullable<PlanExecRun['lease']>;
 
 /**
  * A pid reaped before spawnSync returns, so it is reliably gone. Assumes the OS
@@ -39,8 +40,8 @@ type RunLease = NonNullable<PlanExecRun["lease"]>;
  * ever flakes.
  */
 function reapedPid(): number {
-  const { pid } = spawnSync("true");
-  assert.ok(pid, "spawnSync must report a child pid");
+  const { pid } = spawnSync('true');
+  assert.ok(pid, 'spawnSync must report a child pid');
   return pid;
 }
 
@@ -51,28 +52,28 @@ const config = {
   reviewIterations: 5,
   fusionIterations: 10,
   finalizeEnabled: true,
-  workerAgent: "worker",
+  workerAgent: 'worker',
   workerMaxTurns: 50,
-  reviewerAgent: "reviewer",
+  reviewerAgent: 'reviewer',
   reviewerMaxTurns: 30,
-  statsAgent: "reviewer",
+  statsAgent: 'reviewer',
   statsMaxTurns: 30,
 };
 
-type RunSeed = Parameters<RunRegistry["create"]>[0];
+type RunSeed = Parameters<RunRegistry['create']>[0];
 
 /** The create payload every registry test starts from. */
 function runSeed(overrides: Partial<RunSeed> = {}): RunSeed {
   return {
     schemaVersion: 1,
-    repositoryRoot: "/repo",
-    planPath: "/repo/plan.md",
-    planHash: "hash",
-    worktreeCwd: "/repo",
-    branch: "feature",
-    defaultBranch: "main",
-    status: "running",
-    stage: "implementation",
+    repositoryRoot: '/repo',
+    planPath: '/repo/plan.md',
+    planHash: 'hash',
+    worktreeCwd: '/repo',
+    branch: 'feature',
+    defaultBranch: 'main',
+    status: 'running',
+    stage: 'implementation',
     taskAttempts: {},
     stageAttempts: {},
     reviewFindings: [],
@@ -86,47 +87,59 @@ async function seedRegistry(): Promise<{
   directory: string;
   registry: RunRegistry;
 }> {
-  const directory = await mkdtemp(join(tmpdir(), "pi-plan-exec-registry-"));
+  const directory = await mkdtemp(join(tmpdir(), 'pi-plan-exec-registry-'));
   return { directory, registry: new RunRegistry(directory) };
 }
 
 /** This machine's first DNS label: a name that looks like it and is not it. */
 function thisHost(): string {
-  return hostname().split(".")[0]!;
+  return required(hostname().split('.')[0]);
 }
 
-test("registry rejects a second nonterminal run in the same worktree or plan", async () => {
+test('registry rejects a second nonterminal run in the same worktree or plan', async () => {
   const { registry } = await seedRegistry();
-  const first = await registry.create(runSeed({ status: "paused" }), {
+  const first = await registry.create(runSeed({ status: 'paused' }), {
     exclusive: true,
   });
 
   await assert.rejects(
     registry.create(
-      runSeed({ planPath: "/repo/other.md", worktreeCwd: "/repo" }),
+      runSeed({ planPath: '/repo/other.md', worktreeCwd: '/repo' }),
       { exclusive: true },
     ),
     new RegExp(`same worktree.*${first.id}|worktree.*${first.id}`),
   );
   await assert.rejects(
     registry.create(
-      runSeed({ planPath: "/repo/plan.md", worktreeCwd: "/other" }),
+      runSeed({ planPath: '/repo/plan.md', worktreeCwd: '/other' }),
       { exclusive: true },
     ),
     new RegExp(`same plan.*${first.id}|plan.*${first.id}`),
   );
 
-  await registry.update({ ...first, status: "completed" });
+  await registry.update({ ...first, status: 'completed' });
   const replacement = await registry.create(runSeed(), { exclusive: true });
   assert.notEqual(replacement.id, first.id);
 });
 
-test("exclusive creation blocks all resumable statuses and permits only settled terminal runs", async () => {
-  for (const status of ["starting", "running", "paused", "failed", "skip_pending", "cancel_pending", "completed", "completed_with_findings", "cancelled"] as const) {
+test('exclusive creation blocks all resumable statuses and permits only settled terminal runs', async () => {
+  for (const status of [
+    'starting',
+    'running',
+    'paused',
+    'failed',
+    'skip_pending',
+    'cancel_pending',
+    'completed',
+    'completed_with_findings',
+    'cancelled',
+  ] as const) {
     const { registry } = await seedRegistry();
     const old = await registry.create(runSeed({ status }));
     const create = () => registry.create(runSeed(), { exclusive: true });
-    if (["completed", "completed_with_findings", "cancelled"].includes(status)) {
+    if (
+      ['completed', 'completed_with_findings', 'cancelled'].includes(status)
+    ) {
       assert.ok((await create()).id !== old.id, status);
     } else {
       await assert.rejects(create(), new RegExp(old.id), status);
@@ -134,185 +147,464 @@ test("exclusive creation blocks all resumable statuses and permits only settled 
   }
 });
 
-test("concurrent starts through different path aliases admit exactly one run", async (t) => {
+test('concurrent starts through different path aliases admit exactly one run', async (_t) => {
   const { registry, directory } = await seedRegistry();
-  t.after(() => rm(directory, { recursive: true, force: true }));
-  const target = join(directory, "target");
-  const alias = join(directory, "alias");
+  onTestFinished(() => rm(directory, { recursive: true, force: true }));
+  const target = join(directory, 'target');
+  const alias = join(directory, 'alias');
   await mkdir(target);
   await symlink(target, alias);
   const results = await Promise.allSettled([
-    registry.create(runSeed({ worktreeCwd: target, planPath: join(target, "a.md") }), { exclusive: true }),
-    new RunRegistry(directory).create(runSeed({ worktreeCwd: alias, planPath: join(alias, "b.md") }), { exclusive: true }),
+    registry.create(
+      runSeed({ worktreeCwd: target, planPath: join(target, 'a.md') }),
+      { exclusive: true },
+    ),
+    new RunRegistry(directory).create(
+      runSeed({ worktreeCwd: alias, planPath: join(alias, 'b.md') }),
+      { exclusive: true },
+    ),
   ]);
-  assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
-  assert.equal(results.filter((result) => result.status === "rejected").length, 1);
+  assert.equal(
+    results.filter((result) => result.status === 'fulfilled').length,
+    1,
+  );
+  assert.equal(
+    results.filter((result) => result.status === 'rejected').length,
+    1,
+  );
   assert.equal((await registry.list()).length, 1);
 });
 
-test("lane changes retain output, preparation, task and recovery checkouts across resumable and unknown ownership states", async (t) => {
-  for (const status of ["running", "paused", "failed", "cancelled"] as const) {
+test('lane changes retain output, preparation, task and recovery checkouts across resumable and unknown ownership states', async (_t) => {
+  for (const status of ['running', 'paused', 'failed', 'cancelled'] as const) {
     const { registry, directory } = await seedRegistry();
-    t.after(() => rm(directory, { recursive: true, force: true }));
-    const paths = Object.fromEntries(["current", "output", "preparing", "task", "recovery", "history"].map(name => [name, join(directory, name)]));
-    const recovery = (cwd: string) => ({ cwd, branch: "preserved", baselineCommit: "a".repeat(40), headCommit: "b".repeat(40), checkpointRef: "refs/plan-exec/checkpoint" });
-    const existing = await registry.create(runSeed({
-      status, worktreeCwd: paths.current!, planPath: join(paths.current!, "plan.md"),
-      outputTarget: { cwd: paths.output!, branch: "feature", initialHead: "a".repeat(40), planRelativePath: "plan.md" },
-      lanePreparation: { cwd: paths.preparing!, branch: "new-lane", baselineCommit: "a".repeat(40), taskId: 1, state: "create", sourcePlanPath: join(directory, "source-plan", "plan.md") },
-      tasks: { "1": { taskId: 1, dependsOn: [], state: "retry_wait", attempts: 1, laneCwd: paths.task!, laneBranch: "task-a", recoverySource: recovery(paths.recovery!), recoveryHistory: [recovery(paths.history!)] } },
-      ...(status === "cancelled" ? { activeOperation: { operationId: "unknown-writer", service: "bridge" as const, kind: "implementation" as const, recovery: "recovery_required" as const } } : {}),
-    }), { exclusive: true });
+    onTestFinished(() => rm(directory, { recursive: true, force: true }));
+    const paths = Object.fromEntries(
+      ['current', 'output', 'preparing', 'task', 'recovery', 'history'].map(
+        (name) => [name, join(directory, name)],
+      ),
+    );
+    const recovery = (cwd: string) => ({
+      cwd,
+      branch: 'preserved',
+      baselineCommit: 'a'.repeat(40),
+      headCommit: 'b'.repeat(40),
+      checkpointRef: 'refs/plan-exec/checkpoint',
+    });
+    const existing = await registry.create(
+      runSeed({
+        status,
+        worktreeCwd: required(paths.current),
+        planPath: join(required(paths.current), 'plan.md'),
+        outputTarget: {
+          cwd: required(paths.output),
+          branch: 'feature',
+          initialHead: 'a'.repeat(40),
+          planRelativePath: 'plan.md',
+        },
+        lanePreparation: {
+          cwd: required(paths.preparing),
+          branch: 'new-lane',
+          baselineCommit: 'a'.repeat(40),
+          taskId: 1,
+          state: 'create',
+          sourcePlanPath: join(directory, 'source-plan', 'plan.md'),
+        },
+        tasks: {
+          '1': {
+            taskId: 1,
+            dependsOn: [],
+            state: 'retry_wait',
+            attempts: 1,
+            laneCwd: required(paths.task),
+            laneBranch: 'task-a',
+            recoverySource: recovery(required(paths.recovery)),
+            recoveryHistory: [recovery(required(paths.history))],
+          },
+        },
+        ...(status === 'cancelled'
+          ? {
+              activeOperation: {
+                operationId: 'unknown-writer',
+                service: 'bridge' as const,
+                kind: 'implementation' as const,
+                recovery: 'recovery_required' as const,
+              },
+            }
+          : {}),
+      }),
+      { exclusive: true },
+    );
     for (const [name, cwd] of Object.entries(paths)) {
-      await assert.rejects(registry.create(runSeed({ worktreeCwd: cwd, planPath: join(cwd, "other.md") }), { exclusive: true }), new RegExp(existing.id), `${status}: ${name}`);
+      await assert.rejects(
+        registry.create(
+          runSeed({ worktreeCwd: cwd, planPath: join(cwd, 'other.md') }),
+          { exclusive: true },
+        ),
+        new RegExp(existing.id),
+        `${status}: ${name}`,
+      );
     }
-    const independent = await registry.create(runSeed({ worktreeCwd: join(directory, "unrelated"), planPath: join(directory, "unrelated", "plan.md") }), { exclusive: true });
+    const independent = await registry.create(
+      runSeed({
+        worktreeCwd: join(directory, 'unrelated'),
+        planPath: join(directory, 'unrelated', 'plan.md'),
+      }),
+      { exclusive: true },
+    );
     assert.notEqual(independent.id, existing.id);
     await registry.assertExclusive(existing);
   }
 });
 
-test("prospective reservations cannot overlap an existing run through noncurrent checkout fields", async (t) => {
+test('prospective reservations cannot overlap an existing run through noncurrent checkout fields', async (_t) => {
   const { registry, directory } = await seedRegistry();
-  t.after(() => rm(directory, { recursive: true, force: true }));
-  const occupied = join(directory, "occupied");
-  const existing = await registry.create(runSeed({ worktreeCwd: occupied, planPath: join(occupied, "plan.md") }));
-  const recovery = { cwd: occupied, branch: "preserved", baselineCommit: "a".repeat(40), headCommit: "b".repeat(40), checkpointRef: "refs/plan-exec/checkpoint" };
+  onTestFinished(() => rm(directory, { recursive: true, force: true }));
+  const occupied = join(directory, 'occupied');
+  const existing = await registry.create(
+    runSeed({ worktreeCwd: occupied, planPath: join(occupied, 'plan.md') }),
+  );
+  const recovery = {
+    cwd: occupied,
+    branch: 'preserved',
+    baselineCommit: 'a'.repeat(40),
+    headCommit: 'b'.repeat(40),
+    checkpointRef: 'refs/plan-exec/checkpoint',
+  };
   const reservations: Partial<RunSeed>[] = [
-    { outputTarget: { cwd: occupied, branch: "feature", initialHead: "a".repeat(40), planRelativePath: "plan.md" } },
-    { lanePreparation: { cwd: occupied, branch: "prepared", baselineCommit: "a".repeat(40), taskId: 1, state: "create" } },
-    { tasks: { "1": { taskId: 1, dependsOn: [], state: "retry_wait", attempts: 1, laneCwd: occupied } } },
-    { tasks: { "1": { taskId: 1, dependsOn: [], state: "retry_wait", attempts: 1, recoverySource: recovery } } },
-    { tasks: { "1": { taskId: 1, dependsOn: [], state: "retry_wait", attempts: 1, recoveryHistory: [recovery] } } },
+    {
+      outputTarget: {
+        cwd: occupied,
+        branch: 'feature',
+        initialHead: 'a'.repeat(40),
+        planRelativePath: 'plan.md',
+      },
+    },
+    {
+      lanePreparation: {
+        cwd: occupied,
+        branch: 'prepared',
+        baselineCommit: 'a'.repeat(40),
+        taskId: 1,
+        state: 'create',
+      },
+    },
+    {
+      tasks: {
+        '1': {
+          taskId: 1,
+          dependsOn: [],
+          state: 'retry_wait',
+          attempts: 1,
+          laneCwd: occupied,
+        },
+      },
+    },
+    {
+      tasks: {
+        '1': {
+          taskId: 1,
+          dependsOn: [],
+          state: 'retry_wait',
+          attempts: 1,
+          recoverySource: recovery,
+        },
+      },
+    },
+    {
+      tasks: {
+        '1': {
+          taskId: 1,
+          dependsOn: [],
+          state: 'retry_wait',
+          attempts: 1,
+          recoveryHistory: [recovery],
+        },
+      },
+    },
   ];
   for (const reservation of reservations) {
-    await assert.rejects(registry.create(runSeed({ worktreeCwd: join(directory, "new"), planPath: join(directory, "new", "plan.md"), ...reservation }), { exclusive: true }), new RegExp(existing.id));
+    await assert.rejects(
+      registry.create(
+        runSeed({
+          worktreeCwd: join(directory, 'new'),
+          planPath: join(directory, 'new', 'plan.md'),
+          ...reservation,
+        }),
+        { exclusive: true },
+      ),
+      new RegExp(existing.id),
+    );
   }
 });
 
-test("independent new-worktree runs can share a read-only source repository during creation and bootstrap recovery", async (t) => {
-  for (const state of ["create", "bootstrap"] as const) {
+test('independent new-worktree runs can share a read-only source repository during creation and bootstrap recovery', async (_t) => {
+  for (const state of ['create', 'bootstrap'] as const) {
     const { registry, directory } = await seedRegistry();
-    t.after(() => rm(directory, { recursive: true, force: true }));
-    const repository = join(directory, "repository");
-    const firstLane = join(directory, "lane-a");
-    const secondLane = join(directory, "lane-b");
-    await mkdir(join(repository, "plans"), { recursive: true });
+    onTestFinished(() => rm(directory, { recursive: true, force: true }));
+    const repository = join(directory, 'repository');
+    const firstLane = join(directory, 'lane-a');
+    const secondLane = join(directory, 'lane-b');
+    await mkdir(join(repository, 'plans'), { recursive: true });
     const git = (args: string[]) => {
-      const result = spawnSync("git", args, { cwd: repository, env: workspaceEnvironment(), encoding: "utf8" });
+      const result = spawnSync('git', args, {
+        cwd: repository,
+        env: workspaceEnvironment(),
+        encoding: 'utf8',
+      });
       assert.equal(result.status, 0, result.stderr);
       return result.stdout.trim();
     };
-    git(["init", "-q"]);
-    await writeFile(join(repository, "plans", "a.md"), "# A\n");
-    await writeFile(join(repository, "plans", "b.md"), "# B\n");
-    git(["add", "plans"]);
-    git(["-c", "user.name=Registry Test", "-c", "user.email=registry@example.invalid", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "commit", "-qm", "fixture"]);
-    const baseline = git(["rev-parse", "HEAD"]);
-    assert.equal(git(["status", "--porcelain"]), "");
-    if (state === "bootstrap") git(["worktree", "add", "-q", "-b", "lane-a", firstLane]);
-    const prepared = (cwd: string, plan: string, status: RunSeed["status"], phase: "create" | "bootstrap"): RunSeed => runSeed({
-      repositoryRoot: repository, worktreeCwd: cwd, planPath: join(cwd, "plans", plan), status,
-      outputTarget: { cwd, branch: "lane", initialHead: baseline, planRelativePath: `plans/${plan}` },
-      lanePreparation: { cwd, branch: "lane", baselineCommit: baseline, taskId: 1, state: phase, sourcePlanPath: join(repository, "plans", plan), nextAttemptAt: Date.now() + 1_000 },
-    });
-    const first = await registry.create(prepared(firstLane, "a.md", state === "bootstrap" ? "failed" : "starting", state), { exclusive: true });
-    const second = await registry.create(prepared(secondLane, "b.md", "starting", "create"), { exclusive: true });
+    git(['init', '-q']);
+    await writeFile(join(repository, 'plans', 'a.md'), '# A\n');
+    await writeFile(join(repository, 'plans', 'b.md'), '# B\n');
+    git(['add', 'plans']);
+    git([
+      '-c',
+      'user.name=Registry Test',
+      '-c',
+      'user.email=registry@example.invalid',
+      '-c',
+      'commit.gpgsign=false',
+      '-c',
+      'core.hooksPath=/dev/null',
+      'commit',
+      '-qm',
+      'fixture',
+    ]);
+    const baseline = git(['rev-parse', 'HEAD']);
+    assert.equal(git(['status', '--porcelain']), '');
+    if (state === 'bootstrap')
+      git(['worktree', 'add', '-q', '-b', 'lane-a', firstLane]);
+    const prepared = (
+      cwd: string,
+      plan: string,
+      status: RunSeed['status'],
+      phase: 'create' | 'bootstrap',
+    ): RunSeed =>
+      runSeed({
+        repositoryRoot: repository,
+        worktreeCwd: cwd,
+        planPath: join(cwd, 'plans', plan),
+        status,
+        outputTarget: {
+          cwd,
+          branch: 'lane',
+          initialHead: baseline,
+          planRelativePath: `plans/${plan}`,
+        },
+        lanePreparation: {
+          cwd,
+          branch: 'lane',
+          baselineCommit: baseline,
+          taskId: 1,
+          state: phase,
+          sourcePlanPath: join(repository, 'plans', plan),
+          nextAttemptAt: Date.now() + 1_000,
+        },
+      });
+    const first = await registry.create(
+      prepared(
+        firstLane,
+        'a.md',
+        state === 'bootstrap' ? 'failed' : 'starting',
+        state,
+      ),
+      { exclusive: true },
+    );
+    const second = await registry.create(
+      prepared(secondLane, 'b.md', 'starting', 'create'),
+      { exclusive: true },
+    );
     assert.notEqual(first.id, second.id);
-    await assert.rejects(registry.create(runSeed({ worktreeCwd: firstLane, planPath: join(firstLane, "other.md") }), { exclusive: true }), new RegExp(first.id));
-    await registry.update({ ...first, tasks: { "1": { taskId: 1, dependsOn: [], state: "retry_wait", attempts: 1,
-      recoverySource: { cwd: repository, branch: "preserved", baselineCommit: baseline, headCommit: baseline, checkpointRef: "refs/plan-exec/checkpoint" } } } });
-    await assert.rejects(registry.create(runSeed({ worktreeCwd: repository, planPath: join(repository, "plans", "other.md") }), { exclusive: true }), new RegExp(first.id));
+    await assert.rejects(
+      registry.create(
+        runSeed({
+          worktreeCwd: firstLane,
+          planPath: join(firstLane, 'other.md'),
+        }),
+        { exclusive: true },
+      ),
+      new RegExp(first.id),
+    );
+    await registry.update({
+      ...first,
+      tasks: {
+        '1': {
+          taskId: 1,
+          dependsOn: [],
+          state: 'retry_wait',
+          attempts: 1,
+          recoverySource: {
+            cwd: repository,
+            branch: 'preserved',
+            baselineCommit: baseline,
+            headCommit: baseline,
+            checkpointRef: 'refs/plan-exec/checkpoint',
+          },
+        },
+      },
+    });
+    await assert.rejects(
+      registry.create(
+        runSeed({
+          worktreeCwd: repository,
+          planPath: join(repository, 'plans', 'other.md'),
+        }),
+        { exclusive: true },
+      ),
+      new RegExp(first.id),
+    );
     await registry.assertExclusive(second);
   }
 });
 
-test("not-yet-created lanes reserve the same path through a symlinked parent", async (t) => {
+test('not-yet-created lanes reserve the same path through a symlinked parent', async (_t) => {
   const { registry, directory } = await seedRegistry();
-  t.after(() => rm(directory, { recursive: true, force: true }));
-  const lanes = join(directory, "lanes");
-  const alias = join(directory, "alias");
+  onTestFinished(() => rm(directory, { recursive: true, force: true }));
+  const lanes = join(directory, 'lanes');
+  const alias = join(directory, 'alias');
   await mkdir(lanes);
   await symlink(lanes, alias);
-  const existing = await registry.create(runSeed({ worktreeCwd: join(directory, "current"), planPath: join(directory, "current", "plan.md"),
-    lanePreparation: { cwd: join(lanes, "future"), branch: "prepared", baselineCommit: "a".repeat(40), taskId: 1, state: "create" } }));
-  await assert.rejects(registry.create(runSeed({ worktreeCwd: join(alias, "future"), planPath: join(alias, "future", "other.md") }), { exclusive: true }), new RegExp(existing.id));
+  const existing = await registry.create(
+    runSeed({
+      worktreeCwd: join(directory, 'current'),
+      planPath: join(directory, 'current', 'plan.md'),
+      lanePreparation: {
+        cwd: join(lanes, 'future'),
+        branch: 'prepared',
+        baselineCommit: 'a'.repeat(40),
+        taskId: 1,
+        state: 'create',
+      },
+    }),
+  );
+  await assert.rejects(
+    registry.create(
+      runSeed({
+        worktreeCwd: join(alias, 'future'),
+        planPath: join(alias, 'future', 'other.md'),
+      }),
+      { exclusive: true },
+    ),
+    new RegExp(existing.id),
+  );
 });
 
-test("settled terminal runs release retained checkouts only after the independent local ownership fence clears", async (t) => {
-  for (const status of ["completed", "completed_with_findings", "cancelled"] as const) {
+test('settled terminal runs release retained checkouts only after the independent local ownership fence clears', async (_t) => {
+  for (const status of [
+    'completed',
+    'completed_with_findings',
+    'cancelled',
+  ] as const) {
     const { registry, directory } = await seedRegistry();
-    t.after(() => rm(directory, { recursive: true, force: true }));
-    const output = join(directory, "output");
-    const old = await registry.create(runSeed({ status, worktreeCwd: join(directory, "current"), planPath: join(directory, "current", "plan.md"),
-      outputTarget: { cwd: output, branch: "feature", initialHead: "a".repeat(40), planRelativePath: "plan.md" } }));
+    onTestFinished(() => rm(directory, { recursive: true, force: true }));
+    const output = join(directory, 'output');
+    const old = await registry.create(
+      runSeed({
+        status,
+        worktreeCwd: join(directory, 'current'),
+        planPath: join(directory, 'current', 'plan.md'),
+        outputTarget: {
+          cwd: output,
+          branch: 'feature',
+          initialHead: 'a'.repeat(40),
+          planRelativePath: 'plan.md',
+        },
+      }),
+    );
     const index = registry.localOperationsPath(old.id);
     await mkdir(index, { recursive: true });
-    const entry = join(index, `${"c".repeat(64)}.json`);
-    await writeFile(entry, "{unresolved-local-ownership");
-    await assert.rejects(registry.create(runSeed({ worktreeCwd: output, planPath: join(output, "other.md") }), { exclusive: true }), new RegExp(old.id));
+    const entry = join(index, `${'c'.repeat(64)}.json`);
+    await writeFile(entry, '{unresolved-local-ownership');
+    await assert.rejects(
+      registry.create(
+        runSeed({ worktreeCwd: output, planPath: join(output, 'other.md') }),
+        { exclusive: true },
+      ),
+      new RegExp(old.id),
+    );
     await rm(entry);
-    const replacement = await registry.create(runSeed({ worktreeCwd: output, planPath: join(output, "other.md") }), { exclusive: true });
+    const replacement = await registry.create(
+      runSeed({ worktreeCwd: output, planPath: join(output, 'other.md') }),
+      { exclusive: true },
+    );
     assert.notEqual(replacement.id, old.id);
   }
 });
 
-test("deleted nested worktrees retain separate ownership from the enclosing checkout", async (t) => {
+test('deleted nested worktrees retain separate ownership from the enclosing checkout', async (_t) => {
   const { registry, directory } = await seedRegistry();
-  t.after(() => rm(directory, { recursive: true, force: true }));
-  const checkout = join(await realpath(directory), "checkout");
-  const removed = join(checkout, ".worktrees", "feature");
-  await mkdir(join(checkout, ".git"), { recursive: true });
-  await mkdir(join(removed, ".git"), { recursive: true });
-  const old = await registry.create(runSeed({ status: "failed", worktreeCwd: removed,
-    planPath: join(removed, "plan.md") }), { exclusive: true });
+  onTestFinished(() => rm(directory, { recursive: true, force: true }));
+  const checkout = join(await realpath(directory), 'checkout');
+  const removed = join(checkout, '.worktrees', 'feature');
+  await mkdir(join(checkout, '.git'), { recursive: true });
+  await mkdir(join(removed, '.git'), { recursive: true });
+  const old = await registry.create(
+    runSeed({
+      status: 'failed',
+      worktreeCwd: removed,
+      planPath: join(removed, 'plan.md'),
+    }),
+    { exclusive: true },
+  );
   await rm(removed, { recursive: true, force: true });
-  const replacement = await registry.create(runSeed({ worktreeCwd: checkout,
-    planPath: join(checkout, "plan.md") }), { exclusive: true });
+  const replacement = await registry.create(
+    runSeed({ worktreeCwd: checkout, planPath: join(checkout, 'plan.md') }),
+    { exclusive: true },
+  );
   assert.notEqual(replacement.id, old.id);
   await registry.assertExclusive(old);
-  await assert.rejects(registry.create(runSeed({ worktreeCwd: removed,
-    planPath: join(removed, "other.md") }), { exclusive: true }), new RegExp(old.id));
+  await assert.rejects(
+    registry.create(
+      runSeed({ worktreeCwd: removed, planPath: join(removed, 'other.md') }),
+      { exclusive: true },
+    ),
+    new RegExp(old.id),
+  );
 });
 
-test("unreadable ownership records fail closed during exclusive creation", async () => {
+test('unreadable ownership records fail closed during exclusive creation', async () => {
   const { registry, directory } = await seedRegistry();
   const old = await registry.create(runSeed());
-  await writeFile(join(directory, old.id, "run.json"), "not JSON");
-  await assert.rejects(registry.create(runSeed(), { exclusive: true }), /unreadable run/);
+  await writeFile(join(directory, old.id, 'run.json'), 'not JSON');
+  await assert.rejects(
+    registry.create(runSeed(), { exclusive: true }),
+    /unreadable run/,
+  );
 });
 
-test("registry persists runs, protects path traversal, and reclaims stale leases", async () => {
+test('registry persists runs, protects path traversal, and reclaims stale leases', async () => {
   const { registry } = await seedRegistry();
   const run = await registry.create(
     runSeed({
-      planPath: "/repo/docs/plans/example.md",
-      worktreeCwd: "/worktree",
-      status: "starting",
-      stage: "resolve",
+      planPath: '/repo/docs/plans/example.md',
+      worktreeCwd: '/worktree',
+      status: 'starting',
+      stage: 'resolve',
     }),
   );
 
-  const claimed = await registry.claim(run, "session-1");
+  const claimed = await registry.claim(run, 'session-1');
   await assert.rejects(
-    () => registry.claim(claimed, "session-2"),
+    () => registry.claim(claimed, 'session-2'),
     /another active Pi session/,
   );
   await assert.rejects(
-    () => registry.get("../escape"),
+    () => registry.get('../escape'),
     /Invalid plan-exec run ID/,
   );
 
   const stale: PlanExecRun = {
     ...claimed,
-    lease: { sessionId: "session-1", pid: process.pid, heartbeatAt: 0 },
+    lease: { sessionId: 'session-1', pid: process.pid, heartbeatAt: 0 },
   };
-  const adopted = await registry.claim(stale, "session-2");
-  assert.equal(adopted.lease?.sessionId, "session-2");
+  const adopted = await registry.claim(stale, 'session-2');
+  assert.equal(adopted.lease?.sessionId, 'session-2');
   assert.equal(adopted.lease?.hostname, hostname());
 });
 
-test("lease liveness weighs session, heartbeat, hostname, and pid", () => {
+test('lease liveness weighs session, heartbeat, hostname, and pid', () => {
   const gone = reapedPid();
   const fresh = Date.now();
   const stale = Date.now() - LEASE_STALE_MS;
@@ -325,32 +617,32 @@ test("lease liveness weighs session, heartbeat, hostname, and pid", () => {
     live: boolean;
   }> = [
     {
-      name: "the owning session is live whatever the lease says",
-      lease: { sessionId: "s1", pid: gone, heartbeatAt: stale, hostname: here },
-      sessionId: "s1",
+      name: 'the owning session is live whatever the lease says',
+      lease: { sessionId: 's1', pid: gone, heartbeatAt: stale, hostname: here },
+      sessionId: 's1',
       live: true,
     },
     {
-      name: "a foreign lease with a running local pid still blocks",
+      name: 'a foreign lease with a running local pid still blocks',
       lease: {
-        sessionId: "s1",
+        sessionId: 's1',
         pid: process.pid,
         heartbeatAt: fresh,
         hostname: here,
       },
-      sessionId: "s2",
+      sessionId: 's2',
       live: true,
     },
     {
-      name: "a foreign lease with a dead local pid is dead now",
-      lease: { sessionId: "s1", pid: gone, heartbeatAt: fresh, hostname: here },
-      sessionId: "s2",
+      name: 'a foreign lease with a dead local pid is dead now',
+      lease: { sessionId: 's1', pid: gone, heartbeatAt: fresh, hostname: here },
+      sessionId: 's2',
       live: false,
     },
     {
-      name: "a stale heartbeat cannot fence a running local owner",
+      name: 'a stale heartbeat cannot fence a running local owner',
       lease: {
-        sessionId: "s1",
+        sessionId: 's1',
         pid: process.pid,
         heartbeatAt: stale,
         hostname: here,
@@ -361,68 +653,68 @@ test("lease liveness weighs session, heartbeat, hostname, and pid", () => {
       // A foreign pid is not ours to check, so only the heartbeat can speak.
       name: "a name sharing this one's first label is not this machine",
       lease: {
-        sessionId: "s1",
+        sessionId: 's1',
         pid: gone,
         heartbeatAt: fresh,
         hostname: `${shortHere}.corp.example.com`,
       },
-      sessionId: "s2",
+      sessionId: 's2',
       live: true,
     },
     {
-      name: "hostname case is not machine identity",
+      name: 'hostname case is not machine identity',
       lease: {
-        sessionId: "s1",
+        sessionId: 's1',
         pid: gone,
         heartbeatAt: fresh,
         hostname: here.toUpperCase(),
       },
-      sessionId: "s2",
+      sessionId: 's2',
       live: false,
     },
     {
-      name: "an mDNS collision rename is a different machine",
+      name: 'an mDNS collision rename is a different machine',
       lease: {
-        sessionId: "s1",
+        sessionId: 's1',
         pid: gone,
         heartbeatAt: fresh,
         hostname: `${shortHere}-2.local`,
       },
-      sessionId: "s2",
+      sessionId: 's2',
       live: true,
     },
     {
-      name: "another host remains owned while unreachable",
+      name: 'another host remains owned while unreachable',
       lease: {
-        sessionId: "s1",
+        sessionId: 's1',
         pid: gone,
         heartbeatAt: fresh,
-        hostname: "other-host",
+        hostname: 'other-host',
       },
       live: true,
     },
     {
-      name: "another host with a stale heartbeat remains uncertain",
+      name: 'another host with a stale heartbeat remains uncertain',
       lease: {
-        sessionId: "s1",
+        sessionId: 's1',
         pid: process.pid,
         heartbeatAt: stale,
-        hostname: "other-host",
+        hostname: 'other-host',
       },
       live: true,
     },
     {
-      name: "an absent hostname falls back to heartbeat freshness",
-      lease: { sessionId: "s1", pid: gone, heartbeatAt: fresh },
+      name: 'an absent hostname falls back to heartbeat freshness',
+      lease: { sessionId: 's1', pid: gone, heartbeatAt: fresh },
       live: true,
     },
     {
-      name: "an absent hostname with a stale heartbeat is dead",
-      lease: { sessionId: "s1", pid: process.pid, heartbeatAt: stale },
+      name: 'an absent hostname with a stale heartbeat is dead',
+      lease: { sessionId: 's1', pid: process.pid, heartbeatAt: stale },
       live: false,
     },
     {
-      name: "a lease with no session ID never matches an absent argument",
+      name: 'a lease with no session ID never matches an absent argument',
       lease: {
         pid: gone,
         heartbeatAt: fresh,
@@ -440,12 +732,12 @@ test("lease liveness weighs session, heartbeat, hostname, and pid", () => {
     );
 });
 
-test("a dead local pid frees the lease without waiting out the heartbeat", async () => {
+test('a dead local pid frees the lease without waiting out the heartbeat', async () => {
   const { registry } = await seedRegistry();
   const run = await registry.create(
     runSeed({
       lease: {
-        sessionId: "session-1",
+        sessionId: 'session-1',
         pid: reapedPid(),
         heartbeatAt: Date.now(),
         hostname: hostname(),
@@ -453,19 +745,19 @@ test("a dead local pid frees the lease without waiting out the heartbeat", async
     }),
   );
 
-  const claimed = await registry.claim(run, "session-2");
+  const claimed = await registry.claim(run, 'session-2');
 
-  assert.equal(claimed.lease?.sessionId, "session-2");
+  assert.equal(claimed.lease?.sessionId, 'session-2');
   assert.equal(claimed.lease?.pid, process.pid);
 });
 
-test("a heartbeat refreshes liveness without taking over lease identity", async () => {
+test('a heartbeat refreshes liveness without taking over lease identity', async () => {
   const { registry } = await seedRegistry();
   const gone = reapedPid();
   const run = await registry.create(
     runSeed({
       lease: {
-        sessionId: "session-1",
+        sessionId: 'session-1',
         pid: gone,
         heartbeatAt: 1,
         hostname: hostname(),
@@ -477,26 +769,26 @@ test("a heartbeat refreshes liveness without taking over lease identity", async 
 
   assert.ok(lease);
   assert.equal(lease.pid, gone);
-  assert.equal(isLeaseLive(lease, "session-2"), false);
+  assert.equal(isLeaseLive(lease, 'session-2'), false);
 });
 
-test("a lease written before hostname existed is judged by heartbeat alone", async () => {
+test('a lease written before hostname existed is judged by heartbeat alone', async () => {
   const { directory, registry } = await seedRegistry();
-  const runId = "22222222-2222-4222-8222-222222222222";
+  const runId = '22222222-2222-4222-8222-222222222222';
   await mkdir(join(directory, runId), { recursive: true });
   await writeFile(
-    join(directory, runId, "run.json"),
+    join(directory, runId, 'run.json'),
     JSON.stringify({
       schemaVersion: 1,
       id: runId,
-      repositoryRoot: "/repo",
-      planPath: "/repo/plan.md",
-      planHash: "hash",
-      worktreeCwd: "/repo",
-      branch: "feature",
-      defaultBranch: "main",
-      status: "running",
-      stage: "implementation",
+      repositoryRoot: '/repo',
+      planPath: '/repo/plan.md',
+      planHash: 'hash',
+      worktreeCwd: '/repo',
+      branch: 'feature',
+      defaultBranch: 'main',
+      status: 'running',
+      stage: 'implementation',
       taskAttempts: {},
       stageAttempts: {},
       reviewFindings: [],
@@ -505,12 +797,12 @@ test("a lease written before hostname existed is judged by heartbeat alone", asy
       createdAt: 1,
       updatedAt: 1,
       lease: {
-        sessionId: "session-1",
+        sessionId: 'session-1',
         pid: reapedPid(),
         heartbeatAt: Date.now(),
       },
     }),
-    "utf8",
+    'utf8',
   );
 
   const loaded = await registry.get(runId);
@@ -521,24 +813,24 @@ test("a lease written before hostname existed is judged by heartbeat alone", asy
   assert.equal(lease.hostname, undefined);
   assert.equal(loaded.retiredAt, undefined);
   // The pid is dead, so a pid check would free this lease; the heartbeat holds it.
-  assert.equal(isLeaseLive(lease, "session-2"), true);
+  assert.equal(isLeaseLive(lease, 'session-2'), true);
   await assert.rejects(
-    () => registry.claim(loaded, "session-2"),
+    () => registry.claim(loaded, 'session-2'),
     /another active Pi session/,
   );
 });
 
-test("remove retires a terminal run and refuses anything still in play", async () => {
+test('remove retires a terminal run and refuses anything still in play', async () => {
   const { directory, registry } = await seedRegistry();
   const retired = await registry.create(
-    runSeed({ status: "completed", stage: "complete" }),
+    runSeed({ status: 'completed', stage: 'complete' }),
   );
   const running = await registry.create(runSeed());
   const held = await registry.create(
     runSeed({
-      status: "cancelled",
+      status: 'cancelled',
       lease: {
-        sessionId: "session-1",
+        sessionId: 'session-1',
         pid: process.pid,
         heartbeatAt: Date.now(),
         hostname: hostname(),
@@ -559,24 +851,24 @@ test("remove retires a terminal run and refuses anything still in play", async (
     /held by a live lease from session session-1/,
   );
   assert.equal(removalRefusal(retired), undefined);
-  assert.match(removalRefusal(running) ?? "", /only a terminal run/);
+  assert.match(removalRefusal(running) ?? '', /only a terminal run/);
   // A second removal of a gone run is a no-op, not a failure.
   await registry.remove(retired.id);
   await assert.rejects(
-    () => registry.remove("../escape"),
+    () => registry.remove('../escape'),
     /Invalid plan-exec run ID/,
   );
 });
 
-test("remove deletes an unreadable record instead of throwing on it", async () => {
+test('remove deletes an unreadable record instead of throwing on it', async () => {
   const { directory, registry } = await seedRegistry();
-  const corruptId = "22222222-2222-4222-8222-222222222222";
-  const wrongSchemaId = "33333333-3333-4333-8333-333333333333";
+  const corruptId = '22222222-2222-4222-8222-222222222222';
+  const wrongSchemaId = '33333333-3333-4333-8333-333333333333';
   await mkdir(join(directory, corruptId), { recursive: true });
-  await writeFile(join(directory, corruptId, "run.json"), "{not-json\n");
+  await writeFile(join(directory, corruptId, 'run.json'), '{not-json\n');
   await mkdir(join(directory, wrongSchemaId), { recursive: true });
   await writeFile(
-    join(directory, wrongSchemaId, "run.json"),
+    join(directory, wrongSchemaId, 'run.json'),
     `${JSON.stringify({ id: wrongSchemaId, schemaVersion: 2 })}\n`,
   );
 
@@ -588,29 +880,32 @@ test("remove deletes an unreadable record instead of throwing on it", async () =
   assert.deepEqual((await registry.listWithErrors()).errors, []);
 });
 
-test("corrupt run cleanup preserves the independent local ownership fence", async () => {
+test('corrupt run cleanup preserves the independent local ownership fence', async () => {
   const { directory, registry } = await seedRegistry();
-  const id = "22222222-2222-4222-8222-222222222222";
+  const id = '22222222-2222-4222-8222-222222222222';
   const active = registry.localOperationsPath(id);
   await mkdir(active, { recursive: true });
-  await writeFile(join(directory, id, "run.json"), "{not-json\n");
-  const entry = join(active, `${"a".repeat(64)}.json`);
-  await writeFile(entry, "{unresolved-ownership\n");
-  await assert.rejects(registry.remove(id), /unconfirmed local command ownership/);
-  assert.equal(await readFile(entry, "utf8"), "{unresolved-ownership\n");
+  await writeFile(join(directory, id, 'run.json'), '{not-json\n');
+  const entry = join(active, `${'a'.repeat(64)}.json`);
+  await writeFile(entry, '{unresolved-ownership\n');
+  await assert.rejects(
+    registry.remove(id),
+    /unconfirmed local command ownership/,
+  );
+  assert.equal(await readFile(entry, 'utf8'), '{unresolved-ownership\n');
 });
 
-test("abandonment needs a dead lease, an in-flight claim, and a gone operation", () => {
+test('abandonment needs a dead lease, an in-flight claim, and a gone operation', () => {
   const subject = (overrides: Partial<PlanExecRun> = {}): PlanExecRun => ({
     ...runSeed(),
-    id: "11111111-1111-4111-8111-111111111111",
+    id: '11111111-1111-4111-8111-111111111111',
     skippedStages: [],
     branchRebindings: [],
     activeOperation: {
-      operationId: "operation-1",
-      service: "bridge",
-      kind: "implementation",
-      asyncDir: "/tmp/async",
+      operationId: 'operation-1',
+      service: 'bridge',
+      kind: 'implementation',
+      asyncDir: '/tmp/async',
     },
     createdAt: 1,
     updatedAt: 2,
@@ -625,147 +920,147 @@ test("abandonment needs a dead lease, an in-flight claim, and a gone operation",
     expected: Abandonment;
   }> = [
     {
-      name: "dead lease, running, directory gone is inconclusive",
+      name: 'dead lease, running, directory gone is inconclusive',
       run: subject(),
       evidence: { leaseLive: false, asyncDirPresent: false },
-      expected: "ambiguous",
+      expected: 'ambiguous',
     },
     {
-      name: "dead lease, v1 bridge has no record is inconclusive",
+      name: 'dead lease, v1 bridge has no record is inconclusive',
       run: subject(),
-      evidence: { leaseLive: false, bridgeState: "absent" },
-      expected: "ambiguous",
+      evidence: { leaseLive: false, bridgeState: 'absent' },
+      expected: 'ambiguous',
     },
     {
-      name: "dead lease, starting, directory gone is inconclusive",
-      run: subject({ status: "starting" }),
+      name: 'dead lease, starting, directory gone is inconclusive',
+      run: subject({ status: 'starting' }),
       evidence: { leaseLive: false, asyncDirPresent: false },
-      expected: "ambiguous",
+      expected: 'ambiguous',
     },
     {
-      name: "dead lease, cancel_pending, directory gone is inconclusive",
-      run: subject({ status: "cancel_pending" }),
+      name: 'dead lease, cancel_pending, directory gone is inconclusive',
+      run: subject({ status: 'cancel_pending' }),
       evidence: { leaseLive: false, asyncDirPresent: false },
-      expected: "ambiguous",
+      expected: 'ambiguous',
     },
     {
-      name: "dead lease, skip_pending, directory gone",
+      name: 'dead lease, skip_pending, directory gone',
       run: subject({
-        status: "skip_pending",
-        stage: "comprehensive_review",
+        status: 'skip_pending',
+        stage: 'comprehensive_review',
         activeOperation: {
-          operationId: "operation-1",
-          service: "bridge",
-          kind: "review",
-          asyncDir: "/tmp/async",
+          operationId: 'operation-1',
+          service: 'bridge',
+          kind: 'review',
+          asyncDir: '/tmp/async',
         },
         pendingStageSkip: {
-          stage: "comprehensive_review",
-          reason: "blocked",
+          stage: 'comprehensive_review',
+          reason: 'blocked',
           requestedAt: 1,
-          requestedBy: "session-1",
+          requestedBy: 'session-1',
         },
       }),
       evidence: { leaseLive: false, asyncDirPresent: false },
-      expected: "ambiguous",
+      expected: 'ambiguous',
     },
     {
-      name: "native process terminal observation proves abandonment",
+      name: 'native process terminal observation proves abandonment',
       run: subject({
         activeOperation: {
-          operationId: "operation-1",
-          service: "bridge",
-          kind: "implementation",
-          externalRunId: "external-1",
+          operationId: 'operation-1',
+          service: 'bridge',
+          kind: 'implementation',
+          externalRunId: 'external-1',
         },
       }),
       evidence: {
         leaseLive: false,
         processTerminalProof: {
           version: 1,
-          state: "observed",
-          runId: "external-1",
-          runnerProcessInstanceId: "native-instance-1",
+          state: 'observed',
+          runId: 'external-1',
+          runnerProcessInstanceId: 'native-instance-1',
           observedAt: 1,
           instances: [],
         },
       },
-      expected: "abandoned",
+      expected: 'abandoned',
     },
     {
-      name: "durable operation absence alone leaves an unbound launch ambiguous",
+      name: 'durable operation absence alone leaves an unbound launch ambiguous',
       run: subject({
         activeOperation: {
-          operationId: "operation-1",
-          service: "bridge",
-          kind: "implementation",
+          operationId: 'operation-1',
+          service: 'bridge',
+          kind: 'implementation',
         },
       }),
       evidence: {
         leaseLive: false,
-        bridgeState: "absent",
+        bridgeState: 'absent',
         durableOperationLookup: true,
       },
-      expected: "ambiguous",
+      expected: 'ambiguous',
     },
     {
-      name: "explicit replay safety permits reconciliation without proving exit",
+      name: 'explicit replay safety permits reconciliation without proving exit',
       run: subject({
         activeOperation: {
-          operationId: "operation-1",
-          service: "bridge",
-          kind: "implementation",
+          operationId: 'operation-1',
+          service: 'bridge',
+          kind: 'implementation',
         },
       }),
       evidence: {
         leaseLive: false,
-        bridgeState: "absent",
+        bridgeState: 'absent',
         durableOperationLookup: true,
         replaySafe: true,
       },
-      expected: "reconcilable",
+      expected: 'reconcilable',
     },
     {
-      name: "live lease outranks every other signal",
+      name: 'live lease outranks every other signal',
       run: subject(),
       evidence: { leaseLive: true, asyncDirPresent: false },
-      expected: "live",
+      expected: 'live',
     },
     {
-      name: "directory still on disk is not gone",
+      name: 'directory still on disk is not gone',
       run: subject(),
       evidence: { leaseLive: false, asyncDirPresent: true },
-      expected: "ambiguous",
+      expected: 'ambiguous',
     },
     {
-      name: "no operation evidence at all",
+      name: 'no operation evidence at all',
       run: subject(),
       evidence: { leaseLive: false },
-      expected: "ambiguous",
+      expected: 'ambiguous',
     },
     {
-      name: "a running bridge answer is not absence",
+      name: 'a running bridge answer is not absence',
       run: subject(),
-      evidence: { leaseLive: false, bridgeState: "running" },
-      expected: "ambiguous",
+      evidence: { leaseLive: false, bridgeState: 'running' },
+      expected: 'ambiguous',
     },
     {
-      name: "paused does not claim work in flight",
-      run: subject({ status: "paused" }),
+      name: 'paused does not claim work in flight',
+      run: subject({ status: 'paused' }),
       evidence: { leaseLive: false, asyncDirPresent: false },
-      expected: "ambiguous",
+      expected: 'ambiguous',
     },
     {
-      name: "a terminal run is never abandoned",
-      run: subject({ status: "failed" }),
+      name: 'a terminal run is never abandoned',
+      run: subject({ status: 'failed' }),
       evidence: { leaseLive: false, asyncDirPresent: false },
-      expected: "ambiguous",
+      expected: 'ambiguous',
     },
     {
-      name: "no tracked operation cannot be proven gone",
+      name: 'no tracked operation cannot be proven gone',
       run: withoutOperation,
       evidence: { leaseLive: false, asyncDirPresent: false },
-      expected: "ambiguous",
+      expected: 'ambiguous',
     },
   ];
 
@@ -773,172 +1068,186 @@ test("abandonment needs a dead lease, an in-flight claim, and a gone operation",
     assert.equal(classifyAbandonment(run, evidence), expected, name);
 });
 
-test("concurrent claims allow only one session to acquire the lease", async () => {
+test('concurrent claims allow only one session to acquire the lease', async () => {
   const { registry } = await seedRegistry();
-  const run = await registry.create(runSeed({ stage: "resolve" }));
+  const run = await registry.create(runSeed({ stage: 'resolve' }));
 
   const claims = await Promise.allSettled([
-    registry.claim(run, "session-1"),
-    registry.claim(run, "session-2"),
+    registry.claim(run, 'session-1'),
+    registry.claim(run, 'session-2'),
   ]);
 
   assert.equal(
-    claims.filter((claim) => claim.status === "fulfilled").length,
+    claims.filter((claim) => claim.status === 'fulfilled').length,
     1,
   );
-  assert.equal(claims.filter((claim) => claim.status === "rejected").length, 1);
+  assert.equal(claims.filter((claim) => claim.status === 'rejected').length, 1);
   const stored = await registry.get(run.id);
   assert.equal(
     stored?.lease?.sessionId,
-    claims.find((claim) => claim.status === "fulfilled")?.value.lease
+    claims.find((claim) => claim.status === 'fulfilled')?.value.lease
       ?.sessionId,
   );
 });
 
-test("claiming from a stale snapshot preserves newer run state", async () => {
+test('claiming from a stale snapshot preserves newer run state', async () => {
   const { registry } = await seedRegistry();
   const run = await registry.create(runSeed());
   await registry.update({
     ...run,
     activeOperation: {
-      operationId: "operation-1",
-      service: "bridge",
-      kind: "implementation",
+      operationId: 'operation-1',
+      service: 'bridge',
+      kind: 'implementation',
       taskId: 1,
     },
   });
 
-  const claimed = await registry.claim(run, "session-1");
+  const claimed = await registry.claim(run, 'session-1');
 
-  assert.equal(claimed.activeOperation?.operationId, "operation-1");
+  assert.equal(claimed.activeOperation?.operationId, 'operation-1');
 });
 
-test("ordinary stale updates cannot erase a newer active operation", async () => {
+test('ordinary stale updates cannot erase a newer active operation', async () => {
   const { registry } = await seedRegistry();
   const run = await registry.create(runSeed());
   const launching = await registry.update({
     ...run,
     activeOperation: {
-      operationId: "operation-1",
-      service: "bridge",
-      kind: "implementation",
+      operationId: 'operation-1',
+      service: 'bridge',
+      kind: 'implementation',
       taskId: 1,
     },
   });
 
-  const preserved = await registry.update({ ...run, status: "paused" });
+  const preserved = await registry.update({ ...run, status: 'paused' });
 
   assert.equal(preserved.updatedAt, launching.updatedAt);
-  assert.equal(preserved.status, "running");
-  assert.equal(preserved.activeOperation?.operationId, "operation-1");
+  assert.equal(preserved.status, 'running');
+  assert.equal(preserved.activeOperation?.operationId, 'operation-1');
 });
 
-test("stale heartbeat preserves a newer cancellation request", async () => {
+test('stale heartbeat preserves a newer cancellation request', async () => {
   const { registry } = await seedRegistry();
   const run = await registry.create(
-    runSeed({ lease: { sessionId: "session-1", pid: 123, heartbeatAt: 1 } }),
+    runSeed({ lease: { sessionId: 'session-1', pid: 123, heartbeatAt: 1 } }),
   );
   const cancelling = await registry.update({
     ...run,
-    status: "cancel_pending",
+    status: 'cancel_pending',
   });
 
   const observed = await registry.heartbeat(run);
 
-  assert.equal(observed.status, "cancel_pending");
+  assert.equal(observed.status, 'cancel_pending');
   assert.equal(observed.updatedAt, cancelling.updatedAt);
 });
 
-test("controller lock reuses a stable file after release", async (t) => {
+test('controller lock reuses a stable file after release', async (_t) => {
   const { directory, registry } = await seedRegistry();
-  t.after(() => rm(directory, { recursive: true, force: true }));
+  onTestFinished(() => rm(directory, { recursive: true, force: true }));
   const run = await registry.create(runSeed());
-  const lockPath = join(directory, ".locks", `${run.id}.controller.lock`);
-  assert.equal(await registry.withControllerLock(run.id, async () => "first"), "first");
+  const lockPath = join(directory, '.locks', `${run.id}.controller.lock`);
+  assert.equal(
+    await registry.withControllerLock(run.id, async () => 'first'),
+    'first',
+  );
   const before = await stat(lockPath);
-  assert.equal(await registry.withControllerLock(run.id, async () => "second"), "second");
+  assert.equal(
+    await registry.withControllerLock(run.id, async () => 'second'),
+    'second',
+  );
   assert.equal((await stat(lockPath)).ino, before.ino);
 });
 
-test("controller lock bounds contention without stealing a live lock", async (t) => {
+test('controller lock bounds contention without stealing a live lock', async (_t) => {
   const { directory, registry } = await seedRegistry();
-  t.after(() => rm(directory, { recursive: true, force: true }));
+  onTestFinished(() => rm(directory, { recursive: true, force: true }));
   const run = await registry.create(runSeed());
-  const lock = await acquireLock(join(directory, ".locks", `${run.id}.controller.lock`));
+  const lock = await acquireLock(
+    join(directory, '.locks', `${run.id}.controller.lock`),
+  );
   try {
-    assert.equal(await registry.withControllerLock(run.id, async () => "stolen"), undefined);
+    assert.equal(
+      await registry.withControllerLock(run.id, async () => 'stolen'),
+      undefined,
+    );
   } finally {
     await lock.release();
   }
-  assert.equal(await registry.withControllerLock(run.id, async () => "released"), "released");
+  assert.equal(
+    await registry.withControllerLock(run.id, async () => 'released'),
+    'released',
+  );
 });
 
-test("registry update timestamps are monotonic for compare-and-set safety", async () => {
+test('registry update timestamps are monotonic for compare-and-set safety', async () => {
   const { registry } = await seedRegistry();
-  const run = await registry.create(runSeed({ stage: "resolve" }));
+  const run = await registry.create(runSeed({ stage: 'resolve' }));
 
-  const updated = await registry.update({ ...run, status: "paused" });
+  const updated = await registry.update({ ...run, status: 'paused' });
 
   assert.ok(updated.updatedAt > run.updatedAt);
 });
 
-test("registry rejects stale compare-and-set updates", async () => {
+test('registry rejects stale compare-and-set updates', async () => {
   const { registry } = await seedRegistry();
-  const run = await registry.create(runSeed({ stage: "resolve" }));
-  const newer = await registry.update({ ...run, status: "paused" });
+  const run = await registry.create(runSeed({ stage: 'resolve' }));
+  const newer = await registry.update({ ...run, status: 'paused' });
   const result = await registry.updateIfCurrent(
-    { ...run, status: "cancel_pending" },
+    { ...run, status: 'cancel_pending' },
     run.updatedAt,
   );
   assert.equal(result.applied, false);
   assert.equal(result.run.status, newer.status);
 });
 
-test("registry migrates vertical-slice runs missing review metadata", async () => {
+test('registry migrates vertical-slice runs missing review metadata', async () => {
   const { directory, registry } = await seedRegistry();
-  const runId = "11111111-1111-4111-8111-111111111111";
-  const path = join(directory, runId, "run.json");
+  const runId = '11111111-1111-4111-8111-111111111111';
+  const path = join(directory, runId, 'run.json');
   await mkdir(join(directory, runId), { recursive: true });
   await writeFile(
     path,
-    JSON.stringify({
+    `${JSON.stringify({
       schemaVersion: 1,
       id: runId,
-      repositoryRoot: "/repo",
-      planPath: "/repo/plan.md",
-      planHash: "hash",
-      worktreeCwd: "/repo",
-      branch: "feature",
-      defaultBranch: "main",
-      status: "running",
-      stage: "tasks",
+      repositoryRoot: '/repo',
+      planPath: '/repo/plan.md',
+      planHash: 'hash',
+      worktreeCwd: '/repo',
+      branch: 'feature',
+      defaultBranch: 'main',
+      status: 'running',
+      stage: 'tasks',
       taskAttempts: {},
       config: {
         taskRetries: 1,
         maxTaskIterations: 50,
-        workerAgent: "worker",
+        workerAgent: 'worker',
         workerMaxTurns: 50,
       },
       unresolvedFindings: [],
       createdAt: 1,
       updatedAt: 1,
-    }) + "\n",
+    })}\n`,
   );
 
   const migrated = await registry.get(runId);
-  assert.equal(migrated?.stage, "project_tasks");
+  assert.equal(migrated?.stage, 'project_tasks');
   assert.equal(migrated?.config.taskRetries, 1);
   assert.equal(migrated?.config.maxTaskIterations, 50);
-  assert.equal(migrated?.config.workerAgent, "worker");
+  assert.equal(migrated?.config.workerAgent, 'worker');
   assert.equal(migrated?.config.workerMaxTurns, 50);
   assert.equal(migrated?.config.reviewIterations, 5);
   assert.deepEqual(migrated?.reviewFindings, []);
   assert.deepEqual(migrated?.skippedStages, []);
   assert.deepEqual(migrated?.branchRebindings, []);
-  assert.equal(JSON.parse(await readFile(path, "utf8")).stage, "tasks");
+  assert.equal(JSON.parse(await readFile(path, 'utf8')).stage, 'tasks');
 });
 
-test("registry rejects invalid persisted lifecycle shapes", async () => {
+test('registry rejects invalid persisted lifecycle shapes', async () => {
   const { directory, registry } = await seedRegistry();
   const run = await registry.create(runSeed());
   const missingConfig = structuredClone(run) as unknown as PlanExecRun;
@@ -947,7 +1256,7 @@ test("registry rejects invalid persisted lifecycle shapes", async () => {
   await assert.rejects(
     registry.update({
       ...run,
-      status: "not-a-status" as PlanExecRun["status"],
+      status: 'not-a-status' as PlanExecRun['status'],
     }),
     /Invalid plan-exec run registry entry/,
   );
@@ -959,9 +1268,9 @@ test("registry rejects invalid persisted lifecycle shapes", async () => {
     registry.update({
       ...run,
       activeOperation: {
-        operationId: "review-at-implementation",
-        service: "bridge",
-        kind: "review",
+        operationId: 'review-at-implementation',
+        service: 'bridge',
+        kind: 'review',
       },
     }),
     /Invalid plan-exec run registry entry/,
@@ -969,12 +1278,12 @@ test("registry rejects invalid persisted lifecycle shapes", async () => {
   await assert.rejects(
     registry.update({
       ...run,
-      status: "skip_pending",
+      status: 'skip_pending',
       pendingStageSkip: {
-        stage: "implementation",
-        reason: "unsafe waiver",
+        stage: 'implementation',
+        reason: 'unsafe waiver',
         requestedAt: 1,
-        requestedBy: "session-1",
+        requestedBy: 'session-1',
       },
     }),
     /Invalid plan-exec run registry entry/,
@@ -984,10 +1293,10 @@ test("registry rejects invalid persisted lifecycle shapes", async () => {
       ...run,
       skippedStages: [
         {
-          stage: "archive",
-          reason: "unsafe waiver",
+          stage: 'archive',
+          reason: 'unsafe waiver',
           requestedAt: 1,
-          requestedBy: "session-1",
+          requestedBy: 'session-1',
           completedAt: 2,
         },
       ],
@@ -996,15 +1305,18 @@ test("registry rejects invalid persisted lifecycle shapes", async () => {
   );
 
   for (const blocked of [
-    { taskId: 0, reason: "Blocked" },
-    { taskId: 1.5, reason: "Blocked" },
-    { taskId: 1, reason: "  " },
-    { reason: "" },
+    { taskId: 0, reason: 'Blocked' },
+    { taskId: 1.5, reason: 'Blocked' },
+    { taskId: 1, reason: '  ' },
+    { reason: '' },
   ]) {
-    await assert.rejects(registry.update({ ...run, blocked }), /Invalid plan-exec run registry entry/);
+    await assert.rejects(
+      registry.update({ ...run, blocked }),
+      /Invalid plan-exec run registry entry/,
+    );
   }
 
-  const path = join(directory, run.id, "run.json");
+  const path = join(directory, run.id, 'run.json');
   await writeFile(path, JSON.stringify({ ...run, skippedStages: {} }));
   await assert.rejects(
     registry.get(run.id),
@@ -1012,12 +1324,12 @@ test("registry rejects invalid persisted lifecycle shapes", async () => {
   );
 });
 
-test("registry lists healthy runs when a sibling entry is corrupt", async () => {
+test('registry lists healthy runs when a sibling entry is corrupt', async () => {
   const { directory, registry } = await seedRegistry();
-  const healthy = await registry.create(runSeed({ stage: "resolve" }));
-  const corruptId = "22222222-2222-4222-8222-222222222222";
+  const healthy = await registry.create(runSeed({ stage: 'resolve' }));
+  const corruptId = '22222222-2222-4222-8222-222222222222';
   await mkdir(join(directory, corruptId), { recursive: true });
-  await writeFile(join(directory, corruptId, "run.json"), "{not-json\n");
+  await writeFile(join(directory, corruptId, 'run.json'), '{not-json\n');
 
   const result = await registry.listWithErrors();
 
@@ -1026,7 +1338,7 @@ test("registry lists healthy runs when a sibling entry is corrupt", async () => 
     [healthy.id],
   );
   assert.equal(result.errors[0]?.runId, corruptId);
-  assert.notEqual(result.errors[0]?.message, "");
+  assert.notEqual(result.errors[0]?.message, '');
 });
 
 /** The seed every removal test starts from: a run the registry would delete. */
@@ -1037,250 +1349,303 @@ async function seedRemovable(overrides: Partial<RunSeed> = {}): Promise<{
 }> {
   const { directory, registry } = await seedRegistry();
   const run = await registry.create(
-    runSeed({ status: "completed", stage: "complete", ...overrides }),
+    runSeed({ status: 'completed', stage: 'complete', ...overrides }),
   );
   return { directory, registry, run };
 }
 
-test("remove refuses a record it cannot read for an I/O reason", async () => {
+test('remove refuses a record it cannot read for an I/O reason', async () => {
   const { directory, registry, run } = await seedRemovable();
   // A directory where the file belongs yields EISDIR without needing root:
   // unreadable, but not evidence of anything, so it must not be deleted.
-  await rm(join(directory, run.id, "run.json"));
-  await mkdir(join(directory, run.id, "run.json"), { recursive: true });
+  await rm(join(directory, run.id, 'run.json'));
+  await mkdir(join(directory, run.id, 'run.json'), { recursive: true });
 
   await assert.rejects(registry.remove(run.id), /EISDIR|illegal operation/i);
   assert.ok(
     await stat(join(directory, run.id)),
-    "an unreadable-for-I/O record survives",
+    'an unreadable-for-I/O record survives',
   );
 });
 
-test("remove decides refusal under the lock, not before it", async () => {
+test('remove decides refusal under the lock, not before it', async () => {
   const { directory, registry, run } = await seedRemovable();
-  const path = join(directory, run.id, "run.json");
-  const lock = await acquireLock(join(directory, ".locks", `${run.id}.record.lock`));
+  const path = join(directory, run.id, 'run.json');
+  const lock = await acquireLock(
+    join(directory, '.locks', `${run.id}.record.lock`),
+  );
 
   const removal = registry.remove(run.id);
   // Revived while the removal waits for the lock: a refusal decided before
   // locking would delete a directory a live worker is writing to.
   await writeFile(
     path,
-    `${JSON.stringify({ ...run, status: "running", stage: "implementation" })}\n`,
+    `${JSON.stringify({ ...run, status: 'running', stage: 'implementation' })}\n`,
   );
   await lock.release();
 
   await assert.rejects(removal, /only a terminal run can be removed/);
-  assert.equal((await registry.get(run.id))?.status, "running");
+  assert.equal((await registry.get(run.id))?.status, 'running');
 });
 
-test("remove refuses a run a controller is recovering", async () => {
+test('remove refuses a run a controller is recovering', async () => {
   const { directory, registry, run } = await seedRemovable({
-    status: "failed",
+    status: 'failed',
   });
-  const lock = await acquireLock(join(directory, ".locks", `${run.id}.controller.lock`));
+  const lock = await acquireLock(
+    join(directory, '.locks', `${run.id}.controller.lock`),
+  );
   try {
     await assert.rejects(registry.remove(run.id), /being recovered/);
   } finally {
     await lock.release();
   }
   assert.ok(
-    await stat(join(directory, run.id, "run.json")),
-    "a run under recovery survives",
+    await stat(join(directory, run.id, 'run.json')),
+    'a run under recovery survives',
   );
 });
 
-test("remove reports whether a record was actually deleted", async () => {
+test('remove reports whether a record was actually deleted', async () => {
   const { registry, run } = await seedRemovable();
 
   assert.equal(await registry.remove(run.id), true);
-  assert.equal(await registry.remove(run.id), false, "already gone is not a removal");
+  assert.equal(
+    await registry.remove(run.id),
+    false,
+    'already gone is not a removal',
+  );
 });
 
-test("updateLatest re-applies a write that update would have dropped", async () => {
+test('updateLatest re-applies a write that update would have dropped', async () => {
   const { registry, run } = await seedRemovable();
-  const stale = await registry.update({ ...run, branch: "first" });
-  await registry.update({ ...stale, branch: "second" });
+  const stale = await registry.update({ ...run, branch: 'first' });
+  await registry.update({ ...stale, branch: 'second' });
 
   // Dropped silently, and the newer record is handed back instead of an error.
-  const dropped = await registry.update({ ...stale, branch: "third" });
-  assert.equal(dropped.branch, "second");
-  assert.equal((await registry.get(run.id))?.branch, "second");
+  const dropped = await registry.update({ ...stale, branch: 'third' });
+  assert.equal(dropped.branch, 'second');
+  assert.equal((await registry.get(run.id))?.branch, 'second');
 
   const merged = await registry.updateLatest(run.id, (current) => ({
     ...current,
-    status: "cancelled",
+    status: 'cancelled',
   }));
 
-  assert.equal(merged.status, "cancelled");
-  assert.equal(merged.branch, "second", "the other writer's change survives");
+  assert.equal(merged.status, 'cancelled');
+  assert.equal(merged.branch, 'second', "the other writer's change survives");
   await assert.rejects(
-    registry.updateLatest("11111111-1111-4111-8111-111111111111", (it) => it),
+    registry.updateLatest('11111111-1111-4111-8111-111111111111', (it) => it),
     /Plan execution run not found/,
   );
 });
 
 test("only this host's evidence speaks for a run", () => {
   const local = (lease?: RunLease): PlanExecRun =>
-    ({ id: "11111111-1111-4111-8111-111111111111", lease }) as PlanExecRun;
+    ({ id: '11111111-1111-4111-8111-111111111111', lease }) as PlanExecRun;
 
-  assert.equal(isLocalRun(local()), true, "no lease is no other host");
+  assert.equal(isLocalRun(local()), true, 'no lease is no other host');
   assert.equal(
-    isLocalRun(local({ sessionId: "s", pid: 1, heartbeatAt: 0 })),
+    isLocalRun(local({ sessionId: 's', pid: 1, heartbeatAt: 0 })),
     true,
-    "a pre-upgrade lease is treated as local, as it always was",
+    'a pre-upgrade lease is treated as local, as it always was',
   );
   assert.equal(
     isLocalRun(
-      local({ sessionId: "s", pid: 1, heartbeatAt: 0, hostname: hostname() }),
+      local({ sessionId: 's', pid: 1, heartbeatAt: 0, hostname: hostname() }),
     ),
     true,
   );
   assert.equal(
     isLocalRun(
-      local({ sessionId: "s", pid: 1, heartbeatAt: 0, hostname: "other-host" }),
+      local({ sessionId: 's', pid: 1, heartbeatAt: 0, hostname: 'other-host' }),
     ),
     false,
   );
   assert.equal(
     isLocalRun(
       local({
-        sessionId: "s",
+        sessionId: 's',
         pid: 1,
         heartbeatAt: 0,
         hostname: hostname().toUpperCase(),
       }),
     ),
     true,
-    "DNS names are case-insensitive, so case alone is not another machine",
+    'DNS names are case-insensitive, so case alone is not another machine',
   );
   const shortHere = thisHost();
   assert.equal(
     isLocalRun(
       local({
-        sessionId: "s",
+        sessionId: 's',
         pid: 1,
         heartbeatAt: 0,
         hostname: `${shortHere}.b.corp.example`,
       }),
     ),
     false,
-    "a shared first label is not a shared machine: corporate DNS gives two hosts the same one",
+    'a shared first label is not a shared machine: corporate DNS gives two hosts the same one',
   );
   assert.equal(
     isLocalRun(
       local({
-        sessionId: "s",
+        sessionId: 's',
         pid: 1,
         heartbeatAt: 0,
         hostname: `${shortHere}-2.local`,
       }),
     ),
     false,
-    "the suffix mDNS adds to avoid a collision names a different machine",
+    'the suffix mDNS adds to avoid a collision names a different machine',
   );
 });
 
-test("a live lease survives the release-then-claim of a worktree handoff", async () => {
+test('a live lease survives the release-then-claim of a worktree handoff', async () => {
   const { registry } = await seedRegistry();
   const held = await registry.claim(
     await registry.create(
       runSeed({
-        planPath: "/repo/docs/plans/example.md",
-        worktreeCwd: "/worktree",
+        planPath: '/repo/docs/plans/example.md',
+        worktreeCwd: '/worktree',
       }),
     ),
-    "session-a",
+    'session-a',
   );
 
   // The handoff releases before it claims, so `claim`'s own refusal comes too
   // late; this one must be asked first.
   assert.match(
-    takeoverRefusal(held, "session-b") ?? "",
+    takeoverRefusal(held, 'session-b') ?? '',
     /controlled by another active Pi session/,
   );
   await assert.rejects(
-    () => registry.claim(held, "session-b"),
+    () => registry.claim(held, 'session-b'),
     /controlled by another active Pi session/,
   );
-  assert.equal((await registry.get(held.id))?.lease?.sessionId, "session-a");
+  assert.equal((await registry.get(held.id))?.lease?.sessionId, 'session-a');
 
   const lease = (over: Partial<RunLease>): PlanExecRun =>
-    ({ ...held, lease: { ...held.lease!, ...over } }) as PlanExecRun;
+    ({ ...held, lease: { ...required(held.lease), ...over } }) as PlanExecRun;
   assert.equal(
-    takeoverRefusal(held, "session-a"),
+    takeoverRefusal(held, 'session-a'),
     undefined,
-    "the holder may still drop its own lease",
+    'the holder may still drop its own lease',
   );
   assert.equal(
-    takeoverRefusal(lease({ pid: reapedPid(), heartbeatAt: Date.now() - LEASE_STALE_MS }), "b"),
+    takeoverRefusal(
+      lease({ pid: reapedPid(), heartbeatAt: Date.now() - LEASE_STALE_MS }),
+      'b',
+    ),
     undefined,
-    "a confirmed dead local owner releases the lease",
+    'a confirmed dead local owner releases the lease',
   );
   const unheld: PlanExecRun = { ...held };
   delete unheld.lease;
-  assert.equal(takeoverRefusal(unheld, "session-b"), undefined);
+  assert.equal(takeoverRefusal(unheld, 'session-b'), undefined);
 });
 
-test("matching session text does not authorize takeover from a live remote owner", async () => {
+test('matching session text does not authorize takeover from a live remote owner', async () => {
   const { registry } = await seedRegistry();
-  const held = await registry.create(runSeed({
-    lease: { sessionId: "shared-session", pid: process.pid, heartbeatAt: 0, hostname: "another-machine" },
-  }));
-  await assert.rejects(() => registry.claim(held, "shared-session"), /another active Pi session/);
-  assert.equal((await registry.get(held.id))?.lease?.hostname, "another-machine");
+  const held = await registry.create(
+    runSeed({
+      lease: {
+        sessionId: 'shared-session',
+        pid: process.pid,
+        heartbeatAt: 0,
+        hostname: 'another-machine',
+      },
+    }),
+  );
+  await assert.rejects(
+    () => registry.claim(held, 'shared-session'),
+    /another active Pi session/,
+  );
+  assert.equal(
+    (await registry.get(held.id))?.lease?.hostname,
+    'another-machine',
+  );
 });
 
-test("durable autonomous task state and retry schedule survive reload", async () => {
+test('durable autonomous task state and retry schedule survive reload', async () => {
   const { directory, registry } = await seedRegistry();
   const nextAttemptAt = Date.now() + 60_000;
-  const created = await registry.create(runSeed({
-    tasks: { "1": { taskId: 1, dependsOn: [], state: "retry_wait", attempts: 8, nextAttemptAt, reason: "provider unavailable", laneCwd: "/repo/lane-a" } },
-    nextAttemptAt,
-    wakeReason: "Reconcile the same durable operation",
-    stopGeneration: 3,
-  }));
+  const created = await registry.create(
+    runSeed({
+      tasks: {
+        '1': {
+          taskId: 1,
+          dependsOn: [],
+          state: 'retry_wait',
+          attempts: 8,
+          nextAttemptAt,
+          reason: 'provider unavailable',
+          laneCwd: '/repo/lane-a',
+        },
+      },
+      nextAttemptAt,
+      wakeReason: 'Reconcile the same durable operation',
+      stopGeneration: 3,
+    }),
+  );
   const restored = await new RunRegistry(directory).get(created.id);
   assert.deepEqual(restored?.tasks, created.tasks);
   assert.equal(restored?.nextAttemptAt, nextAttemptAt);
-  assert.deepEqual(restored?.config.executionLifetime, { mode: "unbounded" });
+  assert.deepEqual(restored?.config.executionLifetime, { mode: 'unbounded' });
 });
 
-test("malformed persisted dependencies or lifetime cannot be resumed", async () => {
+test('malformed persisted dependencies or lifetime cannot be resumed', async () => {
   const { directory, registry } = await seedRegistry();
   const run = await registry.create(runSeed());
-  const path = join(directory, run.id, "run.json");
-  await writeFile(path, JSON.stringify({ ...run, tasks: { "1": { taskId: 1, dependsOn: [1], state: "ready", attempts: 0 } } }));
+  const path = join(directory, run.id, 'run.json');
+  await writeFile(
+    path,
+    JSON.stringify({
+      ...run,
+      tasks: {
+        '1': { taskId: 1, dependsOn: [1], state: 'ready', attempts: 0 },
+      },
+    }),
+  );
   await assert.rejects(() => registry.get(run.id), /Invalid plan-exec/);
-  await writeFile(path, JSON.stringify({ ...run, config: { ...run.config, executionLifetime: { mode: "bounded", timeoutMs: 0 } } }));
+  await writeFile(
+    path,
+    JSON.stringify({
+      ...run,
+      config: {
+        ...run.config,
+        executionLifetime: { mode: 'bounded', timeoutMs: 0 },
+      },
+    }),
+  );
   await assert.rejects(() => registry.get(run.id), /Invalid plan-exec/);
   await writeFile(path, JSON.stringify({ ...run, usage: { cost: -1 } }));
   await assert.rejects(() => registry.get(run.id), /Invalid plan-exec/);
 });
 
-test("--same-machine asserts the host and touches nothing else", () => {
+test('--same-machine asserts the host and touches nothing else', () => {
   const lease = {
-    sessionId: "s",
+    sessionId: 's',
     pid: 1,
     heartbeatAt: 7,
-    hostname: "renamed-by-dhcp",
+    hostname: 'renamed-by-dhcp',
   };
   const run = {
-    id: "11111111-1111-4111-8111-111111111111",
-    status: "running",
+    id: '11111111-1111-4111-8111-111111111111',
+    status: 'running',
     lease,
   } as PlanExecRun;
 
   const asserted = asLocalRun(run);
 
-  assert.equal(isLocalRun(run), false, "the stored run is left alone");
+  assert.equal(isLocalRun(run), false, 'the stored run is left alone');
   assert.equal(isLocalRun(asserted), true);
-  assert.equal(asserted.lease?.sessionId, "s");
+  assert.equal(asserted.lease?.sessionId, 's');
   assert.equal(asserted.lease?.pid, 1);
   assert.equal(asserted.lease?.heartbeatAt, 7);
   assert.deepEqual(
     asLocalRun({ id: run.id } as PlanExecRun),
     { id: run.id },
-    "a run with no lease has no host to assert",
+    'a run with no lease has no host to assert',
   );
 });

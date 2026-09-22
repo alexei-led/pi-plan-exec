@@ -1,7 +1,8 @@
-import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
-import { resolve } from "node:path";
-import type { ParsedPlan, PlanTask } from "./types.js";
+import { createHash } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
+import { required } from './required.js';
+import type { ParsedPlan, PlanTask } from './types.js';
 
 const TASK_HEADING =
   /^\s{0,3}#{2,6}\s+(?:(Task|Iteration)\s+(\d+)\s*:\s*(.+?)|((?:P|T)\d+)\s*(?::|[-–—])\s*(.+?)|(Phase|Step)\s+(\d+)\s*:\s*(.+?))\s*$/i;
@@ -14,13 +15,13 @@ type TaskHeading = {
   id: number;
   title: string;
   line: number;
-  style: "canonical" | "prefixed" | "named";
+  style: 'canonical' | 'prefixed' | 'named';
   sourceId: string;
 };
 
 export async function readPlan(path: string): Promise<ParsedPlan> {
   const absolutePath = resolve(path);
-  const content = await readFile(absolutePath, "utf8");
+  const content = await readFile(absolutePath, 'utf8');
   return parsePlan(absolutePath, content);
 }
 
@@ -36,7 +37,7 @@ export function parsePlan(path: string, content: string): ParsedPlan {
     if (!heading) continue;
     if (sourceIds.has(heading.sourceId))
       throw new Error(
-        heading.style === "canonical"
+        heading.style === 'canonical'
           ? `Duplicate task number ${heading.id}.`
           : `Duplicate task heading ${heading.sourceId}.`,
       );
@@ -46,24 +47,25 @@ export function parsePlan(path: string, content: string): ParsedPlan {
 
   if (headings.length === 0) {
     throw new Error(
-      "Plan contains no supported task sections. Use Task, Iteration, P, T, Phase, or Step headings with a number.",
+      'Plan contains no supported task sections. Use Task, Iteration, P, T, Phase, or Step headings with a number.',
     );
   }
-  if (headings.every((heading) => heading.style === "canonical")) {
+  if (headings.every((heading) => heading.style === 'canonical')) {
     for (const [index, heading] of headings.entries()) {
       if (heading.id !== index + 1) {
-        throw new Error("Task numbers must be consecutive and start at 1.");
+        throw new Error('Task numbers must be consecutive and start at 1.');
       }
     }
   }
 
   const tasks: PlanTask[] = headings.map((heading, index) => {
     const endLine = headings[index + 1]?.line ?? lines.length;
-    const dependencyLines = lines.slice(heading.line + 1, endLine)
+    const dependencyLines = lines
+      .slice(heading.line + 1, endLine)
       .flatMap((line, offset) => {
         if (ignoredLines[heading.line + 1 + offset]) return [];
         const match = DEPENDENCIES.exec(line);
-        return match ? [match[1] ?? ""] : [];
+        return match ? [match[1] ?? ''] : [];
       });
     if (dependencyLines.length > 1)
       throw new Error(`Task ${index + 1} has duplicate dependsOn metadata.`);
@@ -74,7 +76,7 @@ export function parsePlan(path: string, content: string): ParsedPlan {
         if (ignoredLines[heading.line + 1 + offset]) return [];
         const match = CHECKBOX.exec(line);
         return match
-          ? [{ checked: match[1]?.toLowerCase() === "x", text: match[2] ?? "" }]
+          ? [{ checked: match[1]?.toLowerCase() === 'x', text: match[2] ?? '' }]
           : [];
       });
     if (checkboxes.length === 0) {
@@ -97,49 +99,83 @@ export function parsePlan(path: string, content: string): ParsedPlan {
 }
 
 /** Carry committed checkbox facts into explicitly approved structure, never partial lane claims. */
-export function materializeApprovedPlan(path: string, approved: string, baseline: string | undefined): string {
+export function materializeApprovedPlan(
+  path: string,
+  approved: string,
+  baseline: string | undefined,
+): string {
   const plan = parsePlan(path, approved);
-  const committed = baseline === undefined ? undefined : parsePlan(path, baseline);
+  const committed =
+    baseline === undefined ? undefined : parsePlan(path, baseline);
   const lines = approved.split(/\r?\n/);
   const baselineLines = baseline?.split(/\r?\n/) ?? [];
   const ignored = fencedLines(lines);
   const baselineIgnored = fencedLines(baselineLines);
   for (const task of plan.tasks) {
-    const prior = committed?.tasks.find((entry) => entry.id === task.id && entry.title === task.title);
+    const prior = committed?.tasks.find(
+      (entry) => entry.id === task.id && entry.title === task.title,
+    );
     const facts = new Map<string, boolean[]>();
-    if (prior) for (let line = prior.startLine; line < prior.endLine; line++) {
-      const box = baselineIgnored[line] ? undefined : CHECKBOX.exec(baselineLines[line] ?? "");
-      if (box) facts.set(box[2]!, [...(facts.get(box[2]!) ?? []), box[1]?.toLowerCase() === "x"]);
-    }
+    if (prior)
+      for (let line = prior.startLine; line < prior.endLine; line++) {
+        const box = baselineIgnored[line]
+          ? undefined
+          : CHECKBOX.exec(baselineLines[line] ?? '');
+        if (box)
+          facts.set(required(box[2]), [
+            ...(facts.get(required(box[2])) ?? []),
+            box[1]?.toLowerCase() === 'x',
+          ]);
+      }
     for (let line = task.startLine; line < task.endLine; line++) {
-      const box = ignored[line] ? undefined : CHECKBOX.exec(lines[line] ?? "");
+      const box = ignored[line] ? undefined : CHECKBOX.exec(lines[line] ?? '');
       if (!box) continue;
-      const checked = facts.get(box[2]!)?.shift() ?? false;
-      lines[line] = lines[line]!.replace(/\[[ xX]\]/, checked ? "[x]" : "[ ]");
+      const checked = facts.get(required(box[2]))?.shift() ?? false;
+      lines[line] = (lines[line] ?? '').replace(
+        /\[[ xX]\]/,
+        checked ? '[x]' : '[ ]',
+      );
     }
   }
-  return lines.join(approved.includes("\r\n") ? "\r\n" : "\n");
+  return lines.join(approved.includes('\r\n') ? '\r\n' : '\n');
 }
 
-function parseDependencies(value: string | undefined, taskId: number): number[] {
+function parseDependencies(
+  value: string | undefined,
+  taskId: number,
+): number[] {
   if (value === undefined) return taskId > 1 ? [taskId - 1] : [];
   let parsed: unknown;
   try {
     parsed = JSON.parse(value);
   } catch {
-    throw new Error(`Task ${taskId} dependsOn must be a JSON array of earlier task IDs.`);
+    throw new Error(
+      `Task ${taskId} dependsOn must be a JSON array of earlier task IDs.`,
+    );
   }
-  if (!Array.isArray(parsed) || !parsed.every((id: unknown) =>
-    typeof id === "number" && Number.isSafeInteger(id) && id >= 1 && id < taskId,
-  ))
-    throw new Error(`Task ${taskId} dependsOn must contain only earlier task IDs.`);
+  if (
+    !Array.isArray(parsed) ||
+    !parsed.every(
+      (id: unknown) =>
+        typeof id === 'number' &&
+        Number.isSafeInteger(id) &&
+        id >= 1 &&
+        id < taskId,
+    )
+  )
+    throw new Error(
+      `Task ${taskId} dependsOn must contain only earlier task IDs.`,
+    );
   const dependencies = parsed as number[];
   if (new Set(dependencies).size !== dependencies.length)
     throw new Error(`Task ${taskId} dependsOn contains duplicate IDs.`);
   return dependencies;
 }
 
-function parseTaskHeading(line: string, lineNumber: number): TaskHeading | undefined {
+function parseTaskHeading(
+  line: string,
+  lineNumber: number,
+): TaskHeading | undefined {
   const match = TASK_HEADING.exec(line);
   if (!match) return undefined;
 
@@ -153,17 +189,17 @@ function parseTaskHeading(line: string, lineNumber: number): TaskHeading | undef
     throw new Error(`Invalid task heading at line ${lineNumber + 1}.`);
 
   const style = canonicalKind
-    ? "canonical"
+    ? 'canonical'
     : prefixedLabel
-      ? "prefixed"
-      : "named";
+      ? 'prefixed'
+      : 'named';
   const sourceId = `${canonicalKind ?? prefixedLabel ?? namedKind}:${id}`;
   return { id, title, line: lineNumber, style, sourceId };
 }
 
 function fencedLines(lines: string[]): boolean[] {
   const ignored = lines.map(() => false);
-  let fence: { marker: "`" | "~"; length: number } | undefined;
+  let fence: { marker: '`' | '~'; length: number } | undefined;
 
   for (const [index, line] of lines.entries()) {
     if (fence) {
@@ -176,7 +212,7 @@ function fencedLines(lines: string[]): boolean[] {
     const opening = FENCE.exec(line)?.[1];
     if (!opening) continue;
     ignored[index] = true;
-    fence = { marker: opening[0] as "`" | "~", length: opening.length };
+    fence = { marker: opening[0] as '`' | '~', length: opening.length };
   }
   return ignored;
 }
@@ -188,5 +224,5 @@ function structureHash(tasks: PlanTask[]): string {
     items: task.items,
     dependsOn: task.dependsOn,
   }));
-  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+  return createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
 }

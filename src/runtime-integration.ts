@@ -1,21 +1,21 @@
-import { basename } from "node:path";
-import { isInFlightStatus, isTerminalStatus } from "./lifecycle.js";
-import { type PlanExecRun, RUN_STATUS } from "./types.js";
+import { basename } from 'node:path';
+import { isInFlightStatus, isTerminalStatus } from './lifecycle.js';
+import { type PlanExecRun, RUN_STATUS } from './types.js';
 
-const EXTERNAL_SOURCE = "pi-plan-exec";
-const PROVIDER_NAME = "pi-plan-exec";
-const OWNERSHIP_KEY = Symbol.for("pi-plan-exec.runtime-integration.owners.v1");
+const EXTERNAL_SOURCE = 'pi-plan-exec';
+const PROVIDER_NAME = 'pi-plan-exec';
+const OWNERSHIP_KEY = Symbol.for('pi-plan-exec.runtime-integration.owners.v1');
 
 export type ExternalRunState =
-  | "queued"
-  | "running"
-  | "completed"
-  | "failed"
-  | "stopped"
-  | "unknown";
+  | 'queued'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'stopped'
+  | 'unknown';
 
 export type ExternalRunUpdate = Partial<
-  Omit<ExternalRunRecord, "id" | "sessionId" | "source">
+  Omit<ExternalRunRecord, 'id' | 'sessionId' | 'source'>
 >;
 
 export interface ExternalRunRecord {
@@ -54,9 +54,7 @@ export interface PlanExecRuntimeApi {
     update: ExternalRunUpdate,
   ): void;
   unregisterExternalRun(sessionId: string, runId: string): void;
-  registerBackgroundWorkProvider(
-    provider: BackgroundWorkProvider,
-  ): () => void;
+  registerBackgroundWorkProvider(provider: BackgroundWorkProvider): () => void;
 }
 
 interface RegisteredRow {
@@ -75,7 +73,7 @@ interface RuntimeOwnership {
 }
 
 export class PlanExecRuntimeIntegration {
-  private readonly token = Symbol("pi-plan-exec-runtime");
+  private readonly token = Symbol('pi-plan-exec-runtime');
   private readonly generation: number;
   private readonly rows = new Map<string, RegisteredRow>();
   private readonly activeWork = new Map<string, BackgroundWorkItem>();
@@ -90,7 +88,9 @@ export class PlanExecRuntimeIntegration {
     if (this.disposed) return;
     this.ensureProvider();
     const desired = new Set(
-      runs.filter((run) => matchesContextRun(run, sessionId)).map((run) => run.id),
+      runs
+        .filter((run) => matchesContextRun(run, sessionId))
+        .map((run) => run.id),
     );
     const desiredExternal = new Set([...desired].map(externalRunId));
     const ownership = runtimeOwnership(this.api);
@@ -133,7 +133,11 @@ export class PlanExecRuntimeIntegration {
     const currentOwner = ownership.get(rowKey);
     if (currentOwner && currentOwner.generation > this.generation) return;
     if (currentOwner?.token === this.token) {
-      this.api.updateExternalRun(sessionId, externalId, externalRunUpdate(record));
+      this.api.updateExternalRun(
+        sessionId,
+        externalId,
+        externalRunUpdate(record),
+      );
     } else {
       this.api.unregisterExternalRun(sessionId, externalId);
       ownership.set(rowKey, {
@@ -182,28 +186,31 @@ export class PlanExecRuntimeIntegration {
 }
 
 export async function loadPlanExecRuntimeIntegration(): Promise<PlanExecRuntimeIntegration> {
-  const externalRunsId = "pi-subagents/external-runs";
-  const backgroundWorkId = "pi-subagents/background-work";
+  const externalRunsId = 'pi-subagents/external-runs';
+  const backgroundWorkId = 'pi-subagents/background-work';
   const [externalRuns, backgroundWork]: unknown[] = await Promise.all([
     import(externalRunsId),
     import(backgroundWorkId),
   ]);
   if (
     !isRecord(externalRuns) ||
-    typeof externalRuns.registerExternalRun !== "function" ||
-    typeof externalRuns.updateExternalRun !== "function" ||
-    typeof externalRuns.unregisterExternalRun !== "function" ||
+    typeof externalRuns.registerExternalRun !== 'function' ||
+    typeof externalRuns.updateExternalRun !== 'function' ||
+    typeof externalRuns.unregisterExternalRun !== 'function' ||
     !isRecord(backgroundWork) ||
-    typeof backgroundWork.registerBackgroundWorkProvider !== "function"
+    typeof backgroundWork.registerBackgroundWorkProvider !== 'function'
   )
-    throw new Error("Installed pi-subagents extension APIs are incompatible.");
+    throw new Error('Installed pi-subagents extension APIs are incompatible.');
   return new PlanExecRuntimeIntegration({
     ownershipKey: externalRuns,
-    registerExternalRun: externalRuns.registerExternalRun as PlanExecRuntimeApi["registerExternalRun"],
-    updateExternalRun: externalRuns.updateExternalRun as PlanExecRuntimeApi["updateExternalRun"],
-    unregisterExternalRun: externalRuns.unregisterExternalRun as PlanExecRuntimeApi["unregisterExternalRun"],
+    registerExternalRun:
+      externalRuns.registerExternalRun as PlanExecRuntimeApi['registerExternalRun'],
+    updateExternalRun:
+      externalRuns.updateExternalRun as PlanExecRuntimeApi['updateExternalRun'],
+    unregisterExternalRun:
+      externalRuns.unregisterExternalRun as PlanExecRuntimeApi['unregisterExternalRun'],
     registerBackgroundWorkProvider:
-      backgroundWork.registerBackgroundWorkProvider as PlanExecRuntimeApi["registerBackgroundWorkProvider"],
+      backgroundWork.registerBackgroundWorkProvider as PlanExecRuntimeApi['registerBackgroundWorkProvider'],
   });
 }
 
@@ -213,8 +220,8 @@ function externalRecord(
   id: string,
 ): ExternalRunRecord {
   const projectionError =
-    run.taskProjection?.state === "degraded"
-      ? run.taskProjection.error ?? "unknown projection error"
+    run.taskProjection?.state === 'degraded'
+      ? (run.taskProjection.error ?? 'unknown projection error')
       : undefined;
   return {
     id,
@@ -236,30 +243,33 @@ function externalRecord(
 function externalRunUpdate(record: ExternalRunRecord): ExternalRunUpdate {
   return Object.fromEntries(
     Object.entries(record).filter(
-      ([key]) => key !== "id" && key !== "sessionId" && key !== "source",
+      ([key]) => key !== 'id' && key !== 'sessionId' && key !== 'source',
     ),
   ) as ExternalRunUpdate;
 }
 
 function matchesContextRun(run: PlanExecRun, sessionId: string): boolean {
-  return run.lease?.sessionId === sessionId || run.taskProjection?.sessionId === sessionId;
+  return (
+    run.lease?.sessionId === sessionId ||
+    run.taskProjection?.sessionId === sessionId
+  );
 }
 
 function externalState(run: PlanExecRun): ExternalRunState {
   switch (run.status) {
     case RUN_STATUS.STARTING:
-      return "queued";
+      return 'queued';
     case RUN_STATUS.COMPLETED:
     case RUN_STATUS.COMPLETED_WITH_FINDINGS:
-      return "completed";
+      return 'completed';
     case RUN_STATUS.FAILED:
-      return "failed";
+      return 'failed';
     case RUN_STATUS.CANCELLED:
-      return "stopped";
+      return 'stopped';
     case RUN_STATUS.PAUSED:
-      return "stopped";
+      return 'stopped';
     default:
-      return "running";
+      return 'running';
   }
 }
 
@@ -272,7 +282,7 @@ function registrationKey(sessionId: string, runId: string): string {
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
+  return typeof value === 'object' && value !== null;
 }
 
 function nextRuntimeGeneration(): number {
@@ -283,17 +293,16 @@ function runtimeState(): RuntimeOwnership {
   const root = globalThis as typeof globalThis & {
     [OWNERSHIP_KEY]?: RuntimeOwnership;
   };
-  const state = (root[OWNERSHIP_KEY] ??= {
-    nextGeneration: 0,
-    rowsByApi: new WeakMap(),
-  });
+  let state = root[OWNERSHIP_KEY];
+  if (!state) {
+    state = { nextGeneration: 0, rowsByApi: new WeakMap() };
+    root[OWNERSHIP_KEY] = state;
+  }
   if (!Number.isSafeInteger(state.nextGeneration)) state.nextGeneration = 0;
   return state;
 }
 
-function runtimeOwnership(
-  api: PlanExecRuntimeApi,
-): Map<string, RuntimeOwner> {
+function runtimeOwnership(api: PlanExecRuntimeApi): Map<string, RuntimeOwner> {
   const state = runtimeState();
   const key = api.ownershipKey ?? (api as object);
   let ownership = state.rowsByApi.get(key);
@@ -303,7 +312,7 @@ function runtimeOwnership(
   }
   const legacy = ownership as unknown as Map<string, RuntimeOwner | symbol>;
   for (const [rowKey, owner] of legacy) {
-    if (typeof owner === "symbol")
+    if (typeof owner === 'symbol')
       legacy.set(rowKey, { token: owner, generation: 0 });
   }
   return ownership;

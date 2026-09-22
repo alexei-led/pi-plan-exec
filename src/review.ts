@@ -1,11 +1,11 @@
-import type { ReviewFinding } from "./types.js";
+import type { ReviewFinding } from './types.js';
 
 const FINDING = /^FINDING:[ \t]*(CRITICAL|MAJOR|MINOR)[ \t]*\|[ \t]*(.+)$/i;
 
 export function parseReviewFindings(output: string): ReviewFinding[] {
-  if (output.trim() === "NO_FINDINGS") return [];
+  if (output.trim() === 'NO_FINDINGS') return [];
   if (/^[\t ]*NO_FINDINGS[\t ]*$/im.test(output))
-    throw new Error("Reviewer output contradicts NO_FINDINGS.");
+    throw new Error('Reviewer output contradicts NO_FINDINGS.');
   const findings: ReviewFinding[] = [];
   for (const rawLine of output.split(/\r?\n/)) {
     const line = rawLine.trim();
@@ -15,7 +15,7 @@ export function parseReviewFindings(output: string): ReviewFinding[] {
     const summary = match?.[2]?.trim();
     if (
       summary &&
-      (severity === "CRITICAL" || severity === "MAJOR" || severity === "MINOR")
+      (severity === 'CRITICAL' || severity === 'MAJOR' || severity === 'MINOR')
     ) {
       findings.push({
         id: `${severity.toLowerCase()}-${findings.length + 1}`,
@@ -30,15 +30,20 @@ export function parseReviewFindings(output: string): ReviewFinding[] {
     if (current && evidence && !current.evidence) current.evidence = evidence;
     else if (current && suggestion && !current.suggestion)
       current.suggestion = suggestion;
-    else throw new Error("Reviewer output contains a malformed structured FINDING.");
+    else
+      throw new Error(
+        'Reviewer output contains a malformed structured FINDING.',
+      );
   }
   if (findings.length === 0) {
     throw new Error(
-      "Reviewer output did not contain NO_FINDINGS or a structured FINDING.",
+      'Reviewer output did not contain NO_FINDINGS or a structured FINDING.',
     );
   }
   if (findings.some((finding) => !finding.evidence || !finding.suggestion))
-    throw new Error("Each structured FINDING requires its own Evidence and Fix.");
+    throw new Error(
+      'Each structured FINDING requires its own Evidence and Fix.',
+    );
   return findings;
 }
 
@@ -47,7 +52,7 @@ export function hasBlockingFindings(
 ): boolean {
   return findings.some(
     (finding) =>
-      finding.severity === "CRITICAL" || finding.severity === "MAJOR",
+      finding.severity === 'CRITICAL' || finding.severity === 'MAJOR',
   );
 }
 
@@ -58,7 +63,7 @@ export function formatFindings(findings: readonly ReviewFinding[]): string {
         `FINDING: ${finding.severity} | ${finding.summary}`,
         ...(finding.evidence ? [`Evidence: ${finding.evidence}`] : []),
         ...(finding.suggestion ? [`Fix: ${finding.suggestion}`] : []),
-      ].join("\n"),
+      ].join('\n'),
     )
-    .join("\n\n");
+    .join('\n\n');
 }

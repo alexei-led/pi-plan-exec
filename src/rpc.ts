@@ -1,7 +1,10 @@
-import { randomUUID } from "node:crypto";
+import { randomUUID } from 'node:crypto';
 
 export interface EventBus {
-  on(event: string, handler: (payload: unknown) => void): (() => void) | void;
+  on(
+    event: string,
+    handler: (payload: unknown) => void,
+  ): (() => void) | undefined;
   emit(event: string, payload: unknown): void;
 }
 
@@ -15,7 +18,7 @@ export function requestRpc<T>(options: {
   label?: string;
   body: Record<string, unknown>;
   parseReply(value: unknown): T;
-  failure(code: "timeout" | "transport", message: string): T;
+  failure(code: 'timeout' | 'transport', message: string): T;
 }): Promise<T> {
   const requestId = randomUUID();
   return new Promise((resolve) => {
@@ -32,7 +35,7 @@ export function requestRpc<T>(options: {
       () =>
         finish(
           options.failure(
-            "timeout",
+            'timeout',
             `${options.label ?? options.method} timed out after ${options.timeoutMs}ms.`,
           ),
         ),
@@ -44,7 +47,7 @@ export function requestRpc<T>(options: {
         (payload: unknown) => finish(options.parseReply(payload)),
       );
       unsubscribe =
-        typeof registered === "function" ? registered : () => undefined;
+        typeof registered === 'function' ? registered : () => undefined;
       if (settled) {
         unsubscribe();
         return;
@@ -58,7 +61,7 @@ export function requestRpc<T>(options: {
     } catch (error: unknown) {
       finish(
         options.failure(
-          "transport",
+          'transport',
           error instanceof Error ? error.message : String(error),
         ),
       );

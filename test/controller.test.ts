@@ -1,30 +1,39 @@
-import assert from "node:assert/strict";
-import { execFile as execFileCallback } from "node:child_process";
+import assert from 'node:assert/strict';
+import { execFile as execFileCallback } from 'node:child_process';
 import {
-  mkdtemp,
   mkdir,
+  mkdtemp,
   readFile,
   realpath,
   rm,
   symlink,
   writeFile,
-} from "node:fs/promises";
-import { hostname, tmpdir } from "node:os";
-import { promisify } from "node:util";
-import { join } from "node:path";
-import test from "node:test";
-import { bridgeRequestDigest, type BridgeCapabilities } from "../src/bridge.js";
+} from 'node:fs/promises';
+import { hostname, tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { promisify } from 'node:util';
+import { onTestFinished, test } from 'vitest';
+import { type BridgeCapabilities, bridgeRequestDigest } from '../src/bridge.js';
 import {
-  parseWorkerSignal,
   PLAN_STRUCTURE_CHANGED_ERROR,
   PlanExecController as ProductionController,
-} from "../src/controller.js";
-import { execReconcile } from "../src/index.js";
-import { parsePlan } from "../src/plan.js";
-import { appendProgressOnce } from "../src/progress.js";
-import { RunRegistry } from "../src/registry.js";
-import { DEFAULT_FROZEN_RUN_CONFIG, type BridgeResult, type PlanExecRun } from "../src/types.js";
-import { LocalOperationCancelledError, LocalOperationFailedError, LocalOperationUnknownError } from "../src/local-operation.js";
+  parseWorkerSignal,
+} from '../src/controller.js';
+import { execReconcile } from '../src/index.js';
+import {
+  LocalOperationCancelledError,
+  LocalOperationFailedError,
+  LocalOperationUnknownError,
+} from '../src/local-operation.js';
+import { parsePlan } from '../src/plan.js';
+import { appendProgressOnce } from '../src/progress.js';
+import { RunRegistry } from '../src/registry.js';
+import { required } from '../src/required.js';
+import {
+  type BridgeResult,
+  DEFAULT_FROZEN_RUN_CONFIG,
+  type PlanExecRun,
+} from '../src/types.js';
 
 const success = (data: Record<string, unknown>) => ({
   success: true as const,
@@ -35,20 +44,34 @@ type ControllerArguments = ConstructorParameters<typeof ProductionController>;
 type LocalCommands = NonNullable<ControllerArguments[4]>;
 
 function fixtureCommands(command: ControllerArguments[3]): LocalCommands {
-  const operations = new Map<string, { request: string; result: Promise<void> }>();
+  const operations = new Map<
+    string,
+    { request: string; result: Promise<void> }
+  >();
   return async (cwd, commands, options) => {
-    const key = JSON.stringify([options.runId, options.operationId, options.authorization?.stopGeneration ?? 0]);
+    const key = JSON.stringify([
+      options.runId,
+      options.operationId,
+      options.authorization?.stopGeneration ?? 0,
+    ]);
     const request = JSON.stringify([cwd, commands, options.candidate]);
     const previous = operations.get(key);
     if (previous) {
-      if (previous.request !== request) throw new LocalOperationUnknownError("Fixture operation changed.");
+      if (previous.request !== request)
+        throw new LocalOperationUnknownError('Fixture operation changed.');
       return previous.result;
     }
     const result = (async () => {
       for (const [program, ...args] of commands) {
-        if (!(await options.isAuthorized())) throw new LocalOperationCancelledError("Fixture operation cancelled.");
-        const result = await command(program!, args, cwd);
-        if (result.code !== 0) throw new LocalOperationFailedError(result.stderr || "Fixture command failed.");
+        if (!(await options.isAuthorized()))
+          throw new LocalOperationCancelledError(
+            'Fixture operation cancelled.',
+          );
+        const result = await command(required(program), args, cwd);
+        if (result.code !== 0)
+          throw new LocalOperationFailedError(
+            result.stderr || 'Fixture command failed.',
+          );
       }
     })();
     operations.set(key, { request, result });
@@ -58,94 +81,109 @@ function fixtureCommands(command: ControllerArguments[3]): LocalCommands {
 
 class PlanExecController extends ProductionController {
   constructor(...args: ControllerArguments) {
-    super(args[0], args[1], args[2], args[3], args[4] ?? fixtureCommands(args[3]));
+    super(
+      args[0],
+      args[1],
+      args[2],
+      args[3],
+      args[4] ?? fixtureCommands(args[3]),
+    );
   }
 }
 
-async function advanceThroughArchive(controller: PlanExecController, run: PlanExecRun): Promise<PlanExecRun> {
+async function advanceThroughArchive(
+  controller: PlanExecController,
+  run: PlanExecRun,
+): Promise<PlanExecRun> {
   for (let step = 0; step < 8; step++) {
-    if (run.status !== "running") return run;
+    if (run.status !== 'running') return run;
     run = await controller.advance(run);
-    if (run.stage !== "archive" || run.error) return run;
+    if (run.stage !== 'archive' || run.error) return run;
   }
-  throw new Error("Archive did not settle through its durable phases.");
+  throw new Error('Archive did not settle through its durable phases.');
 }
 
 const terminalProof = (
   runId: string,
-  operationId = runId === "fusion-1" ? "fusion-operation" : runId,
+  operationId = runId === 'fusion-1' ? 'fusion-operation' : runId,
   requestDigest = `digest-${operationId}`,
 ) => {
-  const hostId = "11111111-1111-4111-8111-111111111111";
-  const bootId = "22222222-2222-4222-8222-222222222222";
+  const hostId = '11111111-1111-4111-8111-111111111111';
+  const bootId = '22222222-2222-4222-8222-222222222222';
   const binding = { operationId, requestDigest, hostId, bootId };
-  const leader = { pid: process.pid, uniqueId: "1", pidVersion: 1 };
+  const leader = { pid: process.pid, uniqueId: '1', pidVersion: 1 };
   const identity = {
     version: 1,
-    backend: "darwin-resource-coalition-v1",
-    coalitionId: "1",
+    backend: 'darwin-resource-coalition-v1',
+    coalitionId: '1',
     leader,
     ...binding,
   };
   const kernelProof = {
     ...binding,
-    status: "retired",
+    status: 'retired',
     binding,
     identity,
     proof: {
-      kind: "darwin-coalition-retired",
+      kind: 'darwin-coalition-retired',
       observedAt: new Date().toISOString(),
       identity,
       ...binding,
     },
   };
   return {
-  version: 1 as const,
-  state: "observed" as const,
-  runId,
-  runnerProcessInstanceId: `runner-${runId}`,
-  observedAt: Date.now(),
-  instances: [],
-  processTreeOwnership: {
     version: 1 as const,
-    scope: "owned-process-tree" as const,
-    escapedDescendants: "contained" as const,
-  },
-  nativeOperation: { operationId, digest: requestDigest },
-  callerBinding: binding,
-  kernelBinding: binding,
-  kernelProof,
+    state: 'observed' as const,
+    runId,
+    runnerProcessInstanceId: `runner-${runId}`,
+    observedAt: Date.now(),
+    instances: [],
+    processTreeOwnership: {
+      version: 1 as const,
+      scope: 'owned-process-tree' as const,
+      escapedDescendants: 'contained' as const,
+    },
+    nativeOperation: { operationId, digest: requestDigest },
+    callerBinding: binding,
+    kernelBinding: binding,
+    kernelProof,
   };
 };
 
-test("existing linked worktree execution keeps its branch and plan", async () => {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-")));
-  const target = join(root, "feature-worktree");
-  const planPath = join(target, "docs", "plans", "example.md");
-  await mkdir(join(target, "docs", "plans"), { recursive: true });
-  await writeFile(planPath, "### Task 1: Implement\n- [ ] Do the work\n");
+test('existing linked worktree execution keeps its branch and plan', async () => {
+  const root = await realpath(
+    await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-')),
+  );
+  const target = join(root, 'feature-worktree');
+  const planPath = join(target, 'docs', 'plans', 'example.md');
+  await mkdir(join(target, 'docs', 'plans'), { recursive: true });
+  await writeFile(planPath, '### Task 1: Implement\n- [ ] Do the work\n');
   const calls: string[][] = [];
   const runCommand = async (_command: string, args: string[], cwd: string) => {
     calls.push([cwd, ...args]);
-    if (args[0] === "symbolic-ref")
-      return { stdout: "origin/main\n", stderr: "", code: 0 };
-    if (args[0] === "branch")
-      return { stdout: cwd === target ? "feature/existing\n" : "main\n", stderr: "", code: 0 };
-    if (args[0] === "worktree")
+    if (args[0] === 'symbolic-ref')
+      return { stdout: 'origin/main\n', stderr: '', code: 0 };
+    if (args[0] === 'branch')
       return {
-        stdout: `worktree ${root}\0\0worktree ${target}\0\0`,
-        stderr: "",
+        stdout: cwd === target ? 'feature/existing\n' : 'main\n',
+        stderr: '',
         code: 0,
       };
-    if (args[0] === "rev-parse" && args[1] === "HEAD")
-      return { stdout: `${"a".repeat(40)}\n`, stderr: "", code: 0 };
-    if (args.includes("--git-common-dir"))
-      return { stdout: `${root}/.git\n`, stderr: "", code: 0 };
-    return { stdout: `${root}\n`, stderr: "", code: 0 };
+    if (args[0] === 'worktree')
+      return {
+        stdout: `worktree ${root}\0\0worktree ${target}\0\0`,
+        stderr: '',
+        code: 0,
+      };
+    if (args[0] === 'rev-parse' && args[1] === 'HEAD')
+      return { stdout: `${'a'.repeat(40)}\n`, stderr: '', code: 0 };
+    if (args.includes('--git-common-dir'))
+      return { stdout: `${root}/.git\n`, stderr: '', code: 0 };
+    return { stdout: `${root}\n`, stderr: '', code: 0 };
   };
   const controller = new PlanExecController(
-    new RunRegistry(join(root, "runs")),
-    new FakeBridge(join(root, "none.json")),
+    new RunRegistry(join(root, 'runs')),
+    new FakeBridge(join(root, 'none.json')),
     new FakeFusion(),
     runCommand,
   );
@@ -155,33 +193,36 @@ test("existing linked worktree execution keeps its branch and plan", async () =>
     planPath,
     useWorktree: false,
     existingWorktree: target,
-    sessionId: "session-1",
+    sessionId: 'session-1',
   });
 
-  assert.equal(run.branch, "feature/existing");
+  assert.equal(run.branch, 'feature/existing');
   assert.equal(run.worktreeCwd, target);
   assert.equal(run.planPath, planPath);
-  assert.equal(calls.some((call) => call.includes("add")), false);
+  assert.equal(
+    calls.some((call) => call.includes('add')),
+    false,
+  );
 });
 
-test("existing linked worktree rejects a plan outside the selected worktree", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const target = join(root, "feature-worktree");
-  const planPath = join(root, "plan.md");
+test('existing linked worktree rejects a plan outside the selected worktree', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const target = join(root, 'feature-worktree');
+  const planPath = join(root, 'plan.md');
   await mkdir(target, { recursive: true });
-  await writeFile(planPath, "### Task 1: Implement\n- [ ] Do the work\n");
+  await writeFile(planPath, '### Task 1: Implement\n- [ ] Do the work\n');
   const controller = new PlanExecController(
-    new RunRegistry(join(root, "runs")),
-    new FakeBridge(join(root, "none.json")),
+    new RunRegistry(join(root, 'runs')),
+    new FakeBridge(join(root, 'none.json')),
     new FakeFusion(),
     async (_command, args) => {
-      if (args[0] === "worktree")
-        return { stdout: `worktree ${target}\0\0`, stderr: "", code: 0 };
-      if (args.includes("--git-common-dir"))
-        return { stdout: `${root}/.git\n`, stderr: "", code: 0 };
-      if (args[0] === "branch")
-        return { stdout: "feature/existing\n", stderr: "", code: 0 };
-      return { stdout: `${root}\n`, stderr: "", code: 0 };
+      if (args[0] === 'worktree')
+        return { stdout: `worktree ${target}\0\0`, stderr: '', code: 0 };
+      if (args.includes('--git-common-dir'))
+        return { stdout: `${root}/.git\n`, stderr: '', code: 0 };
+      if (args[0] === 'branch')
+        return { stdout: 'feature/existing\n', stderr: '', code: 0 };
+      return { stdout: `${root}\n`, stderr: '', code: 0 };
     },
   );
 
@@ -191,149 +232,237 @@ test("existing linked worktree rejects a plan outside the selected worktree", as
       planPath,
       useWorktree: false,
       existingWorktree: target,
-      sessionId: "session-1",
+      sessionId: 'session-1',
     }),
     /inside the selected Git worktree/,
   );
 });
 
-test("real Git existing-worktree start validates paths and retains dirty branch state", async (t) => {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "exec-real-worktree-")));
-  t.after(() => rm(root, { recursive: true, force: true }));
-  const source = join(root, "source");
-  const target = join(root, "feature tree\nλ");
-  const alias = join(root, "alias");
+test('real Git existing-worktree start validates paths and retains dirty branch state', async (_t) => {
+  const root = await realpath(
+    await mkdtemp(join(tmpdir(), 'exec-real-worktree-')),
+  );
+  onTestFinished(() => rm(root, { recursive: true, force: true }));
+  const source = join(root, 'source');
+  const target = join(root, 'feature tree\nλ');
+  const alias = join(root, 'alias');
   await mkdir(source);
   const command = realGit();
   const git = async (cwd: string, args: string[]) => {
-    const result = await command("git", args, cwd);
+    const result = await command('git', args, cwd);
     assert.equal(result.code, 0, result.stderr);
     return result.stdout;
   };
-  await git(source, ["init", "-b", "main"]);
-  await git(source, ["-c", "user.name=Test", "-c", "user.email=test@example.org",
-    "-c", "commit.gpgSign=false", "-c", "core.hooksPath=/dev/null",
-    "commit", "--allow-empty", "-m", "initial"]);
-  await git(source, ["worktree", "add", "-b", "feature/existing", target]);
+  await git(source, ['init', '-b', 'main']);
+  await git(source, [
+    '-c',
+    'user.name=Test',
+    '-c',
+    'user.email=test@example.org',
+    '-c',
+    'commit.gpgSign=false',
+    '-c',
+    'core.hooksPath=/dev/null',
+    'commit',
+    '--allow-empty',
+    '-m',
+    'initial',
+  ]);
+  await git(source, ['worktree', 'add', '-b', 'feature/existing', target]);
   await symlink(target, alias);
-  const planPath = join(target, "plan with spaces.md");
-  const plan = "### Task 1: Implement\n- [ ] Do the work\n";
+  const planPath = join(target, 'plan with spaces.md');
+  const plan = '### Task 1: Implement\n- [ ] Do the work\n';
   await writeFile(planPath, plan);
-  await writeFile(join(source, "source-dirty.txt"), "untouched source");
-  await writeFile(join(target, "target-dirty.txt"), "untouched target");
-  const before = await git(target, ["status", "--porcelain", "-z"]);
-  const registry = new RunRegistry(join(root, "runs"));
-  const controller = new PlanExecController(registry,
-    new FakeBridge(join(root, "none.json")), new FakeFusion(), command);
-  const options = { cwd: source, existingWorktree: alias,
-    planPath: "plan with spaces.md", useWorktree: false, sessionId: "session-1" };
+  await writeFile(join(source, 'source-dirty.txt'), 'untouched source');
+  await writeFile(join(target, 'target-dirty.txt'), 'untouched target');
+  const before = await git(target, ['status', '--porcelain', '-z']);
+  const registry = new RunRegistry(join(root, 'runs'));
+  const controller = new PlanExecController(
+    registry,
+    new FakeBridge(join(root, 'none.json')),
+    new FakeFusion(),
+    command,
+  );
+  const options = {
+    cwd: source,
+    existingWorktree: alias,
+    planPath: 'plan with spaces.md',
+    useWorktree: false,
+    sessionId: 'session-1',
+  };
   const run = await controller.start(options);
   assert.equal(run.repositoryRoot, source);
   assert.equal(run.worktreeCwd, target);
   assert.equal(run.planPath, planPath);
-  assert.equal(run.branch, "feature/existing");
-  assert.equal(run.stage, "project_tasks");
-  assert.equal(await git(source, ["branch", "--show-current"]), "main\n");
-  assert.equal(await readFile(planPath, "utf8"), plan);
-  assert.equal(await git(target, ["status", "--porcelain", "-z"]), before);
-  await assert.rejects(controller.start(options), /already exists for worktree/);
-  await assert.rejects(controller.start({ ...options, planPath: "../source/plan.md" }), /ENOENT/);
-  const outsidePlan = join(source, "outside.md");
+  assert.equal(run.branch, 'feature/existing');
+  assert.equal(run.stage, 'project_tasks');
+  assert.equal(await git(source, ['branch', '--show-current']), 'main\n');
+  assert.equal(await readFile(planPath, 'utf8'), plan);
+  assert.equal(await git(target, ['status', '--porcelain', '-z']), before);
+  await assert.rejects(
+    controller.start(options),
+    /already exists for worktree/,
+  );
+  await assert.rejects(
+    controller.start({ ...options, planPath: '../source/plan.md' }),
+    /ENOENT/,
+  );
+  const outsidePlan = join(source, 'outside.md');
   await writeFile(outsidePlan, plan);
-  await symlink(outsidePlan, join(target, "escape.md"));
-  await assert.rejects(controller.start({ ...options, planPath: "escape.md" }), /inside the selected Git worktree/);
-  await git(target, ["checkout", "--detach"]);
+  await symlink(outsidePlan, join(target, 'escape.md'));
+  await assert.rejects(
+    controller.start({ ...options, planPath: 'escape.md' }),
+    /inside the selected Git worktree/,
+  );
+  await git(target, ['checkout', '--detach']);
   await assert.rejects(controller.start(options), /Detached HEAD/);
-  const foreign = join(root, "foreign");
+  const foreign = join(root, 'foreign');
   await mkdir(foreign);
-  await git(foreign, ["init", "-b", "main"]);
-  await writeFile(join(foreign, "plan.md"), plan);
-  await assert.rejects(controller.start({ ...options, existingWorktree: foreign, planPath: "plan.md" }), /not registered/);
-  await assert.rejects(controller.start({ ...options, existingWorktree: source, planPath: "outside.md", useWorktree: true }), /either an existing/);
-  const mainRun = await controller.start({ ...options, existingWorktree: source, planPath: "outside.md" });
-  assert.equal(mainRun.branch, "main");
+  await git(foreign, ['init', '-b', 'main']);
+  await writeFile(join(foreign, 'plan.md'), plan);
+  await assert.rejects(
+    controller.start({
+      ...options,
+      existingWorktree: foreign,
+      planPath: 'plan.md',
+    }),
+    /not registered/,
+  );
+  await assert.rejects(
+    controller.start({
+      ...options,
+      existingWorktree: source,
+      planPath: 'outside.md',
+      useWorktree: true,
+    }),
+    /either an existing/,
+  );
+  const mainRun = await controller.start({
+    ...options,
+    existingWorktree: source,
+    planPath: 'outside.md',
+  });
+  assert.equal(mainRun.branch, 'main');
   assert.equal(mainRun.worktreeCwd, source);
-  await registry.release(await registry.update({ ...mainRun, status: "completed" }));
-  const subdir = join(source, "packages", "api");
+  await registry.release(
+    await registry.update({ ...mainRun, status: 'completed' }),
+  );
+  const subdir = join(source, 'packages', 'api');
   await mkdir(subdir, { recursive: true });
-  const inPlace = await controller.start({ cwd: subdir, planPath: outsidePlan,
-    useWorktree: false, sessionId: "session-1" });
+  const inPlace = await controller.start({
+    cwd: subdir,
+    planPath: outsidePlan,
+    useWorktree: false,
+    sessionId: 'session-1',
+  });
   assert.equal(inPlace.worktreeCwd, subdir);
   assert.equal(inPlace.repositoryRoot, source);
-  const otherPlan = join(source, "other.md");
+  const otherPlan = join(source, 'other.md');
   await writeFile(otherPlan, plan);
-  await assert.rejects(controller.start({ ...options, existingWorktree: source, planPath: otherPlan }), /already exists for worktree/);
+  await assert.rejects(
+    controller.start({
+      ...options,
+      existingWorktree: source,
+      planPath: otherPlan,
+    }),
+    /already exists for worktree/,
+  );
 });
 
-test("resume refuses a legacy failed run when another run owns its worktree", async () => {
-  const root = await mkdtemp(join(tmpdir(), "exec-resume-conflict-"));
-  const registry = new RunRegistry(join(root, "runs"));
-  const bridge = new FakeBridge(join(root, "none.json"));
-  const controller = new PlanExecController(registry, bridge, new FakeFusion(), fakeGit(root));
-  const failed = await registry.create({ ...baseRun(root, join(root, "plan.md")), status: "failed" });
-  const active = await registry.create(baseRun(root, join(root, "other.md")));
-  await assert.rejects(controller.resume(failed.id, "session-1"), new RegExp(active.id));
-  await assert.rejects(controller.rebindBranchAndResume(failed.id, "session-1"), new RegExp(active.id));
+test('resume refuses a legacy failed run when another run owns its worktree', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'exec-resume-conflict-'));
+  const registry = new RunRegistry(join(root, 'runs'));
+  const bridge = new FakeBridge(join(root, 'none.json'));
+  const controller = new PlanExecController(
+    registry,
+    bridge,
+    new FakeFusion(),
+    fakeGit(root),
+  );
+  const failed = await registry.create({
+    ...baseRun(root, join(root, 'plan.md')),
+    status: 'failed',
+  });
+  const active = await registry.create(baseRun(root, join(root, 'other.md')));
+  await assert.rejects(
+    controller.resume(failed.id, 'session-1'),
+    new RegExp(active.id),
+  );
+  await assert.rejects(
+    controller.rebindBranchAndResume(failed.id, 'session-1'),
+    new RegExp(active.id),
+  );
   assert.equal(bridge.spawnCount, 0);
   assert.equal((await registry.get(failed.id))?.lease, undefined);
 });
 
-for (const blocker of ["unreadable", "legacy-conflict"] as const) {
-  test(`background advance ignores ${blocker} while explicit resume refuses it`, async (t) => {
-    const root = await mkdtemp(join(tmpdir(), "exec-background-ownership-"));
-    t.after(() => rm(root, { recursive: true, force: true }));
-    const registry = new RunRegistry(join(root, "runs"));
-    const planPath = join(root, "plan.md");
-    await writeFile(planPath, "### Task 1: Implement\n- [ ] Do the work\n");
-    const controller = new PlanExecController(registry,
-      new FakeBridge(join(root, "none.json")), new FakeFusion(), fakeGit(root));
-    const started = await controller.start({ cwd: root, planPath,
-      useWorktree: false, sessionId: "session-1" });
-    const unrelated = await registry.create({
-      ...baseRun(root, join(root, "other.md")), status: "failed",
+for (const blocker of ['unreadable', 'legacy-conflict'] as const) {
+  test(`background advance ignores ${blocker} while explicit resume refuses it`, async (_t) => {
+    const root = await mkdtemp(join(tmpdir(), 'exec-background-ownership-'));
+    onTestFinished(() => rm(root, { recursive: true, force: true }));
+    const registry = new RunRegistry(join(root, 'runs'));
+    const planPath = join(root, 'plan.md');
+    await writeFile(planPath, '### Task 1: Implement\n- [ ] Do the work\n');
+    const controller = new PlanExecController(
+      registry,
+      new FakeBridge(join(root, 'none.json')),
+      new FakeFusion(),
+      fakeGit(root),
+    );
+    const started = await controller.start({
+      cwd: root,
+      planPath,
+      useWorktree: false,
+      sessionId: 'session-1',
     });
-    if (blocker === "unreadable")
-      await writeFile(join(root, "runs", unrelated.id, "run.json"), "not JSON");
-    const advanced = await controller.resume(started.id, "session-1", false);
-    assert.equal(advanced.status, "running");
-    await assert.rejects(controller.resume(started.id, "session-1"),
-      /unreadable run|already exists for worktree/);
-    assert.equal((await registry.get(started.id))?.status, "running");
+    const unrelated = await registry.create({
+      ...baseRun(root, join(root, 'other.md')),
+      status: 'failed',
+    });
+    if (blocker === 'unreadable')
+      await writeFile(join(root, 'runs', unrelated.id, 'run.json'), 'not JSON');
+    const advanced = await controller.resume(started.id, 'session-1', false);
+    assert.equal(advanced.status, 'running');
+    await assert.rejects(
+      controller.resume(started.id, 'session-1'),
+      /unreadable run|already exists for worktree/,
+    );
+    assert.equal((await registry.get(started.id))?.status, 'running');
   });
 }
 
-test("in-place execution on the default branch keeps that branch", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  await writeFile(planPath, "### Task 1: Implement\n- [ ] Do the work\n");
+test('in-place execution on the default branch keeps that branch', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  await writeFile(planPath, '### Task 1: Implement\n- [ ] Do the work\n');
   const controller = new PlanExecController(
-    new RunRegistry(join(root, "runs")),
-    new FakeBridge(join(root, "none.json")),
+    new RunRegistry(join(root, 'runs')),
+    new FakeBridge(join(root, 'none.json')),
     new FakeFusion(),
-    fakeGit(root, "main"),
+    fakeGit(root, 'main'),
   );
 
   const run = await controller.start({
     cwd: root,
     planPath,
     useWorktree: false,
-    sessionId: "session-1",
+    sessionId: 'session-1',
   });
 
-  assert.equal(run.branch, "main");
+  assert.equal(run.branch, 'main');
   assert.equal(run.worktreeCwd, root);
-  assert.equal(run.stage, "project_tasks");
+  assert.equal(run.stage, 'project_tasks');
 });
 
-test("controller accepts a committed implementation and runs the required reviewer", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  const reviewPath = join(root, "review-result.json");
-  await writeFile(planPath, "### Task 1: Implement\n- [ ] Do the work\n");
-  await writeFile(reviewPath, JSON.stringify({ output: "NO_FINDINGS" }));
+test('controller accepts a committed implementation and runs the required reviewer', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  const reviewPath = join(root, 'review-result.json');
+  await writeFile(planPath, '### Task 1: Implement\n- [ ] Do the work\n');
+  await writeFile(reviewPath, JSON.stringify({ output: 'NO_FINDINGS' }));
   const bridge = new FakeBridge(reviewPath);
   const controller = new PlanExecController(
-    new RunRegistry(join(root, "runs")),
+    new RunRegistry(join(root, 'runs')),
     bridge,
     new FakeFusion(),
     acceptedCandidateGit(root, planPath),
@@ -343,48 +472,48 @@ test("controller accepts a committed implementation and runs the required review
     cwd: root,
     planPath,
     useWorktree: false,
-    sessionId: "session-1",
+    sessionId: 'session-1',
   });
-  assert.equal(run.stage, "project_tasks");
+  assert.equal(run.stage, 'project_tasks');
   run = await controller.advance(run);
   run = await controller.advance(run);
   run = await controller.advance(run);
-  assert.equal(run.stage, "implementation");
+  assert.equal(run.stage, 'implementation');
   run = await controller.advance(run);
-  assert.equal(run.activeOperation?.kind, "implementation");
+  assert.equal(run.activeOperation?.kind, 'implementation');
 
-  await writeFile(planPath, "### Task 1: Implement\n- [x] Do the work\n");
+  await writeFile(planPath, '### Task 1: Implement\n- [x] Do the work\n');
   run = await controller.advance(run);
   run = await controller.advance(run);
-  assert.equal(run.stage, "comprehensive_review");
+  assert.equal(run.stage, 'comprehensive_review');
   assert.equal(run.activeOperation, undefined);
 
   run = await controller.advance(run);
-  assert.equal(run.activeOperation?.kind, "review");
+  assert.equal(run.activeOperation?.kind, 'review');
   run = await controller.advance(run);
-  assert.equal(run.stage, "stats");
+  assert.equal(run.stage, 'stats');
   assert.equal(run.reviewFindings.length, 0);
   assert.equal(run.stageAttempts.comprehensive_review, 1);
 });
 
-test("plan structure drift pauses for review and resumes after repair", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
+test('plan structure drift pauses for review and resumes after repair', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
   const original = `### Task 1: Implement
 - [ ] Do the work
 `;
   await writeFile(planPath, original);
-  const registry = new RunRegistry(join(root, "runs"));
+  const registry = new RunRegistry(join(root, 'runs'));
   const controller = new PlanExecController(
     registry,
-    new FakeBridge(join(root, "none.json")),
+    new FakeBridge(join(root, 'none.json')),
     new FakeFusion(),
     fakeGit(root),
   );
   const run = await registry.create({
     ...baseRun(root, planPath),
     planHash: parsePlan(planPath, original).hash,
-    stage: "implementation",
+    stage: 'implementation',
   });
 
   await writeFile(
@@ -394,23 +523,23 @@ test("plan structure drift pauses for review and resumes after repair", async ()
 `,
   );
   const paused = await controller.advance(run);
-  assert.equal(paused.status, "paused");
+  assert.equal(paused.status, 'paused');
   assert.equal(paused.error, PLAN_STRUCTURE_CHANGED_ERROR);
 
   await writeFile(planPath, original);
-  const resumed = await controller.resume(paused.id, "session-1");
-  assert.equal(resumed.status, "running");
+  const resumed = await controller.resume(paused.id, 'session-1');
+  assert.equal(resumed.status, 'running');
   assert.equal(resumed.error, undefined);
-  assert.equal(resumed.activeOperation?.kind, "implementation");
+  assert.equal(resumed.activeOperation?.kind, 'implementation');
 });
 
-test("plain resume clears legacy recovery model pins before launching", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  const plan = "### Task 1: Implement\n- [ ] Do the work\n";
+test('plain resume clears legacy recovery model pins before launching', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  const plan = '### Task 1: Implement\n- [ ] Do the work\n';
   await writeFile(planPath, plan);
-  const registry = new RunRegistry(join(root, "runs"));
-  const bridge = new FakeBridge(join(root, "none.json"));
+  const registry = new RunRegistry(join(root, 'runs'));
+  const bridge = new FakeBridge(join(root, 'none.json'));
   const controller = new PlanExecController(
     registry,
     bridge,
@@ -420,126 +549,189 @@ test("plain resume clears legacy recovery model pins before launching", async ()
   const paused = await registry.create({
     ...baseRun(root, planPath),
     planHash: parsePlan(planPath, plan).hash,
-    status: "paused",
-    stage: "implementation",
+    status: 'paused',
+    stage: 'implementation',
     config: {
       ...baseRun(root, planPath).config,
-      workerModel: "anthropic-work/claude-sonnet-4-6",
+      workerModel: 'anthropic-work/claude-sonnet-4-6',
     },
   });
 
-  const resumed = await controller.resume(paused.id, "session-1");
+  const resumed = await controller.resume(paused.id, 'session-1');
 
-  assert.equal(resumed.status, "running");
+  assert.equal(resumed.status, 'running');
   assert.equal(resumed.config.workerModel, undefined);
   assert.equal(resumed.activeOperation?.params?.model, undefined);
   assert.equal(bridge.spawnCount, 1);
   assert.equal(bridge.lastSpawnParams?.mission, false);
 });
 
-test("TASK_FAILED keeps the run running and schedules automatic task recovery", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "exec-task-blocked-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
-  const planPath = join(root, "plan.md");
-  const plan = "### Task 1: Implement\n- [ ] Do the work\n";
+test('TASK_FAILED keeps the run running and schedules automatic task recovery', async (_t) => {
+  const root = await mkdtemp(join(tmpdir(), 'exec-task-blocked-'));
+  onTestFinished(() => rm(root, { recursive: true, force: true }));
+  const planPath = join(root, 'plan.md');
+  const plan = '### Task 1: Implement\n- [ ] Do the work\n';
   await writeFile(planPath, plan);
-  const resultPath = join(root, "result.json");
-  const reason = "Constructor merge and operator readiness checkpoint is missing.";
-  await writeFile(resultPath, JSON.stringify({
-    mode: "workflow", results: [{ output: `<<<RALPHEX:TASK_FAILED>>>\n\nBlocker: ${reason}` }],
-  }));
-  const registry = new RunRegistry(join(root, "runs"));
+  const resultPath = join(root, 'result.json');
+  const reason =
+    'Constructor merge and operator readiness checkpoint is missing.';
+  await writeFile(
+    resultPath,
+    JSON.stringify({
+      mode: 'workflow',
+      results: [{ output: `<<<RALPHEX:TASK_FAILED>>>\n\nBlocker: ${reason}` }],
+    }),
+  );
+  const registry = new RunRegistry(join(root, 'runs'));
   const bridge = new FakeBridge(resultPath);
-  const controller = new PlanExecController(registry, bridge, new FakeFusion(), acceptedCandidateGit(root, planPath));
+  const controller = new PlanExecController(
+    registry,
+    bridge,
+    new FakeFusion(),
+    acceptedCandidateGit(root, planPath),
+  );
   const running = await registry.create({
-    ...baseRun(root, planPath), planHash: parsePlan(planPath, plan).hash,
-    stage: "implementation", taskAttempts: { "1": 0 },
+    ...baseRun(root, planPath),
+    planHash: parsePlan(planPath, plan).hash,
+    stage: 'implementation',
+    taskAttempts: { '1': 0 },
     activeOperation: {
-      operationId: "blocked-worker", externalRunId: "blocked-worker", service: "bridge",
-      kind: "implementation", taskId: 1, asyncDir: root, requestDigest: "digest-blocked-worker",
+      operationId: 'blocked-worker',
+      externalRunId: 'blocked-worker',
+      service: 'bridge',
+      kind: 'implementation',
+      taskId: 1,
+      asyncDir: root,
+      requestDigest: 'digest-blocked-worker',
     },
   });
 
   const retry = await controller.advance(running);
 
-  assert.equal(retry.status, "running");
-  assert.equal(retry.stage, "implementation");
+  assert.equal(retry.status, 'running');
+  assert.equal(retry.stage, 'implementation');
   assert.equal(retry.activeOperation, undefined);
-  assert.equal(retry.failedOperation?.externalRunId, "blocked-worker");
-  assert.equal(retry.tasks?.["1"]?.state, "retry_wait");
-  assert.ok((retry.tasks?.["1"]?.nextAttemptAt ?? 0) > Date.now());
-  assert.match(retry.tasks?.["1"]?.reason ?? "", /Constructor merge/);
+  assert.equal(retry.failedOperation?.externalRunId, 'blocked-worker');
+  assert.equal(retry.tasks?.['1']?.state, 'retry_wait');
+  assert.ok((retry.tasks?.['1']?.nextAttemptAt ?? 0) > Date.now());
+  assert.match(retry.tasks?.['1']?.reason ?? '', /Constructor merge/);
   assert.equal(bridge.spawnCount, 0);
-  assert.equal(await readFile(planPath, "utf8"), plan);
+  assert.equal(await readFile(planPath, 'utf8'), plan);
 
-  const retryTask = retry.tasks?.["1"];
+  const retryTask = retry.tasks?.['1'];
   assert.ok(retryTask);
   await registry.update({
     ...retry,
     nextAttemptAt: 0,
-    tasks: { ...retry.tasks, "1": { ...retryTask, nextAttemptAt: 0 } },
+    tasks: { ...retry.tasks, '1': { ...retryTask, nextAttemptAt: 0 } },
   });
-  const recovered = await controller.tick(retry.id, "session-1");
-  assert.equal(recovered.status, "running");
+  const recovered = await controller.tick(retry.id, 'session-1');
+  assert.equal(recovered.status, 'running');
   assert.equal(recovered.activeOperation?.taskId, 1);
   assert.equal(bridge.spawnCount, 1);
   assert.match(String(bridge.lastSpawnParams?.task), /TASK_FAILED/);
   assert.equal(bridge.lastSpawnParams?.completionGuard, false);
 });
 
-test("implementation failures do not become terminal at the legacy attempt cap", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "exec-legacy-blocked-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
-  const planPath = join(root, "plan.md");
-  const plan = "### Task 1: Implement\n- [ ] Do the work\n";
+test('implementation failures do not become terminal at the legacy attempt cap', async (_t) => {
+  const root = await mkdtemp(join(tmpdir(), 'exec-legacy-blocked-'));
+  onTestFinished(() => rm(root, { recursive: true, force: true }));
+  const planPath = join(root, 'plan.md');
+  const plan = '### Task 1: Implement\n- [ ] Do the work\n';
   await writeFile(planPath, plan);
-  const registry = new RunRegistry(join(root, "runs"));
-  const bridge = new FakeBridge(join(root, "expired.json"));
-  const controller = new PlanExecController(registry, bridge, new FakeFusion(), fakeGit(root));
+  const registry = new RunRegistry(join(root, 'runs'));
+  const bridge = new FakeBridge(join(root, 'expired.json'));
+  const controller = new PlanExecController(
+    registry,
+    bridge,
+    new FakeFusion(),
+    fakeGit(root),
+  );
   const run = await registry.create({
-    ...baseRun(root, planPath), planHash: parsePlan(planPath, plan).hash,
-    status: "running", stage: "implementation", taskAttempts: { "1": 100 },
-    activeOperation: { operationId: "old-workflow", externalRunId: "old-workflow", service: "bridge", kind: "implementation", taskId: 1, requestDigest: "digest-old-workflow" },
+    ...baseRun(root, planPath),
+    planHash: parsePlan(planPath, plan).hash,
+    status: 'running',
+    stage: 'implementation',
+    taskAttempts: { '1': 100 },
+    activeOperation: {
+      operationId: 'old-workflow',
+      externalRunId: 'old-workflow',
+      service: 'bridge',
+      kind: 'implementation',
+      taskId: 1,
+      requestDigest: 'digest-old-workflow',
+    },
   });
   const retry = await controller.advance(run);
-  assert.equal(retry.status, "running");
-  assert.equal(retry.taskAttempts["1"], 101);
-  assert.equal(retry.tasks?.["1"]?.state, "retry_wait");
-  assert.equal(retry.failedOperation?.externalRunId, "old-workflow");
+  assert.equal(retry.status, 'running');
+  assert.equal(retry.taskAttempts['1'], 101);
+  assert.equal(retry.tasks?.['1']?.state, 'retry_wait');
+  assert.equal(retry.failedOperation?.externalRunId, 'old-workflow');
 });
 
-test("implementation output lookup cannot overwrite a concurrent cancellation", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "exec-blocked-cancel-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
-  const planPath = join(root, "plan.md");
-  const plan = "### Task 1: Implement\n- [ ] Do the work\n";
+test('implementation output lookup cannot overwrite a concurrent cancellation', async (_t) => {
+  const root = await mkdtemp(join(tmpdir(), 'exec-blocked-cancel-'));
+  onTestFinished(() => rm(root, { recursive: true, force: true }));
+  const planPath = join(root, 'plan.md');
+  const plan = '### Task 1: Implement\n- [ ] Do the work\n';
   await writeFile(planPath, plan);
-  const resultPath = join(root, "result.json");
-  await writeFile(resultPath, JSON.stringify({ output: "<<<RALPHEX:TASK_FAILED>>>\nBlocker: Approval missing." }));
-  const registry = new RunRegistry(join(root, "runs"));
+  const resultPath = join(root, 'result.json');
+  await writeFile(
+    resultPath,
+    JSON.stringify({
+      output: '<<<RALPHEX:TASK_FAILED>>>\nBlocker: Approval missing.',
+    }),
+  );
+  const registry = new RunRegistry(join(root, 'runs'));
   const bridge = new DeferredResultBridge(resultPath);
-  bridge.bindOperation("blocked-worker", "blocked-operation", "digest-blocked-worker");
-  const controller = new PlanExecController(registry, bridge, new FakeFusion(), fakeGit(root));
+  bridge.bindOperation(
+    'blocked-worker',
+    'blocked-operation',
+    'digest-blocked-worker',
+  );
+  const controller = new PlanExecController(
+    registry,
+    bridge,
+    new FakeFusion(),
+    fakeGit(root),
+  );
   const running = await registry.create({
-    ...baseRun(root, planPath), planHash: parsePlan(planPath, plan).hash, stage: "implementation",
-    activeOperation: { operationId: "blocked-operation", externalRunId: "blocked-worker", service: "bridge", kind: "implementation", taskId: 1, requestDigest: "digest-blocked-worker" },
+    ...baseRun(root, planPath),
+    planHash: parsePlan(planPath, plan).hash,
+    stage: 'implementation',
+    activeOperation: {
+      operationId: 'blocked-operation',
+      externalRunId: 'blocked-worker',
+      service: 'bridge',
+      kind: 'implementation',
+      taskId: 1,
+      requestDigest: 'digest-blocked-worker',
+    },
   });
   const advancing = controller.advance(running);
-  await Promise.race([bridge.resultRequested, advancing.then(() => { throw new Error("Controller did not request the worker result."); })]);
-  await registry.updateLatest(running.id, (current) => ({ ...current, status: "cancel_pending" }));
+  await Promise.race([
+    bridge.resultRequested,
+    advancing.then(() => {
+      throw new Error('Controller did not request the worker result.');
+    }),
+  ]);
+  await registry.updateLatest(running.id, (current) => ({
+    ...current,
+    status: 'cancel_pending',
+  }));
   bridge.completeResult();
-  assert.equal((await advancing).status, "cancel_pending");
-  assert.equal((await registry.get(running.id))?.status, "cancel_pending");
+  assert.equal((await advancing).status, 'cancel_pending');
+  assert.equal((await registry.get(running.id))?.status, 'cancel_pending');
   assert.equal(bridge.spawnCount, 0);
 });
 
-test("resume does not refuse a worker at the legacy task attempt cap", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  const plan = "### Task 1: Implement\n- [ ] Do the work\n";
+test('resume does not refuse a worker at the legacy task attempt cap', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  const plan = '### Task 1: Implement\n- [ ] Do the work\n';
   await writeFile(planPath, plan);
-  const registry = new RunRegistry(join(root, "runs"));
-  const bridge = new FakeBridge(join(root, "none.json"));
+  const registry = new RunRegistry(join(root, 'runs'));
+  const bridge = new FakeBridge(join(root, 'none.json'));
   const controller = new PlanExecController(
     registry,
     bridge,
@@ -549,63 +741,63 @@ test("resume does not refuse a worker at the legacy task attempt cap", async () 
   const failed = await registry.create({
     ...baseRun(root, planPath),
     planHash: parsePlan(planPath, plan).hash,
-    status: "failed",
-    stage: "implementation",
-    taskAttempts: { "1": 100 },
-    error: "Worker run-2 ended as failed and left task 1 checkboxes unchecked.",
+    status: 'failed',
+    stage: 'implementation',
+    taskAttempts: { '1': 100 },
+    error: 'Worker run-2 ended as failed and left task 1 checkboxes unchecked.',
   });
 
-  const resumed = await controller.resume(failed.id, "session-1");
+  const resumed = await controller.resume(failed.id, 'session-1');
 
-  assert.equal(resumed.status, "running");
-  assert.equal(resumed.taskAttempts["1"], 0);
-  assert.equal(resumed.activeOperation?.kind, "implementation");
+  assert.equal(resumed.status, 'running');
+  assert.equal(resumed.taskAttempts['1'], 0);
+  assert.equal(resumed.activeOperation?.kind, 'implementation');
   assert.equal(bridge.spawnCount, 1);
 });
 
-test("explicit resume retries a worker after its task retry limit", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  const plan = "### Task 1: Implement\n- [ ] Do the work\n";
+test('explicit resume retries a worker after its task retry limit', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  const plan = '### Task 1: Implement\n- [ ] Do the work\n';
   await writeFile(planPath, plan);
-  const registry = new RunRegistry(join(root, "runs"));
+  const registry = new RunRegistry(join(root, 'runs'));
   const controller = new PlanExecController(
     registry,
-    new FakeBridge(join(root, "none.json")),
+    new FakeBridge(join(root, 'none.json')),
     new FakeFusion(),
     fakeGit(root),
   );
   const failed = await registry.create({
     ...baseRun(root, planPath),
     planHash: parsePlan(planPath, plan).hash,
-    status: "failed",
-    stage: "implementation",
-    taskAttempts: { "1": 2 },
-    error: "Worker run-2 ended as failed and left task 1 checkboxes unchecked.",
+    status: 'failed',
+    stage: 'implementation',
+    taskAttempts: { '1': 2 },
+    error: 'Worker run-2 ended as failed and left task 1 checkboxes unchecked.',
   });
 
   const resumed = await controller.resume(
     failed.id,
-    "session-1",
+    'session-1',
     true,
     undefined,
     true,
   );
 
-  assert.equal(resumed.status, "running");
+  assert.equal(resumed.status, 'running');
   assert.equal(resumed.error, undefined);
-  assert.equal(resumed.taskAttempts["1"], 0);
+  assert.equal(resumed.taskAttempts['1'], 0);
   assert.equal(resumed.config.workerMaxTurns, 75);
-  assert.equal(resumed.activeOperation?.kind, "implementation");
+  assert.equal(resumed.activeOperation?.kind, 'implementation');
 });
 
-test("resume automatically retries a legacy failed worker without an external blocker", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  const plan = "### Task 1: Implement\n- [ ] Do the work\n";
+test('resume automatically retries a legacy failed worker without an external blocker', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  const plan = '### Task 1: Implement\n- [ ] Do the work\n';
   await writeFile(planPath, plan);
-  const registry = new RunRegistry(join(root, "runs"));
-  const bridge = new FakeBridge(join(root, "none.json"));
+  const registry = new RunRegistry(join(root, 'runs'));
+  const bridge = new FakeBridge(join(root, 'none.json'));
   const controller = new PlanExecController(
     registry,
     bridge,
@@ -615,27 +807,27 @@ test("resume automatically retries a legacy failed worker without an external bl
   const failed = await registry.create({
     ...baseRun(root, planPath),
     planHash: parsePlan(planPath, plan).hash,
-    status: "failed",
-    stage: "implementation",
-    taskAttempts: { "1": 2 },
-    error: "Worker run-2 ended as failed and left task 1 checkboxes unchecked.",
+    status: 'failed',
+    stage: 'implementation',
+    taskAttempts: { '1': 2 },
+    error: 'Worker run-2 ended as failed and left task 1 checkboxes unchecked.',
   });
 
-  const resumed = await controller.resume(failed.id, "session-1");
+  const resumed = await controller.resume(failed.id, 'session-1');
 
-  assert.equal(resumed.status, "running");
-  assert.equal(resumed.taskAttempts["1"], 0);
-  assert.equal(resumed.activeOperation?.kind, "implementation");
+  assert.equal(resumed.status, 'running');
+  assert.equal(resumed.taskAttempts['1'], 0);
+  assert.equal(resumed.activeOperation?.kind, 'implementation');
   assert.equal(bridge.spawnCount, 1);
 });
 
-test("model failures preserve diagnostics and schedule automatic recovery", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  const plan = "### Task 1: Implement\n- [ ] Do the work\n";
+test('model failures preserve diagnostics and schedule automatic recovery', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  const plan = '### Task 1: Implement\n- [ ] Do the work\n';
   await writeFile(planPath, plan);
-  const registry = new RunRegistry(join(root, "runs"));
-  const bridge = new ModelFailureBridge(join(root, "none.json"));
+  const registry = new RunRegistry(join(root, 'runs'));
+  const bridge = new ModelFailureBridge(join(root, 'none.json'));
   const controller = new PlanExecController(
     registry,
     bridge,
@@ -645,73 +837,73 @@ test("model failures preserve diagnostics and schedule automatic recovery", asyn
   const running = await registry.create({
     ...baseRun(root, planPath),
     planHash: parsePlan(planPath, plan).hash,
-    status: "running",
-    stage: "implementation",
-    taskAttempts: { "1": 0 },
+    status: 'running',
+    stage: 'implementation',
+    taskAttempts: { '1': 0 },
     activeOperation: {
-      operationId: "model-failure-run",
-      service: "bridge",
-      kind: "implementation",
-      externalRunId: "model-failure-run",
-      asyncDir: "/tmp/model-failure-run",
+      operationId: 'model-failure-run',
+      service: 'bridge',
+      kind: 'implementation',
+      externalRunId: 'model-failure-run',
+      asyncDir: '/tmp/model-failure-run',
       taskId: 1,
-      requestDigest: "digest-model-failure-run",
+      requestDigest: 'digest-model-failure-run',
     },
   });
 
   const retry = await controller.advance(running);
 
-  assert.equal(retry.status, "running");
-  assert.equal(retry.taskAttempts["1"], 1);
+  assert.equal(retry.status, 'running');
+  assert.equal(retry.taskAttempts['1'], 1);
   assert.equal(retry.activeOperation, undefined);
-  assert.equal(retry.failedOperation?.externalRunId, "model-failure-run");
-  assert.equal(retry.tasks?.["1"]?.state, "retry_wait");
+  assert.equal(retry.failedOperation?.externalRunId, 'model-failure-run');
+  assert.equal(retry.tasks?.['1']?.state, 'retry_wait');
   assert.match(
-    retry.failedOperation?.terminalError ?? "",
+    retry.failedOperation?.terminalError ?? '',
     /OAuth refresh failed/,
   );
-  assert.match(retry.wakeReason ?? "", /model\/provider|OAuth refresh/);
-  assert.ok((retry.tasks?.["1"]?.nextAttemptAt ?? 0) > Date.now());
+  assert.match(retry.wakeReason ?? '', /model\/provider|OAuth refresh/);
+  assert.ok((retry.tasks?.['1']?.nextAttemptAt ?? 0) > Date.now());
 });
 
-test("resume retries a failed review in the same stage with a larger review budget", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  const plan = "### Task 1: Implement\n- [x] Done\n";
+test('resume retries a failed review in the same stage with a larger review budget', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  const plan = '### Task 1: Implement\n- [x] Done\n';
   await writeFile(planPath, plan);
-  const registry = new RunRegistry(join(root, "runs"));
+  const registry = new RunRegistry(join(root, 'runs'));
   const controller = new PlanExecController(
     registry,
-    new FakeBridge(join(root, "none.json")),
+    new FakeBridge(join(root, 'none.json')),
     new FakeFusion(),
     fakeGit(root),
   );
   const failed = await registry.create({
     ...baseRun(root, planPath),
     planHash: parsePlan(planPath, plan).hash,
-    status: "failed",
-    stage: "comprehensive_review",
-    error: "Review operation ended as failed.",
+    status: 'failed',
+    stage: 'comprehensive_review',
+    error: 'Review operation ended as failed.',
   });
 
   const resumed = await controller.resume(
     failed.id,
-    "session-1",
+    'session-1',
     true,
     undefined,
     false,
-    "anthropic-work/claude-sonnet-4-6",
+    'anthropic-work/claude-sonnet-4-6',
   );
 
-  assert.equal(resumed.status, "running");
-  assert.equal(resumed.stage, "comprehensive_review");
+  assert.equal(resumed.status, 'running');
+  assert.equal(resumed.stage, 'comprehensive_review');
   assert.equal(resumed.error, undefined);
   assert.equal(resumed.config.reviewerMaxTurns, 75);
   assert.equal(resumed.config.reviewerModel, undefined);
-  assert.equal(resumed.activeOperation?.kind, "review");
+  assert.equal(resumed.activeOperation?.kind, 'review');
   assert.equal(
     resumed.activeOperation?.params?.model,
-    "anthropic-work/claude-sonnet-4-6",
+    'anthropic-work/claude-sonnet-4-6',
   );
   assert.equal(resumed.worktreeCwd, failed.worktreeCwd);
   assert.equal(resumed.branch, failed.branch);
@@ -720,46 +912,46 @@ test("resume retries a failed review in the same stage with a larger review budg
   });
 });
 
-test("stats launches use the frozen stats model", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  const plan = "### Task 1: Implement\n- [x] Done\n";
+test('stats launches use the frozen stats model', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  const plan = '### Task 1: Implement\n- [x] Done\n';
   await writeFile(planPath, plan);
-  const registry = new RunRegistry(join(root, "runs"));
+  const registry = new RunRegistry(join(root, 'runs'));
   const controller = new PlanExecController(
     registry,
-    new FakeBridge(join(root, "none.json")),
+    new FakeBridge(join(root, 'none.json')),
     new FakeFusion(),
     fakeGit(root),
   );
   const running = await registry.create({
     ...baseRun(root, planPath),
     planHash: parsePlan(planPath, plan).hash,
-    status: "running",
-    stage: "stats",
+    status: 'running',
+    stage: 'stats',
     config: {
       ...baseRun(root, planPath).config,
       statsEnabled: true,
-      statsModel: "anthropic-work/claude-haiku-4-5",
+      statsModel: 'anthropic-work/claude-haiku-4-5',
     },
   });
 
   const launched = await controller.advance(running);
 
-  assert.equal(launched.activeOperation?.kind, "stats");
+  assert.equal(launched.activeOperation?.kind, 'stats');
   assert.equal(
     launched.activeOperation?.params?.model,
-    "anthropic-work/claude-haiku-4-5",
+    'anthropic-work/claude-haiku-4-5',
   );
 });
 
-test("resume does not adopt a fixer launched during the same recovery", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  const plan = "### Task 1: Implement\n- [x] Done\n";
+test('resume does not adopt a fixer launched during the same recovery', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  const plan = '### Task 1: Implement\n- [x] Done\n';
   await writeFile(planPath, plan);
-  const registry = new RunRegistry(join(root, "runs"));
-  const bridge = new StartupRaceBridge(join(root, "none.json"));
+  const registry = new RunRegistry(join(root, 'runs'));
+  const bridge = new StartupRaceBridge(join(root, 'none.json'));
   const controller = new PlanExecController(
     registry,
     bridge,
@@ -769,38 +961,38 @@ test("resume does not adopt a fixer launched during the same recovery", async ()
   const failed = await registry.create({
     ...baseRun(root, planPath),
     planHash: parsePlan(planPath, plan).hash,
-    status: "failed",
-    stage: "comprehensive_review",
+    status: 'failed',
+    stage: 'comprehensive_review',
     stageAttempts: { comprehensive_review: 1 },
     reviewFindings: [
-      { id: "major-1", severity: "MAJOR", summary: "Verify this defect" },
+      { id: 'major-1', severity: 'MAJOR', summary: 'Verify this defect' },
     ],
     failedOperation: {
-      operationId: "failed-fix",
-      service: "bridge",
-      kind: "fix",
+      operationId: 'failed-fix',
+      service: 'bridge',
+      kind: 'fix',
       reviewIteration: 1,
     },
-    error: "Fix operation ended as failed.",
+    error: 'Fix operation ended as failed.',
   });
 
-  const resumed = await controller.resume(failed.id, "session-1");
+  const resumed = await controller.resume(failed.id, 'session-1');
 
-  assert.equal(resumed.status, "running");
-  assert.equal(resumed.activeOperation?.kind, "fix");
-  assert.equal(resumed.activeOperation?.externalRunId, "run-1");
+  assert.equal(resumed.status, 'running');
+  assert.equal(resumed.activeOperation?.kind, 'fix');
+  assert.equal(resumed.activeOperation?.externalRunId, 'run-1');
   assert.equal(resumed.activeOperation?.params?.completionGuard, false);
   assert.equal(bridge.spawnCount, 1);
   assert.equal(bridge.adoptCount, 0);
 });
 
-test("resume reconciles a preserved fixer instead of spawning a duplicate", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  const plan = "### Task 1: Implement\n- [x] Done\n";
+test('resume reconciles a preserved fixer instead of spawning a duplicate', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  const plan = '### Task 1: Implement\n- [x] Done\n';
   await writeFile(planPath, plan);
-  const registry = new RunRegistry(join(root, "runs"));
-  const bridge = new RunningBridge(join(root, "none.json"));
+  const registry = new RunRegistry(join(root, 'runs'));
+  const bridge = new RunningBridge(join(root, 'none.json'));
   const controller = new PlanExecController(
     registry,
     bridge,
@@ -810,45 +1002,45 @@ test("resume reconciles a preserved fixer instead of spawning a duplicate", asyn
   const failed = await registry.create({
     ...baseRun(root, planPath),
     planHash: parsePlan(planPath, plan).hash,
-    status: "failed",
-    stage: "comprehensive_review",
+    status: 'failed',
+    stage: 'comprehensive_review',
     reviewFindings: [
-      { id: "major-1", severity: "MAJOR", summary: "Verify this defect" },
+      { id: 'major-1', severity: 'MAJOR', summary: 'Verify this defect' },
     ],
     activeOperation: {
-      operationId: "preserved-fix",
-      service: "bridge",
-      kind: "fix",
-      externalRunId: "existing-run",
-      asyncDir: "/tmp/existing-run",
+      operationId: 'preserved-fix',
+      service: 'bridge',
+      kind: 'fix',
+      externalRunId: 'existing-run',
+      asyncDir: '/tmp/existing-run',
       reviewIteration: 4,
     },
     failedOperation: {
-      operationId: "preserved-fix",
-      service: "bridge",
-      kind: "fix",
-      externalRunId: "existing-run",
-      asyncDir: "/tmp/existing-run",
+      operationId: 'preserved-fix',
+      service: 'bridge',
+      kind: 'fix',
+      externalRunId: 'existing-run',
+      asyncDir: '/tmp/existing-run',
       reviewIteration: 4,
     },
-    error: "Unable to adopt bridge operation: Status file not found.",
+    error: 'Unable to adopt bridge operation: Status file not found.',
   });
 
-  const resumed = await controller.resume(failed.id, "session-1");
+  const resumed = await controller.resume(failed.id, 'session-1');
 
-  assert.equal(resumed.status, "running");
-  assert.equal(resumed.activeOperation?.operationId, "preserved-fix");
-  assert.equal(resumed.activeOperation?.externalRunId, "existing-run");
+  assert.equal(resumed.status, 'running');
+  assert.equal(resumed.activeOperation?.operationId, 'preserved-fix');
+  assert.equal(resumed.activeOperation?.externalRunId, 'existing-run');
   assert.equal(bridge.spawnCount, 0);
 });
 
-test("resume keeps a preserved fixer recoverable when adoption is not ready", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  const plan = "### Task 1: Implement\n- [x] Done\n";
+test('resume keeps a preserved fixer recoverable when adoption is not ready', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  const plan = '### Task 1: Implement\n- [x] Done\n';
   await writeFile(planPath, plan);
-  const registry = new RunRegistry(join(root, "runs"));
-  const bridge = new AdoptionNotReadyBridge(join(root, "none.json"));
+  const registry = new RunRegistry(join(root, 'runs'));
+  const bridge = new AdoptionNotReadyBridge(join(root, 'none.json'));
   const controller = new PlanExecController(
     registry,
     bridge,
@@ -858,64 +1050,64 @@ test("resume keeps a preserved fixer recoverable when adoption is not ready", as
   const failed = await registry.create({
     ...baseRun(root, planPath),
     planHash: parsePlan(planPath, plan).hash,
-    status: "failed",
-    stage: "comprehensive_review",
+    status: 'failed',
+    stage: 'comprehensive_review',
     activeOperation: {
-      operationId: "preserved-fix",
-      service: "bridge",
-      kind: "fix",
-      externalRunId: "existing-run",
-      asyncDir: "/tmp/existing-run",
+      operationId: 'preserved-fix',
+      service: 'bridge',
+      kind: 'fix',
+      externalRunId: 'existing-run',
+      asyncDir: '/tmp/existing-run',
       reviewIteration: 1,
     },
-    error: "Unable to observe bridge/fix (3/3): unavailable",
+    error: 'Unable to observe bridge/fix (3/3): unavailable',
   });
 
-  const resumed = await controller.resume(failed.id, "session-1");
+  const resumed = await controller.resume(failed.id, 'session-1');
 
-  assert.equal(resumed.status, "running");
-  assert.equal(resumed.activeOperation?.operationId, "preserved-fix");
+  assert.equal(resumed.status, 'running');
+  assert.equal(resumed.activeOperation?.operationId, 'preserved-fix');
   assert.equal(resumed.activeOperation?.statusFailures, 1);
   assert.match(
-    resumed.activeOperation?.lastStatusError ?? "",
+    resumed.activeOperation?.lastStatusError ?? '',
     /Status file not found/,
   );
   assert.equal(bridge.spawnCount, 0);
 });
 
-test("resume retries a failed one-pass review fixer instead of skipping the capped stage", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  const plan = "### Task 1: Implement\n- [x] Done\n";
+test('resume retries a failed one-pass review fixer instead of skipping the capped stage', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  const plan = '### Task 1: Implement\n- [x] Done\n';
   await writeFile(planPath, plan);
-  const registry = new RunRegistry(join(root, "runs"));
+  const registry = new RunRegistry(join(root, 'runs'));
   const controller = new PlanExecController(
     registry,
-    new RunningBridge(join(root, "none.json")),
+    new RunningBridge(join(root, 'none.json')),
     new FakeFusion(),
     fakeGit(root),
   );
   const failed = await registry.create({
     ...baseRun(root, planPath),
     planHash: parsePlan(planPath, plan).hash,
-    status: "failed",
-    stage: "critical_review",
+    status: 'failed',
+    stage: 'critical_review',
     stageAttempts: { critical_review: 1 },
     reviewFindings: [
       {
-        id: "major-1",
-        severity: "MAJOR",
-        summary: "Fix this defect",
+        id: 'major-1',
+        severity: 'MAJOR',
+        summary: 'Fix this defect',
       },
     ],
-    error: "Fix operation ended as failed.",
+    error: 'Fix operation ended as failed.',
   });
 
-  const resumed = await controller.resume(failed.id, "session-1");
+  const resumed = await controller.resume(failed.id, 'session-1');
 
-  assert.equal(resumed.status, "running");
-  assert.equal(resumed.stage, "critical_review");
-  assert.equal(resumed.activeOperation?.kind, "fix");
+  assert.equal(resumed.status, 'running');
+  assert.equal(resumed.stage, 'critical_review');
+  assert.equal(resumed.activeOperation?.kind, 'fix');
   assert.equal(resumed.activeOperation?.reviewIteration, 1);
   assert.match(
     String(resumed.activeOperation?.params?.task),
@@ -923,83 +1115,83 @@ test("resume retries a failed one-pass review fixer instead of skipping the capp
   );
 });
 
-test("legacy structure failure adopts reviewed hash after claiming the run", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
+test('legacy structure failure adopts reviewed hash after claiming the run', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
   const current = `### Task 1: Implement
 - [ ] Changed text
 `;
   await writeFile(planPath, current);
-  const registry = new RunRegistry(join(root, "runs"));
+  const registry = new RunRegistry(join(root, 'runs'));
   const controller = new PlanExecController(
     registry,
-    new FakeBridge(join(root, "none.json")),
+    new FakeBridge(join(root, 'none.json')),
     new FakeFusion(),
     fakeGit(root),
   );
   const failed = await registry.create({
     ...baseRun(root, planPath),
-    planHash: "old-hash",
-    status: "failed",
-    stage: "implementation",
+    planHash: 'old-hash',
+    status: 'failed',
+    stage: 'implementation',
     error: PLAN_STRUCTURE_CHANGED_ERROR,
   });
   const reviewedHash = parsePlan(planPath, current).hash;
 
   const resumed = await controller.resume(
     failed.id,
-    "session-1",
+    'session-1',
     true,
     reviewedHash,
   );
 
-  assert.equal(resumed.status, "running");
+  assert.equal(resumed.status, 'running');
   assert.equal(resumed.planHash, reviewedHash);
   assert.equal(resumed.error, undefined);
-  assert.equal(resumed.activeOperation?.kind, "implementation");
+  assert.equal(resumed.activeOperation?.kind, 'implementation');
 });
 
-test("failed claim does not persist a reviewed plan hash", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  await writeFile(planPath, "### Task 1: Implement\n- [ ] Changed text\n");
-  const registry = new RunRegistry(join(root, "runs"));
+test('failed claim does not persist a reviewed plan hash', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  await writeFile(planPath, '### Task 1: Implement\n- [ ] Changed text\n');
+  const registry = new RunRegistry(join(root, 'runs'));
   const controller = new PlanExecController(
     registry,
-    new FakeBridge(join(root, "none.json")),
+    new FakeBridge(join(root, 'none.json')),
     new FakeFusion(),
     fakeGit(root),
   );
   const failed = await registry.create({
     ...baseRun(root, planPath),
-    planHash: "old-hash",
-    status: "failed",
-    stage: "implementation",
+    planHash: 'old-hash',
+    status: 'failed',
+    stage: 'implementation',
     error: PLAN_STRUCTURE_CHANGED_ERROR,
     lease: {
-      sessionId: "session-1",
+      sessionId: 'session-1',
       pid: 123,
       heartbeatAt: Date.now(),
     },
   });
 
   await assert.rejects(
-    controller.resume(failed.id, "session-2", true, "reviewed-hash"),
+    controller.resume(failed.id, 'session-2', true, 'reviewed-hash'),
     /controlled by another active Pi session/,
   );
   const stored = await registry.get(failed.id);
-  assert.equal(stored?.status, "failed");
-  assert.equal(stored?.planHash, "old-hash");
+  assert.equal(stored?.status, 'failed');
+  assert.equal(stored?.planHash, 'old-hash');
   assert.equal(stored?.error, PLAN_STRUCTURE_CHANGED_ERROR);
 });
 
-test("same-session concurrent resumes launch one operation", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  const plan = "### Task 1: Implement\n- [ ] Do the work\n";
+test('same-session concurrent resumes launch one operation', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  const plan = '### Task 1: Implement\n- [ ] Do the work\n';
   await writeFile(planPath, plan);
-  const registry = new RunRegistry(join(root, "runs"));
-  const bridge = new RunningBridge(join(root, "none.json"));
+  const registry = new RunRegistry(join(root, 'runs'));
+  const bridge = new RunningBridge(join(root, 'none.json'));
   const first = new PlanExecController(
     registry,
     bridge,
@@ -1015,29 +1207,29 @@ test("same-session concurrent resumes launch one operation", async () => {
   const paused = await registry.create({
     ...baseRun(root, planPath),
     planHash: parsePlan(planPath, plan).hash,
-    status: "paused",
-    stage: "implementation",
+    status: 'paused',
+    stage: 'implementation',
   });
 
   await Promise.all([
-    first.resume(paused.id, "session-1"),
-    second.resume(paused.id, "session-1"),
+    first.resume(paused.id, 'session-1'),
+    second.resume(paused.id, 'session-1'),
   ]);
 
   assert.equal(bridge.spawnCount, 1);
   assert.equal(
     (await registry.get(paused.id))?.activeOperation?.externalRunId,
-    "run-1",
+    'run-1',
   );
 });
 
-test("controller cancels a stopped review without advancing later stages", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
-  const registry = new RunRegistry(join(root, "runs"));
-  const bridge = new FakeBridge(join(root, "none.json"));
-  bridge.bindOperation("run-1", "operation-1", "digest-operation-1");
+test('controller cancels a stopped review without advancing later stages', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  await writeFile(planPath, '### Task 1: Implement\n- [x] Done\n');
+  const registry = new RunRegistry(join(root, 'runs'));
+  const bridge = new FakeBridge(join(root, 'none.json'));
+  bridge.bindOperation('run-1', 'operation-1', 'digest-operation-1');
   const controller = new PlanExecController(
     registry,
     bridge,
@@ -1047,144 +1239,150 @@ test("controller cancels a stopped review without advancing later stages", async
   const run = await registry.create(baseRun(root, planPath));
   const cancelling: PlanExecRun = {
     ...run,
-    status: "cancel_pending",
-    stage: "comprehensive_review",
+    status: 'cancel_pending',
+    stage: 'comprehensive_review',
     activeOperation: {
-      operationId: "operation-1",
-      service: "bridge",
-      kind: "review",
-      externalRunId: "run-1",
-      asyncDir: "/tmp/async",
-      requestDigest: "digest-operation-1",
+      operationId: 'operation-1',
+      service: 'bridge',
+      kind: 'review',
+      externalRunId: 'run-1',
+      asyncDir: '/tmp/async',
+      requestDigest: 'digest-operation-1',
     },
   };
 
   let cancelled = await controller.advance(await registry.update(cancelling));
-  if (cancelled.status === "cancel_pending")
-    cancelled = await controller.advance(await registry.update({ ...cancelled, nextAttemptAt: 0 }));
-  assert.equal(cancelled.status, "cancelled", cancelled.wakeReason ?? cancelled.error ?? "Cancellation did not settle.");
-  assert.equal(cancelled.stage, "comprehensive_review");
+  if (cancelled.status === 'cancel_pending')
+    cancelled = await controller.advance(
+      await registry.update({ ...cancelled, nextAttemptAt: 0 }),
+    );
+  assert.equal(
+    cancelled.status,
+    'cancelled',
+    cancelled.wakeReason ?? cancelled.error ?? 'Cancellation did not settle.',
+  );
+  assert.equal(cancelled.stage, 'comprehensive_review');
   assert.equal(cancelled.activeOperation, undefined);
 });
 
-test("paused runs retain a terminal child until resume applies its completion", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  await writeFile(planPath, "### Task 1: Implement\n- [ ] Do the work\n");
-  const registry = new RunRegistry(join(root, "runs"));
+test('paused runs retain a terminal child until resume applies its completion', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  await writeFile(planPath, '### Task 1: Implement\n- [ ] Do the work\n');
+  const registry = new RunRegistry(join(root, 'runs'));
   const controller = new PlanExecController(
     registry,
-    new FakeBridge(join(root, "none.json")),
+    new FakeBridge(join(root, 'none.json')),
     new FakeFusion(),
     fakeGit(root),
   );
-  const plan = "### Task 1: Implement\n- [ ] Do the work\n";
+  const plan = '### Task 1: Implement\n- [ ] Do the work\n';
   const run = await registry.create({
     ...baseRun(root, planPath),
     planHash: parsePlan(planPath, plan).hash,
-    status: "paused",
-    stage: "implementation",
+    status: 'paused',
+    stage: 'implementation',
     activeOperation: {
-      operationId: "run-1",
-      service: "bridge",
-      kind: "implementation",
-      externalRunId: "run-1",
+      operationId: 'run-1',
+      service: 'bridge',
+      kind: 'implementation',
+      externalRunId: 'run-1',
       taskId: 1,
-      requestDigest: "digest-run-1",
+      requestDigest: 'digest-run-1',
     },
   });
   const paused = await controller.advance(run);
-  assert.equal(paused.status, "paused");
-  assert.equal(paused.activeOperation?.operationId, "run-1");
-  assert.equal(paused.stage, "implementation");
-  const resumed = await controller.resume(paused.id, "session-1");
-  assert.equal(resumed.stage, "implementation");
-  assert.equal(resumed.status, "running");
+  assert.equal(paused.status, 'paused');
+  assert.equal(paused.activeOperation?.operationId, 'run-1');
+  assert.equal(paused.stage, 'implementation');
+  const resumed = await controller.resume(paused.id, 'session-1');
+  assert.equal(resumed.stage, 'implementation');
+  assert.equal(resumed.status, 'running');
   assert.equal(resumed.activeOperation, undefined);
 });
 
-test("detached workflow keeps polling the same operation for supervisor recovery", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
-  const registry = new RunRegistry(join(root, "runs"));
+test('detached workflow keeps polling the same operation for supervisor recovery', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  await writeFile(planPath, '### Task 1: Implement\n- [x] Done\n');
+  const registry = new RunRegistry(join(root, 'runs'));
   const controller = new PlanExecController(
     registry,
-    new PausedWorkflowBridge(join(root, "none.json")),
+    new PausedWorkflowBridge(join(root, 'none.json')),
     new FakeFusion(),
     fakeGit(root),
   );
   const run = await registry.create({
     ...baseRun(root, planPath),
-    stage: "stats",
+    stage: 'stats',
     activeOperation: {
-      operationId: "run-1",
-      service: "bridge",
-      kind: "stats",
-      externalRunId: "workflow-1",
-      asyncDir: "/tmp/workflow-1",
-      requestDigest: "digest-workflow-1",
+      operationId: 'run-1',
+      service: 'bridge',
+      kind: 'stats',
+      externalRunId: 'workflow-1',
+      asyncDir: '/tmp/workflow-1',
+      requestDigest: 'digest-workflow-1',
     },
   });
 
   const waiting = await controller.advance(run);
 
-  assert.equal(waiting.status, "running");
-  assert.equal(waiting.stage, "stats");
-  assert.equal(waiting.activeOperation?.externalRunId, "workflow-1");
-  assert.match(waiting.activeOperation?.terminalError ?? "", /supervisor/i);
+  assert.equal(waiting.status, 'running');
+  assert.equal(waiting.stage, 'stats');
+  assert.equal(waiting.activeOperation?.externalRunId, 'workflow-1');
+  assert.match(waiting.activeOperation?.terminalError ?? '', /supervisor/i);
   assert.equal(waiting.failedOperation, undefined);
   assert.equal(waiting.error, undefined);
 });
 
-test("resume consumes a settled detached stats child without launching a replacement", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  const plan = "### Task 1: Implement\n- [x] Done\n";
+test('resume consumes a settled detached stats child without launching a replacement', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  const plan = '### Task 1: Implement\n- [x] Done\n';
   await writeFile(planPath, plan);
-  const runtimeRoot = join(root, "runtime");
-  const runId = "workflow-1";
-  const asyncDir = join(runtimeRoot, "async-subagent-runs", runId);
+  const runtimeRoot = join(root, 'runtime');
+  const runId = 'workflow-1';
+  const asyncDir = join(runtimeRoot, 'async-subagent-runs', runId);
   const archiveDir = join(
     runtimeRoot,
-    "async-subagent-results",
-    "output-archives",
+    'async-subagent-results',
+    'output-archives',
   );
   await mkdir(asyncDir, { recursive: true });
   await mkdir(archiveDir, { recursive: true });
   await writeFile(
-    join(asyncDir, "status.json"),
+    join(asyncDir, 'status.json'),
     JSON.stringify({
-      mode: "workflow",
+      mode: 'workflow',
       runId,
-      state: "failed",
+      state: 'failed',
       steps: [
         {
-          workflowKey: "main",
+          workflowKey: 'main',
           parentWorkflowRunId: runId,
-          status: "completed",
+          status: 'completed',
         },
       ],
     }),
   );
   await writeFile(
-    join(asyncDir, "workflow-receipt.json"),
+    join(asyncDir, 'workflow-receipt.json'),
     JSON.stringify({
       workflowRunId: runId,
-      state: "failed",
-      workflowResolution: "settled-awaiting-resume",
+      state: 'failed',
+      workflowResolution: 'settled-awaiting-resume',
       entries: {
-        main: { key: "main", parentWorkflowRunId: runId },
+        main: { key: 'main', parentWorkflowRunId: runId },
       },
     }),
   );
   await writeFile(
     join(archiveDir, `${runId}.json`),
-    JSON.stringify({ runId, entries: [{ text: "stats completed" }] }),
+    JSON.stringify({ runId, entries: [{ text: 'stats completed' }] }),
   );
-  const registry = new RunRegistry(join(root, "runs"));
-  const bridge = new FakeBridge(join(root, "none.json"));
-  bridge.bindOperation(runId, "operation-1", "digest-operation-1");
+  const registry = new RunRegistry(join(root, 'runs'));
+  const bridge = new FakeBridge(join(root, 'none.json'));
+  bridge.bindOperation(runId, 'operation-1', 'digest-operation-1');
   const controller = new PlanExecController(
     registry,
     bridge,
@@ -1195,36 +1393,43 @@ test("resume consumes a settled detached stats child without launching a replace
     ...baseRun(root, planPath),
     ...archiveAcceptance(),
     planHash: parsePlan(planPath, plan).hash,
-    status: "failed",
-    stage: "stats",
-    error: "stats operation ended as paused.",
+    status: 'failed',
+    stage: 'stats',
+    error: 'stats operation ended as paused.',
     failedOperation: {
-      operationId: "operation-1",
-      service: "bridge",
-      kind: "stats",
+      operationId: 'operation-1',
+      service: 'bridge',
+      kind: 'stats',
       externalRunId: runId,
       asyncDir,
       terminalError: "Run 'main' detached for intercom coordination.",
-      requestDigest: "digest-operation-1",
-      expectedLifetime: { mode: "unbounded" },
+      requestDigest: 'digest-operation-1',
+      expectedLifetime: { mode: 'unbounded' },
     },
   });
 
-  const recovered = await advanceThroughArchive(controller, await controller.resume(failed.id, "session-1"));
+  const recovered = await advanceThroughArchive(
+    controller,
+    await controller.resume(failed.id, 'session-1'),
+  );
 
-  assert.equal(recovered.status, "completed", recovered.error ?? recovered.wakeReason ?? "Archive did not settle.");
-  assert.equal(recovered.stage, "complete");
+  assert.equal(
+    recovered.status,
+    'completed',
+    recovered.error ?? recovered.wakeReason ?? 'Archive did not settle.',
+  );
+  assert.equal(recovered.stage, 'complete');
   assert.equal(bridge.spawnCount, 0);
   assert.equal(recovered.failedOperation, undefined);
 });
 
-test("resume reattaches an unsettled detached workflow instead of duplicating it", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  const plan = "### Task 1: Implement\n- [x] Done\n";
+test('resume reattaches an unsettled detached workflow instead of duplicating it', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  const plan = '### Task 1: Implement\n- [x] Done\n';
   await writeFile(planPath, plan);
-  const registry = new RunRegistry(join(root, "runs"));
-  const bridge = new PausedWorkflowBridge(join(root, "none.json"));
+  const registry = new RunRegistry(join(root, 'runs'));
+  const bridge = new PausedWorkflowBridge(join(root, 'none.json'));
   const controller = new PlanExecController(
     registry,
     bridge,
@@ -1235,45 +1440,45 @@ test("resume reattaches an unsettled detached workflow instead of duplicating it
     ...baseRun(root, planPath),
     ...archiveAcceptance(),
     planHash: parsePlan(planPath, plan).hash,
-    status: "failed",
-    stage: "stats",
-    error: "stats operation ended as paused.",
+    status: 'failed',
+    stage: 'stats',
+    error: 'stats operation ended as paused.',
     failedOperation: {
-      operationId: "operation-1",
-      service: "bridge",
-      kind: "stats",
-      externalRunId: "workflow-1",
-      asyncDir: join(root, "missing-workflow-artifacts"),
+      operationId: 'operation-1',
+      service: 'bridge',
+      kind: 'stats',
+      externalRunId: 'workflow-1',
+      asyncDir: join(root, 'missing-workflow-artifacts'),
       terminalError: "Run 'main' detached for intercom coordination.",
     },
   });
 
-  const recovered = await controller.resume(failed.id, "session-1");
+  const recovered = await controller.resume(failed.id, 'session-1');
 
-  assert.equal(recovered.status, "failed");
-  assert.match(recovered.error ?? "", /refusing blind reattachment/);
+  assert.equal(recovered.status, 'failed');
+  assert.match(recovered.error ?? '', /refusing blind reattachment/);
   assert.equal(bridge.spawnCount, 0);
 });
 
-test("status-observation errors remain recoverable past the legacy cap", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  await writeFile(planPath, "### Task 1: Implement\n- [ ] Do the work\n");
-  const registry = new RunRegistry(join(root, "runs"));
+test('status-observation errors remain recoverable past the legacy cap', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  await writeFile(planPath, '### Task 1: Implement\n- [ ] Do the work\n');
+  const registry = new RunRegistry(join(root, 'runs'));
   const controller = new PlanExecController(
     registry,
-    new UnavailableBridge(join(root, "none.json")),
+    new UnavailableBridge(join(root, 'none.json')),
     new FakeFusion(),
     fakeGit(root),
   );
   let run = await registry.create({
     ...baseRun(root, planPath),
-    stage: "implementation",
+    stage: 'implementation',
     activeOperation: {
-      operationId: "operation-1",
-      service: "bridge",
-      kind: "implementation",
-      externalRunId: "run-1",
+      operationId: 'operation-1',
+      service: 'bridge',
+      kind: 'implementation',
+      externalRunId: 'run-1',
       taskId: 1,
     },
   });
@@ -1281,21 +1486,21 @@ test("status-observation errors remain recoverable past the legacy cap", async (
   for (let attempt = 1; attempt <= 5; attempt += 1) {
     run = await controller.advance(run);
     assert.equal(run.activeOperation?.statusFailures, attempt);
-    assert.match(run.activeOperation?.lastStatusError ?? "", /unavailable/);
+    assert.match(run.activeOperation?.lastStatusError ?? '', /unavailable/);
     run = await registry.update({ ...run, nextAttemptAt: 0 });
   }
-  assert.equal(run.status, "running");
-  assert.equal(run.activeOperation?.externalRunId, "run-1");
+  assert.equal(run.status, 'running');
+  assert.equal(run.activeOperation?.externalRunId, 'run-1');
   assert.equal(run.needsAttention, true);
-  assert.match(run.wakeReason ?? "", /unavailable/);
+  assert.match(run.wakeReason ?? '', /unavailable/);
 });
 
-test("stale completed observation preserves a newer cancellation request", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
-  const registry = new RunRegistry(join(root, "runs"));
-  const bridge = new DeferredStatusBridge(join(root, "none.json"));
+test('stale completed observation preserves a newer cancellation request', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  await writeFile(planPath, '### Task 1: Implement\n- [x] Done\n');
+  const registry = new RunRegistry(join(root, 'runs'));
+  const bridge = new DeferredStatusBridge(join(root, 'none.json'));
   const controller = new PlanExecController(
     registry,
     bridge,
@@ -1304,35 +1509,35 @@ test("stale completed observation preserves a newer cancellation request", async
   );
   const run = await registry.create({
     ...baseRun(root, planPath),
-    stage: "implementation",
-    lease: { sessionId: "session-1", pid: 123, heartbeatAt: Date.now() },
+    stage: 'implementation',
+    lease: { sessionId: 'session-1', pid: 123, heartbeatAt: Date.now() },
     activeOperation: {
-      operationId: "operation-1",
-      service: "bridge",
-      kind: "implementation",
-      externalRunId: "run-1",
+      operationId: 'operation-1',
+      service: 'bridge',
+      kind: 'implementation',
+      externalRunId: 'run-1',
       taskId: 1,
     },
   });
 
   const observing = controller.advance(run);
   await bridge.statusRequested;
-  await registry.update({ ...run, status: "cancel_pending" });
+  await registry.update({ ...run, status: 'cancel_pending' });
   bridge.completeStatus();
   const preserved = await observing;
 
-  assert.equal(preserved.status, "cancel_pending");
-  assert.equal(preserved.activeOperation?.operationId, "operation-1");
-  assert.equal(preserved.taskAttempts["1"], undefined);
+  assert.equal(preserved.status, 'cancel_pending');
+  assert.equal(preserved.activeOperation?.operationId, 'operation-1');
+  assert.equal(preserved.taskAttempts['1'], undefined);
 });
 
-test("cancellation during missing reviewer output prevents a retry", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
-  const registry = new RunRegistry(join(root, "runs"));
-  const bridge = new DeferredResultBridge(join(root, "missing-result.json"));
-  bridge.bindOperation("run-1", "review-1", "digest-review-1");
+test('cancellation during missing reviewer output prevents a retry', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  await writeFile(planPath, '### Task 1: Implement\n- [x] Done\n');
+  const registry = new RunRegistry(join(root, 'runs'));
+  const bridge = new DeferredResultBridge(join(root, 'missing-result.json'));
+  bridge.bindOperation('run-1', 'review-1', 'digest-review-1');
   const controller = new PlanExecController(
     registry,
     bridge,
@@ -1341,39 +1546,46 @@ test("cancellation during missing reviewer output prevents a retry", async () =>
   );
   const run = await registry.create({
     ...baseRun(root, planPath),
-    stage: "comprehensive_review",
+    stage: 'comprehensive_review',
     stageAttempts: { comprehensive_review: 1 },
-    lease: { sessionId: "session-1", pid: 123, heartbeatAt: Date.now() },
+    lease: { sessionId: 'session-1', pid: 123, heartbeatAt: Date.now() },
     activeOperation: {
-      operationId: "review-1",
-      service: "bridge",
-      kind: "review",
-      externalRunId: "run-1",
-      asyncDir: join(root, "missing-async"),
+      operationId: 'review-1',
+      service: 'bridge',
+      kind: 'review',
+      externalRunId: 'run-1',
+      asyncDir: join(root, 'missing-async'),
       reviewIteration: 1,
-      requestDigest: "digest-review-1",
+      requestDigest: 'digest-review-1',
     },
   });
 
   const observing = controller.advance(run);
-  await Promise.race([bridge.resultRequested, observing.then(run => { throw new Error(`Controller did not request the reviewer result: ${run.error ?? run.wakeReason ?? run.status}`); })]);
+  await Promise.race([
+    bridge.resultRequested,
+    observing.then((run) => {
+      throw new Error(
+        `Controller did not request the reviewer result: ${run.error ?? run.wakeReason ?? run.status}`,
+      );
+    }),
+  ]);
   const current = await registry.get(run.id);
-  await registry.update({ ...current!, status: "cancel_pending" });
+  await registry.update({ ...required(current), status: 'cancel_pending' });
   bridge.completeResult();
   const preserved = await observing;
 
-  assert.equal(preserved.status, "cancel_pending");
-  assert.equal(preserved.activeOperation?.operationId, "review-1");
+  assert.equal(preserved.status, 'cancel_pending');
+  assert.equal(preserved.activeOperation?.operationId, 'review-1');
   assert.equal(bridge.spawnCount, 0);
   assert.equal(preserved.stageAttempts.comprehensive_review, 1);
 });
 
-test("controller refuses an untracked persisted bridge operation rather than duplicating work", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  await writeFile(planPath, "### Task 1: Implement\n- [ ] Do the work\n");
-  const registry = new RunRegistry(join(root, "runs"));
-  const bridge = new FakeBridge(join(root, "none.json"));
+test('controller refuses an untracked persisted bridge operation rather than duplicating work', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  await writeFile(planPath, '### Task 1: Implement\n- [ ] Do the work\n');
+  const registry = new RunRegistry(join(root, 'runs'));
+  const bridge = new FakeBridge(join(root, 'none.json'));
   const controller = new PlanExecController(
     registry,
     bridge,
@@ -1382,37 +1594,37 @@ test("controller refuses an untracked persisted bridge operation rather than dup
   );
   const run = await registry.create({
     ...baseRun(root, planPath),
-    stage: "implementation",
+    stage: 'implementation',
     activeOperation: {
-      operationId: "operation-crashed-before-reply",
-      service: "bridge",
-      kind: "implementation",
+      operationId: 'operation-crashed-before-reply',
+      service: 'bridge',
+      kind: 'implementation',
       taskId: 1,
-      params: { agent: "worker", task: "recover", cwd: root },
+      params: { agent: 'worker', task: 'recover', cwd: root },
     },
   });
   const recovered = await controller.advance(run);
-  assert.equal(recovered.status, "running");
+  assert.equal(recovered.status, 'running');
   assert.match(
-    recovered.error ?? "",
+    recovered.error ?? '',
     /refusing to launch a possible duplicate/,
   );
   assert.equal(recovered.activeOperation?.externalRunId, undefined);
-  assert.equal(recovered.activeOperation?.recovery, "recovery_required");
-  assert.equal(recovered.activeOperation?.lastObservedState, "unknown_launch");
+  assert.equal(recovered.activeOperation?.recovery, 'recovery_required');
+  assert.equal(recovered.activeOperation?.lastObservedState, 'unknown_launch');
   assert.equal(
     recovered.activeOperation?.operationId,
-    "operation-crashed-before-reply",
+    'operation-crashed-before-reply',
   );
   assert.equal(bridge.spawnCount, 0);
 });
 
-test("controller safely replays a v2 operation proven durably absent", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  await writeFile(planPath, "### Task 1: Implement\n- [ ] Do the work\n");
-  const registry = new RunRegistry(join(root, "runs"));
-  const bridge = new DurableAbsentBridge(join(root, "none.json"));
+test('controller safely replays a v2 operation proven durably absent', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  await writeFile(planPath, '### Task 1: Implement\n- [ ] Do the work\n');
+  const registry = new RunRegistry(join(root, 'runs'));
+  const bridge = new DurableAbsentBridge(join(root, 'none.json'));
   const controller = new PlanExecController(
     registry,
     bridge,
@@ -1420,41 +1632,41 @@ test("controller safely replays a v2 operation proven durably absent", async () 
     fakeGit(root),
   );
   const params = {
-    agent: "worker",
-    task: "recover",
+    agent: 'worker',
+    task: 'recover',
     cwd: root,
     mission: false,
-    executionLifetime: { mode: "unbounded" },
+    executionLifetime: { mode: 'unbounded' },
   };
   const run = await registry.create({
     ...baseRun(root, planPath),
-    stage: "implementation",
+    stage: 'implementation',
     activeOperation: {
-      operationId: "operation-v2-absent",
-      service: "bridge",
-      kind: "implementation",
+      operationId: 'operation-v2-absent',
+      service: 'bridge',
+      kind: 'implementation',
       taskId: 1,
       params,
       requestDigest: bridgeRequestDigest(params),
-      expectedLifetime: { mode: "unbounded" },
+      expectedLifetime: { mode: 'unbounded' },
     },
   });
 
   const recovered = await controller.advance(run);
 
-  assert.equal(recovered.status, "running");
-  assert.equal(recovered.activeOperation?.externalRunId, "run-1");
-  assert.equal(recovered.activeOperation?.recovery, "observe");
+  assert.equal(recovered.status, 'running');
+  assert.equal(recovered.activeOperation?.externalRunId, 'run-1');
+  assert.equal(recovered.activeOperation?.recovery, 'observe');
   assert.equal(bridge.spawnCount, 1);
   assert.equal(bridge.lastSpawnParams?.mission, false);
 });
 
-test("controller refuses v2 absence without matching digest attestation", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  await writeFile(planPath, "### Task 1: Implement\n- [ ] Do the work\n");
-  const registry = new RunRegistry(join(root, "runs"));
-  const bridge = new UnattestedAbsentBridge(join(root, "none.json"));
+test('controller refuses v2 absence without matching digest attestation', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  await writeFile(planPath, '### Task 1: Implement\n- [ ] Do the work\n');
+  const registry = new RunRegistry(join(root, 'runs'));
+  const bridge = new UnattestedAbsentBridge(join(root, 'none.json'));
   const controller = new PlanExecController(
     registry,
     bridge,
@@ -1462,18 +1674,18 @@ test("controller refuses v2 absence without matching digest attestation", async 
     fakeGit(root),
   );
   const params = {
-    agent: "worker",
-    task: "recover",
+    agent: 'worker',
+    task: 'recover',
     cwd: root,
     mission: false,
   };
   const run = await registry.create({
     ...baseRun(root, planPath),
-    stage: "implementation",
+    stage: 'implementation',
     activeOperation: {
-      operationId: "operation-v2-unattested-absent",
-      service: "bridge",
-      kind: "implementation",
+      operationId: 'operation-v2-unattested-absent',
+      service: 'bridge',
+      kind: 'implementation',
       taskId: 1,
       params,
       requestDigest: bridgeRequestDigest(params),
@@ -1482,19 +1694,19 @@ test("controller refuses v2 absence without matching digest attestation", async 
 
   const recovered = await controller.advance(run);
 
-  assert.equal(recovered.status, "running");
-  assert.equal(recovered.activeOperation?.recovery, "recovery_required");
-  assert.equal(recovered.activeOperation?.lastObservedState, "unknown_launch");
+  assert.equal(recovered.status, 'running');
+  assert.equal(recovered.activeOperation?.recovery, 'recovery_required');
+  assert.equal(recovered.activeOperation?.lastObservedState, 'unknown_launch');
   assert.equal(bridge.spawnCount, 0);
 });
 
-test("concurrent controllers launch one bridge operation", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  const plan = "### Task 1: Implement\n- [ ] Do the work\n";
+test('concurrent controllers launch one bridge operation', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  const plan = '### Task 1: Implement\n- [ ] Do the work\n';
   await writeFile(planPath, plan);
-  const registry = new RunRegistry(join(root, "runs"));
-  const bridge = new FakeBridge(join(root, "none.json"));
+  const registry = new RunRegistry(join(root, 'runs'));
+  const bridge = new FakeBridge(join(root, 'none.json'));
   const first = new PlanExecController(
     registry,
     bridge,
@@ -1510,24 +1722,24 @@ test("concurrent controllers launch one bridge operation", async () => {
   const run = await registry.create({
     ...baseRun(root, planPath),
     planHash: parsePlan(planPath, plan).hash,
-    stage: "implementation",
+    stage: 'implementation',
   });
 
   await Promise.all([first.advance(run), second.advance(run)]);
 
   const stored = await registry.get(run.id);
   assert.equal(bridge.spawnCount, 1);
-  assert.equal(stored?.tasks?.["1"]?.attempts, 1);
-  assert.equal(stored?.tasks?.["1"]?.operationId !== undefined, true);
+  assert.equal(stored?.tasks?.['1']?.attempts, 1);
+  assert.equal(stored?.tasks?.['1']?.operationId !== undefined, true);
 });
 
-test("stale structure pause cannot erase a persisted launch intent", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  const plan = "### Task 1: Implement\n- [ ] Do the work\n";
+test('stale structure pause cannot erase a persisted launch intent', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  const plan = '### Task 1: Implement\n- [ ] Do the work\n';
   await writeFile(planPath, plan);
-  const registry = new RunRegistry(join(root, "runs"));
-  const bridge = new DeferredBridge(join(root, "none.json"));
+  const registry = new RunRegistry(join(root, 'runs'));
+  const bridge = new DeferredBridge(join(root, 'none.json'));
   const launchingController = new PlanExecController(
     registry,
     bridge,
@@ -1543,28 +1755,28 @@ test("stale structure pause cannot erase a persisted launch intent", async () =>
   const run = await registry.create({
     ...baseRun(root, planPath),
     planHash: parsePlan(planPath, plan).hash,
-    stage: "implementation",
+    stage: 'implementation',
   });
 
   const advancing = launchingController.advance(run);
   await bridge.spawned;
-  await writeFile(planPath, "### Task 1: Changed\n- [ ] Changed text\n");
+  await writeFile(planPath, '### Task 1: Changed\n- [ ] Changed text\n');
   const stale = await staleController.advance(run);
-  assert.equal(stale.status, "running");
+  assert.equal(stale.status, 'running');
   assert.equal(stale.activeOperation?.operationId !== undefined, true);
 
   bridge.completeSpawn();
   const attached = await advancing;
-  assert.equal(attached.status, "running");
-  assert.equal(attached.activeOperation?.externalRunId, "run-1");
+  assert.equal(attached.status, 'running');
+  assert.equal(attached.activeOperation?.externalRunId, 'run-1');
 });
 
-test("concurrent controllers launch one review operation and record one attempt", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
-  const registry = new RunRegistry(join(root, "runs"));
-  const bridge = new FakeBridge(join(root, "none.json"));
+test('concurrent controllers launch one review operation and record one attempt', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  await writeFile(planPath, '### Task 1: Implement\n- [x] Done\n');
+  const registry = new RunRegistry(join(root, 'runs'));
+  const bridge = new FakeBridge(join(root, 'none.json'));
   const first = new PlanExecController(
     registry,
     bridge,
@@ -1579,7 +1791,7 @@ test("concurrent controllers launch one review operation and record one attempt"
   );
   const run = await registry.create({
     ...baseRun(root, planPath),
-    stage: "comprehensive_review",
+    stage: 'comprehensive_review',
   });
 
   await Promise.all([first.advance(run), second.advance(run)]);
@@ -1590,13 +1802,13 @@ test("concurrent controllers launch one review operation and record one attempt"
   assert.equal(stored?.activeOperation?.operationId, undefined);
 });
 
-test("spawn reply preserves cancel requested while launch was pending", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  const plan = "### Task 1: Implement\n- [ ] Do the work\n";
+test('spawn reply preserves cancel requested while launch was pending', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  const plan = '### Task 1: Implement\n- [ ] Do the work\n';
   await writeFile(planPath, plan);
-  const registry = new RunRegistry(join(root, "runs"));
-  const bridge = new DeferredBridge(join(root, "none.json"));
+  const registry = new RunRegistry(join(root, 'runs'));
+  const bridge = new DeferredBridge(join(root, 'none.json'));
   const controller = new PlanExecController(
     registry,
     bridge,
@@ -1606,28 +1818,28 @@ test("spawn reply preserves cancel requested while launch was pending", async ()
   const run = await registry.create({
     ...baseRun(root, planPath),
     planHash: parsePlan(planPath, plan).hash,
-    stage: "implementation",
+    stage: 'implementation',
   });
 
   const advancing = controller.advance(run);
   await bridge.spawned;
   const launching = await registry.get(run.id);
   assert.ok(launching?.activeOperation);
-  await registry.update({ ...launching!, status: "cancel_pending" });
+  await registry.update({ ...required(launching), status: 'cancel_pending' });
   bridge.completeSpawn();
   const preserved = await advancing;
 
-  assert.equal(preserved.status, "cancel_pending");
-  assert.equal(preserved.activeOperation?.externalRunId, "run-1");
+  assert.equal(preserved.status, 'cancel_pending');
+  assert.equal(preserved.activeOperation?.externalRunId, 'run-1');
 });
 
-test("cancel waits for a pending spawn reply and then stops the child", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  const plan = "### Task 1: Implement\n- [ ] Do the work\n";
+test('cancel waits for a pending spawn reply and then stops the child', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  const plan = '### Task 1: Implement\n- [ ] Do the work\n';
   await writeFile(planPath, plan);
-  const registry = new RunRegistry(join(root, "runs"));
-  const bridge = new DeferredBridge(join(root, "none.json"));
+  const registry = new RunRegistry(join(root, 'runs'));
+  const bridge = new DeferredBridge(join(root, 'none.json'));
   const controller = new PlanExecController(
     registry,
     bridge,
@@ -1637,39 +1849,45 @@ test("cancel waits for a pending spawn reply and then stops the child", async ()
   const run = await registry.create({
     ...baseRun(root, planPath),
     planHash: parsePlan(planPath, plan).hash,
-    stage: "implementation",
+    stage: 'implementation',
   });
 
   const advancing = controller.advance(run);
   await bridge.spawned;
   const launching = await registry.get(run.id);
   const cancelPending = await registry.update({
-    ...launching!,
-    status: "cancel_pending",
+    ...required(launching),
+    status: 'cancel_pending',
   });
   const waiting = await controller.advance(cancelPending);
-  assert.equal(waiting.status, "cancel_pending");
+  assert.equal(waiting.status, 'cancel_pending');
   assert.equal(waiting.activeOperation?.externalRunId, undefined);
 
   bridge.completeSpawn();
   const attached = await advancing;
-  assert.equal(attached.status, "cancel_pending");
-  assert.equal(attached.activeOperation?.externalRunId, "run-1");
+  assert.equal(attached.status, 'cancel_pending');
+  assert.equal(attached.activeOperation?.externalRunId, 'run-1');
 
   const stopping = await controller.advance(attached);
-  assert.ok(stopping.status === "cancel_pending" || stopping.status === "cancelled");
-  if (stopping.status === "cancel_pending") assert.equal(stopping.activeOperation?.stopRequested, true);
-  const cancelled = stopping.status === "cancel_pending" ? await controller.advance(stopping) : stopping;
-  assert.equal(cancelled.status, "cancelled");
+  assert.ok(
+    stopping.status === 'cancel_pending' || stopping.status === 'cancelled',
+  );
+  if (stopping.status === 'cancel_pending')
+    assert.equal(stopping.activeOperation?.stopRequested, true);
+  const cancelled =
+    stopping.status === 'cancel_pending'
+      ? await controller.advance(stopping)
+      : stopping;
+  assert.equal(cancelled.status, 'cancelled');
   assert.equal(cancelled.activeOperation, undefined);
 });
 
-test("recent launch intent is not replayed while its spawn reply is pending", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  await writeFile(planPath, "### Task 1: Implement\n- [ ] Do the work\n");
-  const registry = new RunRegistry(join(root, "runs"));
-  const bridge = new FakeBridge(join(root, "none.json"));
+test('recent launch intent is not replayed while its spawn reply is pending', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  await writeFile(planPath, '### Task 1: Implement\n- [ ] Do the work\n');
+  const registry = new RunRegistry(join(root, 'runs'));
+  const bridge = new FakeBridge(join(root, 'none.json'));
   const controller = new PlanExecController(
     registry,
     bridge,
@@ -1678,13 +1896,13 @@ test("recent launch intent is not replayed while its spawn reply is pending", as
   );
   const run = await registry.create({
     ...baseRun(root, planPath),
-    stage: "implementation",
+    stage: 'implementation',
     activeOperation: {
-      operationId: "operation-launching",
-      service: "bridge",
-      kind: "implementation",
+      operationId: 'operation-launching',
+      service: 'bridge',
+      kind: 'implementation',
       taskId: 1,
-      params: { agent: "worker", task: "pending", cwd: root },
+      params: { agent: 'worker', task: 'pending', cwd: root },
       launchStartedAt: Date.now(),
     },
   });
@@ -1692,69 +1910,69 @@ test("recent launch intent is not replayed while its spawn reply is pending", as
   const observed = await controller.advance(run);
 
   assert.equal(bridge.spawnCount, 0);
-  assert.equal(observed.activeOperation?.operationId, "operation-launching");
-  assert.equal(observed.status, "running");
+  assert.equal(observed.activeOperation?.operationId, 'operation-launching');
+  assert.equal(observed.status, 'running');
 });
 
-test("bridge spawn contention schedules recovery while preserving the operation identity", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  const plan = "### Task 1: Implement\n- [ ] Do the work\n";
+test('bridge spawn contention schedules recovery while preserving the operation identity', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  const plan = '### Task 1: Implement\n- [ ] Do the work\n';
   await writeFile(planPath, plan);
-  const registry = new RunRegistry(join(root, "runs"));
+  const registry = new RunRegistry(join(root, 'runs'));
   const controller = new PlanExecController(
     registry,
-    new ContendedBridge(join(root, "none.json")),
+    new ContendedBridge(join(root, 'none.json')),
     new FakeFusion(),
     fakeGit(root),
   );
   const run = await registry.create({
     ...baseRun(root, planPath),
     planHash: parsePlan(planPath, plan).hash,
-    stage: "implementation",
+    stage: 'implementation',
   });
 
   const deferred = await controller.advance(run);
 
-  assert.equal(deferred.status, "running");
-  assert.match(deferred.error ?? "", /already in progress/);
+  assert.equal(deferred.status, 'running');
+  assert.match(deferred.error ?? '', /already in progress/);
   assert.equal(deferred.activeOperation?.externalRunId, undefined);
   assert.equal(deferred.activeOperation?.operationId !== undefined, true);
 });
 
-test("ambiguous spawn timeout schedules recovery while preserving the operation identity", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  const plan = "### Task 1: Implement\n- [ ] Do the work\n";
+test('ambiguous spawn timeout schedules recovery while preserving the operation identity', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  const plan = '### Task 1: Implement\n- [ ] Do the work\n';
   await writeFile(planPath, plan);
-  const registry = new RunRegistry(join(root, "runs"));
+  const registry = new RunRegistry(join(root, 'runs'));
   const controller = new PlanExecController(
     registry,
-    new TimedOutSpawnBridge(join(root, "none.json")),
+    new TimedOutSpawnBridge(join(root, 'none.json')),
     new FakeFusion(),
     fakeGit(root),
   );
   const run = await registry.create({
     ...baseRun(root, planPath),
     planHash: parsePlan(planPath, plan).hash,
-    stage: "implementation",
+    stage: 'implementation',
   });
 
   const deferred = await controller.advance(run);
 
-  assert.equal(deferred.status, "running");
-  assert.match(deferred.error ?? "", /timed out/);
+  assert.equal(deferred.status, 'running');
+  assert.match(deferred.error ?? '', /timed out/);
   assert.equal(deferred.activeOperation?.externalRunId, undefined);
   assert.equal(deferred.activeOperation?.operationId !== undefined, true);
 });
 
-test("malformed Fusion start keeps the required review operation owned", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  const outputPath = join(root, "review.txt");
-  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
-  await writeFile(outputPath, "NO_FINDINGS\n");
-  const registry = new RunRegistry(join(root, "runs"));
+test('malformed Fusion start keeps the required review operation owned', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  const outputPath = join(root, 'review.txt');
+  await writeFile(planPath, '### Task 1: Implement\n- [x] Done\n');
+  await writeFile(outputPath, 'NO_FINDINGS\n');
+  const registry = new RunRegistry(join(root, 'runs'));
   const bridge = new FakeBridge(outputPath);
   const controller = new PlanExecController(
     registry,
@@ -1764,25 +1982,28 @@ test("malformed Fusion start keeps the required review operation owned", async (
   );
   const run = await registry.create({
     ...baseRun(root, planPath),
-    stage: "fusion_review",
+    stage: 'fusion_review',
   });
 
   const launched = await controller.advance(run);
 
-  assert.equal(launched.status, "running");
-  assert.equal(launched.activeOperation?.service, "fusion");
-  assert.equal(launched.activeOperation?.recovery, "recovery_required");
-  assert.match(launched.error ?? "", /effective execution lifetime|immutable request digest|owned-process-tree/);
+  assert.equal(launched.status, 'running');
+  assert.equal(launched.activeOperation?.service, 'fusion');
+  assert.equal(launched.activeOperation?.recovery, 'recovery_required');
+  assert.match(
+    launched.error ?? '',
+    /effective execution lifetime|immutable request digest|owned-process-tree/,
+  );
   assert.equal(bridge.spawnCount, 0);
 });
 
-test("Fusion replay preserves the operation identity without unsafe fallback", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  const outputPath = join(root, "review.txt");
-  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
-  await writeFile(outputPath, "NO_FINDINGS\n");
-  const registry = new RunRegistry(join(root, "runs"));
+test('Fusion replay preserves the operation identity without unsafe fallback', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  const outputPath = join(root, 'review.txt');
+  await writeFile(planPath, '### Task 1: Implement\n- [x] Done\n');
+  await writeFile(outputPath, 'NO_FINDINGS\n');
+  const registry = new RunRegistry(join(root, 'runs'));
   const bridge = new FakeBridge(outputPath);
   const controller = new PlanExecController(
     registry,
@@ -1792,70 +2013,70 @@ test("Fusion replay preserves the operation identity without unsafe fallback", a
   );
   const run = await registry.create({
     ...baseRun(root, planPath),
-    stage: "fusion_review",
+    stage: 'fusion_review',
     activeOperation: {
-      operationId: "fusion-replay-operation",
-      service: "fusion",
-      kind: "fusion",
+      operationId: 'fusion-replay-operation',
+      service: 'fusion',
+      kind: 'fusion',
       reviewIteration: 1,
       launchStartedAt: 0,
-      recovery: "replay",
-      expectedLifetime: { mode: "unbounded" },
-      params: { prompt: "Persisted Fusion prompt" },
-      requestDigest: "digest-fusion-replay-operation",
+      recovery: 'replay',
+      expectedLifetime: { mode: 'unbounded' },
+      params: { prompt: 'Persisted Fusion prompt' },
+      requestDigest: 'digest-fusion-replay-operation',
     },
   });
 
   const launched = await controller.advance(run);
 
-  assert.equal(launched.activeOperation?.service, "fusion");
+  assert.equal(launched.activeOperation?.service, 'fusion');
   assert.equal(
     launched.activeOperation?.operationId,
-    "fusion-replay-operation",
+    'fusion-replay-operation',
   );
-  assert.equal(launched.activeOperation?.externalRunId, "fusion-1");
+  assert.equal(launched.activeOperation?.externalRunId, 'fusion-1');
   assert.equal(bridge.spawnCount, 0);
 });
 
-test("unknown persisted launch remains recoverable without a duplicate replay", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  await writeFile(planPath, "### Task 1: Implement\n- [ ] Do the work\n");
-  const registry = new RunRegistry(join(root, "runs"));
+test('unknown persisted launch remains recoverable without a duplicate replay', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  await writeFile(planPath, '### Task 1: Implement\n- [ ] Do the work\n');
+  const registry = new RunRegistry(join(root, 'runs'));
   const controller = new PlanExecController(
     registry,
-    new FakeBridge(join(root, "none.json")),
+    new FakeBridge(join(root, 'none.json')),
     new FakeFusion(),
     fakeGit(root),
   );
   const run = await registry.create({
     ...baseRun(root, planPath),
-    stage: "implementation",
+    stage: 'implementation',
     activeOperation: {
-      operationId: "operation-pending",
-      service: "bridge",
-      kind: "implementation",
+      operationId: 'operation-pending',
+      service: 'bridge',
+      kind: 'implementation',
       taskId: 1,
-      params: { agent: "worker", task: "pending", cwd: root },
+      params: { agent: 'worker', task: 'pending', cwd: root },
       launchStartedAt: 0,
     },
   });
 
   const deferred = await controller.advance(run);
 
-  assert.equal(deferred.status, "running");
-  assert.match(deferred.error ?? "", /refusing to launch a possible duplicate/);
-  assert.equal(deferred.activeOperation?.operationId, "operation-pending");
+  assert.equal(deferred.status, 'running');
+  assert.match(deferred.error ?? '', /refusing to launch a possible duplicate/);
+  assert.equal(deferred.activeOperation?.operationId, 'operation-pending');
   assert.equal(deferred.activeOperation?.externalRunId, undefined);
 });
 
-test("resume attaches a found bridge operation instead of spawning another child", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  const plan = "### Task 1: Implement\n- [ ] Do the work\n";
+test('resume attaches a found bridge operation instead of spawning another child', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  const plan = '### Task 1: Implement\n- [ ] Do the work\n';
   await writeFile(planPath, plan);
-  const registry = new RunRegistry(join(root, "runs"));
-  const bridge = new FoundOperationBridge(join(root, "none.json"));
+  const registry = new RunRegistry(join(root, 'runs'));
+  const bridge = new FoundOperationBridge(join(root, 'none.json'));
   const controller = new PlanExecController(
     registry,
     bridge,
@@ -1865,33 +2086,38 @@ test("resume attaches a found bridge operation instead of spawning another child
   const failed = await registry.create({
     ...baseRun(root, planPath),
     planHash: parsePlan(planPath, plan).hash,
-    status: "failed",
-    stage: "implementation",
-    error: "Unable to observe bridge/implementation (3/3): unavailable",
+    status: 'failed',
+    stage: 'implementation',
+    error: 'Unable to observe bridge/implementation (3/3): unavailable',
     activeOperation: {
-      operationId: "run-1",
-      service: "bridge",
-      kind: "implementation",
+      operationId: 'run-1',
+      service: 'bridge',
+      kind: 'implementation',
       taskId: 1,
-      requestDigest: "digest-run-1",
-      expectedLifetime: { mode: "unbounded" },
-      params: { agent: "worker", task: "Do the work", cwd: root, executionLifetime: { mode: "unbounded" } },
+      requestDigest: 'digest-run-1',
+      expectedLifetime: { mode: 'unbounded' },
+      params: {
+        agent: 'worker',
+        task: 'Do the work',
+        cwd: root,
+        executionLifetime: { mode: 'unbounded' },
+      },
     },
   });
 
-  const resumed = await controller.resume(failed.id, "session-1");
+  const resumed = await controller.resume(failed.id, 'session-1');
 
-  assert.equal(resumed.activeOperation?.externalRunId, "existing-run");
+  assert.equal(resumed.activeOperation?.externalRunId, 'existing-run');
   assert.equal(bridge.spawnCount, 0);
 });
 
-test("unknown bridge lookup stays recoverable without a duplicate spawn", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  const plan = "### Task 1: Implement\n- [ ] Do the work\n";
+test('unknown bridge lookup stays recoverable without a duplicate spawn', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  const plan = '### Task 1: Implement\n- [ ] Do the work\n';
   await writeFile(planPath, plan);
-  const registry = new RunRegistry(join(root, "runs"));
-  const bridge = new UnknownOperationBridge(join(root, "none.json"));
+  const registry = new RunRegistry(join(root, 'runs'));
+  const bridge = new UnknownOperationBridge(join(root, 'none.json'));
   const controller = new PlanExecController(
     registry,
     bridge,
@@ -1901,65 +2127,68 @@ test("unknown bridge lookup stays recoverable without a duplicate spawn", async 
   const failed = await registry.create({
     ...baseRun(root, planPath),
     planHash: parsePlan(planPath, plan).hash,
-    status: "failed",
-    stage: "implementation",
-    error: "Bridge spawn timed out.",
+    status: 'failed',
+    stage: 'implementation',
+    error: 'Bridge spawn timed out.',
     activeOperation: {
-      operationId: "operation-1",
-      service: "bridge",
-      kind: "implementation",
+      operationId: 'operation-1',
+      service: 'bridge',
+      kind: 'implementation',
       taskId: 1,
-      requestDigest: "digest-operation-1",
-      params: { agent: "worker", task: "Do the work", cwd: root },
+      requestDigest: 'digest-operation-1',
+      params: { agent: 'worker', task: 'Do the work', cwd: root },
     },
   });
 
-  const resumed = await controller.resume(failed.id, "session-1");
+  const resumed = await controller.resume(failed.id, 'session-1');
 
-  assert.equal(resumed.status, "running");
-  assert.match(resumed.error ?? "", /lookup is unresolved/);
+  assert.equal(resumed.status, 'running');
+  assert.match(resumed.error ?? '', /lookup is unresolved/);
   assert.equal(bridge.spawnCount, 0);
 });
 
-test("bridge lookup recovery handles pending and malformed outcomes without spawning", async () => {
+test('bridge lookup recovery handles pending and malformed outcomes without spawning', async () => {
   const cases: Array<{
     name: string;
     lookup: Record<string, unknown>;
-    status: "running" | "failed";
+    status: 'running' | 'failed';
     error?: RegExp;
   }> = [
     {
-      name: "pending",
-      lookup: { state: "pending" },
-      status: "running",
+      name: 'pending',
+      lookup: { state: 'pending' },
+      status: 'running',
     },
     {
-      name: "unknown",
-      lookup: { state: "unknown" },
-      status: "running",
+      name: 'unknown',
+      lookup: { state: 'unknown' },
+      status: 'running',
       error: /lookup is unresolved/,
     },
     {
-      name: "invalid state",
-      lookup: { state: "unexpected" },
-      status: "running",
+      name: 'invalid state',
+      lookup: { state: 'unexpected' },
+      status: 'running',
       error: /invalid state/,
     },
     {
-      name: "found without run ID",
-      lookup: { state: "found", effectiveExecutionLifetime: { mode: "unbounded" } },
-      status: "running",
+      name: 'found without run ID',
+      lookup: {
+        state: 'found',
+        effectiveExecutionLifetime: { mode: 'unbounded' },
+      },
+      status: 'running',
       error: /omitted a run ID/,
     },
   ];
   for (const testCase of cases) {
-    const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-    const planPath = join(root, "plan.md");
-    const plan = "### Task 1: Implement\n- [ ] Do the work\n";
+    const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+    const planPath = join(root, 'plan.md');
+    const plan = '### Task 1: Implement\n- [ ] Do the work\n';
     await writeFile(planPath, plan);
-    const registry = new RunRegistry(join(root, "runs"));
+    const registry = new RunRegistry(join(root, 'runs'));
     const bridge = new LookupOperationBridge(
-      join(root, "none.json"),
+      join(root, 'none.json'),
       testCase.lookup,
     );
     const controller = new PlanExecController(
@@ -1971,82 +2200,82 @@ test("bridge lookup recovery handles pending and malformed outcomes without spaw
     const failed = await registry.create({
       ...baseRun(root, planPath),
       planHash: parsePlan(planPath, plan).hash,
-      status: "failed",
-      stage: "implementation",
-      error: "Bridge spawn timed out.",
+      status: 'failed',
+      stage: 'implementation',
+      error: 'Bridge spawn timed out.',
       activeOperation: {
-        operationId: "operation-1",
-        service: "bridge",
-        kind: "implementation",
+        operationId: 'operation-1',
+        service: 'bridge',
+        kind: 'implementation',
         taskId: 1,
-        expectedLifetime: { mode: "unbounded" },
-        requestDigest: "digest-operation-1",
+        expectedLifetime: { mode: 'unbounded' },
+        requestDigest: 'digest-operation-1',
       },
     });
 
-    const recovered = await controller.resume(failed.id, "session-1");
+    const recovered = await controller.resume(failed.id, 'session-1');
 
     assert.equal(recovered.status, testCase.status, testCase.name);
     if (testCase.error)
-      assert.match(recovered.error ?? "", testCase.error, testCase.name);
+      assert.match(recovered.error ?? '', testCase.error, testCase.name);
     assert.equal(bridge.spawnCount, 0, testCase.name);
   }
 });
 
-test("resume retries reviewer stages beyond legacy attempt caps", async () => {
+test('resume retries reviewer stages beyond legacy attempt caps', async () => {
   const cases: Array<{
-    stage: "smells_review" | "comprehensive_review" | "fusion_review";
-    kind: "review" | "fusion";
-    service: "bridge" | "fusion";
+    stage: 'smells_review' | 'comprehensive_review' | 'fusion_review';
+    kind: 'review' | 'fusion';
+    service: 'bridge' | 'fusion';
     attempts: number;
   }> = [
     {
-      stage: "smells_review",
-      kind: "review",
-      service: "bridge",
+      stage: 'smells_review',
+      kind: 'review',
+      service: 'bridge',
       attempts: 1,
     },
     {
-      stage: "comprehensive_review",
-      kind: "review",
-      service: "bridge",
+      stage: 'comprehensive_review',
+      kind: 'review',
+      service: 'bridge',
       attempts: 5,
     },
     {
-      stage: "fusion_review",
-      kind: "fusion",
-      service: "fusion",
+      stage: 'fusion_review',
+      kind: 'fusion',
+      service: 'fusion',
       attempts: 10,
     },
   ];
   for (const testCase of cases) {
-    const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-    const planPath = join(root, "plan.md");
-    const plan = "### Task 1: Implement\n- [x] Done\n";
+    const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+    const planPath = join(root, 'plan.md');
+    const plan = '### Task 1: Implement\n- [x] Done\n';
     await writeFile(planPath, plan);
-    const registry = new RunRegistry(join(root, "runs"));
+    const registry = new RunRegistry(join(root, 'runs'));
     const controller = new PlanExecController(
       registry,
-      new FakeBridge(join(root, "none.json")),
+      new FakeBridge(join(root, 'none.json')),
       new FakeFusion(),
       fakeGit(root),
     );
     const failed = await registry.create({
       ...baseRun(root, planPath),
       planHash: parsePlan(planPath, plan).hash,
-      status: "failed",
+      status: 'failed',
       stage: testCase.stage,
       stageAttempts: { [testCase.stage]: testCase.attempts },
-      error: "Reviewer terminated without output.",
+      error: 'Reviewer terminated without output.',
       failedOperation: {
-        operationId: "review-operation",
+        operationId: 'review-operation',
         service: testCase.service,
         kind: testCase.kind,
         reviewIteration: testCase.attempts,
       },
     });
 
-    const resumed = await controller.resume(failed.id, "session-1");
+    const resumed = await controller.resume(failed.id, 'session-1');
 
     assert.equal(resumed.stage, testCase.stage, testCase.stage);
     assert.equal(resumed.stageAttempts[testCase.stage], testCase.attempts);
@@ -2054,28 +2283,28 @@ test("resume retries reviewer stages beyond legacy attempt caps", async () => {
   }
 });
 
-test("repeated cancellation failures keep the active child recoverable", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  await writeFile(planPath, "### Task 1: Implement\n- [ ] Do the work\n");
-  const registry = new RunRegistry(join(root, "runs"));
+test('repeated cancellation failures keep the active child recoverable', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  await writeFile(planPath, '### Task 1: Implement\n- [ ] Do the work\n');
+  const registry = new RunRegistry(join(root, 'runs'));
   const controller = new PlanExecController(
     registry,
-    new StopFailingBridge(join(root, "none.json")),
+    new StopFailingBridge(join(root, 'none.json')),
     new FakeFusion(),
     fakeGit(root),
   );
   let run = await registry.create({
     ...baseRun(root, planPath),
-    status: "cancel_pending",
-    stage: "implementation",
+    status: 'cancel_pending',
+    stage: 'implementation',
     activeOperation: {
-      operationId: "run-1",
-      service: "bridge",
-      kind: "implementation",
-      externalRunId: "run-1",
+      operationId: 'run-1',
+      service: 'bridge',
+      kind: 'implementation',
+      externalRunId: 'run-1',
       taskId: 1,
-      requestDigest: "digest-run-1",
+      requestDigest: 'digest-run-1',
     },
   });
 
@@ -2084,300 +2313,305 @@ test("repeated cancellation failures keep the active child recoverable", async (
     run = await registry.update({ ...run, nextAttemptAt: 0 });
   }
 
-  assert.ok(run.status === "cancel_pending" || run.status === "cancelled");
-  if (run.status === "cancel_pending") {
-    assert.equal(run.activeOperation?.externalRunId, "run-1");
+  assert.ok(run.status === 'cancel_pending' || run.status === 'cancelled');
+  if (run.status === 'cancel_pending') {
+    assert.equal(run.activeOperation?.externalRunId, 'run-1');
     assert.equal(run.activeOperation?.stopRequested, true);
     assert.equal(run.activeOperation?.statusFailures, 4);
-    assert.match(run.activeOperation?.lastStatusError ?? "", /stop unavailable/);
+    assert.match(
+      run.activeOperation?.lastStatusError ?? '',
+      /stop unavailable/,
+    );
   }
 });
 
-test("resume retries cancellation after a provider outage without launching work", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  const plan = "### Task 1: Implement\n- [ ] Do the work\n";
+test('resume retries cancellation after a provider outage without launching work', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  const plan = '### Task 1: Implement\n- [ ] Do the work\n';
   await writeFile(planPath, plan);
-  const registry = new RunRegistry(join(root, "runs"));
+  const registry = new RunRegistry(join(root, 'runs'));
   const failing = new PlanExecController(
     registry,
-    new StopFailingBridge(join(root, "none.json")),
+    new StopFailingBridge(join(root, 'none.json')),
     new FakeFusion(),
     fakeGit(root),
   );
   let run = await registry.create({
     ...baseRun(root, planPath),
     planHash: parsePlan(planPath, plan).hash,
-    status: "cancel_pending",
-    stage: "implementation",
+    status: 'cancel_pending',
+    stage: 'implementation',
     activeOperation: {
-      operationId: "run-1",
-      service: "bridge",
-      kind: "implementation",
-      externalRunId: "run-1",
+      operationId: 'run-1',
+      service: 'bridge',
+      kind: 'implementation',
+      externalRunId: 'run-1',
       taskId: 1,
-      requestDigest: "digest-run-1",
+      requestDigest: 'digest-run-1',
     },
   });
   for (let attempt = 0; attempt < 3; attempt += 1) {
     run = await failing.advance(run);
     run = await registry.update({ ...run, nextAttemptAt: 0 });
   }
-  assert.ok(run.status === "cancel_pending" || run.status === "cancelled");
-  if (run.status === "cancel_pending") assert.equal(run.activeOperation?.recovery, "cancel");
+  assert.ok(run.status === 'cancel_pending' || run.status === 'cancelled');
+  if (run.status === 'cancel_pending')
+    assert.equal(run.activeOperation?.recovery, 'cancel');
 
-  const recoveringBridge = new FakeBridge(join(root, "none.json"));
+  const recoveringBridge = new FakeBridge(join(root, 'none.json'));
   const recovering = new PlanExecController(
     registry,
     recoveringBridge,
     new FakeFusion(),
     fakeGit(root),
   );
-  const resumed = await recovering.resume(run.id, "session-1");
-  let cancelled = resumed.status === "cancelled" ? resumed : await recovering.advance(resumed);
-  if (cancelled.status === "cancel_pending") cancelled = await recovering.advance(cancelled);
+  const resumed = await recovering.resume(run.id, 'session-1');
+  let cancelled =
+    resumed.status === 'cancelled'
+      ? resumed
+      : await recovering.advance(resumed);
+  if (cancelled.status === 'cancel_pending')
+    cancelled = await recovering.advance(cancelled);
 
-  assert.equal(cancelled.status, "cancelled");
+  assert.equal(cancelled.status, 'cancelled');
   assert.equal(recoveringBridge.spawnCount, 0);
 });
 
-test("Fusion result failure remains owned for automatic recovery", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
-  const registry = new RunRegistry(join(root, "runs"));
+test('Fusion result failure remains owned for automatic recovery', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  await writeFile(planPath, '### Task 1: Implement\n- [x] Done\n');
+  const registry = new RunRegistry(join(root, 'runs'));
   const fusion = new ResultFailingFusion();
   const controller = new PlanExecController(
     registry,
-    new FakeBridge(join(root, "none.json")),
+    new FakeBridge(join(root, 'none.json')),
     fusion,
     fakeGit(root),
   );
   const run = await registry.create({
     ...baseRun(root, planPath),
-    stage: "fusion_review",
+    stage: 'fusion_review',
     activeOperation: {
-      operationId: "fusion-operation",
-      service: "fusion",
-      kind: "fusion",
-      externalRunId: "fusion-1",
-      requestDigest: "digest-fusion-operation",
+      operationId: 'fusion-operation',
+      service: 'fusion',
+      kind: 'fusion',
+      externalRunId: 'fusion-1',
+      requestDigest: 'digest-fusion-operation',
     },
   });
 
   const failed = await controller.advance(run);
   const terminal = await controller.advance(failed);
 
-  assert.equal(failed.status, "running");
-  assert.equal(failed.activeOperation?.operationId, "fusion-operation");
+  assert.equal(failed.status, 'running');
+  assert.equal(failed.activeOperation?.operationId, 'fusion-operation');
   assert.equal(terminal.updatedAt, failed.updatedAt);
   assert.equal(fusion.statusCount, 1);
   assert.equal(fusion.resultCount, 1);
 });
 
-test("Fusion review uses validated caller output instead of run.report", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
-  const registry = new RunRegistry(join(root, "runs"));
+test('Fusion review uses validated caller output instead of run.report', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  await writeFile(planPath, '### Task 1: Implement\n- [x] Done\n');
+  const registry = new RunRegistry(join(root, 'runs'));
   const controller = new PlanExecController(
     registry,
-    new FakeBridge(join(root, "none.json")),
+    new FakeBridge(join(root, 'none.json')),
     new ContradictoryReportFusion(),
     fakeGit(root),
   );
   const run = await registry.create({
     ...baseRun(root, planPath),
-    stage: "fusion_review",
+    stage: 'fusion_review',
     activeOperation: {
-      operationId: "fusion-operation",
-      service: "fusion",
-      kind: "fusion",
-      externalRunId: "fusion-1",
-      requestDigest: "digest-fusion-operation",
+      operationId: 'fusion-operation',
+      service: 'fusion',
+      kind: 'fusion',
+      externalRunId: 'fusion-1',
+      requestDigest: 'digest-fusion-operation',
     },
   });
 
   const advanced = await controller.advance(run);
 
-  assert.equal(advanced.stage, "stats");
+  assert.equal(advanced.stage, 'stats');
   assert.deepEqual(advanced.reviewFindings, []);
 });
 
-test("Fusion done without validated caller output schedules recovery", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
-  const registry = new RunRegistry(join(root, "runs"));
+test('Fusion done without validated caller output schedules recovery', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  await writeFile(planPath, '### Task 1: Implement\n- [x] Done\n');
+  const registry = new RunRegistry(join(root, 'runs'));
   const controller = new PlanExecController(
     registry,
-    new FakeBridge(join(root, "none.json")),
+    new FakeBridge(join(root, 'none.json')),
     new NoCallerOutputFusion(),
     fakeGit(root),
   );
   const run = await registry.create({
     ...baseRun(root, planPath),
-    stage: "fusion_review",
+    stage: 'fusion_review',
     activeOperation: {
-      operationId: "fusion-operation",
-      service: "fusion",
-      kind: "fusion",
-      externalRunId: "fusion-1",
-      requestDigest: "digest-fusion-operation",
+      operationId: 'fusion-operation',
+      service: 'fusion',
+      kind: 'fusion',
+      externalRunId: 'fusion-1',
+      requestDigest: 'digest-fusion-operation',
     },
   });
 
   const failed = await controller.advance(run);
 
-  assert.equal(failed.status, "running");
-  assert.match(failed.error ?? "", /validated caller output/);
-  assert.doesNotMatch(failed.error ?? "", /NO_FINDINGS/);
+  assert.equal(failed.status, 'running');
+  assert.match(failed.error ?? '', /validated caller output/);
+  assert.doesNotMatch(failed.error ?? '', /NO_FINDINGS/);
 });
 
-test("failed and cancelled Fusion runs preserve terminal phase errors", async () => {
+test('failed and cancelled Fusion runs preserve terminal phase errors', async () => {
   for (const terminal of [
-    { phase: "failed" as const, error: "provider quota exhausted" },
-    { phase: "cancelled" as const, error: "operator stopped Fusion" },
+    { phase: 'failed' as const, error: 'provider quota exhausted' },
+    { phase: 'cancelled' as const, error: 'operator stopped Fusion' },
   ]) {
-    const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-    const planPath = join(root, "plan.md");
-    await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
-    const registry = new RunRegistry(join(root, "runs"));
+    const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+    const planPath = join(root, 'plan.md');
+    await writeFile(planPath, '### Task 1: Implement\n- [x] Done\n');
+    const registry = new RunRegistry(join(root, 'runs'));
     const controller = new PlanExecController(
       registry,
-      new FakeBridge(join(root, "none.json")),
+      new FakeBridge(join(root, 'none.json')),
       new TerminalFusion(terminal.phase, terminal.error),
       fakeGit(root),
     );
     const run = await registry.create({
       ...baseRun(root, planPath),
-      stage: "fusion_review",
+      stage: 'fusion_review',
       activeOperation: {
-        operationId: "fusion-operation",
-        service: "fusion",
-        kind: "fusion",
-      externalRunId: "fusion-1",
-      requestDigest: "digest-fusion-operation",
-    },
+        operationId: 'fusion-operation',
+        service: 'fusion',
+        kind: 'fusion',
+        externalRunId: 'fusion-1',
+        requestDigest: 'digest-fusion-operation',
+      },
     });
 
     const failed = await controller.advance(run);
 
-    assert.equal(failed.status, "running", terminal.phase);
-    assert.match(failed.error ?? "", new RegExp(terminal.phase));
-    assert.match(failed.error ?? "", new RegExp(terminal.error));
-    assert.doesNotMatch(failed.error ?? "", /validated caller output/);
+    assert.equal(failed.status, 'running', terminal.phase);
+    assert.match(failed.error ?? '', new RegExp(terminal.phase));
+    assert.match(failed.error ?? '', new RegExp(terminal.error));
+    assert.doesNotMatch(failed.error ?? '', /validated caller output/);
   }
 });
 
-test("Fusion terminal errors are bounded before persistence", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
-  const longError = "x".repeat(5000);
-  const registry = new RunRegistry(join(root, "runs"));
+test('Fusion terminal errors are bounded before persistence', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  await writeFile(planPath, '### Task 1: Implement\n- [x] Done\n');
+  const longError = 'x'.repeat(5000);
+  const registry = new RunRegistry(join(root, 'runs'));
   const controller = new PlanExecController(
     registry,
-    new FakeBridge(join(root, "none.json")),
-    new TerminalFusion("failed", longError),
+    new FakeBridge(join(root, 'none.json')),
+    new TerminalFusion('failed', longError),
     fakeGit(root),
   );
   const run = await registry.create({
     ...baseRun(root, planPath),
-    stage: "fusion_review",
+    stage: 'fusion_review',
     activeOperation: {
-      operationId: "fusion-operation",
-      service: "fusion",
-      kind: "fusion",
-      externalRunId: "fusion-1",
-      requestDigest: "digest-fusion-operation",
+      operationId: 'fusion-operation',
+      service: 'fusion',
+      kind: 'fusion',
+      externalRunId: 'fusion-1',
+      requestDigest: 'digest-fusion-operation',
     },
   });
 
   const failed = await controller.advance(run);
 
-  assert.equal(
-    failed.error,
-    `Fusion run failed: ${longError.slice(0, 2_000)}`,
-  );
+  assert.equal(failed.error, `Fusion run failed: ${longError.slice(0, 2_000)}`);
 });
 
-test("Fusion recovery reuses the persisted prompt and profile", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
-  const registry = new RunRegistry(join(root, "runs"));
+test('Fusion recovery reuses the persisted prompt and profile', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  await writeFile(planPath, '### Task 1: Implement\n- [x] Done\n');
+  const registry = new RunRegistry(join(root, 'runs'));
   const fusion = new RecordingFusion();
   const controller = new PlanExecController(
     registry,
-    new FakeBridge(join(root, "none.json")),
+    new FakeBridge(join(root, 'none.json')),
     fusion,
     fakeGit(root),
   );
   const run = await registry.create({
     ...baseRun(root, planPath),
-    stage: "fusion_review",
+    stage: 'fusion_review',
     activeOperation: {
-      operationId: "fusion-operation",
-      service: "fusion",
-      kind: "fusion",
+      operationId: 'fusion-operation',
+      service: 'fusion',
+      kind: 'fusion',
       launchStartedAt: 0,
-      params: { prompt: "saved prompt", profile: "saved-profile" },
-      requestDigest: "digest-fusion-operation",
-      expectedLifetime: { mode: "unbounded" },
+      params: { prompt: 'saved prompt', profile: 'saved-profile' },
+      requestDigest: 'digest-fusion-operation',
+      expectedLifetime: { mode: 'unbounded' },
     },
   });
 
   const recovered = await controller.advance(run);
 
-  assert.equal(recovered.activeOperation?.externalRunId, "fusion-1");
+  assert.equal(recovered.activeOperation?.externalRunId, 'fusion-1');
   assert.deepEqual(fusion.startCalls, []);
 });
 
-test("archive records completed_with_findings when findings remain", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  const progressPath = join(root, "progress.txt");
-  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
-  await writeFile(progressPath, "");
-  const registry = new RunRegistry(join(root, "runs"));
+test('archive records completed_with_findings when findings remain', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  const progressPath = join(root, 'progress.txt');
+  await writeFile(planPath, '### Task 1: Implement\n- [x] Done\n');
+  await writeFile(progressPath, '');
+  const registry = new RunRegistry(join(root, 'runs'));
   const controller = new PlanExecController(
     registry,
-    new FakeBridge(join(root, "none.json")),
+    new FakeBridge(join(root, 'none.json')),
     new FakeFusion(),
     fakeGit(root),
   );
   const run = await registry.create({
     ...baseRun(root, planPath),
-    stage: "archive",
+    stage: 'archive',
     ...archiveAcceptance(),
     progressPath,
     unresolvedFindings: [
-      { id: "minor-1", severity: "MINOR", summary: "Known issue" },
+      { id: 'minor-1', severity: 'MINOR', summary: 'Known issue' },
     ],
   });
 
   const completed = await advanceThroughArchive(controller, run);
 
-  assert.equal(completed.status, "completed_with_findings");
-  assert.equal(completed.stage, "complete");
-  assert.match(await readFile(progressPath, "utf8"), /completed_with_findings/);
+  assert.equal(completed.status, 'completed_with_findings');
+  assert.equal(completed.stage, 'complete');
+  assert.match(await readFile(progressPath, 'utf8'), /completed_with_findings/);
 });
 
-test("archive retires the run record with a persisted retiredAt", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
-  const registry = new RunRegistry(join(root, "runs"));
+test('archive retires the run record with a persisted retiredAt', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  await writeFile(planPath, '### Task 1: Implement\n- [x] Done\n');
+  const registry = new RunRegistry(join(root, 'runs'));
   const controller = new PlanExecController(
     registry,
-    new FakeBridge(join(root, "none.json")),
+    new FakeBridge(join(root, 'none.json')),
     new FakeFusion(),
     fakeGit(root),
   );
   const run = await registry.create({
     ...baseRun(root, planPath),
-    stage: "archive",
+    stage: 'archive',
     ...archiveAcceptance(),
   });
   assert.equal(run.retiredAt, undefined);
@@ -2385,7 +2619,7 @@ test("archive retires the run record with a persisted retiredAt", async () => {
 
   const completed = await advanceThroughArchive(controller, run);
 
-  assert.equal(completed.status, "completed");
+  assert.equal(completed.status, 'completed');
   // release() rewrites the record after archive; the stamp must survive to disk.
   const reloaded = await registry.get(run.id);
   assert.ok(reloaded?.retiredAt);
@@ -2393,432 +2627,458 @@ test("archive retires the run record with a persisted retiredAt", async () => {
   assert.equal(reloaded.retiredAt, completed.retiredAt);
 });
 
-test("terminal progress dedupe is strict and serialized", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-progress-"));
-  const progressPath = join(root, ".ralphex", "progress", "progress-plan.txt");
-  await mkdir(join(root, ".ralphex", "progress"), { recursive: true });
+test('terminal progress dedupe is strict and serialized', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-progress-'));
+  const progressPath = join(root, '.ralphex', 'progress', 'progress-plan.txt');
+  await mkdir(join(root, '.ralphex', 'progress'), { recursive: true });
   const run = { progressPath } as PlanExecRun;
   await writeFile(
     progressPath,
-    "prefix [2024-01-02T03:04:05.000Z] Run completed as completed.\n[2024-99-99T03:04:05.000Z] Run completed as completed.\n",
+    'prefix [2024-01-02T03:04:05.000Z] Run completed as completed.\n[2024-99-99T03:04:05.000Z] Run completed as completed.\n',
   );
 
-  await appendProgressOnce(run, "Run completed as completed.");
+  await appendProgressOnce(run, 'Run completed as completed.');
   await Promise.all(
     Array.from({ length: 20 }, () =>
-      appendProgressOnce(run, "Concurrent terminal message."),
+      appendProgressOnce(run, 'Concurrent terminal message.'),
     ),
   );
   await Promise.all([
-    appendProgressOnce(run, "Archived path with\na newline."),
-    appendProgressOnce(run, "Archived path with\na newline."),
+    appendProgressOnce(run, 'Archived path with\na newline.'),
+    appendProgressOnce(run, 'Archived path with\na newline.'),
   ]);
 
-  const progress = await readFile(progressPath, "utf8");
+  const progress = await readFile(progressPath, 'utf8');
   assert.equal(
     progress
-      .split("\n")
+      .split('\n')
       .filter(
         (line) =>
           /^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\] Run completed as completed\.$/.test(
             line,
-          ) && !line.startsWith("[2024-99"),
+          ) && !line.startsWith('[2024-99'),
       ).length,
     1,
   );
   assert.equal(
-    (progress.match(/^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\] Concurrent terminal message\.$/gm) ?? []).length,
+    (
+      progress.match(
+        /^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\] Concurrent terminal message\.$/gm,
+      ) ?? []
+    ).length,
     1,
   );
-  assert.equal((progress.match(/\] Archived path with\na newline\./g) ?? []).length, 1);
+  assert.equal(
+    (progress.match(/\] Archived path with\na newline\./g) ?? []).length,
+    1,
+  );
   await assert.rejects(readFile(`${progressPath}.lock`), /ENOENT/);
 });
 
-test("archive commit failure remains resumable and retries idempotently", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
-  const registry = new RunRegistry(join(root, "runs"));
+test('archive commit failure remains resumable and retries idempotently', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  await writeFile(planPath, '### Task 1: Implement\n- [x] Done\n');
+  const registry = new RunRegistry(join(root, 'runs'));
   const failingGit = async (command: string, args: string[]) =>
-    args[0] === "commit"
-      ? { stdout: "", stderr: "commit failed", code: 1 }
-      : args[0] === "status"
-        ? { stdout: " M plan.md\0", stderr: "", code: 0 }
-      : fakeGit(root)(command, args);
+    args[0] === 'commit'
+      ? { stdout: '', stderr: 'commit failed', code: 1 }
+      : args[0] === 'status'
+        ? { stdout: ' M plan.md\0', stderr: '', code: 0 }
+        : fakeGit(root)(command, args);
   const failing = new PlanExecController(
     registry,
-    new FakeBridge(join(root, "none.json")),
+    new FakeBridge(join(root, 'none.json')),
     new FakeFusion(),
     failingGit,
   );
   const run = await registry.create({
     ...baseRun(root, planPath),
-    stage: "archive",
+    stage: 'archive',
     ...archiveAcceptance(),
   });
 
   const failed = await advanceThroughArchive(failing, run);
-  assert.equal(failed.status, "running");
-  assert.equal(failed.stage, "archive");
-  assert.match(failed.error ?? "", /commit failed/);
+  assert.equal(failed.status, 'running');
+  assert.equal(failed.stage, 'archive');
+  assert.match(failed.error ?? '', /commit failed/);
 
   const recovering = new PlanExecController(
     registry,
-    new FakeBridge(join(root, "none.json")),
+    new FakeBridge(join(root, 'none.json')),
     new FakeFusion(),
     fakeGit(root),
   );
-  const completed = await advanceThroughArchive(recovering, await recovering.resume(failed.id, "session-1"));
+  const completed = await advanceThroughArchive(
+    recovering,
+    await recovering.resume(failed.id, 'session-1'),
+  );
 
-  assert.equal(completed.status, "completed");
-  assert.equal(completed.stage, "complete");
+  assert.equal(completed.status, 'completed');
+  assert.equal(completed.stage, 'complete');
   assert.match(
-    await readFile(join(root, "completed", "plan.md"), "utf8"),
+    await readFile(join(root, 'completed', 'plan.md'), 'utf8'),
     /Task 1/,
   );
 });
 
-test("archive retry preserves a partially staged move and unrelated changes", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planName = ":(glob) plan-ü\n**.md";
+test('archive retry preserves a partially staged move and unrelated changes', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planName = ':(glob) plan-ü\n**.md';
   const planPath = join(root, planName);
-  const progressPath = join(root, ".ralphex", "progress", "progress-plan.txt");
-  const unrelatedPath = join(root, "unrelated.md");
-  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
-  await writeFile(unrelatedPath, "original\n");
-  await mkdir(join(root, ".ralphex", "progress"), { recursive: true });
+  const progressPath = join(root, '.ralphex', 'progress', 'progress-plan.txt');
+  const unrelatedPath = join(root, 'unrelated.md');
+  await writeFile(planPath, '### Task 1: Implement\n- [x] Done\n');
+  await writeFile(unrelatedPath, 'original\n');
+  await mkdir(join(root, '.ralphex', 'progress'), { recursive: true });
   await writeFile(
     progressPath,
-    `started\nnot-a-timestamp] Archived plan to ${join(root, "completed", planName)}.\n`,
+    `started\nnot-a-timestamp] Archived plan to ${join(root, 'completed', planName)}.\n`,
   );
-  await writeFile(join(root, ".gitignore"), ".ralphex/\nruns/\n");
+  await writeFile(join(root, '.gitignore'), '.ralphex/\nruns/\n');
   const git = realGit();
-  let branch = "";
+  let branch = '';
   for (const args of [
-    ["init", "--quiet"],
-    ["config", "user.email", "test@example.com"],
-    ["config", "user.name", "Plan Exec Test"],
-    ["add", "-A"],
-    ["commit", "--quiet", "-m", "initial"],
+    ['init', '--quiet'],
+    ['config', 'user.email', 'test@example.com'],
+    ['config', 'user.name', 'Plan Exec Test'],
+    ['add', '-A'],
+    ['commit', '--quiet', '-m', 'initial'],
   ]) {
-    const result = await git("git", args, root);
+    const result = await git('git', args, root);
     assert.equal(result.code, 0, result.stderr);
-    if (args[0] === "init") {
-      const current = await git("git", ["branch", "--show-current"], root);
+    if (args[0] === 'init') {
+      const current = await git('git', ['branch', '--show-current'], root);
       assert.equal(current.code, 0, current.stderr);
       branch = current.stdout.trim();
     }
   }
-  assert.notEqual(branch, "");
-  await writeFile(unrelatedPath, "changed\n");
-  const unrelatedStage = await git("git", ["add", "--", unrelatedPath], root);
+  assert.notEqual(branch, '');
+  await writeFile(unrelatedPath, 'changed\n');
+  const unrelatedStage = await git('git', ['add', '--', unrelatedPath], root);
   assert.equal(unrelatedStage.code, 0, unrelatedStage.stderr);
-  const registry = new RunRegistry(join(root, "runs"));
+  const registry = new RunRegistry(join(root, 'runs'));
   let failCommit = true;
-  const failingGit = async (
-    command: string,
-    args: string[],
-    cwd: string,
-  ) => {
-    if (args[0] === "commit" && failCommit) {
+  const failingGit = async (command: string, args: string[], cwd: string) => {
+    if (args[0] === 'commit' && failCommit) {
       failCommit = false;
-      return { stdout: "", stderr: "commit failed", code: 1 };
+      return { stdout: '', stderr: 'commit failed', code: 1 };
     }
     return git(command, args, cwd);
   };
   const failing = new PlanExecController(
     registry,
-    new FakeBridge(join(root, "none.json")),
+    new FakeBridge(join(root, 'none.json')),
     new FakeFusion(),
     failingGit,
   );
   const run = await registry.create({
     ...baseRun(root, planPath),
     branch,
-    stage: "archive",
+    stage: 'archive',
     ...archiveAcceptance(),
-    verifiedCommit: (await git("git", ["rev-parse", "HEAD"], root)).stdout.trim(),
-    reviewedCommit: (await git("git", ["rev-parse", "HEAD"], root)).stdout.trim(),
+    verifiedCommit: (
+      await git('git', ['rev-parse', 'HEAD'], root)
+    ).stdout.trim(),
+    reviewedCommit: (
+      await git('git', ['rev-parse', 'HEAD'], root)
+    ).stdout.trim(),
     progressPath,
   });
 
   const failed = await failing.advance(run);
-  assert.equal(failed.status, "running");
-  assert.equal(failed.stage, "archive");
-  const staged = await git("git", ["diff", "--cached", "--name-only"], root);
+  assert.equal(failed.status, 'running');
+  assert.equal(failed.stage, 'archive');
+  const staged = await git('git', ['diff', '--cached', '--name-only'], root);
   assert.equal(staged.code, 0, staged.stderr);
   assert.match(staged.stdout, /unrelated\.md/);
 
   const recovering = new PlanExecController(
     registry,
-    new FakeBridge(join(root, "none.json")),
+    new FakeBridge(join(root, 'none.json')),
     new FakeFusion(),
     git,
   );
-  const completed = await recovering.resume(failed.id, "session-1");
+  const completed = await recovering.resume(failed.id, 'session-1');
 
-  assert.equal(completed.status, "running");
-  assert.equal(completed.stage, "archive");
-  assert.match(completed.error ?? "", /Uncommitted source changes/);
-  assert.match(
-    await readFile(planPath, "utf8"),
-    /Task 1/,
+  assert.equal(completed.status, 'running');
+  assert.equal(completed.stage, 'archive');
+  assert.match(completed.error ?? '', /Uncommitted source changes/);
+  assert.match(await readFile(planPath, 'utf8'), /Task 1/);
+  const progress = await readFile(progressPath, 'utf8');
+  assert.equal(
+    (progress.match(/\[[^\]\n]+\] Archived plan to/g) ?? []).length,
+    0,
   );
-  const progress = await readFile(progressPath, "utf8");
-  assert.equal((progress.match(/\[[^\]\n]+\] Archived plan to/g) ?? []).length, 0);
-  assert.equal((progress.match(/\[[^\]\n]+\] Run completed as completed/g) ?? []).length, 0);
-  const committed = await git("git", ["show", "--format=", "--name-only", "HEAD"], root);
+  assert.equal(
+    (progress.match(/\[[^\]\n]+\] Run completed as completed/g) ?? []).length,
+    0,
+  );
+  const committed = await git(
+    'git',
+    ['show', '--format=', '--name-only', 'HEAD'],
+    root,
+  );
   assert.equal(committed.code, 0, committed.stderr);
-  const clean = await git("git", ["status", "--porcelain"], root);
+  const clean = await git('git', ['status', '--porcelain'], root);
   assert.equal(clean.code, 0);
-  assert.equal(clean.stdout, "M  unrelated.md\n");
+  assert.equal(clean.stdout, 'M  unrelated.md\n');
 });
 
-test("archive refuses an untracked source without a committed candidate", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "untracked-plan.md");
-  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
-  await writeFile(join(root, ".gitignore"), ".ralphex/\nruns/\n");
+test('archive refuses an untracked source without a committed candidate', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'untracked-plan.md');
+  await writeFile(planPath, '### Task 1: Implement\n- [x] Done\n');
+  await writeFile(join(root, '.gitignore'), '.ralphex/\nruns/\n');
   const git = realGit();
   for (const args of [
-    ["init", "--quiet"],
-    ["config", "user.email", "test@example.com"],
-    ["config", "user.name", "Plan Exec Test"],
-    ["add", ".gitignore"],
-    ["commit", "--quiet", "-m", "initial"],
+    ['init', '--quiet'],
+    ['config', 'user.email', 'test@example.com'],
+    ['config', 'user.name', 'Plan Exec Test'],
+    ['add', '.gitignore'],
+    ['commit', '--quiet', '-m', 'initial'],
   ]) {
-    const result = await git("git", args, root);
+    const result = await git('git', args, root);
     assert.equal(result.code, 0, result.stderr);
   }
-  const branchResult = await git("git", ["branch", "--show-current"], root);
+  const branchResult = await git('git', ['branch', '--show-current'], root);
   assert.equal(branchResult.code, 0, branchResult.stderr);
-  const progressPath = join(root, ".ralphex", "progress", "progress-plan.txt");
-  const registry = new RunRegistry(join(root, "runs"));
+  const progressPath = join(root, '.ralphex', 'progress', 'progress-plan.txt');
+  const registry = new RunRegistry(join(root, 'runs'));
   const controller = new PlanExecController(
     registry,
-    new FakeBridge(join(root, "none.json")),
+    new FakeBridge(join(root, 'none.json')),
     new FakeFusion(),
     git,
   );
   const run = await registry.create({
     ...baseRun(root, planPath),
     branch: branchResult.stdout.trim(),
-    stage: "archive",
+    stage: 'archive',
     ...archiveAcceptance(),
-    verifiedCommit: (await git("git", ["rev-parse", "HEAD"], root)).stdout.trim(),
-    reviewedCommit: (await git("git", ["rev-parse", "HEAD"], root)).stdout.trim(),
+    verifiedCommit: (
+      await git('git', ['rev-parse', 'HEAD'], root)
+    ).stdout.trim(),
+    reviewedCommit: (
+      await git('git', ['rev-parse', 'HEAD'], root)
+    ).stdout.trim(),
     progressPath,
   });
 
   const completed = await controller.advance(run);
 
-  assert.equal(completed.status, "running");
-  assert.match(completed.error ?? "", /exists on disk, but not in/);
-  assert.match(await readFile(planPath, "utf8"), /Task 1/);
+  assert.equal(completed.status, 'running');
+  assert.match(completed.error ?? '', /exists on disk, but not in/);
+  assert.match(await readFile(planPath, 'utf8'), /Task 1/);
 });
 
-test("archive does not mark a committed move failed when registry finalization retries", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
-  const registry = new FinalizationFailingRegistry(join(root, "runs"));
+test('archive does not mark a committed move failed when registry finalization retries', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  await writeFile(planPath, '### Task 1: Implement\n- [x] Done\n');
+  const registry = new FinalizationFailingRegistry(join(root, 'runs'));
   const controller = new PlanExecController(
     registry,
-    new FakeBridge(join(root, "none.json")),
+    new FakeBridge(join(root, 'none.json')),
     new FakeFusion(),
     fakeGit(root),
   );
   const run = await registry.create({
     ...baseRun(root, planPath),
-    stage: "archive",
+    stage: 'archive',
     ...archiveAcceptance(),
   });
 
   const afterCommit = await advanceThroughArchive(controller, run);
 
-  assert.equal(afterCommit.status, "completed");
-  assert.equal(afterCommit.stage, "complete");
-  assert.equal((await registry.get(run.id))?.status, "completed");
+  assert.equal(afterCommit.status, 'completed');
+  assert.equal(afterCommit.stage, 'complete');
+  assert.equal((await registry.get(run.id))?.status, 'completed');
   assert.match(
-    await readFile(join(root, "completed", "plan.md"), "utf8"),
+    await readFile(join(root, 'completed', 'plan.md'), 'utf8'),
     /Task 1/,
   );
-
 });
 
-test("archive recreates a missing progress artifact after the plan move", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  const progressPath = join(root, ".ralphex", "progress", "progress-plan.txt");
-  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
-  const registry = new RunRegistry(join(root, "runs"));
+test('archive recreates a missing progress artifact after the plan move', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  const progressPath = join(root, '.ralphex', 'progress', 'progress-plan.txt');
+  await writeFile(planPath, '### Task 1: Implement\n- [x] Done\n');
+  const registry = new RunRegistry(join(root, 'runs'));
   const controller = new PlanExecController(
     registry,
-    new FakeBridge(join(root, "none.json")),
+    new FakeBridge(join(root, 'none.json')),
     new FakeFusion(),
     fakeGit(root),
   );
   const run = await registry.create({
     ...baseRun(root, planPath),
-    stage: "archive",
+    stage: 'archive',
     ...archiveAcceptance(),
     progressPath,
   });
 
   const completed = await advanceThroughArchive(controller, run);
 
-  assert.equal(completed.status, "completed");
-  assert.match(await readFile(progressPath, "utf8"), /Archival prepared for completed; waiting for owned Git commands to retire/);
+  assert.equal(completed.status, 'completed');
+  assert.match(
+    await readFile(progressPath, 'utf8'),
+    /Archival prepared for completed; waiting for owned Git commands to retire/,
+  );
 });
 
-test("archive recovery completes after a committed plan move without committing again", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  const destination = join(root, "completed", "plan.md");
-  await mkdir(join(root, "completed"), { recursive: true });
-  await writeFile(destination, "### Task 1: Implement\n- [x] Done\n");
-  const registry = new RunRegistry(join(root, "runs"));
+test('archive recovery completes after a committed plan move without committing again', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  const destination = join(root, 'completed', 'plan.md');
+  await mkdir(join(root, 'completed'), { recursive: true });
+  await writeFile(destination, '### Task 1: Implement\n- [x] Done\n');
+  const registry = new RunRegistry(join(root, 'runs'));
   let commits = 0;
   const gitAfterCommit = async (_command: string, args: string[]) => {
-    if (args[0] === "status") return { stdout: "", stderr: "", code: 0 };
-    if (args[0] === "commit") {
+    if (args[0] === 'status') return { stdout: '', stderr: '', code: 0 };
+    if (args[0] === 'commit') {
       commits += 1;
-      return { stdout: "", stderr: "", code: 0 };
+      return { stdout: '', stderr: '', code: 0 };
     }
-    return fakeGit(root)("git", args);
+    return fakeGit(root)('git', args);
   };
   const controller = new PlanExecController(
     registry,
-    new FakeBridge(join(root, "none.json")),
+    new FakeBridge(join(root, 'none.json')),
     new FakeFusion(),
     gitAfterCommit,
   );
   const failed = await registry.create({
     ...baseRun(root, planPath),
-    status: "failed",
-    stage: "archive",
+    status: 'failed',
+    stage: 'archive',
     ...archiveAcceptance(),
-    error: "Pi stopped after archive commit.",
+    error: 'Pi stopped after archive commit.',
   });
 
-  const completed = await advanceThroughArchive(controller, await controller.resume(failed.id, "session-1"));
+  const completed = await advanceThroughArchive(
+    controller,
+    await controller.resume(failed.id, 'session-1'),
+  );
 
-  assert.equal(completed.status, "completed");
+  assert.equal(completed.status, 'completed');
   assert.equal(commits, 0);
-  assert.match(await readFile(destination, "utf8"), /Task 1/);
+  assert.match(await readFile(destination, 'utf8'), /Task 1/);
 });
 
-test("explicit recovery can adopt the verified current execution branch", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  const plan = "### Task 1: Implement\n- [x] Done\n";
+test('explicit recovery can adopt the verified current execution branch', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  const plan = '### Task 1: Implement\n- [x] Done\n';
   await writeFile(planPath, plan);
-  const registry = new RunRegistry(join(root, "runs"));
-  const bridge = new FakeBridge(join(root, "none.json"));
+  const registry = new RunRegistry(join(root, 'runs'));
+  const bridge = new FakeBridge(join(root, 'none.json'));
   const controller = new PlanExecController(
     registry,
     bridge,
     new FakeFusion(),
-    fakeGit(root, "feature/current"),
+    fakeGit(root, 'feature/current'),
   );
   const stale = await registry.create({
     ...baseRun(root, planPath),
     planHash: parsePlan(planPath, plan).hash,
-    branch: "master",
-    status: "failed",
-    stage: "smells_review",
-    error: "Execution directory is on feature/current, expected master.",
+    branch: 'master',
+    status: 'failed',
+    stage: 'smells_review',
+    error: 'Execution directory is on feature/current, expected master.',
   });
 
-  const rebound = await controller.rebindBranchAndResume(stale.id, "session-1");
+  const rebound = await controller.rebindBranchAndResume(stale.id, 'session-1');
 
-  assert.equal(rebound.branch, "feature/current");
-  assert.equal(rebound.activeOperation?.kind, "review");
+  assert.equal(rebound.branch, 'feature/current');
+  assert.equal(rebound.activeOperation?.kind, 'review');
   assert.deepEqual(rebound.branchRebindings, [
     {
-      from: "master",
-      to: "feature/current",
+      from: 'master',
+      to: 'feature/current',
       requestedAt: rebound.branchRebindings[0]?.requestedAt,
-      requestedBy: "session-1",
+      requestedBy: 'session-1',
     },
   ]);
   assert.equal(bridge.spawnCount, 1);
 });
 
-test("branch adoption rejects a run with an active child", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
-  const registry = new RunRegistry(join(root, "runs"));
+test('branch adoption rejects a run with an active child', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  await writeFile(planPath, '### Task 1: Implement\n- [x] Done\n');
+  const registry = new RunRegistry(join(root, 'runs'));
   const controller = new PlanExecController(
     registry,
-    new FakeBridge(join(root, "none.json")),
+    new FakeBridge(join(root, 'none.json')),
     new FakeFusion(),
-    fakeGit(root, "feature/current"),
+    fakeGit(root, 'feature/current'),
   );
   const busy = await registry.create({
     ...baseRun(root, planPath),
-    branch: "master",
-    status: "running",
-    stage: "smells_review",
+    branch: 'master',
+    status: 'running',
+    stage: 'smells_review',
     activeOperation: {
-      operationId: "live-review",
-      service: "bridge",
-      kind: "review",
-      externalRunId: "live-run",
+      operationId: 'live-review',
+      service: 'bridge',
+      kind: 'review',
+      externalRunId: 'live-run',
     },
   });
 
   await assert.rejects(
-    controller.rebindBranchAndResume(busy.id, "session-1"),
+    controller.rebindBranchAndResume(busy.id, 'session-1'),
     /external operation is tracked/,
   );
 });
 
-test("force skip advances a failed review and preserves findings as unresolved", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
-  const registry = new RunRegistry(join(root, "runs"));
+test('force skip advances a failed review and preserves findings as unresolved', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  await writeFile(planPath, '### Task 1: Implement\n- [x] Done\n');
+  const registry = new RunRegistry(join(root, 'runs'));
   const controller = new PlanExecController(
     registry,
-    new FakeBridge(join(root, "none.json")),
+    new FakeBridge(join(root, 'none.json')),
     new FakeFusion(),
     fakeGit(root),
   );
   const failed = await registry.create({
     ...baseRun(root, planPath),
     config: { ...baseRun(root, planPath).config, reviewRequired: false },
-    status: "failed",
-    stage: "comprehensive_review",
+    status: 'failed',
+    stage: 'comprehensive_review',
     reviewFindings: [
-      { id: "major-1", severity: "MAJOR", summary: "Unresolved defect" },
+      { id: 'major-1', severity: 'MAJOR', summary: 'Unresolved defect' },
     ],
-    error: "Fix operation ended as stopped.",
+    error: 'Fix operation ended as stopped.',
   });
 
   const skipped = await controller.skip(
     failed.id,
-    "session-1",
-    "review loop is repeating an already evaluated finding",
+    'session-1',
+    'review loop is repeating an already evaluated finding',
   );
 
-  assert.equal(skipped.status, "running");
-  assert.equal(skipped.stage, "smells_review");
+  assert.equal(skipped.status, 'running');
+  assert.equal(skipped.stage, 'smells_review');
   assert.equal(skipped.pendingStageSkip, undefined);
   assert.equal(skipped.skippedStages.length, 1);
-  assert.equal(skipped.skippedStages[0]?.stage, "comprehensive_review");
-  assert.equal(skipped.skippedStages[0]?.requestedBy, "session-1");
-  assert.equal(skipped.unresolvedFindings[0]?.id, "major-1");
+  assert.equal(skipped.skippedStages[0]?.stage, 'comprehensive_review');
+  assert.equal(skipped.skippedStages[0]?.requestedBy, 'session-1');
+  assert.equal(skipped.unresolvedFindings[0]?.id, 'major-1');
 });
 
-test("force skip stops a live fixer before advancing", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
-  const registry = new RunRegistry(join(root, "runs"));
-  const bridge = new SkippableRunningBridge(join(root, "none.json"));
-  bridge.bindOperation("live-run", "live-fix", "digest-live-fix");
+test('force skip stops a live fixer before advancing', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  await writeFile(planPath, '### Task 1: Implement\n- [x] Done\n');
+  const registry = new RunRegistry(join(root, 'runs'));
+  const bridge = new SkippableRunningBridge(join(root, 'none.json'));
+  bridge.bindOperation('live-run', 'live-fix', 'digest-live-fix');
   const controller = new PlanExecController(
     registry,
     bridge,
@@ -2828,51 +3088,51 @@ test("force skip stops a live fixer before advancing", async () => {
   const failed = await registry.create({
     ...baseRun(root, planPath),
     config: { ...baseRun(root, planPath).config, reviewRequired: false },
-    status: "failed",
-    stage: "comprehensive_review",
+    status: 'failed',
+    stage: 'comprehensive_review',
     activeOperation: {
-      operationId: "live-fix",
-      service: "bridge",
-      kind: "fix",
-      externalRunId: "live-run",
-      asyncDir: "/tmp/live-run",
+      operationId: 'live-fix',
+      service: 'bridge',
+      kind: 'fix',
+      externalRunId: 'live-run',
+      asyncDir: '/tmp/live-run',
       reviewIteration: 2,
-      requestDigest: "digest-live-fix",
+      requestDigest: 'digest-live-fix',
     },
-    error: "Unable to observe bridge/fix (3/3): unavailable",
+    error: 'Unable to observe bridge/fix (3/3): unavailable',
   });
 
   const stopping = await controller.skip(
     failed.id,
-    "session-1",
-    "operator accepted the remaining review risk",
+    'session-1',
+    'operator accepted the remaining review risk',
   );
 
-  assert.equal(stopping.status, "skip_pending");
-  assert.equal(stopping.stage, "comprehensive_review");
+  assert.equal(stopping.status, 'skip_pending');
+  assert.equal(stopping.stage, 'comprehensive_review');
   assert.equal(stopping.activeOperation?.stopRequested, true);
   assert.equal(
     stopping.pendingStageSkip?.reason,
-    "operator accepted the remaining review risk",
+    'operator accepted the remaining review risk',
   );
   assert.equal(bridge.stopCount, 1);
   assert.equal(bridge.spawnCount, 0);
 
-  bridge.state = "stopped";
+  bridge.state = 'stopped';
   const skipped = await controller.advance(stopping);
-  assert.equal(skipped.status, "running");
-  assert.equal(skipped.stage, "smells_review");
-  assert.equal(skipped.activeOperation?.kind, "review");
-  assert.equal(skipped.skippedStages[0]?.terminalOperationState, "stopped");
+  assert.equal(skipped.status, 'running');
+  assert.equal(skipped.stage, 'smells_review');
+  assert.equal(skipped.activeOperation?.kind, 'review');
+  assert.equal(skipped.skippedStages[0]?.terminalOperationState, 'stopped');
 });
 
-test("force skip does not treat an absent operation as terminal", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
-  const registry = new RunRegistry(join(root, "runs"));
-  const bridge = new LookupOperationBridge(join(root, "none.json"), {
-    state: "absent",
+test('force skip does not treat an absent operation as terminal', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  await writeFile(planPath, '### Task 1: Implement\n- [x] Done\n');
+  const registry = new RunRegistry(join(root, 'runs'));
+  const bridge = new LookupOperationBridge(join(root, 'none.json'), {
+    state: 'absent',
   });
   const controller = new PlanExecController(
     registry,
@@ -2883,36 +3143,36 @@ test("force skip does not treat an absent operation as terminal", async () => {
   const failed = await registry.create({
     ...baseRun(root, planPath),
     config: { ...baseRun(root, planPath).config, reviewRequired: false },
-    status: "failed",
-    stage: "comprehensive_review",
+    status: 'failed',
+    stage: 'comprehensive_review',
     activeOperation: {
-      operationId: "uncertain-fix",
-      service: "bridge",
-      kind: "fix",
+      operationId: 'uncertain-fix',
+      service: 'bridge',
+      kind: 'fix',
       reviewIteration: 2,
     },
-    error: "Launch outcome is unknown.",
+    error: 'Launch outcome is unknown.',
   });
 
   const pending = await controller.skip(
     failed.id,
-    "session-1",
-    "operator accepts review risk",
+    'session-1',
+    'operator accepts review risk',
   );
 
-  assert.equal(pending.status, "skip_pending");
-  assert.equal(pending.stage, "comprehensive_review");
+  assert.equal(pending.status, 'skip_pending');
+  assert.equal(pending.stage, 'comprehensive_review');
   assert.equal(pending.skippedStages.length, 0);
-  assert.match(pending.activeOperation?.lastSkipError ?? "", /cannot prove/);
+  assert.match(pending.activeOperation?.lastSkipError ?? '', /cannot prove/);
 });
 
-test("force skip does not treat unknown bridge states as terminal", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
-  const registry = new RunRegistry(join(root, "runs"));
-  const bridge = new SkippableRunningBridge(join(root, "none.json"));
-  bridge.state = "mystery";
+test('force skip does not treat unknown bridge states as terminal', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  await writeFile(planPath, '### Task 1: Implement\n- [x] Done\n');
+  const registry = new RunRegistry(join(root, 'runs'));
+  const bridge = new SkippableRunningBridge(join(root, 'none.json'));
+  bridge.state = 'mystery';
   const controller = new PlanExecController(
     registry,
     bridge,
@@ -2922,83 +3182,83 @@ test("force skip does not treat unknown bridge states as terminal", async () => 
   const failed = await registry.create({
     ...baseRun(root, planPath),
     config: { ...baseRun(root, planPath).config, reviewRequired: false },
-    status: "failed",
-    stage: "comprehensive_review",
+    status: 'failed',
+    stage: 'comprehensive_review',
     activeOperation: {
-      operationId: "mystery-fix",
-      service: "bridge",
-      kind: "fix",
-      externalRunId: "mystery-run",
+      operationId: 'mystery-fix',
+      service: 'bridge',
+      kind: 'fix',
+      externalRunId: 'mystery-run',
     },
-    error: "Unknown provider state.",
+    error: 'Unknown provider state.',
   });
 
   const pending = await controller.skip(
     failed.id,
-    "session-1",
-    "operator accepts review risk",
+    'session-1',
+    'operator accepts review risk',
   );
 
-  assert.equal(pending.status, "skip_pending");
-  assert.equal(pending.stage, "comprehensive_review");
+  assert.equal(pending.status, 'skip_pending');
+  assert.equal(pending.stage, 'comprehensive_review');
   assert.equal(pending.skippedStages.length, 0);
   assert.equal(pending.activeOperation?.skipFailures, 1);
   assert.equal(bridge.stopCount, 1);
 
   const retried = await controller.advance(pending);
-  assert.equal(retried.status, "skip_pending");
+  assert.equal(retried.status, 'skip_pending');
   assert.equal(retried.activeOperation?.skipFailures, 2);
   const failedAgain = await controller.advance(retried);
-  assert.equal(failedAgain.status, "skip_pending");
+  assert.equal(failedAgain.status, 'skip_pending');
   assert.equal(failedAgain.activeOperation?.skipFailures, 3);
-  assert.equal(failedAgain.pendingStageSkip?.stage, "comprehensive_review");
+  assert.equal(failedAgain.pendingStageSkip?.stage, 'comprehensive_review');
 });
 
-test("force skip recovers a Fusion launch before stopping it", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
-  const registry = new RunRegistry(join(root, "runs"));
+test('force skip recovers a Fusion launch before stopping it', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  await writeFile(planPath, '### Task 1: Implement\n- [x] Done\n');
+  const registry = new RunRegistry(join(root, 'runs'));
   const fusion = new SkippableFusion();
   const controller = new PlanExecController(
     registry,
-    new FakeBridge(join(root, "none.json")),
+    new FakeBridge(join(root, 'none.json')),
     fusion,
     fakeGit(root),
   );
   const failed = await registry.create({
     ...baseRun(root, planPath),
     config: { ...baseRun(root, planPath).config, reviewRequired: false },
-    status: "failed",
-    stage: "fusion_review",
+    status: 'failed',
+    stage: 'fusion_review',
     activeOperation: {
-      operationId: "fusion-launch",
-      service: "fusion",
-      kind: "fusion",
-      params: { prompt: "Review this diff", profile: "default" },
+      operationId: 'fusion-launch',
+      service: 'fusion',
+      kind: 'fusion',
+      params: { prompt: 'Review this diff', profile: 'default' },
     },
-    error: "Fusion launch response was lost.",
+    error: 'Fusion launch response was lost.',
   });
 
   const pending = await controller.skip(
     failed.id,
-    "session-1",
-    "operator accepts remaining Fusion risk",
+    'session-1',
+    'operator accepts remaining Fusion risk',
   );
 
-  assert.equal(pending.status, "skip_pending");
-  assert.equal(pending.activeOperation?.externalRunId, "recovered-fusion");
+  assert.equal(pending.status, 'skip_pending');
+  assert.equal(pending.activeOperation?.externalRunId, 'recovered-fusion');
   assert.equal(pending.activeOperation?.stopRequested, true);
   assert.equal(fusion.startCount, 0);
   assert.equal(fusion.cancelCount, 1);
 });
 
-test("Fusion fallback preserves pending force-skip state", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
-  const registry = new RunRegistry(join(root, "runs"));
-  const bridge = new FakeBridge(join(root, "none.json"));
+test('Fusion fallback preserves pending force-skip state', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  await writeFile(planPath, '### Task 1: Implement\n- [x] Done\n');
+  const registry = new RunRegistry(join(root, 'runs'));
+  const bridge = new FakeBridge(join(root, 'none.json'));
   const controller = new PlanExecController(
     registry,
     bridge,
@@ -3008,43 +3268,43 @@ test("Fusion fallback preserves pending force-skip state", async () => {
   const failed = await registry.create({
     ...baseRun(root, planPath),
     config: { ...baseRun(root, planPath).config, reviewRequired: false },
-    status: "failed",
-    stage: "fusion_review",
+    status: 'failed',
+    stage: 'fusion_review',
     pendingStageSkip: {
-      stage: "fusion_review",
-      reason: "operator waiver",
+      stage: 'fusion_review',
+      reason: 'operator waiver',
       requestedAt: 1,
-      requestedBy: "session-1",
+      requestedBy: 'session-1',
     },
     activeOperation: {
-      operationId: "fusion-launch",
-      service: "fusion",
-      kind: "fusion",
-      params: { prompt: "Review this diff" },
+      operationId: 'fusion-launch',
+      service: 'fusion',
+      kind: 'fusion',
+      params: { prompt: 'Review this diff' },
     },
-    error: "Fusion launch response was lost.",
+    error: 'Fusion launch response was lost.',
   });
 
   const pending = await controller.skip(
     failed.id,
-    "session-1",
-    "operator accepts remaining Fusion risk",
+    'session-1',
+    'operator accepts remaining Fusion risk',
   );
 
-  assert.equal(pending.status, "skip_pending");
-  assert.equal(pending.pendingStageSkip?.stage, "fusion_review");
-  assert.equal(pending.activeOperation?.service, "fusion");
+  assert.equal(pending.status, 'skip_pending');
+  assert.equal(pending.pendingStageSkip?.stage, 'fusion_review');
+  assert.equal(pending.activeOperation?.service, 'fusion');
   assert.equal(bridge.spawnCount, 0);
 });
 
-test("resume returns a failed pending skip to skip_pending", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
-  const registry = new RunRegistry(join(root, "runs"));
-  const bridge = new SkippableRunningBridge(join(root, "none.json"));
-  bridge.bindOperation("stopping-run", "stopping-fix", "digest-stopping-fix");
-  bridge.state = "stopped";
+test('resume returns a failed pending skip to skip_pending', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  await writeFile(planPath, '### Task 1: Implement\n- [x] Done\n');
+  const registry = new RunRegistry(join(root, 'runs'));
+  const bridge = new SkippableRunningBridge(join(root, 'none.json'));
+  bridge.bindOperation('stopping-run', 'stopping-fix', 'digest-stopping-fix');
+  bridge.state = 'stopped';
   const controller = new PlanExecController(
     registry,
     bridge,
@@ -3053,214 +3313,217 @@ test("resume returns a failed pending skip to skip_pending", async () => {
   );
   const failed = await registry.create({
     ...baseRun(root, planPath),
-    planHash: parsePlan(planPath, "### Task 1: Implement\n- [x] Done\n").hash,
-    status: "failed",
-    stage: "comprehensive_review",
+    planHash: parsePlan(planPath, '### Task 1: Implement\n- [x] Done\n').hash,
+    status: 'failed',
+    stage: 'comprehensive_review',
     pendingStageSkip: {
-      stage: "comprehensive_review",
-      reason: "operator waiver",
+      stage: 'comprehensive_review',
+      reason: 'operator waiver',
       requestedAt: 1,
-      requestedBy: "session-1",
+      requestedBy: 'session-1',
     },
     activeOperation: {
-      operationId: "stopping-fix",
-      service: "bridge",
-      kind: "fix",
-      externalRunId: "stopping-run",
+      operationId: 'stopping-fix',
+      service: 'bridge',
+      kind: 'fix',
+      externalRunId: 'stopping-run',
       stopRequested: true,
-      requestDigest: "digest-stopping-fix",
+      requestDigest: 'digest-stopping-fix',
       statusFailures: 3,
-      lastStatusError: "provider unavailable",
+      lastStatusError: 'provider unavailable',
     },
-    error: "Unable to finish force-skip.",
+    error: 'Unable to finish force-skip.',
   });
 
-  const resumed = await controller.resume(failed.id, "session-1");
+  const resumed = await controller.resume(failed.id, 'session-1');
 
-  assert.equal(resumed.status, "running");
-  assert.equal(resumed.stage, "smells_review");
+  assert.equal(resumed.status, 'running');
+  assert.equal(resumed.stage, 'smells_review');
   assert.equal(resumed.pendingStageSkip, undefined);
   assert.equal(resumed.skippedStages.length, 1);
 });
 
-test("force skip rejects implementation and archive stages", async () => {
-  for (const stage of ["implementation", "archive"] as const) {
-    const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-    const planPath = join(root, "plan.md");
-    await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
-    const registry = new RunRegistry(join(root, "runs"));
+test('force skip rejects implementation and archive stages', async () => {
+  for (const stage of ['implementation', 'archive'] as const) {
+    const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+    const planPath = join(root, 'plan.md');
+    await writeFile(planPath, '### Task 1: Implement\n- [x] Done\n');
+    const registry = new RunRegistry(join(root, 'runs'));
     const controller = new PlanExecController(
       registry,
-      new FakeBridge(join(root, "none.json")),
+      new FakeBridge(join(root, 'none.json')),
       new FakeFusion(),
       fakeGit(root),
     );
     const failed = await registry.create({
       ...baseRun(root, planPath),
-      status: "failed",
+      status: 'failed',
       stage,
-      error: "blocked",
+      error: 'blocked',
     });
 
     await assert.rejects(
-      controller.skip(failed.id, "session-1", "force it"),
+      controller.skip(failed.id, 'session-1', 'force it'),
       /cannot be force-skipped/,
     );
   }
 });
 
-test("a force-skipped stage makes terminal completion honest", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
-  const registry = new RunRegistry(join(root, "runs"));
+test('a force-skipped stage makes terminal completion honest', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  await writeFile(planPath, '### Task 1: Implement\n- [x] Done\n');
+  const registry = new RunRegistry(join(root, 'runs'));
   const controller = new PlanExecController(
     registry,
-    new FakeBridge(join(root, "none.json")),
+    new FakeBridge(join(root, 'none.json')),
     new FakeFusion(),
     fakeGit(root),
   );
   const run = await registry.create({
     ...baseRun(root, planPath),
     ...archiveAcceptance(),
-    stage: "complete",
+    stage: 'complete',
     skippedStages: [
       {
-        stage: "comprehensive_review",
-        reason: "operator waiver",
+        stage: 'comprehensive_review',
+        reason: 'operator waiver',
         requestedAt: 1,
-        requestedBy: "session-1",
+        requestedBy: 'session-1',
         completedAt: 2,
       },
     ],
   });
 
   const completed = await controller.advance(run);
-  assert.equal(completed.status, "completed_with_findings");
+  assert.equal(completed.status, 'completed_with_findings');
 });
 
-test("archive rejects source paths through symlinked directories", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const outside = await mkdtemp(join(tmpdir(), "pi-plan-exec-outside-"));
-  await writeFile(join(outside, "plan.md"), "### Task 1: Implement\n- [x] Done\n");
-  await symlink(outside, join(root, "linked"), "dir");
-  const planPath = join(root, "linked", "plan.md");
-  const registry = new RunRegistry(join(root, "runs"));
+test('archive rejects source paths through symlinked directories', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const outside = await mkdtemp(join(tmpdir(), 'pi-plan-exec-outside-'));
+  await writeFile(
+    join(outside, 'plan.md'),
+    '### Task 1: Implement\n- [x] Done\n',
+  );
+  await symlink(outside, join(root, 'linked'), 'dir');
+  const planPath = join(root, 'linked', 'plan.md');
+  const registry = new RunRegistry(join(root, 'runs'));
   const controller = new PlanExecController(
     registry,
-    new FakeBridge(join(root, "none.json")),
+    new FakeBridge(join(root, 'none.json')),
     new FakeFusion(),
     fakeGit(root),
   );
   const run = await registry.create({
     ...baseRun(root, planPath),
-    stage: "archive",
+    stage: 'archive',
     ...archiveAcceptance(),
   });
 
   const failed = await controller.advance(run);
 
-  assert.equal(failed.status, "running");
-  assert.match(failed.error ?? "", /symbolic link/);
-  assert.match(await readFile(join(outside, "plan.md"), "utf8"), /Task 1/);
+  assert.equal(failed.status, 'running');
+  assert.match(failed.error ?? '', /symbolic link/);
+  assert.match(await readFile(join(outside, 'plan.md'), 'utf8'), /Task 1/);
 });
 
-test("archive fails closed when both source and destination are missing", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  const registry = new RunRegistry(join(root, "runs"));
+test('archive fails closed when both source and destination are missing', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  const registry = new RunRegistry(join(root, 'runs'));
   const controller = new PlanExecController(
     registry,
-    new FakeBridge(join(root, "none.json")),
+    new FakeBridge(join(root, 'none.json')),
     new FakeFusion(),
     fakeGit(root),
   );
   const run = await registry.create({
     ...baseRun(root, planPath),
-    stage: "archive",
+    stage: 'archive',
     ...archiveAcceptance(),
   });
 
   const failed = await controller.advance(run);
 
-  assert.equal(failed.status, "running");
-  assert.match(failed.error ?? "", /Plan to archive is missing|ENOENT/);
+  assert.equal(failed.status, 'running');
+  assert.match(failed.error ?? '', /Plan to archive is missing|ENOENT/);
   await assert.rejects(readFile(planPath), /ENOENT/);
 });
 
-test("archive refuses to overwrite an existing completed plan", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  const destination = join(root, "completed", "plan.md");
-  await mkdir(join(root, "completed"), { recursive: true });
-  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
-  await writeFile(destination, "old archive\n");
-  const registry = new RunRegistry(join(root, "runs"));
+test('archive refuses to overwrite an existing completed plan', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  const destination = join(root, 'completed', 'plan.md');
+  await mkdir(join(root, 'completed'), { recursive: true });
+  await writeFile(planPath, '### Task 1: Implement\n- [x] Done\n');
+  await writeFile(destination, 'old archive\n');
+  const registry = new RunRegistry(join(root, 'runs'));
   const controller = new PlanExecController(
     registry,
-    new FakeBridge(join(root, "none.json")),
+    new FakeBridge(join(root, 'none.json')),
     new FakeFusion(),
     fakeGit(root),
   );
   const run = await registry.create({
     ...baseRun(root, planPath),
-    stage: "archive",
+    stage: 'archive',
     ...archiveAcceptance(),
   });
 
   const failed = await controller.advance(run);
 
-  assert.equal(failed.status, "running");
-  assert.match(failed.error ?? "", /destination already exists/);
-  assert.match(await readFile(planPath, "utf8"), /Task 1/);
-  assert.equal(await readFile(destination, "utf8"), "old archive\n");
+  assert.equal(failed.status, 'running');
+  assert.match(failed.error ?? '', /destination already exists/);
+  assert.match(await readFile(planPath, 'utf8'), /Task 1/);
+  assert.equal(await readFile(destination, 'utf8'), 'old archive\n');
 });
 
-test("failed fixer recovery uses operation metadata instead of its error text", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  const plan = "### Task 1: Implement\n- [x] Done\n";
+test('failed fixer recovery uses operation metadata instead of its error text', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  const plan = '### Task 1: Implement\n- [x] Done\n';
   await writeFile(planPath, plan);
-  const registry = new RunRegistry(join(root, "runs"));
+  const registry = new RunRegistry(join(root, 'runs'));
   const controller = new PlanExecController(
     registry,
-    new RunningBridge(join(root, "none.json")),
+    new RunningBridge(join(root, 'none.json')),
     new FakeFusion(),
     fakeGit(root),
   );
   const failed = await registry.create({
     ...baseRun(root, planPath),
     planHash: parsePlan(planPath, plan).hash,
-    status: "failed",
-    stage: "smells_review",
+    status: 'failed',
+    stage: 'smells_review',
     stageAttempts: { smells_review: 1 },
-    reviewFindings: [{ id: "major-1", severity: "MAJOR", summary: "Fix it" }],
+    reviewFindings: [{ id: 'major-1', severity: 'MAJOR', summary: 'Fix it' }],
     failedOperation: {
-      operationId: "fix-1",
-      service: "bridge",
-      kind: "fix",
-      externalRunId: "run-1",
+      operationId: 'fix-1',
+      service: 'bridge',
+      kind: 'fix',
+      externalRunId: 'run-1',
       reviewIteration: 1,
     },
-    error: "Unable to observe bridge/fix (3/3): unavailable",
+    error: 'Unable to observe bridge/fix (3/3): unavailable',
   });
 
-  const resumed = await controller.resume(failed.id, "session-1");
+  const resumed = await controller.resume(failed.id, 'session-1');
 
-  assert.equal(resumed.stage, "smells_review");
-  assert.equal(resumed.activeOperation?.kind, "fix");
+  assert.equal(resumed.stage, 'smells_review');
+  assert.equal(resumed.activeOperation?.kind, 'fix');
   assert.match(
     String(resumed.activeOperation?.params?.task),
     /FINDING: MAJOR \| Fix it/,
   );
 });
 
-test("missing reviewer output schedules automatic recovery", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
-  const registry = new RunRegistry(join(root, "runs"));
-  const bridge = new FakeBridge(join(root, "missing-result.json"));
+test('missing reviewer output schedules automatic recovery', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  await writeFile(planPath, '### Task 1: Implement\n- [x] Done\n');
+  const registry = new RunRegistry(join(root, 'runs'));
+  const bridge = new FakeBridge(join(root, 'missing-result.json'));
   const controller = new PlanExecController(
     registry,
     bridge,
@@ -3269,33 +3532,33 @@ test("missing reviewer output schedules automatic recovery", async () => {
   );
   const run = await registry.create({
     ...baseRun(root, planPath),
-    stage: "comprehensive_review",
+    stage: 'comprehensive_review',
   });
 
   const first = await controller.advance(run);
   const waiting = await controller.advance(first);
 
-  assert.equal(waiting.status, "running");
-  assert.equal(waiting.stage, "comprehensive_review");
+  assert.equal(waiting.status, 'running');
+  assert.equal(waiting.stage, 'comprehensive_review');
   assert.equal(waiting.stageAttempts.comprehensive_review, 1);
   assert.equal(waiting.activeOperation, undefined);
   assert.ok((waiting.nextAttemptAt ?? 0) > Date.now());
   assert.equal(bridge.spawnCount, 1);
 
   const due = await registry.update({ ...waiting, nextAttemptAt: 0 });
-  const retried = await controller.tick(due.id, "session-1");
-  assert.equal(retried.activeOperation?.kind, "review");
+  const retried = await controller.tick(due.id, 'session-1');
+  assert.equal(retried.activeOperation?.kind, 'review');
   assert.equal(retried.activeOperation?.reviewIteration, 2);
   assert.equal(bridge.spawnCount, 2);
 });
 
-test("malformed reviewer output schedules review recovery", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  const reviewPath = join(root, "malformed-review.json");
-  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
-  await writeFile(reviewPath, JSON.stringify({ output: "looks fine" }));
-  const registry = new RunRegistry(join(root, "runs"));
+test('malformed reviewer output schedules review recovery', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  const reviewPath = join(root, 'malformed-review.json');
+  await writeFile(planPath, '### Task 1: Implement\n- [x] Done\n');
+  await writeFile(reviewPath, JSON.stringify({ output: 'looks fine' }));
+  const registry = new RunRegistry(join(root, 'runs'));
   const bridge = new FakeBridge(reviewPath);
   const controller = new PlanExecController(
     registry,
@@ -3305,112 +3568,114 @@ test("malformed reviewer output schedules review recovery", async () => {
   );
   const run = await registry.create({
     ...baseRun(root, planPath),
-    stage: "comprehensive_review",
+    stage: 'comprehensive_review',
   });
 
   const launched = await controller.advance(run);
   const waiting = await controller.advance(launched);
 
-  assert.equal(waiting.status, "running");
+  assert.equal(waiting.status, 'running');
   assert.equal(waiting.activeOperation, undefined);
-  assert.match(waiting.error ?? "", /structured FINDING/);
+  assert.match(waiting.error ?? '', /structured FINDING/);
   assert.ok((waiting.nextAttemptAt ?? 0) > Date.now());
   assert.equal(bridge.spawnCount, 1);
 
   const due = await registry.update({ ...waiting, nextAttemptAt: 0 });
-  const retried = await controller.tick(due.id, "session-1");
-  assert.equal(retried.activeOperation?.kind, "review");
+  const retried = await controller.tick(due.id, 'session-1');
+  assert.equal(retried.activeOperation?.kind, 'review');
   assert.equal(retried.stageAttempts.comprehensive_review, 2);
   assert.equal(bridge.spawnCount, 2);
 });
 
-test("archive stages the plan move and truthful preparation progress together", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  const progressPath = join(root, ".ralphex", "progress", "progress-plan.txt");
-  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
-  await mkdir(join(root, ".ralphex", "progress"), { recursive: true });
-  await writeFile(progressPath, "started\n");
+test('archive stages the plan move and truthful preparation progress together', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  const progressPath = join(root, '.ralphex', 'progress', 'progress-plan.txt');
+  await writeFile(planPath, '### Task 1: Implement\n- [x] Done\n');
+  await mkdir(join(root, '.ralphex', 'progress'), { recursive: true });
+  await writeFile(progressPath, 'started\n');
   const calls: string[][] = [];
   const git = async (command: string, args: string[]) => {
     calls.push(args);
-    if (args[0] === "status" && args.includes(":(literal)plan.md"))
-      return { stdout: " M plan.md\n", stderr: "", code: 0 };
+    if (args[0] === 'status' && args.includes(':(literal)plan.md'))
+      return { stdout: ' M plan.md\n', stderr: '', code: 0 };
     return fakeGit(root)(command, args);
   };
-  const registry = new RunRegistry(join(root, "runs"));
+  const registry = new RunRegistry(join(root, 'runs'));
   const controller = new PlanExecController(
     registry,
-    new FakeBridge(join(root, "none.json")),
+    new FakeBridge(join(root, 'none.json')),
     new FakeFusion(),
     git,
   );
   const run = await registry.create({
     ...baseRun(root, planPath),
-    stage: "archive",
+    stage: 'archive',
     ...archiveAcceptance(),
     progressPath,
   });
 
   const completed = await advanceThroughArchive(controller, run);
 
-  assert.equal(completed.status, "completed");
-  assert.equal(completed.stage, "complete");
+  assert.equal(completed.status, 'completed');
+  assert.equal(completed.stage, 'complete');
   await assert.rejects(readFile(planPath));
   assert.match(
-    await readFile(join(root, "completed", "plan.md"), "utf8"),
+    await readFile(join(root, 'completed', 'plan.md'), 'utf8'),
     /Task 1/,
   );
   assert.match(
-    await readFile(progressPath, "utf8"),
+    await readFile(progressPath, 'utf8'),
     /Archival prepared for completed; waiting for owned Git commands to retire/,
   );
-  const status = calls.find((args) => args[0] === "status" && args.includes(":(literal)plan.md"));
+  const status = calls.find(
+    (args) => args[0] === 'status' && args.includes(':(literal)plan.md'),
+  );
   assert.deepEqual(status, [
-    "status",
-    "--porcelain",
-    "--",
-    ":(literal)plan.md",
-    ":(literal)completed/plan.md",
-    ":(literal).ralphex/progress/progress-plan.txt",
+    'status',
+    '--porcelain',
+    '--',
+    ':(literal)plan.md',
+    ':(literal)completed/plan.md',
+    ':(literal).ralphex/progress/progress-plan.txt',
   ]);
-  const add = calls.find((args) => args[0] === "add");
+  const add = calls.find((args) => args[0] === 'add');
   assert.deepEqual(add, [
-    "add",
-    "-f",
-    "-A",
-    "--",
-    ":(literal)plan.md",
-    ":(literal)completed/plan.md",
-    ":(literal).ralphex/progress/progress-plan.txt",
+    'add',
+    '-f',
+    '-A',
+    '--',
+    ':(literal)plan.md',
+    ':(literal)completed/plan.md',
+    ':(literal).ralphex/progress/progress-plan.txt',
   ]);
-  const commit = calls.find((args) => args[0] === "commit");
+  const commit = calls.find((args) => args[0] === 'commit');
   assert.deepEqual(commit, [
-    "commit",
-    "--only",
-    "-m",
-    "chore: archive plan.md",
-    "--",
-    ":(literal)plan.md",
-    ":(literal)completed/plan.md",
-    ":(literal).ralphex/progress/progress-plan.txt",
+    'commit',
+    '--only',
+    '-m',
+    'chore: archive plan.md',
+    '--',
+    ':(literal)plan.md',
+    ':(literal)completed/plan.md',
+    ':(literal).ralphex/progress/progress-plan.txt',
   ]);
 });
 
-test("blocking review findings keep the required review unmet", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  const reviewPath = join(root, "review-result.json");
-  await writeFile(planPath, "### Task 1: Implement\n- [x] Done\n");
+test('blocking review findings keep the required review unmet', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  const reviewPath = join(root, 'review-result.json');
+  await writeFile(planPath, '### Task 1: Implement\n- [x] Done\n');
   await writeFile(
     reviewPath,
     JSON.stringify({
       output:
-        "FINDING: MAJOR | Broken boundary\nEvidence: src/a.ts:1\nFix: validate input",
+        'FINDING: MAJOR | Broken boundary\nEvidence: src/a.ts:1\nFix: validate input',
     }),
   );
   const bridge = new FakeBridge(reviewPath);
-  const registry = new RunRegistry(join(root, "runs"));
+  const registry = new RunRegistry(join(root, 'runs'));
   const controller = new PlanExecController(
     registry,
     bridge,
@@ -3422,17 +3687,17 @@ test("blocking review findings keep the required review unmet", async () => {
   );
   const reviewRun: PlanExecRun = {
     ...run,
-    status: "running",
-    stage: "comprehensive_review",
+    status: 'running',
+    stage: 'comprehensive_review',
   };
 
   await registry.update(reviewRun);
   const launched = await controller.advance(reviewRun);
-  assert.equal(launched.activeOperation?.kind, "review");
+  assert.equal(launched.activeOperation?.kind, 'review');
   const fix = await controller.advance(launched);
-  assert.equal(fix.stage, "comprehensive_review");
-  assert.equal(fix.activeOperation?.kind, "fix");
-  assert.equal(fix.reviewFindings[0]?.severity, "MAJOR");
+  assert.equal(fix.stage, 'comprehensive_review');
+  assert.equal(fix.activeOperation?.kind, 'fix');
+  assert.equal(fix.reviewFindings[0]?.severity, 'MAJOR');
   assert.equal(fix.unresolvedFindings.length, 0);
 });
 
@@ -3456,7 +3721,7 @@ Updated: 2026-08-09T10:09:00.000Z
 Turn budget: 14/75+5 (within)
 Step 1: worker running, active 12s ago`;
 
-test("worker signal digest never carries a workflow-mode activity value", () => {
+test('worker signal digest never carries a workflow-mode activity value', () => {
   const cases: {
     name: string;
     text: unknown;
@@ -3467,35 +3732,35 @@ test("worker signal digest never carries a workflow-mode activity value", () => 
     empty?: boolean;
   }[] = [
     {
-      name: "workflow mode suppresses activity and its step lines",
+      name: 'workflow mode suppresses activity and its step lines',
       text: WORKFLOW_STATUS_TEXT,
-      mode: "workflow",
+      mode: 'workflow',
     },
     {
-      name: "workflow mode with no activity line is still suppressed",
-      text: WORKFLOW_STATUS_TEXT.replace("Activity: active 9m ago\n", ""),
-      mode: "workflow",
+      name: 'workflow mode with no activity line is still suppressed',
+      text: WORKFLOW_STATUS_TEXT.replace('Activity: active 9m ago\n', ''),
+      mode: 'workflow',
     },
     {
-      name: "non-workflow mode keeps activity and steps",
+      name: 'non-workflow mode keeps activity and steps',
       text: CHAIN_STATUS_TEXT,
-      mode: "chain",
-      activity: "active 12s ago",
-      steps: ["worker running, active 12s ago"],
+      mode: 'chain',
+      activity: 'active 12s ago',
+      steps: ['worker running, active 12s ago'],
     },
     {
-      name: "no activity line and no mode line yields neither",
-      text: "Run: worker-run-1\nState: running\nProgress: warming up",
+      name: 'no activity line and no mode line yields neither',
+      text: 'Run: worker-run-1\nState: running\nProgress: warming up',
     },
-    { name: "empty text yields no digest", text: "", empty: true },
+    { name: 'empty text yields no digest', text: '', empty: true },
     {
-      name: "non-string text yields no digest",
-      text: { state: "running" },
+      name: 'non-string text yields no digest',
+      text: { state: 'running' },
       empty: true,
     },
     {
-      name: "a text with no readable field yields no digest",
-      text: "Run: worker-run-1\nState: running",
+      name: 'a text with no readable field yields no digest',
+      text: 'Run: worker-run-1\nState: running',
       empty: true,
     },
   ];
@@ -3510,132 +3775,134 @@ test("worker signal digest never carries a workflow-mode activity value", () => 
     assert.equal(signal?.activity, testCase.activity, testCase.name);
     assert.equal(signal?.mode, testCase.mode, testCase.name);
     assert.deepEqual(signal?.steps, testCase.steps, testCase.name);
-    if (testCase.mode !== "workflow") continue;
+    if (testCase.mode !== 'workflow') continue;
     assert.equal(
-      JSON.stringify(signal).includes("9m ago"),
+      JSON.stringify(signal).includes('9m ago'),
       false,
       `${testCase.name}: the launch-anchored age must not survive anywhere`,
     );
   }
 });
 
-test("worker signal digest caps the step lines it carries", () => {
+test('worker signal digest caps the step lines it carries', () => {
   const steps = Array.from(
     { length: 8 },
     (_, index) => `Step ${index + 1}: doing thing ${index + 1}`,
-  ).join("\n");
+  ).join('\n');
 
-  const signal = parseWorkerSignal(`Run: r\nState: running\nMode: chain\n${steps}`);
+  const signal = parseWorkerSignal(
+    `Run: r\nState: running\nMode: chain\n${steps}`,
+  );
 
   // The digest is persisted on every observation, so the list must be bounded.
   assert.equal(signal?.steps?.length, 5);
-  assert.deepEqual(signal?.steps?.[4], "doing thing 5");
+  assert.deepEqual(signal?.steps?.[4], 'doing thing 5');
 });
 
-test("worker signal digest keeps the fields that are not activity", () => {
+test('worker signal digest keeps the fields that are not activity', () => {
   const signal = parseWorkerSignal(WORKFLOW_STATUS_TEXT);
 
-  assert.equal(signal?.progress, "implementation step 1");
-  assert.equal(signal?.updated, "2026-08-09T10:00:00.023Z");
+  assert.equal(signal?.progress, 'implementation step 1');
+  assert.equal(signal?.updated, '2026-08-09T10:00:00.023Z');
   assert.equal(
     parseWorkerSignal(CHAIN_STATUS_TEXT)?.turnBudget,
-    "14/75+5 (within)",
+    '14/75+5 (within)',
   );
 });
 
-test("observation persists the worker digest without the workflow activity", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  const plan = "### Task 1: Implement\n- [ ] Do the work\n";
+test('observation persists the worker digest without the workflow activity', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  const plan = '### Task 1: Implement\n- [ ] Do the work\n';
   await writeFile(planPath, plan);
-  const asyncDir = join(root, "async");
+  const asyncDir = join(root, 'async');
   await mkdir(asyncDir);
-  const registry = new RunRegistry(join(root, "runs"));
+  const registry = new RunRegistry(join(root, 'runs'));
   const controller = new PlanExecController(
     registry,
-    new StatusTextBridge(join(root, "none.json"), WORKFLOW_STATUS_TEXT),
+    new StatusTextBridge(join(root, 'none.json'), WORKFLOW_STATUS_TEXT),
     new FakeFusion(),
     fakeGit(root),
   );
   const run = await registry.create({
     ...baseRun(root, planPath),
     planHash: parsePlan(planPath, plan).hash,
-    stage: "implementation",
+    stage: 'implementation',
     activeOperation: {
-      operationId: "operation-1",
-      service: "bridge",
-      kind: "implementation",
-      externalRunId: "worker-run-1",
+      operationId: 'operation-1',
+      service: 'bridge',
+      kind: 'implementation',
+      externalRunId: 'worker-run-1',
       asyncDir,
       taskId: 1,
       launchStartedAt: Date.now(),
     },
   });
 
-  await controller.advance(await registry.claim(run, "session-1"));
+  await controller.advance(await registry.claim(run, 'session-1'));
   const stored = await registry.get(run.id);
 
-  assert.equal(stored?.activeOperation?.workerSignal?.mode, "workflow");
+  assert.equal(stored?.activeOperation?.workerSignal?.mode, 'workflow');
   assert.equal(stored?.activeOperation?.workerSignal?.activity, undefined);
   assert.equal(
     stored?.activeOperation?.workerSignal?.progress,
-    "implementation step 1",
+    'implementation step 1',
   );
   assert.ok(
     stored?.activeOperation?.lastObservedAt,
-    "the digest is only trustworthy with the moment it was taken",
+    'the digest is only trustworthy with the moment it was taken',
   );
 });
 
-test("observation persists no liveness verdict of its own", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  const plan = "### Task 1: Implement\n- [ ] Do the work\n";
+test('observation persists no liveness verdict of its own', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  const plan = '### Task 1: Implement\n- [ ] Do the work\n';
   await writeFile(planPath, plan);
-  const registry = new RunRegistry(join(root, "runs"));
+  const registry = new RunRegistry(join(root, 'runs'));
   const controller = new PlanExecController(
     registry,
-    new StatusTextBridge(join(root, "none.json"), WORKFLOW_STATUS_TEXT),
+    new StatusTextBridge(join(root, 'none.json'), WORKFLOW_STATUS_TEXT),
     new FakeFusion(),
     fakeGit(root),
   );
   const run = await registry.create({
     ...baseRun(root, planPath),
     planHash: parsePlan(planPath, plan).hash,
-    stage: "implementation",
+    stage: 'implementation',
     activeOperation: {
-      operationId: "operation-1",
-      service: "bridge",
-      kind: "implementation",
-      externalRunId: "worker-run-1",
+      operationId: 'operation-1',
+      service: 'bridge',
+      kind: 'implementation',
+      externalRunId: 'worker-run-1',
       // Never created: the temp root is wiped while the bridge still answers.
-      asyncDir: join(root, "gone"),
+      asyncDir: join(root, 'gone'),
       taskId: 1,
       launchStartedAt: Date.now(),
     },
   });
 
-  await controller.advance(await registry.claim(run, "session-1"));
+  await controller.advance(await registry.claim(run, 'session-1'));
   const stored = await registry.get(run.id);
 
   // No liveness fact is persisted: it would freeze when the polling session
   // dies. The read surface measures it live instead.
   assert.deepEqual(stored?.activeOperation?.workerSignal, {
-    mode: "workflow",
-    progress: "implementation step 1",
-    updated: "2026-08-09T10:00:00.023Z",
+    mode: 'workflow',
+    progress: 'implementation step 1',
+    updated: '2026-08-09T10:00:00.023Z',
   });
-  assert.equal(stored?.status, "running");
+  assert.equal(stored?.status, 'running');
 });
 
-test("a reconciled run preserves its attempt and automatically schedules recovery", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-controller-"));
-  const planPath = join(root, "plan.md");
-  const plan = "### Task 1: Implement\n- [ ] Do the work\n";
+test('a reconciled run preserves its attempt and automatically schedules recovery', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  const plan = '### Task 1: Implement\n- [ ] Do the work\n';
   await writeFile(planPath, plan);
-  const registry = new RunRegistry(join(root, "runs"));
-  const bridge = new FakeBridge(join(root, "none.json"));
-  bridge.bindOperation("external-1", "operation-1", "digest-operation-1");
+  const registry = new RunRegistry(join(root, 'runs'));
+  const bridge = new FakeBridge(join(root, 'none.json'));
+  bridge.bindOperation('external-1', 'operation-1', 'digest-operation-1');
   const controller = new PlanExecController(
     registry,
     bridge,
@@ -3645,19 +3912,19 @@ test("a reconciled run preserves its attempt and automatically schedules recover
   const created = await registry.create({
     ...baseRun(root, planPath),
     planHash: parsePlan(planPath, plan).hash,
-    stage: "implementation",
-    taskAttempts: { "1": 1 },
+    stage: 'implementation',
+    taskAttempts: { '1': 1 },
     activeOperation: {
-      operationId: "operation-1",
-      service: "bridge",
-      kind: "implementation",
-      externalRunId: "external-1",
+      operationId: 'operation-1',
+      service: 'bridge',
+      kind: 'implementation',
+      externalRunId: 'external-1',
       taskId: 1,
-      asyncDir: join(root, "async-directory-that-is-gone"),
-      requestDigest: "digest-operation-1",
+      asyncDir: join(root, 'async-directory-that-is-gone'),
+      requestDigest: 'digest-operation-1',
     },
     lease: {
-      sessionId: "session-old",
+      sessionId: 'session-old',
       pid: 999_999_999,
       heartbeatAt: Date.now() - 10 * 60_000,
       hostname: hostname(),
@@ -3665,25 +3932,29 @@ test("a reconciled run preserves its attempt and automatically schedules recover
   });
 
   const report = await execReconcile(registry, async () => ({
-    processTerminalProof: terminalProof("external-1", "operation-1", "digest-operation-1"),
+    processTerminalProof: terminalProof(
+      'external-1',
+      'operation-1',
+      'digest-operation-1',
+    ),
   }));
 
   assert.match(report, /Reconciled 1 run.*existing operation identity/);
   const reconciled = await registry.get(created.id);
-  assert.equal(reconciled?.status, "running");
-  assert.equal(reconciled?.activeOperation?.operationId, "operation-1");
+  assert.equal(reconciled?.status, 'running');
+  assert.equal(reconciled?.activeOperation?.operationId, 'operation-1');
   assert.equal(reconciled?.activeOperation?.processTreeExited, true);
   assert.deepEqual(
     reconciled?.taskAttempts,
-    { "1": 1 },
-    "reconcile must not consume a task attempt",
+    { '1': 1 },
+    'reconcile must not consume a task attempt',
   );
 
-  const resumed = await controller.tick(created.id, "session-new");
+  const resumed = await controller.tick(created.id, 'session-new');
 
-  assert.equal(resumed.status, "running");
-  assert.equal(resumed.tasks?.["1"]?.state, "retry_wait");
-  assert.ok((resumed.tasks?.["1"]?.nextAttemptAt ?? 0) > Date.now());
+  assert.equal(resumed.status, 'running');
+  assert.equal(resumed.tasks?.['1']?.state, 'retry_wait');
+  assert.ok((resumed.tasks?.['1']?.nextAttemptAt ?? 0) > Date.now());
   assert.equal(bridge.spawnCount, 0);
 });
 
@@ -3696,12 +3967,12 @@ function baseRun(
     schemaVersion: 1 as const,
     repositoryRoot: root,
     planPath,
-    planHash: "ignored",
+    planHash: 'ignored',
     worktreeCwd: root,
-    branch: "feature",
-    defaultBranch: "main",
-    status: "running" as const,
-    stage: "resolve" as const,
+    branch: 'feature',
+    defaultBranch: 'main',
+    status: 'running' as const,
+    stage: 'resolve' as const,
     taskAttempts: {},
     stageAttempts: {},
     reviewFindings: [],
@@ -3715,23 +3986,23 @@ function baseRun(
       reviewIterations: overrides.reviewIterations ?? 5,
       fusionIterations: 10,
       finalizeEnabled: true,
-      workerAgent: "worker",
+      workerAgent: 'worker',
       workerMaxTurns: 50,
-      reviewerAgent: "reviewer",
+      reviewerAgent: 'reviewer',
       reviewerMaxTurns: 30,
-      statsAgent: "reviewer",
+      statsAgent: 'reviewer',
       statsMaxTurns: 30,
     },
   };
 }
 
 function acceptedTasks() {
-  const commit = "a".repeat(40);
+  const commit = 'a'.repeat(40);
   return {
-    "1": {
+    '1': {
       taskId: 1,
       dependsOn: [],
-      state: "accepted" as const,
+      state: 'accepted' as const,
       attempts: 1,
       baselineCommit: commit,
       candidateCommit: commit,
@@ -3741,10 +4012,10 @@ function acceptedTasks() {
 }
 
 function archiveAcceptance() {
-  const commit = "a".repeat(40);
+  const commit = 'a'.repeat(40);
   return {
     tasks: acceptedTasks(),
-    planHash: parsePlan("plan.md", "### Task 1: Implement\n- [x] Done\n").hash,
+    planHash: parsePlan('plan.md', '### Task 1: Implement\n- [x] Done\n').hash,
     verifiedCommit: commit,
     reviewedCommit: commit,
   };
@@ -3752,10 +4023,17 @@ function archiveAcceptance() {
 
 class FakeBridge {
   protected current = 0;
-  protected readonly bindings = new Map<string, { operationId: string; requestDigest: string }>();
+  protected readonly bindings = new Map<
+    string,
+    { operationId: string; requestDigest: string }
+  >();
   lastSpawnParams?: Record<string, unknown>;
   constructor(protected readonly resultPath: string) {}
-  bindOperation(runId: string, operationId: string, requestDigest: string): void {
+  bindOperation(
+    runId: string,
+    operationId: string,
+    requestDigest: string,
+  ): void {
     this.bindings.set(runId, { operationId, requestDigest });
   }
   get spawnCount() {
@@ -3770,16 +4048,16 @@ class FakeBridge {
       durableOperationLookup: true,
       processTerminalProofVersion: 1,
       executionLifetimeVersion: 1 as const,
-      executionLifetimeModes: ["unbounded"] as const,
+      executionLifetimeModes: ['unbounded'] as const,
       processTreeOwnership: {
         version: 1 as const,
-        scope: "owned-process-tree" as const,
-        escapedDescendants: "contained" as const,
+        scope: 'owned-process-tree' as const,
+        escapedDescendants: 'contained' as const,
       },
       diagnosticGuidance: {
         version: 1 as const,
         idempotent: true as const,
-        mode: "follow_up" as const,
+        mode: 'follow_up' as const,
         confirmedToolFailure: true as const,
       },
     };
@@ -3797,14 +4075,16 @@ class FakeBridge {
     });
     return success({
       runId: `run-${this.current}`,
-      asyncDir: "/tmp/async",
-      effectiveExecutionLifetime: { mode: "unbounded" },
+      asyncDir: '/tmp/async',
+      effectiveExecutionLifetime: { mode: 'unbounded' },
     });
   }
   async operation(): Promise<BridgeResult> {
-    return success({ state: "absent" });
+    return success({ state: 'absent' });
   }
-  async status(runId = "run-1"): Promise<
+  async status(
+    runId = 'run-1',
+  ): Promise<
     | { success: true; data: Record<string, unknown> }
     | { success: false; error: { message: string } }
   > {
@@ -3813,20 +4093,24 @@ class FakeBridge {
       requestDigest: `digest-${runId}`,
     };
     return success({
-      state: "complete",
-      processTerminalProof: terminalProof(runId, binding.operationId, binding.requestDigest),
+      state: 'complete',
+      processTerminalProof: terminalProof(
+        runId,
+        binding.operationId,
+        binding.requestDigest,
+      ),
       operationId: binding.operationId,
       requestDigest: binding.requestDigest,
     });
   }
   async result(): Promise<BridgeResult> {
-    return success({ state: "complete", resultPath: this.resultPath });
+    return success({ state: 'complete', resultPath: this.resultPath });
   }
   async adopt(): Promise<BridgeResult> {
-    return success({ state: "complete" });
+    return success({ state: 'complete' });
   }
   async stop(): Promise<BridgeResult> {
-    return success({ state: "stopping" });
+    return success({ state: 'stopping' });
   }
 
   async diagnoseOperation(
@@ -3834,17 +4118,30 @@ class FakeBridge {
     _owner: { requestDigest?: string },
     params: { diagnosticId: string; toolCallId: string },
   ): Promise<BridgeResult> {
-    return success({ operationId, diagnosticId: params.diagnosticId, toolCallId: params.toolCallId,
-      guidanceOnly: true, state: "queued", requestDigest: _owner.requestDigest });
+    return success({
+      operationId,
+      diagnosticId: params.diagnosticId,
+      toolCallId: params.toolCallId,
+      guidanceOnly: true,
+      state: 'queued',
+      requestDigest: _owner.requestDigest,
+    });
   }
 
-  protected registerBinding(runId: string, operationId: string, params: Record<string, unknown> = {}): void {
-    this.bindings.set(runId, { operationId, requestDigest: bridgeRequestDigest(params) });
+  protected registerBinding(
+    runId: string,
+    operationId: string,
+    params: Record<string, unknown> = {},
+  ): void {
+    this.bindings.set(runId, {
+      operationId,
+      requestDigest: bridgeRequestDigest(params),
+    });
   }
 }
 
 class DurableAbsentBridge extends FakeBridge {
-  async capabilities() {
+  override async capabilities() {
     return {
       protocolVersion: 2 as const,
       healthy: true,
@@ -3853,16 +4150,16 @@ class DurableAbsentBridge extends FakeBridge {
       durableOperationLookup: true,
       processTerminalProofVersion: 1,
       executionLifetimeVersion: 1 as const,
-      executionLifetimeModes: ["unbounded"] as const,
+      executionLifetimeModes: ['unbounded'] as const,
       processTreeOwnership: {
         version: 1 as const,
-        scope: "owned-process-tree" as const,
-        escapedDescendants: "contained" as const,
+        scope: 'owned-process-tree' as const,
+        escapedDescendants: 'contained' as const,
       },
       diagnosticGuidance: {
         version: 1 as const,
         idempotent: true as const,
-        mode: "follow_up" as const,
+        mode: 'follow_up' as const,
         confirmedToolFailure: true as const,
       },
     };
@@ -3873,7 +4170,7 @@ class DurableAbsentBridge extends FakeBridge {
     owner?: { requestDigest?: string },
   ) {
     return success({
-      state: "absent",
+      state: 'absent',
       replaySafe: true,
       ...(owner?.requestDigest ? { requestDigest: owner.requestDigest } : {}),
     });
@@ -3888,36 +4185,36 @@ class DurableAbsentBridge extends FakeBridge {
     return success({
       runId: `run-${this.current}`,
       requestDigest: bridgeRequestDigest(params ?? {}),
-      operationId: operationId ?? "",
-      effectiveExecutionLifetime: { mode: "unbounded" },
+      operationId: operationId ?? '',
+      effectiveExecutionLifetime: { mode: 'unbounded' },
     });
   }
 }
 
 class UnattestedAbsentBridge extends DurableAbsentBridge {
   override async operation() {
-    return success({ state: "absent" });
+    return success({ state: 'absent' });
   }
 }
 
 class PausedWorkflowBridge extends FakeBridge {
-  override async status(runId = "run-1") {
+  override async status(runId = 'run-1') {
     return success({
-      state: "paused",
-      processTerminalProof: terminalProof(runId, "run-1", "digest-workflow-1"),
+      state: 'paused',
+      processTerminalProof: terminalProof(runId, 'run-1', 'digest-workflow-1'),
       text: [
-        "State: paused",
+        'State: paused',
         "Error: Run 'main' detached: waiting for supervisor reply",
-        "Detached for intercom coordination: reviewer.",
-      ].join("\n"),
+        'Detached for intercom coordination: reviewer.',
+      ].join('\n'),
     });
   }
 }
 
 class ModelFailureBridge extends FakeBridge {
-  state = "failed";
+  state = 'failed';
 
-  override async status(runId = "run-1") {
+  override async status(runId = 'run-1') {
     return success({
       state: this.state,
       processTerminalProof: terminalProof(runId),
@@ -3967,10 +4264,12 @@ class DeferredStatusBridge extends FakeBridge {
   }
 
   completeStatus(): void {
-    this.releaseStatus?.(success({
-      state: "complete",
-      processTerminalProof: terminalProof("run-1"),
-    }));
+    this.releaseStatus?.(
+      success({
+        state: 'complete',
+        processTerminalProof: terminalProof('run-1'),
+      }),
+    );
   }
 }
 
@@ -3981,7 +4280,10 @@ class DeferredBridge extends FakeBridge {
     this.announceSpawn = resolve;
   });
 
-  override spawn(operationId = `operation-${this.current + 1}`, params?: Record<string, unknown>): Promise<BridgeResult> {
+  override spawn(
+    operationId = `operation-${this.current + 1}`,
+    params?: Record<string, unknown>,
+  ): Promise<BridgeResult> {
     this.current += 1;
     this.registerBinding(`run-${this.current}`, operationId, params);
     this.announceSpawn();
@@ -3994,8 +4296,8 @@ class DeferredBridge extends FakeBridge {
     this.releaseSpawn?.(
       success({
         runId: `run-${this.current}`,
-        asyncDir: "/tmp/async",
-        effectiveExecutionLifetime: { mode: "unbounded" },
+        asyncDir: '/tmp/async',
+        effectiveExecutionLifetime: { mode: 'unbounded' },
       }),
     );
   }
@@ -4005,14 +4307,14 @@ class StartupRaceBridge extends FakeBridge {
   adoptCount = 0;
 
   override async status() {
-    return success({ state: "running" });
+    return success({ state: 'running' });
   }
 
   override async adopt(): Promise<BridgeResult> {
     this.adoptCount += 1;
     return {
       success: false,
-      error: { message: "Status file not found." },
+      error: { message: 'Status file not found.' },
     };
   }
 }
@@ -4021,33 +4323,44 @@ class AdoptionNotReadyBridge extends FakeBridge {
   override async adopt(): Promise<BridgeResult> {
     return {
       success: false,
-      error: { message: "Status file not found." },
+      error: { message: 'Status file not found.' },
     };
   }
 
   override async status() {
     return {
       success: false as const,
-      error: { message: "Status file not found." },
+      error: { message: 'Status file not found.' },
     };
   }
 }
 
 class SkippableRunningBridge extends FakeBridge {
-  state = "running";
+  state = 'running';
   stopCount = 0;
 
-  override async status(runId = "stopping-run") {
-    const binding = this.bindings.get(runId) ?? { operationId: runId, requestDigest: `digest-${runId}` };
+  override async status(runId = 'stopping-run') {
+    const binding = this.bindings.get(runId) ?? {
+      operationId: runId,
+      requestDigest: `digest-${runId}`,
+    };
     return success({
       state: this.state,
-      ...(this.state === "stopped" ? { processTerminalProof: terminalProof(runId, binding.operationId, binding.requestDigest) } : {}),
+      ...(this.state === 'stopped'
+        ? {
+            processTerminalProof: terminalProof(
+              runId,
+              binding.operationId,
+              binding.requestDigest,
+            ),
+          }
+        : {}),
     });
   }
 
   override async stop(): Promise<BridgeResult> {
     this.stopCount += 1;
-    return success({ state: "stopping" });
+    return success({ state: 'stopping' });
   }
 }
 
@@ -4056,7 +4369,7 @@ class RunningBridge extends FakeBridge {
     | { success: true; data: Record<string, unknown> }
     | { success: false; error: { message: string } }
   > {
-    return success({ state: "running" });
+    return success({ state: 'running' });
   }
 }
 
@@ -4072,7 +4385,7 @@ class StatusTextBridge extends FakeBridge {
     | { success: true; data: Record<string, unknown> }
     | { success: false; error: { message: string } }
   > {
-    return success({ state: "running", text: this.statusText });
+    return success({ state: 'running', text: this.statusText });
   }
 }
 
@@ -4080,7 +4393,7 @@ class TimedOutSpawnBridge extends FakeBridge {
   override async spawn(): Promise<BridgeResult> {
     return {
       success: false,
-      error: { code: "timeout", message: "Bridge spawn timed out." },
+      error: { code: 'timeout', message: 'Bridge spawn timed out.' },
     };
   }
 }
@@ -4091,10 +4404,10 @@ class FoundOperationBridge extends FakeBridge {
     owner?: { requestDigest?: string },
   ): Promise<BridgeResult> {
     return success({
-      state: "found",
-      runId: "existing-run",
-      asyncDir: "/tmp/existing-run",
-      effectiveExecutionLifetime: { mode: "unbounded" },
+      state: 'found',
+      runId: 'existing-run',
+      asyncDir: '/tmp/existing-run',
+      effectiveExecutionLifetime: { mode: 'unbounded' },
       ...(owner?.requestDigest ? { requestDigest: owner.requestDigest } : {}),
     });
   }
@@ -4102,7 +4415,7 @@ class FoundOperationBridge extends FakeBridge {
 
 class UnknownOperationBridge extends FakeBridge {
   override async operation(): Promise<BridgeResult> {
-    return success({ state: "unknown" });
+    return success({ state: 'unknown' });
   }
 }
 
@@ -4118,7 +4431,7 @@ class LookupOperationBridge extends FakeBridge {
     return success({
       ...this.lookup,
       ...(this.lookup.effectiveExecutionLifetime === undefined
-        ? { effectiveExecutionLifetime: { mode: "unbounded" } }
+        ? { effectiveExecutionLifetime: { mode: 'unbounded' } }
         : {}),
     });
   }
@@ -4128,7 +4441,7 @@ class StopFailingBridge extends FakeBridge {
   override async stop(): Promise<BridgeResult> {
     return {
       success: false,
-      error: { message: "stop unavailable" },
+      error: { message: 'stop unavailable' },
     };
   }
 }
@@ -4139,7 +4452,7 @@ class ContendedBridge extends FakeBridge {
       success: false as const,
       error: {
         message:
-          "Rejected: a subagent call is already in progress. Issue exactly ONE subagent call per turn.",
+          'Rejected: a subagent call is already in progress. Issue exactly ONE subagent call per turn.',
       },
     };
   }
@@ -4149,14 +4462,14 @@ class UnavailableBridge extends FakeBridge {
   override async status() {
     return {
       success: false as const,
-      error: { message: "bridge unavailable" },
+      error: { message: 'bridge unavailable' },
     };
   }
 }
 
 class FakeFusion {
-  private operationId = "fusion-operation";
-  private requestDigest = "digest-fusion-operation";
+  private operationId = 'fusion-operation';
+  private requestDigest = 'digest-fusion-operation';
   async capabilities() {
     return {
       healthy: true,
@@ -4164,18 +4477,20 @@ class FakeFusion {
       processTerminalProofVersion: 1,
       processTreeOwnership: {
         version: 1 as const,
-        scope: "owned-process-tree" as const,
-        escapedDescendants: "contained" as const,
+        scope: 'owned-process-tree' as const,
+        escapedDescendants: 'contained' as const,
       },
       executionLifetimeVersion: 1 as const,
-      executionLifetimeModes: ["unbounded"] as const,
+      executionLifetimeModes: ['unbounded'] as const,
     };
   }
   async start(
     _operationId?: string,
     _prompt?: string,
     _profile?: string,
-    _executionLifetime?: { mode: "unbounded" } | { mode: "bounded"; timeoutMs: number },
+    _executionLifetime?:
+      | { mode: 'unbounded' }
+      | { mode: 'bounded'; timeoutMs: number },
     _callerDigest?: string,
   ): Promise<BridgeResult> {
     if (_operationId) this.operationId = _operationId;
@@ -4184,38 +4499,38 @@ class FakeFusion {
     void _profile;
     void _executionLifetime;
     return success({
-      run: { runId: "fusion-1", phase: "panel", terminal: false },
+      run: { runId: 'fusion-1', phase: 'panel', terminal: false },
       operationId: this.operationId,
       requestDigest: this.requestDigest,
-      effectiveExecutionLifetime: { mode: "unbounded" },
+      effectiveExecutionLifetime: { mode: 'unbounded' },
     });
   }
   async status(): Promise<BridgeResult> {
     return success({
       operationId: this.operationId,
       requestDigest: this.requestDigest,
-      effectiveExecutionLifetime: { mode: "unbounded" },
-      run: { runId: "fusion-1", phase: "panel", terminal: false },
+      effectiveExecutionLifetime: { mode: 'unbounded' },
+      run: { runId: 'fusion-1', phase: 'panel', terminal: false },
     });
   }
   async result(): Promise<BridgeResult> {
     return success({
       run: {
-        runId: "fusion-1",
-        phase: "done",
+        runId: 'fusion-1',
+        phase: 'done',
         terminal: true,
-        report: "NO_FINDINGS",
-        processTerminalProof: terminalProof("fusion-1"),
+        report: 'NO_FINDINGS',
+        processTerminalProof: terminalProof('fusion-1'),
       },
       callerOutput: {
-        contract: "plan-review-v1",
-        output: "NO_FINDINGS",
+        contract: 'plan-review-v1',
+        output: 'NO_FINDINGS',
       },
     });
   }
   async adopt(): Promise<BridgeResult> {
     return success({
-      run: { runId: "fusion-1", phase: "panel", terminal: false },
+      run: { runId: 'fusion-1', phase: 'panel', terminal: false },
     });
   }
   async cancel(): Promise<BridgeResult> {
@@ -4230,14 +4545,14 @@ class SkippableFusion extends FakeFusion {
   override async start(): Promise<BridgeResult> {
     this.startCount += 1;
     return success({
-      run: { runId: "recovered-fusion", phase: "panel", terminal: false },
-      effectiveExecutionLifetime: { mode: "unbounded" },
+      run: { runId: 'recovered-fusion', phase: 'panel', terminal: false },
+      effectiveExecutionLifetime: { mode: 'unbounded' },
     });
   }
 
   override async status(): Promise<BridgeResult> {
     return success({
-      run: { runId: "recovered-fusion", phase: "panel", terminal: false },
+      run: { runId: 'recovered-fusion', phase: 'panel', terminal: false },
     });
   }
 
@@ -4257,8 +4572,8 @@ class RecordingFusion extends FakeFusion {
   ): Promise<BridgeResult> {
     this.startCalls.push([operationId, prompt, profile]);
     return success({
-      run: { runId: "recovered-fusion", phase: "panel", terminal: false },
-      effectiveExecutionLifetime: { mode: "unbounded" },
+      run: { runId: 'recovered-fusion', phase: 'panel', terminal: false },
+      effectiveExecutionLifetime: { mode: 'unbounded' },
     });
   }
 }
@@ -4270,12 +4585,12 @@ class ResultFailingFusion extends FakeFusion {
   override async status(): Promise<BridgeResult> {
     this.statusCount += 1;
     return success({
-      processTerminalProof: terminalProof("fusion-1"),
+      processTerminalProof: terminalProof('fusion-1'),
       run: {
-        runId: "fusion-1",
-        phase: "done",
+        runId: 'fusion-1',
+        phase: 'done',
         terminal: true,
-        processTerminalProof: terminalProof("fusion-1"),
+        processTerminalProof: terminalProof('fusion-1'),
       },
     });
   }
@@ -4284,7 +4599,7 @@ class ResultFailingFusion extends FakeFusion {
     this.resultCount += 1;
     return {
       success: false as const,
-      error: { message: "Fusion report unavailable" },
+      error: { message: 'Fusion report unavailable' },
     };
   }
 }
@@ -4292,12 +4607,12 @@ class ResultFailingFusion extends FakeFusion {
 class ContradictoryReportFusion extends FakeFusion {
   override async status(): Promise<BridgeResult> {
     return success({
-      processTerminalProof: terminalProof("fusion-1"),
+      processTerminalProof: terminalProof('fusion-1'),
       run: {
-        runId: "fusion-1",
-        phase: "done",
+        runId: 'fusion-1',
+        phase: 'done',
         terminal: true,
-        processTerminalProof: terminalProof("fusion-1"),
+        processTerminalProof: terminalProof('fusion-1'),
       },
     });
   }
@@ -4305,12 +4620,12 @@ class ContradictoryReportFusion extends FakeFusion {
   override async result(): Promise<BridgeResult> {
     return success({
       run: {
-        runId: "fusion-1",
-        phase: "done",
+        runId: 'fusion-1',
+        phase: 'done',
         terminal: true,
-        report: "FINDING: CRITICAL | Contradictory unvalidated report",
+        report: 'FINDING: CRITICAL | Contradictory unvalidated report',
       },
-      callerOutput: { contract: "plan-review-v1", output: "NO_FINDINGS" },
+      callerOutput: { contract: 'plan-review-v1', output: 'NO_FINDINGS' },
     });
   }
 }
@@ -4318,12 +4633,12 @@ class ContradictoryReportFusion extends FakeFusion {
 class NoCallerOutputFusion extends FakeFusion {
   override async status(): Promise<BridgeResult> {
     return success({
-      processTerminalProof: terminalProof("fusion-1"),
+      processTerminalProof: terminalProof('fusion-1'),
       run: {
-        runId: "fusion-1",
-        phase: "done",
+        runId: 'fusion-1',
+        phase: 'done',
         terminal: true,
-        processTerminalProof: terminalProof("fusion-1"),
+        processTerminalProof: terminalProof('fusion-1'),
       },
     });
   }
@@ -4331,10 +4646,10 @@ class NoCallerOutputFusion extends FakeFusion {
   override async result(): Promise<BridgeResult> {
     return success({
       run: {
-        runId: "fusion-1",
-        phase: "done",
+        runId: 'fusion-1',
+        phase: 'done',
         terminal: true,
-        report: "NO_FINDINGS",
+        report: 'NO_FINDINGS',
       },
     });
   }
@@ -4349,7 +4664,7 @@ class FinalizationFailingRegistry extends RunRegistry {
   ): Promise<PlanExecRun> {
     if (this.failNextFinalization) {
       this.failNextFinalization = false;
-      throw new Error("registry temporarily unavailable");
+      throw new Error('registry temporarily unavailable');
     }
     return super.updateLatest(runId, apply);
   }
@@ -4357,7 +4672,7 @@ class FinalizationFailingRegistry extends RunRegistry {
 
 class TerminalFusion extends FakeFusion {
   constructor(
-    private readonly phase: "failed" | "cancelled",
+    private readonly phase: 'failed' | 'cancelled',
     private readonly terminalError: string,
   ) {
     super();
@@ -4365,13 +4680,13 @@ class TerminalFusion extends FakeFusion {
 
   override async status(): Promise<BridgeResult> {
     return success({
-      processTerminalProof: terminalProof("fusion-1"),
+      processTerminalProof: terminalProof('fusion-1'),
       run: {
-        runId: "fusion-1",
+        runId: 'fusion-1',
         phase: this.phase,
         terminal: true,
         error: this.terminalError,
-        processTerminalProof: terminalProof("fusion-1"),
+        processTerminalProof: terminalProof('fusion-1'),
       },
     });
   }
@@ -4379,11 +4694,11 @@ class TerminalFusion extends FakeFusion {
   override async result(): Promise<BridgeResult> {
     return success({
       run: {
-        runId: "fusion-1",
+        runId: 'fusion-1',
         phase: this.phase,
         terminal: true,
         error: this.terminalError,
-        processTerminalProof: terminalProof("fusion-1"),
+        processTerminalProof: terminalProof('fusion-1'),
       },
     });
   }
@@ -4399,16 +4714,16 @@ class StartFailingFusion extends FakeFusion {
   override async start(): Promise<BridgeResult> {
     return {
       success: false,
-      error: { message: "Fusion extension unavailable." },
+      error: { message: 'Fusion extension unavailable.' },
     };
   }
 
   override async status(): Promise<BridgeResult> {
     return success({
-      operationId: "fusion-replay-operation",
-      requestDigest: "digest-fusion-replay-operation",
-      effectiveExecutionLifetime: { mode: "unbounded" },
-      run: { runId: "fusion-1", phase: "panel", terminal: false },
+      operationId: 'fusion-replay-operation',
+      requestDigest: 'digest-fusion-replay-operation',
+      effectiveExecutionLifetime: { mode: 'unbounded' },
+      run: { runId: 'fusion-1', phase: 'panel', terminal: false },
     });
   }
 }
@@ -4420,7 +4735,7 @@ function realGit() {
     try {
       const result = await execFile(command, args, {
         cwd,
-        encoding: "utf8",
+        encoding: 'utf8',
       });
       return {
         stdout: String(result.stdout),
@@ -4434,60 +4749,70 @@ function realGit() {
         stdout?: unknown;
       };
       return {
-        stdout: typeof result.stdout === "string" ? result.stdout : "",
-        stderr: typeof result.stderr === "string" ? result.stderr : "",
-        code: typeof result.code === "number" ? result.code : null,
+        stdout: typeof result.stdout === 'string' ? result.stdout : '',
+        stderr: typeof result.stderr === 'string' ? result.stderr : '',
+        code: typeof result.code === 'number' ? result.code : null,
       };
     }
   };
 }
 
-function fakeGit(root: string, branch = "feature") {
+function fakeGit(root: string, branch = 'feature') {
   return async (_command: string, args: string[]) => {
-    if (args[0] === "rev-parse" && args[1] === "--show-cdup")
-      return { stdout: "", stderr: "", code: 0 };
-    if (args[0] === "rev-parse" && args[1] === "HEAD")
-      return { stdout: `${"a".repeat(40)}\n`, stderr: "", code: 0 };
-    if (args[0] === "show" && args[1]) {
-      const separator = args[1].indexOf(":");
-      const relativePath = separator >= 0 ? args[1].slice(separator + 1) : "";
+    if (args[0] === 'rev-parse' && args[1] === '--show-cdup')
+      return { stdout: '', stderr: '', code: 0 };
+    if (args[0] === 'rev-parse' && args[1] === 'HEAD')
+      return { stdout: `${'a'.repeat(40)}\n`, stderr: '', code: 0 };
+    if (args[0] === 'show' && args[1]) {
+      const separator = args[1].indexOf(':');
+      const relativePath = separator >= 0 ? args[1].slice(separator + 1) : '';
       try {
-        return { stdout: await readFile(join(root, relativePath), "utf8"), stderr: "", code: 0 };
+        return {
+          stdout: await readFile(join(root, relativePath), 'utf8'),
+          stderr: '',
+          code: 0,
+        };
       } catch {
-        return { stdout: "### Task 1: Implement\n- [x] Done\n", stderr: "", code: 0 };
+        return {
+          stdout: '### Task 1: Implement\n- [x] Done\n',
+          stderr: '',
+          code: 0,
+        };
       }
     }
-    if (args[0] === "merge-base")
-      return { stdout: "", stderr: "", code: 0 };
-    if (args[0] === "status")
-      return { stdout: "", stderr: "", code: 0 };
-    if (args[0] === "symbolic-ref")
-      return { stdout: "origin/main\n", stderr: "", code: 0 };
-    if (args[0] === "branch")
-      return { stdout: `${branch}\n`, stderr: "", code: 0 };
-    if (args.includes("--git-common-dir"))
-      return { stdout: `${root}/.git\n`, stderr: "", code: 0 };
-    return { stdout: `${root}\n`, stderr: "", code: 0 };
+    if (args[0] === 'merge-base') return { stdout: '', stderr: '', code: 0 };
+    if (args[0] === 'status') return { stdout: '', stderr: '', code: 0 };
+    if (args[0] === 'symbolic-ref')
+      return { stdout: 'origin/main\n', stderr: '', code: 0 };
+    if (args[0] === 'branch')
+      return { stdout: `${branch}\n`, stderr: '', code: 0 };
+    if (args.includes('--git-common-dir'))
+      return { stdout: `${root}/.git\n`, stderr: '', code: 0 };
+    return { stdout: `${root}\n`, stderr: '', code: 0 };
   };
 }
 
-function acceptedCandidateGit(root: string, planPath: string, branch = "feature") {
+function acceptedCandidateGit(
+  root: string,
+  planPath: string,
+  branch = 'feature',
+) {
   return async (command: string, args: string[]) => {
-    if (command === "git" && args[0] === "rev-parse" && args[1] === "HEAD") {
-      const plan = await readFile(planPath, "utf8");
+    if (command === 'git' && args[0] === 'rev-parse' && args[1] === 'HEAD') {
+      const plan = await readFile(planPath, 'utf8');
       return {
-        stdout: `${plan.includes("[ ]") ? "a".repeat(40) : "b".repeat(40)}\n`,
-        stderr: "",
+        stdout: `${plan.includes('[ ]') ? 'a'.repeat(40) : 'b'.repeat(40)}\n`,
+        stderr: '',
         code: 0,
       };
     }
-    if (command === "git" && args[0] === "show") {
-      return { stdout: await readFile(planPath, "utf8"), stderr: "", code: 0 };
+    if (command === 'git' && args[0] === 'show') {
+      return { stdout: await readFile(planPath, 'utf8'), stderr: '', code: 0 };
     }
-    if (command === "git" && args[0] === "merge-base")
-      return { stdout: "", stderr: "", code: 0 };
-    if (command === "git" && args[0] === "status")
-      return { stdout: "", stderr: "", code: 0 };
+    if (command === 'git' && args[0] === 'merge-base')
+      return { stdout: '', stderr: '', code: 0 };
+    if (command === 'git' && args[0] === 'status')
+      return { stdout: '', stderr: '', code: 0 };
     return fakeGit(root, branch)(command, args);
   };
 }

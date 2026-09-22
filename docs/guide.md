@@ -727,5 +727,5 @@ For local setup, validation, and tag-driven releases, see
 [DEVELOPMENT.md](../DEVELOPMENT.md).
 
 The declared host-boundary check is `npm run test:runtime-smoke`. It uses
-scripted model turns and does not prove a live-LLM run. Supported Darwin
-prerequisites are required; the full pipeline passed on the final source pins.
+scripted model turns and does not prove a live-LLM run. It runs on any POSIX
+host and passed the full pipeline on the released pins.
