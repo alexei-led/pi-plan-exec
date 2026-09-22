@@ -72,6 +72,7 @@ import {
   TASK_FAILED_MARKER,
   goalHash,
   goalPrompt,
+  normalizeCheckOutput,
   normalizeGoalText,
   parseGoalOutcome,
 } from "./goal-loop.js";
@@ -336,7 +337,7 @@ export class PlanExecController {
       unresolvedFindings: [],
       skippedStages: [],
       branchRebindings: [],
-    }, { exclusive: true, ...(options.onRunAllocated ? { onRunAllocated: options.onRunAllocated } : {}) });
+    }, { exclusive: true, ...(options.onRunAllocated ? { onAllocated: options.onRunAllocated } : {}) });
     return this.advance(await this.registry.claim(run, options.sessionId));
   }
 
@@ -900,7 +901,7 @@ export class PlanExecController {
         `No progress after ${noProgress} goal turns: HEAD is unchanged and the required checks produced the same result.`);
     if (outcome.kind === GOAL_OUTCOME.DONE && !failure) {
       const violation = await this.goalCompletionGuard(run);
-      if (violation) return this.pauseGoal({ ...run, goal: nextGoal }, violation);
+      if (violation) return this.pauseGoalForGuard({ ...run, goal: nextGoal }, violation);
       const advanced = await this.registry.updateIfCurrent(clearError(withoutOperation({
         ...run, goal: nextGoal, nextAttemptAt: 0,
         wakeReason: `Goal achieved after ${goal.iteration} turns.`,
@@ -934,14 +935,15 @@ export class PlanExecController {
     } catch (error: unknown) {
       if (error instanceof LocalOperationUnknownError || error instanceof LocalOperationCancelledError) throw error;
       const details = error instanceof LocalOperationFailedError ? error.details : undefined;
-      const output = (details?.outputTail ?? "").replace(/\s+/gu, " ").trim().slice(0, GOAL_CHECK_OUTPUT_LIMIT);
+      const output = normalizeCheckOutput(details?.outputTail ?? "").replace(/\s+/gu, " ").trim().slice(0, GOAL_CHECK_OUTPUT_LIMIT);
+      const summary = output || `exit ${details?.code ?? "unknown"}`;
       const text = [
         `checks: ${commands.join(" · ")}`,
         `exit: ${details?.code ?? "unknown"}`,
         output ? `output: ${output}` : `error: ${error instanceof Error ? error.message : String(error)}`,
       ].join("\n");
       const fingerprint = `fail:${details?.code ?? "unknown"}:${createHash("sha256")
-        .update(`${commands.join("\n")}\n${output || (error instanceof Error ? error.message : String(error))}`)
+        .update(`${commands.join("\n")}\n${summary}`)
         .digest("hex").slice(0, GOAL_FINGERPRINT_LENGTH)}`;
       return { text, fingerprint };
     }
@@ -987,6 +989,30 @@ export class PlanExecController {
       needsAttention: true,
     }), run.updatedAt);
     if (paused.applied) await appendProgressBestEffort(paused.run, `Goal paused: ${reason}`);
+    return paused.run;
+  }
+
+  /**
+   * A guard violation at the final gate happens after review; resume must run
+   * another implementation turn, so the stage returns to IMPLEMENTATION and the
+   * stale verified/reviewed commits are dropped.
+   */
+  private async pauseGoalForGuard(run: PlanExecRun, reason: string): Promise<PlanExecRun> {
+    const cleared: PlanExecRun = {
+      ...run,
+      stage: RUN_STAGE.IMPLEMENTATION,
+      status: RUN_STATUS.PAUSED,
+      blocked: { reason },
+      nextAttemptAt: 0,
+      wakeReason: reason,
+      error: reason,
+      needsAttention: true,
+      goal: run.goal === undefined ? run.goal : { ...run.goal, lastOutcome: `Goal completion guard: ${reason}` },
+    } as PlanExecRun;
+    delete cleared.verifiedCommit;
+    delete cleared.reviewedCommit;
+    const paused = await this.registry.updateIfCurrent(withoutOperation(cleared), run.updatedAt);
+    if (paused.applied) await appendProgressBestEffort(paused.run, `Goal paused by the completion guard: ${reason}`);
     return paused.run;
   }
 
@@ -2848,7 +2874,7 @@ export class PlanExecController {
   private async complete(run: PlanExecRun): Promise<PlanExecRun> {
     if (isGoalRun(run)) {
       const violation = await this.goalCompletionGuard(run);
-      if (violation) return this.pauseGoal(run, violation);
+      if (violation) return this.pauseGoalForGuard(run, violation);
     }
     const unmet = await this.completionPrerequisite(run);
     if (unmet) return this.fail(run, unmet);
