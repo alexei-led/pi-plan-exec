@@ -322,6 +322,11 @@ async function runOwnedOperation(cwd: string, commands: string[][], options: Loc
     if (observation.status === EXTERNAL_OPERATION_STATE.UNKNOWN) throw new LocalOperationUnknownError(observation.reason ?? "Local command ownership is unknown.");
     if (ownedProcessTerminal(observation, binding)) {
       if (activePath) await removeActiveEntry(activePath);
+      // A concurrent generation fence may land between the stop read and the
+      // retirement observation; re-read it so a cancelled run never reports as
+      // a lost result.
+      if (stopped === undefined) stopped = await json(join(directory, "stop.json"));
+      if (stopped !== undefined && !stopMatches(stopped, intent)) throw new LocalOperationUnknownError("Local command cancellation identity mismatch.");
       if (stopped !== undefined || !(await bounded(options.isAuthorized()))) throw new LocalOperationCancelledError("Local operation was cancelled after confirmed process-tree exit.");
       const result = await json(join(directory, "result.json"));
       if (result === undefined) throw new LocalOperationFailedError("Local command failed: lost-result-after-exit.");
