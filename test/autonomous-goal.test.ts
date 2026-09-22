@@ -319,15 +319,35 @@ test("the final gate rechecks test weakening after a review-style fix commit", a
   await f.git("commit", "-m", "review fixer deletes the test");
   run = await advanceToCompletion(f, run);
   assert.equal(run.status, "paused");
+  assert.equal(run.stage, "implementation", "resume must be able to run a worker turn after a final-gate guard pause");
   assert.match(run.blocked?.reason ?? "", /deleted test files/);
+
+  await writeFile(join(f.root, "tests", "sample.test.ts"), "test('ok', () => {});\n");
+  await f.git("add", "--all");
+  await f.git("commit", "-m", "restore the test");
+  run = await f.controller.resume(run.id, "session", true);
+  assert.equal(run.stage, "implementation");
+  run = await finishTurn(f, run, "<<<RALPHEX:GOAL_DONE>>>\nRestored.");
+  run = await advanceToCompletion(f, run);
+  assert.equal(run.status, "completed", "a restored goal must be able to complete");
+});
+
+test("startGoal reports its allocated run to the caller", async (t) => {
+  const f = await fixture(t);
+  let allocated: PlanExecRun | undefined;
+  await f.controller.startGoal({ goal: "Fix the failing tests", sessionId: "session", cwd: f.root, checks: CHECK,
+    onRunAllocated: (run) => { allocated = run; } });
+  assert.ok(allocated, "the allocation callback must run so session retirement can track the goal");
 });
 
 test("a failing check reports its commands and output and keeps a stable fingerprint", async (t) => {
   const f = await fixture(t);
+  let attempt = 0;
   const failing = async () => {
+    attempt += 1;
     throw new LocalOperationFailedError("Local command failed (exit 1): /journal/local-operations/deadbeef/generation-1", {
       code: 1,
-      outputTail: "AssertionError: expected 5 got 4",
+      outputTail: `duration_ms: ${100 + attempt}\nStart at 12:0${attempt}\nAssertionError: expected 5 got 4`,
     });
   };
   const controller = new PlanExecController(f.registry, f.worker, fusion, command, failing);
@@ -345,5 +365,6 @@ test("a failing check reports its commands and output and keeps a stable fingerp
 
   run = await controller.tick((await due(f, run)).id, "session");
   run = await finish();
-  assert.equal(run.goal!.lastCheck!.fingerprint, fingerprint, "an identical failure must not look like progress");
+  assert.equal(run.goal!.lastCheck!.fingerprint, fingerprint, "test-runner timings must not look like progress");
+  assert.doesNotMatch(run.goal!.lastCheck!.failures, /duration_ms/);
 });
