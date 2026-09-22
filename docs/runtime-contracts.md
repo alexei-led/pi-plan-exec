@@ -138,7 +138,9 @@ main full gate passed all 537 tests, lint, TypeScript and package validation,
 including optional skip races and frozen candidate checkouts, and
 `npm run test:runtime-smoke` passed the installed controller, Bridge/native RPC,
 owned workers, required review, promotion and archive. The cumulative Revmux
-confirmation remains pending.
+confirmation passed on the corrected pins: round `12-final` reported four of
+four sources, no degradation and no findings on main `091d499`, native
+`e785953`, Fusion `b113212`, Bridge `3e99ec2` and Revmux `988904f`.
 
 ## Source and review tracking
 
