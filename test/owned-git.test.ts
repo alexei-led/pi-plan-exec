@@ -428,6 +428,7 @@ nativeTest(
       children.push(restarted);
       await waitForFile(restartReady, 'restarted controller readiness');
       assert.equal(lineCount(await fileText(restartEntry)), 0);
+      await writeFile(`${restartReady}.proceed`, '');
       await waitForOperationEntry(restartEntry, operationId);
       assert.equal(lineCount(await fileText(fixture.bridgeMarker)), 0);
       assert.equal(lineCount(await fileText(fixture.writerDone)), 0);
@@ -617,6 +618,7 @@ nativeTest(
       children.push(restarted);
       await waitForFile(restartReady, 'restarted controller readiness');
       assert.equal(lineCount(await fileText(restartEntry)), 0);
+      await writeFile(`${restartReady}.proceed`, '');
       await waitForOperationEntry(restartEntry, operationId);
       assert.equal(lineCount(await fileText(fixture.bridgeMarker)), 0);
       assert.equal(lineCount(await fileText(fixture.writerDone)), 0);
