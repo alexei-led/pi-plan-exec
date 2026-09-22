@@ -1,11 +1,11 @@
-import assert from "node:assert/strict";
-import test from "node:test";
+import assert from 'node:assert/strict';
+import { test } from 'vitest';
 import {
-  PlanExecRuntimeIntegration,
   type BackgroundWorkProvider,
   type ExternalRunRecord,
-} from "../src/runtime-integration.js";
-import { DEFAULT_FROZEN_RUN_CONFIG, type PlanExecRun } from "../src/types.js";
+  PlanExecRuntimeIntegration,
+} from '../src/runtime-integration.js';
+import { DEFAULT_FROZEN_RUN_CONFIG, type PlanExecRun } from '../src/types.js';
 
 class FakeRuntimeApi {
   readonly rows = new Map<string, ExternalRunRecord>();
@@ -45,23 +45,23 @@ class FakeRuntimeApi {
 function run(overrides: Partial<PlanExecRun> = {}): PlanExecRun {
   return {
     schemaVersion: 1,
-    id: "11111111-1111-4111-8111-111111111111",
+    id: '11111111-1111-4111-8111-111111111111',
     revision: 3,
-    repositoryRoot: "/repo",
-    planPath: "/repo/plan.md",
-    planHash: "hash",
-    worktreeCwd: "/repo",
-    branch: "feature",
-    defaultBranch: "main",
-    status: "running",
-    stage: "implementation",
+    repositoryRoot: '/repo',
+    planPath: '/repo/plan.md',
+    planHash: 'hash',
+    worktreeCwd: '/repo',
+    branch: 'feature',
+    defaultBranch: 'main',
+    status: 'running',
+    stage: 'implementation',
     taskAttempts: {},
     stageAttempts: {},
     reviewFindings: [],
     unresolvedFindings: [],
     skippedStages: [],
     branchRebindings: [],
-    lease: { sessionId: "session-1", pid: process.pid, heartbeatAt: 1 },
+    lease: { sessionId: 'session-1', pid: process.pid, heartbeatAt: 1 },
     config: {
       ...DEFAULT_FROZEN_RUN_CONFIG,
       taskRetries: 1,
@@ -69,11 +69,11 @@ function run(overrides: Partial<PlanExecRun> = {}): PlanExecRun {
       reviewIterations: 5,
       fusionIterations: 10,
       finalizeEnabled: true,
-      workerAgent: "worker",
+      workerAgent: 'worker',
       workerMaxTurns: 50,
-      reviewerAgent: "reviewer",
+      reviewerAgent: 'reviewer',
       reviewerMaxTurns: 30,
-      statsAgent: "reviewer",
+      statsAgent: 'reviewer',
       statsMaxTurns: 30,
     },
     createdAt: 1,
@@ -82,31 +82,31 @@ function run(overrides: Partial<PlanExecRun> = {}): PlanExecRun {
   };
 }
 
-test("registers one PlanExec row and one background provider", () => {
+test('registers one PlanExec row and one background provider', () => {
   const api = new FakeRuntimeApi();
   const integration = new PlanExecRuntimeIntegration(api);
-  integration.reconcile([run()], "session-1");
+  integration.reconcile([run()], 'session-1');
 
   assert.equal(api.rows.size, 1);
   const row = [...api.rows.values()][0];
-  assert.equal(row?.id, "plan-exec:11111111-1111-4111-8111-111111111111");
-  assert.equal(row?.source, "pi-plan-exec");
+  assert.equal(row?.id, 'plan-exec:11111111-1111-4111-8111-111111111111');
+  assert.equal(row?.source, 'pi-plan-exec');
   assert.equal(api.providers.size, 1);
   const provider = [...api.providers.values()][0];
   assert.deepEqual(provider?.listActiveWork(), [
     {
-      id: "plan-exec:11111111-1111-4111-8111-111111111111",
-      sessionId: "session-1",
+      id: 'plan-exec:11111111-1111-4111-8111-111111111111',
+      sessionId: 'session-1',
     },
   ]);
 });
 
-test("reload reconciliation replaces owned registrations without duplicates", () => {
+test('reload reconciliation replaces owned registrations without duplicates', () => {
   const api = new FakeRuntimeApi();
   const first = new PlanExecRuntimeIntegration(api);
-  first.reconcile([run()], "session-1");
+  first.reconcile([run()], 'session-1');
   const second = new PlanExecRuntimeIntegration(api);
-  second.reconcile([run({ revision: 4, updatedAt: 3 })], "session-1");
+  second.reconcile([run({ revision: 4, updatedAt: 3 })], 'session-1');
 
   assert.equal(api.rows.size, 1);
   assert.equal(api.providers.size, 1);
@@ -118,75 +118,76 @@ test("reload reconciliation replaces owned registrations without duplicates", ()
   assert.equal(api.providers.size, 0);
 });
 
-test("new reload reconciliation removes stale rows from the prior generation", () => {
+test('new reload reconciliation removes stale rows from the prior generation', () => {
   const api = new FakeRuntimeApi();
   const first = new PlanExecRuntimeIntegration(api);
-  const stale = run({ id: "22222222-2222-4222-8222-222222222222" });
-  first.reconcile([run(), stale], "session-1");
+  const stale = run({ id: '22222222-2222-4222-8222-222222222222' });
+  first.reconcile([run(), stale], 'session-1');
   const second = new PlanExecRuntimeIntegration(api);
 
-  second.reconcile([run()], "session-1");
+  second.reconcile([run()], 'session-1');
 
-  assert.deepEqual([...api.rows.values()].map((row) => row.id), [
-    "plan-exec:11111111-1111-4111-8111-111111111111",
-  ]);
+  assert.deepEqual(
+    [...api.rows.values()].map((row) => row.id),
+    ['plan-exec:11111111-1111-4111-8111-111111111111'],
+  );
   first.dispose();
   assert.equal(api.rows.size, 1);
   second.dispose();
 });
 
-test("old reload reconciliation cannot remove a replacement row", () => {
+test('old reload reconciliation cannot remove a replacement row', () => {
   const api = new FakeRuntimeApi();
   const first = new PlanExecRuntimeIntegration(api);
-  first.reconcile([run()], "session-1");
+  first.reconcile([run()], 'session-1');
   const second = new PlanExecRuntimeIntegration(api);
-  second.reconcile([run()], "session-1");
-  first.reconcile([], "session-1");
+  second.reconcile([run()], 'session-1');
+  first.reconcile([], 'session-1');
 
   assert.equal(api.rows.size, 1);
-  second.reconcile([], "session-1");
+  second.reconcile([], 'session-1');
   assert.equal(api.rows.size, 0);
   first.dispose();
   second.dispose();
 });
 
-test("same generation reconciliation removes its own retired row", () => {
+test('same generation reconciliation removes its own retired row', () => {
   const api = new FakeRuntimeApi();
   const integration = new PlanExecRuntimeIntegration(api);
-  integration.reconcile([run()], "session-1");
-  integration.reconcile([], "session-1");
+  integration.reconcile([run()], 'session-1');
+  integration.reconcile([], 'session-1');
 
   assert.equal(api.rows.size, 0);
   integration.dispose();
 });
 
-test("disposed integration cannot resurrect rows or providers", () => {
+test('disposed integration cannot resurrect rows or providers', () => {
   const api = new FakeRuntimeApi();
   const integration = new PlanExecRuntimeIntegration(api);
-  integration.reconcile([run()], "session-1");
+  integration.reconcile([run()], 'session-1');
   integration.dispose();
 
-  integration.sync(run({ revision: 4, updatedAt: 3 }), "session-1");
-  integration.reconcile([run({ revision: 5, updatedAt: 4 })], "session-1");
+  integration.sync(run({ revision: 4, updatedAt: 3 }), 'session-1');
+  integration.reconcile([run({ revision: 5, updatedAt: 4 })], 'session-1');
 
   assert.equal(api.rows.size, 0);
   assert.equal(api.providers.size, 0);
 });
 
-test("terminal runs remain visible but leave background work", () => {
+test('terminal runs remain visible but leave background work', () => {
   const api = new FakeRuntimeApi();
   const integration = new PlanExecRuntimeIntegration(api);
-  integration.reconcile([run()], "session-1");
-  const completed = run({ status: "completed", stage: "complete" });
+  integration.reconcile([run()], 'session-1');
+  const completed = run({ status: 'completed', stage: 'complete' });
   delete completed.lease;
-  integration.sync(completed, "session-1");
+  integration.sync(completed, 'session-1');
 
-  assert.equal([...api.rows.values()][0]?.state, "completed");
+  assert.equal([...api.rows.values()][0]?.state, 'completed');
   const provider = [...api.providers.values()][0];
   assert.deepEqual(provider?.listActiveWork(), []);
 });
 
-test("degraded task projection is visible on the top-level row", () => {
+test('degraded task projection is visible on the top-level row', () => {
   const api = new FakeRuntimeApi();
   const integration = new PlanExecRuntimeIntegration(api);
   integration.reconcile(
@@ -194,20 +195,20 @@ test("degraded task projection is visible on the top-level row", () => {
       run({
         taskProjection: {
           version: 1,
-          state: "degraded",
-          owner: "pi-plan-exec",
-          sessionId: "session-1",
+          state: 'degraded',
+          owner: 'pi-plan-exec',
+          sessionId: 'session-1',
           revision: 3,
           taskIds: {},
-          error: "pi-tasks memory scope has no durable path",
+          error: 'pi-tasks memory scope has no durable path',
         },
       }),
     ],
-    "session-1",
+    'session-1',
   );
 
   assert.match(
-    [...api.rows.values()][0]?.preview ?? "",
+    [...api.rows.values()][0]?.preview ?? '',
     /projection degraded.*memory scope/i,
   );
 });

@@ -1,84 +1,89 @@
-import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import {
   access,
   chmod,
   mkdir,
   mkdtemp,
-  readFile,
   readdir,
+  readFile,
   realpath,
   rm,
   writeFile,
-} from "node:fs/promises";
-import { randomUUID } from "node:crypto";
-import { hostname, tmpdir } from "node:os";
-import { join } from "node:path";
-import test from "node:test";
-import { fileURLToPath } from "node:url";
-import { RunRegistry } from "../src/registry.js";
-import { PlanExecController } from "../src/controller.js";
-import { LocalOperationFailedError } from "../src/local-operation.js";
-import { TaskProjector } from "../src/task-projection.js";
-import { createControllerLocalExecutor } from "./fixtures/controller-local-executor.js";
-import { SessionManager, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+} from 'node:fs/promises';
+import { hostname, tmpdir } from 'node:os';
+import { join } from 'node:path';
+import test from 'node:test';
+import { fileURLToPath } from 'node:url';
+import {
+  type ExtensionAPI,
+  type ExtensionCommandContext,
+  SessionManager,
+} from '@earendil-works/pi-coding-agent';
+import { PlanExecController } from '../src/controller.js';
 import planExecExtension, {
   abandonedRunsNotice,
   abandonmentProbe,
   bridgeRuntimeCompatible,
   chooseStopOutcome,
-  execCleanup,
-  execReconcile,
-  execHelp,
-  execSetup,
-  isRemovableRun,
-  parseCleanupArguments,
-  pausedMessage,
-  parseDoctorArguments,
-  runEvidence,
-  sweepAbandonment,
   type EvidenceProbe,
+  execCleanup,
+  execHelp,
   execRead,
+  execReconcile,
+  execSetup,
   execStatus,
   formatRunStatus,
   formatRunWidget,
   getExecArgumentCompletions,
+  handleCommand,
   hasBridgeOperationMethod,
   hasBridgeWorkflowScriptSpawnCapability,
-  handleCommand,
   isActionAllowed,
   isRecoverableFailure,
+  isRemovableRun,
   isStageWaiverAvailable,
   missingRuntimeTools,
   needsPlanStructureReview,
+  parseCleanupArguments,
+  parseDoctorArguments,
   parseResumeArguments,
   parseResumeOptions,
-  parseStartArguments,
   parseSkipReason,
+  parseStartArguments,
   parseStatusArguments,
+  pausedMessage,
+  prioritizeRunCandidates,
   reconcileForResume,
+  recoveryGuidance,
+  requestStatus,
+  resumeResultMessage,
+  reviewedPlanHashForResume,
   runActionFor,
+  runEvidence,
+  runtimeIntegrationProblem,
   sameMachineRefusal,
   settledRunLines,
   shouldRepairProjectionForSession,
-  resumeResultMessage,
-  prioritizeRunCandidates,
-  recoveryGuidance,
-  reviewedPlanHashForResume,
-  requestStatus,
-  runtimeIntegrationProblem,
   shouldStopBackgroundController,
-} from "../src/index.js";
+  sweepAbandonment,
+} from '../src/index.js';
 import {
+  type AbandonmentEvidence,
+  longRunningOperation,
+} from '../src/lifecycle.js';
+import { LocalOperationFailedError } from '../src/local-operation.js';
+import { RunRegistry } from '../src/registry.js';
+import { required } from '../src/required.js';
+import { TaskProjector } from '../src/task-projection.js';
+import {
+  DEFAULT_FROZEN_RUN_CONFIG,
   EXEC_ACTION,
   EXEC_ALIAS_ACTIONS,
-  DEFAULT_FROZEN_RUN_CONFIG,
   type PlanExecRun,
-} from "../src/types.js";
-import {
-  longRunningOperation,
-  type AbandonmentEvidence,
-} from "../src/lifecycle.js";
+} from '../src/types.js';
+import { createControllerLocalExecutor } from './fixtures/controller-local-executor.js';
 
 // Three distinct turn budgets on purpose: with reviewer and stats equal, a
 // stats operation routed to the reviewer budget would be invisible.
@@ -89,54 +94,127 @@ const config = {
   reviewIterations: 5,
   fusionIterations: 10,
   finalizeEnabled: true,
-  workerAgent: "worker",
+  workerAgent: 'worker',
   workerMaxTurns: 50,
-  reviewerAgent: "reviewer",
+  reviewerAgent: 'reviewer',
   reviewerMaxTurns: 30,
-  statsAgent: "reviewer",
+  statsAgent: 'reviewer',
   statsMaxTurns: 20,
 };
 
 function persistedSession(cwd: string, directory: string): SessionManager {
   const session = SessionManager.create(cwd, directory);
-  session.appendMessage({ role: "user", content: "Execute the saved plan.", timestamp: Date.now() });
-  session.appendMessage({ role: "assistant", content: [{ type: "text", text: "Ready to execute." }],
-    api: "openai-responses", provider: "openai", model: "test-fixture", stopReason: "stop", timestamp: Date.now(),
-    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } });
+  session.appendMessage({
+    role: 'user',
+    content: 'Execute the saved plan.',
+    timestamp: Date.now(),
+  });
+  session.appendMessage({
+    role: 'assistant',
+    content: [{ type: 'text', text: 'Ready to execute.' }],
+    api: 'openai-responses',
+    provider: 'openai',
+    model: 'test-fixture',
+    stopReason: 'stop',
+    timestamp: Date.now(),
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+  });
   return session;
 }
 
 function executionHarness(cwd: string, sessionId: string) {
-  type Handler = (event: unknown, ctx: ExtensionCommandContext) => Promise<unknown>;
+  type Handler = (
+    event: unknown,
+    ctx: ExtensionCommandContext,
+  ) => Promise<unknown>;
   const events = new Map<string, Handler[]>();
-  const commands = new Map<string, { handler(args: string, ctx: ExtensionCommandContext): Promise<void> }>();
+  const commands = new Map<
+    string,
+    { handler(args: string, ctx: ExtensionCommandContext): Promise<void> }
+  >();
   const notifications: string[] = [];
-  const pi = { events: { on() {}, emit() {} },
-    on(name: string, handler: Handler) { events.set(name, [...events.get(name) ?? [], handler]); },
-    registerCommand(name: string, command: { handler(args: string, ctx: ExtensionCommandContext): Promise<void> }) { commands.set(name, command); },
-    registerTool() {}, getAllTools() { return []; }, getActiveTools() { return []; }, setActiveTools() {},
+  const pi = {
+    events: { on() {}, emit() {} },
+    on(name: string, handler: Handler) {
+      events.set(name, [...(events.get(name) ?? []), handler]);
+    },
+    registerCommand(
+      name: string,
+      command: {
+        handler(args: string, ctx: ExtensionCommandContext): Promise<void>;
+      },
+    ) {
+      commands.set(name, command);
+    },
+    registerTool() {},
+    getAllTools() {
+      return [];
+    },
+    getActiveTools() {
+      return [];
+    },
+    setActiveTools() {},
     exec: async (program: string, args: string[], options: { cwd: string }) => {
-      const result = spawnSync(program, args, { cwd: options.cwd, encoding: "utf8" });
-      return { stdout: result.stdout ?? "", stderr: result.stderr ?? "", code: result.status ?? 1 };
+      const result = spawnSync(program, args, {
+        cwd: options.cwd,
+        encoding: 'utf8',
+      });
+      return {
+        stdout: result.stdout ?? '',
+        stderr: result.stderr ?? '',
+        code: result.status ?? 1,
+      };
     },
   } as unknown as ExtensionAPI;
-  const ctx = { cwd, hasUI: true,
-    sessionManager: { getSessionId: () => sessionId, getSessionFile: () => undefined },
-    ui: { select: async (_title: string, options: string[]) => options.includes("In-place") ? "In-place" : options[0],
-      confirm: async () => true, setStatus() {}, setWidget() {}, notify(message: string) { notifications.push(message); } },
+  const ctx = {
+    cwd,
+    hasUI: true,
+    sessionManager: {
+      getSessionId: () => sessionId,
+      getSessionFile: () => undefined,
+    },
+    ui: {
+      select: async (_title: string, options: string[]) =>
+        options.includes('In-place') ? 'In-place' : options[0],
+      confirm: async () => true,
+      setStatus() {},
+      setWidget() {},
+      notify(message: string) {
+        notifications.push(message);
+      },
+    },
   } as unknown as ExtensionCommandContext;
   planExecExtension(pi);
-  return { ctx, notifications, command: (args: string) => commands.get("exec")!.handler(args, ctx),
+  return {
+    ctx,
+    notifications,
+    command: (args: string) => {
+      const command = commands.get('exec');
+      assert.ok(command, 'exec command is not registered');
+      return command.handler(args, ctx);
+    },
     emit: async (name: string, details: Record<string, unknown> = {}) => {
-      for (const handler of events.get(name) ?? []) await handler({ type: name, reason: "new", ...details }, ctx);
-    } };
+      for (const handler of events.get(name) ?? [])
+        await handler({ type: name, reason: 'new', ...details }, ctx);
+    },
+  };
 }
 
-test("task blocker status and pause notification explain recovery without a crash", () => {
+test('task blocker status and pause notification explain recovery without a crash', () => {
   const blocked = run({
-    status: "paused", stage: "implementation",
-    blocked: { taskId: 4, reason: "Constructor merge and readiness evidence missing." },
+    status: 'paused',
+    stage: 'implementation',
+    blocked: {
+      taskId: 4,
+      reason: 'Constructor merge and readiness evidence missing.',
+    },
   });
   delete blocked.activeOperation;
   const status = formatRunStatus(blocked);
@@ -152,10 +230,12 @@ test("task blocker status and pause notification explain recovery without a cras
   }
 });
 
-test("legacy TASK_FAILED diagnostics show a resumable outside blocker", () => {
+test('legacy TASK_FAILED diagnostics show a resumable outside blocker', () => {
   const legacy = run({
-    status: "failed", stage: "implementation",
-    error: 'Worker workflow-1 ended as complete and left task 4 checkboxes unchecked. Return: {"output":"<<<RALPHEX:TASK_FAILED>>>\\nBlocker: Constructor merge missing."}',
+    status: 'failed',
+    stage: 'implementation',
+    error:
+      'Worker workflow-1 ended as complete and left task 4 checkboxes unchecked. Return: {"output":"<<<RALPHEX:TASK_FAILED>>>\\nBlocker: Constructor merge missing."}',
   });
   delete legacy.activeOperation;
   const status = formatRunStatus(legacy);
@@ -167,25 +247,25 @@ test("legacy TASK_FAILED diagnostics show a resumable outside blocker", () => {
 function run(overrides: Partial<PlanExecRun> = {}): PlanExecRun {
   return {
     schemaVersion: 1,
-    id: "11111111-1111-4111-8111-111111111111",
-    repositoryRoot: "/repo",
-    planPath: "/repo/docs/plans/example.md",
-    planHash: "hash",
-    worktreeCwd: "/repo",
-    branch: "feature",
-    defaultBranch: "main",
-    status: "running",
-    stage: "implementation",
+    id: '11111111-1111-4111-8111-111111111111',
+    repositoryRoot: '/repo',
+    planPath: '/repo/docs/plans/example.md',
+    planHash: 'hash',
+    worktreeCwd: '/repo',
+    branch: 'feature',
+    defaultBranch: 'main',
+    status: 'running',
+    stage: 'implementation',
     taskAttempts: {},
     stageAttempts: {},
     reviewFindings: [],
     skippedStages: [],
     branchRebindings: [],
-    progressPath: "/repo/.ralphex/progress.txt",
+    progressPath: '/repo/.ralphex/progress.txt',
     activeOperation: {
-      operationId: "operation-1",
-      service: "bridge",
-      kind: "implementation",
+      operationId: 'operation-1',
+      service: 'bridge',
+      kind: 'implementation',
       taskId: 1,
     },
     config,
@@ -204,8 +284,8 @@ const INSIDE_RETENTION = Date.now() - 6 * DAY_MS;
 /** A terminal run with no tracked operation, the shape cleanup considers. */
 function retiredRun(overrides: Partial<PlanExecRun> = {}): PlanExecRun {
   const retired = run({
-    status: "completed",
-    stage: "complete",
+    status: 'completed',
+    stage: 'complete',
     updatedAt: PAST_RETENTION,
     ...overrides,
   });
@@ -217,13 +297,13 @@ function retiredRun(overrides: Partial<PlanExecRun> = {}): PlanExecRun {
 async function seedDirectory(
   runs: PlanExecRun[],
 ): Promise<{ registry: RunRegistry; directory: string }> {
-  const directory = await mkdtemp(join(tmpdir(), "pi-plan-exec-cleanup-"));
+  const directory = await mkdtemp(join(tmpdir(), 'pi-plan-exec-cleanup-'));
   for (const seed of runs) {
     await mkdir(join(directory, seed.id), { recursive: true });
     await writeFile(
-      join(directory, seed.id, "run.json"),
+      join(directory, seed.id, 'run.json'),
       `${JSON.stringify(seed)}\n`,
-      "utf8",
+      'utf8',
     );
   }
   return { registry: new RunRegistry(directory), directory };
@@ -239,10 +319,10 @@ async function snapshotRuns(
 ): Promise<Record<string, string>> {
   const snapshot: Record<string, string> = {};
   for (const entry of await readdir(directory)) {
-    if (entry.startsWith(".")) continue;
+    if (entry.startsWith('.')) continue;
     snapshot[entry] = await readFile(
-      join(directory, entry, "run.json"),
-      "utf8",
+      join(directory, entry, 'run.json'),
+      'utf8',
     );
   }
   return snapshot;
@@ -250,20 +330,20 @@ async function snapshotRuns(
 
 /** This machine's first label: a name that looks like this machine and is not it. */
 function thisHost(): string {
-  return hostname().split(".")[0]!;
+  return required(hostname().split('.')[0]);
 }
 
 /** Return a local PID whose process has actually exited. A stale heartbeat is
  * not enough proof now that a local live PID fences the lease. */
 function reapedPid(): number {
-  const child = spawnSync(process.execPath, ["-e", ""], { stdio: "ignore" });
+  const child = spawnSync(process.execPath, ['-e', ''], { stdio: 'ignore' });
   if (child.pid === undefined)
-    throw new Error("Could not create a reaped process for the lease fixture.");
+    throw new Error('Could not create a reaped process for the lease fixture.');
   return child.pid;
 }
 
 const DEAD_LEASE = {
-  sessionId: "session-gone",
+  sessionId: 'session-gone',
   pid: reapedPid(),
   heartbeatAt: Date.now() - 10 * 60_000,
   hostname: hostname(),
@@ -271,25 +351,25 @@ const DEAD_LEASE = {
 
 const OWNED_PROCESS_TREE = {
   version: 1 as const,
-  scope: "owned-process-tree" as const,
-  escapedDescendants: "contained" as const,
+  scope: 'owned-process-tree' as const,
+  escapedDescendants: 'contained' as const,
 };
 
 function observedTerminalProof(
   runId: string,
-): NonNullable<AbandonmentEvidence["processTerminalProof"]> {
+): NonNullable<AbandonmentEvidence['processTerminalProof']> {
   return {
     version: 1,
-    state: "observed",
+    state: 'observed',
     runId,
-    runnerProcessInstanceId: "native-instance-1",
+    runnerProcessInstanceId: 'native-instance-1',
     observedAt: 1,
     instances: [],
     processTreeOwnership: OWNED_PROCESS_TREE,
-  } as NonNullable<AbandonmentEvidence["processTerminalProof"]>;
+  } as NonNullable<AbandonmentEvidence['processTerminalProof']>;
 }
 
-const LIVE_SESSION_ID = "session-live";
+const LIVE_SESSION_ID = 'session-live';
 
 /**
  * Built per use: a module-level `Date.now()` freezes at import, and the 30s
@@ -315,12 +395,12 @@ const MISSING_ASYNC_DIR = join(
 function abandonedRun(overrides: Partial<PlanExecRun> = {}): PlanExecRun {
   return run({
     lease: DEAD_LEASE,
-    taskAttempts: { "1": 2 },
+    taskAttempts: { '1': 2 },
     activeOperation: {
-      operationId: "operation-1",
-      service: "bridge",
-      kind: "implementation",
-      externalRunId: "external-1",
+      operationId: 'operation-1',
+      service: 'bridge',
+      kind: 'implementation',
+      externalRunId: 'external-1',
       taskId: 1,
       asyncDir: MISSING_ASYNC_DIR,
     },
@@ -328,7 +408,7 @@ function abandonedRun(overrides: Partial<PlanExecRun> = {}): PlanExecRun {
   });
 }
 
-function terminalEvidence(runId = "external-1"): AbandonmentEvidence {
+function terminalEvidence(runId = 'external-1'): AbandonmentEvidence {
   return {
     leaseLive: false,
     asyncDirPresent: false,
@@ -354,13 +434,13 @@ const durableTerminalProbe: EvidenceProbe = async (candidate) => {
     ? evidence
     : {
         ...evidence,
-        bridgeState: "absent",
+        bridgeState: 'absent',
         durableOperationLookup: true,
         replaySafe: true,
       };
 };
 
-test("bridge runtime compatibility requires direct owned-agent recovery rather than workflow scripting", () => {
+test('bridge runtime compatibility requires direct owned-agent recovery rather than workflow scripting', () => {
   const v1 = {
     protocolVersion: 1 as const,
     healthy: true,
@@ -370,22 +450,38 @@ test("bridge runtime compatibility requires direct owned-agent recovery rather t
   assert.equal(
     bridgeRuntimeCompatible(
       {
-        methods: ["ping", "operation"],
+        methods: ['ping', 'operation'],
         capabilities: { workflowScriptSpawn: true },
       },
       v1,
     ),
     false,
   );
-  assert.equal(bridgeRuntimeCompatible({}, { protocolVersion: 2, healthy: true,
-    workflowScriptSpawn: false, singleAgentSpawn: true, durableOperationLookup: true,
-    processTerminalProofVersion: 1, executionLifetimeVersion: 1, executionLifetimeModes: ["unbounded"],
-    processTreeOwnership: { version: 1, scope: "owned-process-tree", escapedDescendants: "contained" },
-  }), true);
+  assert.equal(
+    bridgeRuntimeCompatible(
+      {},
+      {
+        protocolVersion: 2,
+        healthy: true,
+        workflowScriptSpawn: false,
+        singleAgentSpawn: true,
+        durableOperationLookup: true,
+        processTerminalProofVersion: 1,
+        executionLifetimeVersion: 1,
+        executionLifetimeModes: ['unbounded'],
+        processTreeOwnership: {
+          version: 1,
+          scope: 'owned-process-tree',
+          escapedDescendants: 'contained',
+        },
+      },
+    ),
+    true,
+  );
   assert.equal(
     bridgeRuntimeCompatible(
       {
-        methods: ["ping", "spawn"],
+        methods: ['ping', 'spawn'],
         capabilities: { workflowScriptSpawn: true },
       },
       v1,
@@ -393,11 +489,11 @@ test("bridge runtime compatibility requires direct owned-agent recovery rather t
     false,
   );
   assert.equal(
-    hasBridgeOperationMethod({ methods: ["ping", "operation"] }),
+    hasBridgeOperationMethod({ methods: ['ping', 'operation'] }),
     true,
   );
-  assert.equal(hasBridgeOperationMethod({ methods: ["ping", "spawn"] }), false);
-  assert.equal(hasBridgeOperationMethod({ methods: "operation" }), false);
+  assert.equal(hasBridgeOperationMethod({ methods: ['ping', 'spawn'] }), false);
+  assert.equal(hasBridgeOperationMethod({ methods: 'operation' }), false);
   assert.equal(hasBridgeOperationMethod(undefined), false);
 
   assert.equal(
@@ -415,94 +511,115 @@ test("bridge runtime compatibility requires direct owned-agent recovery rather t
   assert.equal(hasBridgeWorkflowScriptSpawnCapability(undefined), false);
 });
 
-test("exec command completions explain the command family", () => {
-  const items = getExecArgumentCompletions("st");
+test('exec command completions explain the command family', () => {
+  const items = getExecArgumentCompletions('st');
   assert.deepEqual(
     items?.map((item) => item.value),
-    ["status", "stop"],
+    ['status', 'stop'],
   );
-  assert.match(items?.[0]?.description ?? "", /every run and what it needs/);
-  const allItems = getExecArgumentCompletions("") ?? [];
+  assert.match(items?.[0]?.description ?? '', /every run and what it needs/);
+  const allItems = getExecArgumentCompletions('') ?? [];
   assert.match(
-    allItems.find((item) => item.value === "resume")?.description ?? "",
+    allItems.find((item) => item.value === 'resume')?.description ?? '',
     /Continue the current run safely/,
   );
   assert.match(
-    allItems.find((item) => item.value === "skip")?.description ?? "",
+    allItems.find((item) => item.value === 'skip')?.description ?? '',
     /Force-skip/,
   );
 });
 
-test("runtime prerequisite check identifies missing provider extensions", () => {
-  assert.deepEqual(missingRuntimeTools(["TaskCreate"]), ["pi-subagents"]);
-  assert.deepEqual(missingRuntimeTools(["subagent", "TaskCreate"]), []);
-  assert.deepEqual(missingRuntimeTools(["subagent"]), []);
+test('runtime prerequisite check identifies missing provider extensions', () => {
+  assert.deepEqual(missingRuntimeTools(['TaskCreate']), ['pi-subagents']);
+  assert.deepEqual(missingRuntimeTools(['subagent', 'TaskCreate']), []);
+  assert.deepEqual(missingRuntimeTools(['subagent']), []);
   assert.equal(runtimeIntegrationProblem(true), undefined);
   assert.match(
-    runtimeIntegrationProblem(false) ?? "",
+    runtimeIntegrationProblem(false) ?? '',
     /external-runs\/background-work APIs unavailable/,
   );
 });
 
-test("reload repairs terminal projections owned by the current session", () => {
+test('reload repairs terminal projections owned by the current session', () => {
   const terminal = retiredRun({
     taskProjection: {
       version: 1,
-      state: "ready",
-      owner: "pi-plan-exec",
-      sessionId: "session-1",
-      scope: "session",
+      state: 'ready',
+      owner: 'pi-plan-exec',
+      sessionId: 'session-1',
+      scope: 'session',
       revision: 1,
       taskIds: {},
     },
   });
 
+  assert.equal(shouldRepairProjectionForSession(terminal, 'session-1'), true);
   assert.equal(
-    shouldRepairProjectionForSession(terminal, "session-1"),
-    true,
-  );
-  assert.equal(
-    shouldRepairProjectionForSession(terminal, "foreign-session"),
+    shouldRepairProjectionForSession(terminal, 'foreign-session'),
     false,
   );
 });
 
-test("start paths preserve spaces and accept quoted explicit worktree paths", () => {
-  for (const input of ["docs/plans/my  plan.md", '"docs/plans/my  plan.md"', "'docs/plans/my  plan.md'"])
-    assert.deepEqual(parseStartArguments(input), { planPath: "docs/plans/my  plan.md" });
-  for (const input of ['--worktree "../feature tree" docs/plans/my  plan.md', "--worktree='../feature tree' 'docs/plans/my  plan.md'"])
-    assert.deepEqual(parseStartArguments(input), { worktreePath: "../feature tree", planPath: "docs/plans/my  plan.md" });
-  assert.deepEqual(parseStartArguments(""), {});
-  for (const input of ["--worktree", "--worktree=", '--worktree "" plan.md', "--worktree --unknown plan.md", '--worktree "broken plan.md', "--worktree target --worktree other plan.md", "--unknown plan.md", '"unterminated', '--worktree target ""'])
-    assert.throws(() => parseStartArguments(input), /Usage:|matching quotes/, input);
+test('start paths preserve spaces and accept quoted explicit worktree paths', () => {
+  for (const input of [
+    'docs/plans/my  plan.md',
+    '"docs/plans/my  plan.md"',
+    "'docs/plans/my  plan.md'",
+  ])
+    assert.deepEqual(parseStartArguments(input), {
+      planPath: 'docs/plans/my  plan.md',
+    });
+  for (const input of [
+    '--worktree "../feature tree" docs/plans/my  plan.md',
+    "--worktree='../feature tree' 'docs/plans/my  plan.md'",
+  ])
+    assert.deepEqual(parseStartArguments(input), {
+      worktreePath: '../feature tree',
+      planPath: 'docs/plans/my  plan.md',
+    });
+  assert.deepEqual(parseStartArguments(''), {});
+  for (const input of [
+    '--worktree',
+    '--worktree=',
+    '--worktree "" plan.md',
+    '--worktree --unknown plan.md',
+    '--worktree "broken plan.md',
+    '--worktree target --worktree other plan.md',
+    '--unknown plan.md',
+    '"unterminated',
+    '--worktree target ""',
+  ])
+    assert.throws(
+      () => parseStartArguments(input),
+      /Usage:|matching quotes/,
+      input,
+    );
 });
 
-test("start arguments accept an explicit existing worktree", () => {
+test('start arguments accept an explicit existing worktree', () => {
   assert.deepEqual(
     parseStartArguments(
-      "--worktree /repo.worktrees/feature docs/plans/example.md",
+      '--worktree /repo.worktrees/feature docs/plans/example.md',
     ),
     {
-      worktreePath: "/repo.worktrees/feature",
-      planPath: "docs/plans/example.md",
+      worktreePath: '/repo.worktrees/feature',
+      planPath: 'docs/plans/example.md',
     },
   );
   assert.deepEqual(
-    parseStartArguments(
-      "--worktree=/repo.worktrees/feature /tmp/plan.md",
-    ),
+    parseStartArguments('--worktree=/repo.worktrees/feature /tmp/plan.md'),
     {
-      worktreePath: "/repo.worktrees/feature",
-      planPath: "/tmp/plan.md",
+      worktreePath: '/repo.worktrees/feature',
+      planPath: '/tmp/plan.md',
     },
   );
   assert.throws(
-    () => parseStartArguments("--worktree /repo.worktrees/feature"),
+    () => parseStartArguments('--worktree /repo.worktrees/feature'),
     /Usage: \/exec --worktree/,
   );
 });
 
-test("help and setup explain the installed command surface", () => {
+test('help and setup explain the installed command surface', () => {
   assert.match(execHelp(), /\/exec status \[run-id\]/);
   assert.match(execHelp(), /Continue a stuck run/);
   assert.match(execHelp(), /\/exec skip <full-run-id> --reason <text>/);
@@ -517,40 +634,55 @@ test("help and setup explain the installed command surface", () => {
     execSetup(),
     /pi install -l npm:@alexeiled\/pi-subagents-bridge@\^0\.4\.2$/m,
   );
-  assert.match(execSetup(), /pi install -l npm:@alexeiled\/pi-fusion@\^0\.9\.2$/m);
+  assert.match(
+    execSetup(),
+    /pi install -l npm:@alexeiled\/pi-fusion@\^0\.9\.2$/m,
+  );
   assert.match(execSetup(), /Keep this plan-exec source build installed/);
 });
 
-test("setup installs the released bridge and fusion pins", () => {
+test('setup installs the released bridge and fusion pins', () => {
   assert.match(execSetup(), /^pi install -l npm:pi-subagents@\^0\.70\.1$/m);
-  assert.match(execSetup(), /^pi install -l npm:@alexeiled\/pi-subagents-bridge@\^0\.4\.2$/m);
-  assert.match(execSetup(), /^pi install -l npm:@alexeiled\/pi-fusion@\^0\.9\.2$/m);
-  assert.doesNotMatch(execSetup(), /^pi install npm:(?:pi-subagents|@alexeiled\/pi-plan-exec)$/m);
+  assert.match(
+    execSetup(),
+    /^pi install -l npm:@alexeiled\/pi-subagents-bridge@\^0\.4\.2$/m,
+  );
+  assert.match(
+    execSetup(),
+    /^pi install -l npm:@alexeiled\/pi-fusion@\^0\.9\.2$/m,
+  );
+  assert.doesNotMatch(
+    execSetup(),
+    /^pi install npm:(?:pi-subagents|@alexeiled\/pi-plan-exec)$/m,
+  );
   assert.doesNotMatch(execSetup(), /pi-subagents-codex-fix/);
-  assert.match(execSetup(), /Optional task visibility \(not required for execution\)/);
+  assert.match(
+    execSetup(),
+    /Optional task visibility \(not required for execution\)/,
+  );
 });
 
-test("cancel cannot bypass a pending force-skip", () => {
+test('cancel cannot bypass a pending force-skip', () => {
   const pending = run({
-    status: "skip_pending",
-    stage: "comprehensive_review",
+    status: 'skip_pending',
+    stage: 'comprehensive_review',
     config: { ...config, reviewRequired: false },
     pendingStageSkip: {
-      stage: "comprehensive_review",
-      reason: "operator waiver",
+      stage: 'comprehensive_review',
+      reason: 'operator waiver',
       requestedAt: 1,
-      requestedBy: "session-1",
+      requestedBy: 'session-1',
     },
   });
 
-  assert.equal(isActionAllowed("cancel", pending), false);
-  assert.equal(isActionAllowed("skip", pending), true);
+  assert.equal(isActionAllowed('cancel', pending), false);
+  assert.equal(isActionAllowed('skip', pending), true);
   // Resume is what applies the waiver; nothing holds this run, so it is open.
-  assert.equal(isActionAllowed("resume", pending), true);
+  assert.equal(isActionAllowed('resume', pending), true);
 });
 
-test("resume accepts options without an explicit run ID", () => {
-  assert.deepEqual(parseResumeArguments(["--retry-task"]), {
+test('resume accepts options without an explicit run ID', () => {
+  assert.deepEqual(parseResumeArguments(['--retry-task']), {
     selector: undefined,
     adoptCurrentBranch: false,
     retryTask: true,
@@ -559,37 +691,37 @@ test("resume accepts options without an explicit run ID", () => {
   });
   assert.deepEqual(
     parseResumeArguments([
-      "run-id",
-      "--adopt-current-branch",
-      "--retry-task",
-      "--same-machine",
-      "--model",
-      "current",
+      'run-id',
+      '--adopt-current-branch',
+      '--retry-task',
+      '--same-machine',
+      '--model',
+      'current',
     ]),
     {
-      selector: "run-id",
+      selector: 'run-id',
       adoptCurrentBranch: true,
       retryTask: true,
       sameMachine: true,
-      model: "current",
+      model: 'current',
     },
   );
 });
 
-test("resume branch-adoption and recovery-model options are explicit", () => {
+test('resume branch-adoption and recovery-model options are explicit', () => {
   assert.deepEqual(parseResumeOptions([]), {
     adoptCurrentBranch: false,
     retryTask: false,
     sameMachine: false,
     model: undefined,
   });
-  assert.deepEqual(parseResumeOptions(["--adopt-current-branch"]), {
+  assert.deepEqual(parseResumeOptions(['--adopt-current-branch']), {
     adoptCurrentBranch: true,
     retryTask: false,
     sameMachine: false,
     model: undefined,
   });
-  assert.deepEqual(parseResumeOptions(["--retry-task"]), {
+  assert.deepEqual(parseResumeOptions(['--retry-task']), {
     adoptCurrentBranch: false,
     retryTask: true,
     sameMachine: false,
@@ -597,56 +729,56 @@ test("resume branch-adoption and recovery-model options are explicit", () => {
   });
   assert.deepEqual(
     parseResumeOptions([
-      "--adopt-current-branch",
-      "--retry-task",
-      "--model",
-      "anthropic-work/claude-sonnet-4-6",
+      '--adopt-current-branch',
+      '--retry-task',
+      '--model',
+      'anthropic-work/claude-sonnet-4-6',
     ]),
     {
       adoptCurrentBranch: true,
       retryTask: true,
       sameMachine: false,
-      model: "anthropic-work/claude-sonnet-4-6",
+      model: 'anthropic-work/claude-sonnet-4-6',
     },
   );
-  assert.throws(() => parseResumeOptions(["--model"]), /Usage/);
-  assert.throws(() => parseResumeOptions(["--force"]), /Usage/);
+  assert.throws(() => parseResumeOptions(['--model']), /Usage/);
+  assert.throws(() => parseResumeOptions(['--force']), /Usage/);
 
-  const running = run({ status: "running" });
+  const running = run({ status: 'running' });
   delete running.activeOperation;
-  assert.equal(isActionAllowed("resume", running), true);
-  assert.equal(isActionAllowed("resume", running, true), true);
-  const failed = run({ status: "failed" });
+  assert.equal(isActionAllowed('resume', running), true);
+  assert.equal(isActionAllowed('resume', running, true), true);
+  const failed = run({ status: 'failed' });
   delete failed.activeOperation;
-  assert.equal(isActionAllowed("resume", failed, true), true);
+  assert.equal(isActionAllowed('resume', failed, true), true);
   const busy = run({
-    status: "running",
+    status: 'running',
     activeOperation: {
-      operationId: "live-review",
-      service: "bridge",
-      kind: "review",
-      externalRunId: "live-run",
+      operationId: 'live-review',
+      service: 'bridge',
+      kind: 'review',
+      externalRunId: 'live-run',
     },
   });
-  assert.equal(isActionAllowed("resume", busy, true), false);
+  assert.equal(isActionAllowed('resume', busy, true), false);
 });
 
-test("force-skip reason parsing requires the explicit option and text", () => {
+test('force-skip reason parsing requires the explicit option and text', () => {
   assert.equal(
-    parseSkipReason(["--reason", "review", "loop", "is", "stuck"]),
-    "review loop is stuck",
+    parseSkipReason(['--reason', 'review', 'loop', 'is', 'stuck']),
+    'review loop is stuck',
   );
   assert.throws(() => parseSkipReason([]), /Usage/);
-  assert.throws(() => parseSkipReason(["--reason"]), /Usage/);
-  assert.throws(() => parseSkipReason(["because"]), /Usage/);
+  assert.throws(() => parseSkipReason(['--reason']), /Usage/);
+  assert.throws(() => parseSkipReason(['because']), /Usage/);
 });
 
-test("failed and cancellation-pending runs are eligible for recovery", () => {
+test('failed and cancellation-pending runs are eligible for recovery', () => {
   assert.equal(
     isRecoverableFailure(
       run({
-        status: "failed",
-        error: "Plan task structure changed outside checkbox completion.",
+        status: 'failed',
+        error: 'Plan task structure changed outside checkbox completion.',
       }),
     ),
     true,
@@ -654,51 +786,51 @@ test("failed and cancellation-pending runs are eligible for recovery", () => {
   assert.equal(
     needsPlanStructureReview(
       run({
-        status: "paused",
-        error: "Plan task structure changed outside checkbox completion.",
+        status: 'paused',
+        error: 'Plan task structure changed outside checkbox completion.',
       }),
     ),
     true,
   );
   const exhaustedWorker = run({
-    status: "failed",
-    error: "Worker run-2 ended as failed and left task 1 checkboxes unchecked.",
+    status: 'failed',
+    error: 'Worker run-2 ended as failed and left task 1 checkboxes unchecked.',
   });
   delete exhaustedWorker.activeOperation;
   assert.equal(isRecoverableFailure(exhaustedWorker), true);
   const crashedWorker = run({
-    status: "failed",
-    error: "worker crashed",
+    status: 'failed',
+    error: 'worker crashed',
   });
   delete crashedWorker.activeOperation;
   assert.equal(isRecoverableFailure(crashedWorker), true);
   assert.equal(
     isRecoverableFailure(
       run({
-        status: "failed",
-        error: "worker crashed",
+        status: 'failed',
+        error: 'worker crashed',
         activeOperation: {
-          operationId: "still-running",
-          service: "bridge",
-          kind: "review",
+          operationId: 'still-running',
+          service: 'bridge',
+          kind: 'review',
         },
       }),
     ),
     true,
   );
-  assert.equal(isRecoverableFailure(run({ status: "cancel_pending" })), true);
+  assert.equal(isRecoverableFailure(run({ status: 'cancel_pending' })), true);
 });
 
-test("run status classifies recovery and gives one safe next action", () => {
+test('run status classifies recovery and gives one safe next action', () => {
   const active = formatRunStatus(
     run({
-      status: "running",
+      status: 'running',
       activeOperation: {
-        operationId: "active-operation",
-        service: "bridge",
-        kind: "implementation",
+        operationId: 'active-operation',
+        service: 'bridge',
+        kind: 'implementation',
         taskId: 1,
-        externalRunId: "worker-run-1",
+        externalRunId: 'worker-run-1',
       },
     }),
   );
@@ -716,15 +848,15 @@ test("run status classifies recovery and gives one safe next action", () => {
   ): string =>
     formatRunStatus(
       run({
-        status: "running",
+        status: 'running',
         activeOperation: {
-          operationId: "active-operation",
-          service: "bridge",
-          kind: "implementation",
+          operationId: 'active-operation',
+          service: 'bridge',
+          kind: 'implementation',
           taskId: 1,
-          externalRunId: "worker-run-1",
+          externalRunId: 'worker-run-1',
           lastObservedAt,
-          workerSignal: { mode: "chain", activity: "active 12s ago" },
+          workerSignal: { mode: 'chain', activity: 'active 12s ago' },
         },
       }),
       evidence,
@@ -749,8 +881,8 @@ test("run status classifies recovery and gives one safe next action", () => {
   assert.doesNotMatch(unwatched, /controller is/);
 
   const failedRun = run({
-    status: "failed",
-    error: "worker crashed before launch",
+    status: 'failed',
+    error: 'worker crashed before launch',
   });
   delete failedRun.activeOperation;
   const failed = formatRunStatus(failedRun);
@@ -758,9 +890,9 @@ test("run status classifies recovery and gives one safe next action", () => {
   assert.match(failed, /resume .* retries the same stage/);
 
   const blockedRun = run({
-    status: "failed",
-    taskAttempts: { "1": 2 },
-    error: "Task 1 exhausted its retry limit. Provider billing unavailable.",
+    status: 'failed',
+    taskAttempts: { '1': 2 },
+    error: 'Task 1 exhausted its retry limit. Provider billing unavailable.',
   });
   delete blockedRun.activeOperation;
   const blocked = formatRunStatus(blockedRun);
@@ -774,17 +906,17 @@ test("run status classifies recovery and gives one safe next action", () => {
   assert.match(blocked, /Implementation work cannot be waived/);
 
   const modelFailureRun = run({
-    status: "failed",
+    status: 'failed',
     error:
-      "Worker failed because the model/provider is unusable: Invalid call_id: maximum length 64.",
+      'Worker failed because the model/provider is unusable: Invalid call_id: maximum length 64.',
     failedOperation: {
-      operationId: "failed-model-operation",
-      service: "bridge",
-      kind: "implementation",
-      externalRunId: "failed-model-run",
+      operationId: 'failed-model-operation',
+      service: 'bridge',
+      kind: 'implementation',
+      externalRunId: 'failed-model-run',
       taskId: 1,
       terminalError:
-        "Codex error: [string_above_max_length] Invalid call_id: maximum length 64.",
+        'Codex error: [string_above_max_length] Invalid call_id: maximum length 64.',
     },
   });
   delete modelFailureRun.activeOperation;
@@ -800,19 +932,19 @@ test("run status classifies recovery and gives one safe next action", () => {
   assert.match(modelFailure, /failed-model-run/);
   assert.match(modelFailure, /string_above_max_length/);
 
-  const unnamedWorker = (status: PlanExecRun["status"]): PlanExecRun =>
+  const unnamedWorker = (status: PlanExecRun['status']): PlanExecRun =>
     run({
       status,
-      error: "Bridge operation lookup is unresolved",
+      error: 'Bridge operation lookup is unresolved',
       activeOperation: {
-        operationId: "unknown-operation",
-        service: "bridge",
-        kind: "implementation",
+        operationId: 'unknown-operation',
+        service: 'bridge',
+        kind: 'implementation',
         taskId: 1,
       },
     });
 
-  const unknown = formatRunStatus(unnamedWorker("running"), {
+  const unknown = formatRunStatus(unnamedWorker('running'), {
     leaseLive: true,
   });
   assert.match(unknown, /recovery: cannot check on the worker right now/);
@@ -822,26 +954,26 @@ test("run status classifies recovery and gives one safe next action", () => {
   // The same operation on a settled run: its record already says the
   // controller stopped, and resume looks the operation up rather than
   // launching a second worker.
-  const unknownSettled = formatRunStatus(unnamedWorker("failed"));
+  const unknownSettled = formatRunStatus(unnamedWorker('failed'));
   assert.match(unknownSettled, /recovery: stopped, and you can continue it/);
   assert.match(unknownSettled, /\/exec resume /);
   assert.doesNotMatch(unknownSettled, /cannot check on the worker/);
 
-  const pausedRun = run({ status: "paused", stage: "comprehensive_review" });
+  const pausedRun = run({ status: 'paused', stage: 'comprehensive_review' });
   delete pausedRun.activeOperation;
   const paused = formatRunStatus(pausedRun);
   assert.match(paused, /recovery: paused, waiting for you to continue it/);
   assert.match(paused, /resume .* applies the paused stage/);
 
   const pausedWorkflowRun = run({
-    status: "running",
-    stage: "stats",
+    status: 'running',
+    stage: 'stats',
     activeOperation: {
-      operationId: "paused-workflow-operation",
-      service: "bridge",
-      kind: "stats",
-      externalRunId: "paused-workflow-run",
-      lastObservedState: "paused",
+      operationId: 'paused-workflow-operation',
+      service: 'bridge',
+      kind: 'stats',
+      externalRunId: 'paused-workflow-run',
+      lastObservedState: 'paused',
       terminalError: "Run 'main' detached for intercom coordination.",
     },
   });
@@ -857,14 +989,14 @@ test("run status classifies recovery and gives one safe next action", () => {
   assert.match(pausedWorkflow, /do not resume or start another run/);
 
   const detachedWorkflowRun = run({
-    status: "failed",
-    stage: "stats",
-    error: "stats operation ended as paused.",
+    status: 'failed',
+    stage: 'stats',
+    error: 'stats operation ended as paused.',
     failedOperation: {
-      operationId: "detached-workflow-operation",
-      service: "bridge",
-      kind: "stats",
-      externalRunId: "detached-workflow-run",
+      operationId: 'detached-workflow-operation',
+      service: 'bridge',
+      kind: 'stats',
+      externalRunId: 'detached-workflow-run',
       terminalError: "Run 'main' detached for intercom coordination.",
     },
   });
@@ -877,7 +1009,7 @@ test("run status classifies recovery and gives one safe next action", () => {
   assert.match(detachedWorkflow, /consumes a durably completed child/);
   assert.match(detachedWorkflow, /does not launch a replacement/);
 
-  const cancellingRun = run({ status: "cancel_pending" });
+  const cancellingRun = run({ status: 'cancel_pending' });
   delete cancellingRun.activeOperation;
   const cancelling = formatRunStatus(cancellingRun, { leaseLive: true });
   assert.match(cancelling, /recovery: waiting for the stop you asked for/);
@@ -889,20 +1021,20 @@ test("run status classifies recovery and gives one safe next action", () => {
   assert.match(abandonedStop, /Run \/exec stop /);
 
   const staleOwnerRun = run({
-    status: "failed",
-    lease: { sessionId: "old-session", pid: 1, heartbeatAt: 0 },
+    status: 'failed',
+    lease: { sessionId: 'old-session', pid: 1, heartbeatAt: 0 },
   });
   delete staleOwnerRun.activeOperation;
   const staleOwner = formatRunStatus(staleOwnerRun);
   assert.match(staleOwner, /owner: stale lease/);
   assert.match(staleOwner, /\/exec resume/);
   assert.doesNotMatch(staleOwner, /\/exec adopt/);
-  assert.equal(isActionAllowed("resume", staleOwnerRun), true);
+  assert.equal(isActionAllowed('resume', staleOwnerRun), true);
 
   const branchMismatch = formatRunStatus(
     run({
-      status: "failed",
-      error: "Execution directory is on feature/current, expected master.",
+      status: 'failed',
+      error: 'Execution directory is on feature/current, expected master.',
     }),
   );
   assert.match(
@@ -915,8 +1047,8 @@ test("run status classifies recovery and gives one safe next action", () => {
 
   const planMismatch = formatRunStatus(
     run({
-      status: "paused",
-      error: "Plan task structure changed outside checkbox completion.",
+      status: 'paused',
+      error: 'Plan task structure changed outside checkbox completion.',
     }),
   );
   assert.match(
@@ -926,36 +1058,37 @@ test("run status classifies recovery and gives one safe next action", () => {
   assert.match(planMismatch, /first resume only records this pause/);
 
   const terminal = formatRunStatus(
-    run({ status: "completed", stage: "complete" }),
+    run({ status: 'completed', stage: 'complete' }),
   );
   assert.match(terminal, /recovery: finished/);
   assert.match(terminal, /nothing to recover/);
   assert.match(terminal, /\/exec cleanup/);
 });
 
-test("an overdue operation is classified without being called dead", () => {
+test('an overdue operation is classified without being called dead', () => {
   const MINUTE_MS = 60_000;
   const BOUNDED_CONFIG = {
     ...config,
-    executionLifetime: { mode: "bounded" as const, timeoutMs: 100 * MINUTE_MS },
+    executionLifetime: { mode: 'bounded' as const, timeoutMs: 100 * MINUTE_MS },
   };
   const active = (
     agoMinutes: number | undefined,
-    overrides: Partial<PlanExecRun["activeOperation"]> = {},
+    overrides: Partial<PlanExecRun['activeOperation']> = {},
     runOverrides: Partial<PlanExecRun> = {},
   ): PlanExecRun =>
     run({
-      status: "running",
+      status: 'running',
       activeOperation: {
-        operationId: "active-operation",
-        service: "bridge",
-        kind: "implementation",
+        operationId: 'active-operation',
+        service: 'bridge',
+        kind: 'implementation',
         taskId: 1,
-        externalRunId: "worker-run-1",
+        externalRunId: 'worker-run-1',
         ...(agoMinutes === undefined
           ? {}
           : { launchStartedAt: Date.now() - agoMinutes * MINUTE_MS }),
-        expectedLifetime: (runOverrides.config ?? BOUNDED_CONFIG).executionLifetime,
+        expectedLifetime: (runOverrides.config ?? BOUNDED_CONFIG)
+          .executionLifetime,
         ...overrides,
       },
       config: BOUNDED_CONFIG,
@@ -967,96 +1100,96 @@ test("an overdue operation is classified without being called dead", () => {
   const LIVE: AbandonmentEvidence = { leaseLive: true };
   const cases: [string, PlanExecRun, string, AbandonmentEvidence?][] = [
     [
-      "nine minutes, no signal",
+      'nine minutes, no signal',
       active(9),
-      "running, but nothing proves the worker is alive",
+      'running, but nothing proves the worker is alive',
     ],
     [
-      "nine minutes, workflow-mode signal with no activity",
-      active(9, { workerSignal: { mode: "workflow" } }),
-      "running, but nothing proves the worker is alive",
+      'nine minutes, workflow-mode signal with no activity',
+      active(9, { workerSignal: { mode: 'workflow' } }),
+      'running, but nothing proves the worker is alive',
     ],
     [
-      "inside the worker bound, no signal",
+      'inside the worker bound, no signal',
       active(99),
-      "running, but nothing proves the worker is alive",
+      'running, but nothing proves the worker is alive',
     ],
     [
-      "past the worker bound, no signal",
+      'past the worker bound, no signal',
       active(101),
-      "running longer than its budget allows",
+      'running longer than its budget allows',
     ],
     [
-      "past the reviewer bound but inside the worker bound",
+      'past the reviewer bound but inside the worker bound',
       active(65),
-      "running, but nothing proves the worker is alive",
+      'running, but nothing proves the worker is alive',
     ],
     [
-      "past the reviewer bound on a review operation",
-      active(65, { kind: "review" }),
-      "running, but nothing proves the worker is alive",
+      'past the reviewer bound on a review operation',
+      active(65, { kind: 'review' }),
+      'running, but nothing proves the worker is alive',
     ],
     [
-      "past the stats bound on a stats operation",
-      active(45, { kind: "stats" }, { stage: "stats" }),
-      "running, but nothing proves the worker is alive",
+      'past the stats bound on a stats operation',
+      active(45, { kind: 'stats' }, { stage: 'stats' }),
+      'running, but nothing proves the worker is alive',
     ],
     [
-      "inside the worker bound on a stats-sized elapsed time",
-      active(45, { kind: "fusion" }, { stage: "fusion_review" }),
-      "running, but nothing proves the worker is alive",
+      'inside the worker bound on a stats-sized elapsed time',
+      active(45, { kind: 'fusion' }, { stage: 'fusion_review' }),
+      'running, but nothing proves the worker is alive',
     ],
     [
-      "finalize borrows the worker budget",
-      active(101, { kind: "finalize" }, { stage: "finalize" }),
-      "running longer than its budget allows",
+      'finalize borrows the worker budget',
+      active(101, { kind: 'finalize' }, { stage: 'finalize' }),
+      'running longer than its budget allows',
     ],
     [
-      "past the bound with a trustworthy activity value",
+      'past the bound with a trustworthy activity value',
       active(180, {
         lastObservedAt: Date.now(),
-        workerSignal: { mode: "chain", activity: "active 12s ago" },
+        workerSignal: { mode: 'chain', activity: 'active 12s ago' },
       }),
-      "running, and the worker reported activity",
+      'running, and the worker reported activity',
       LIVE,
     ],
     [
-      "past the bound with an activity value nothing has refreshed",
+      'past the bound with an activity value nothing has refreshed',
       active(180, {
         lastObservedAt: Date.now() - 10 * MINUTE_MS,
-        workerSignal: { mode: "chain", activity: "active 12s ago" },
+        workerSignal: { mode: 'chain', activity: 'active 12s ago' },
       }),
-      "running longer than its budget allows",
+      'running longer than its budget allows',
       LIVE,
     ],
     [
-      "past the bound with a fresh activity value and a dead lease",
+      'past the bound with a fresh activity value and a dead lease',
       active(180, {
         lastObservedAt: Date.now(),
-        workerSignal: { mode: "chain", activity: "active 12s ago" },
+        workerSignal: { mode: 'chain', activity: 'active 12s ago' },
       }),
-      "running longer than its budget allows",
+      'running longer than its budget allows',
     ],
     [
-      "past the bound while observation is unavailable",
+      'past the bound while observation is unavailable',
       active(180, { statusFailures: 1 }),
-      "cannot check on the worker right now",
+      'cannot check on the worker right now',
     ],
     [
-      "past the bound while still starting",
-      active(180, {}, { status: "starting" }),
-      "running longer than its budget allows",
+      'past the bound while still starting',
+      active(180, {}, { status: 'starting' }),
+      'running longer than its budget allows',
     ],
     [
-      "no launch time recorded",
+      'no launch time recorded',
       active(undefined),
-      "running, but nothing proves the worker is alive",
+      'running, but nothing proves the worker is alive',
     ],
     // The bound only speaks while the run still claims work in flight.
     [
-      "past the bound on a failed run",
-      active(180, {}, { status: "failed", error: "worker crashed" }),
-      "stopped, and you can continue it",
+      'past the bound on a failed run',
+      active(180, {}, { status: 'failed', error: 'worker crashed' }),
+      'stopped, and you can continue it',
     ],
   ];
   for (const [name, candidate, classification, evidence] of cases)
@@ -1069,41 +1202,41 @@ test("an overdue operation is classified without being called dead", () => {
   const unbounded = active(180, {}, { config });
   assert.equal(
     recoveryGuidance(unbounded).classification,
-    "running, but nothing proves the worker is alive",
-    "unbounded silence has no synthetic deadline verdict",
+    'running, but nothing proves the worker is alive',
+    'unbounded silence has no synthetic deadline verdict',
   );
   assert.equal(longRunningOperation(unbounded), undefined);
 
   // Only `longRunningOperation` can be asked about the exact bound:
   // `recoveryGuidance` reads its own clock, so a run built to sit on the bound
   // is already past it by the time it runs.
-  const launchStartedAt = Date.parse("2026-08-09T12:00:00Z");
+  const launchStartedAt = Date.parse('2026-08-09T12:00:00Z');
   const onTheBound = active(undefined, { launchStartedAt });
   assert.equal(
     longRunningOperation(onTheBound, launchStartedAt + 100 * MINUTE_MS),
     undefined,
-    "exactly on the worker bound is not past it",
+    'exactly on the worker bound is not past it',
   );
   assert.ok(
     longRunningOperation(onTheBound, launchStartedAt + 100 * MINUTE_MS + 1),
-    "one millisecond past it is",
+    'one millisecond past it is',
   );
 
   // Decisive death outranks a bound breach.
-  const gone = terminalEvidence("worker-run-1");
+  const gone = terminalEvidence('worker-run-1');
   assert.equal(
     recoveryGuidance(active(180), gone).classification,
-    "the worker is gone, so nothing is running",
+    'the worker is gone, so nothing is running',
   );
   assert.equal(
     recoveryGuidance(active(9), gone).classification,
-    "the worker is gone, so nothing is running",
+    'the worker is gone, so nothing is running',
   );
   assert.equal(
     recoveryGuidance(active(180), { leaseLive: false, asyncDirPresent: true })
       .classification,
-    "running longer than its budget allows",
-    "a directory still on disk proves nothing about death",
+    'running longer than its budget allows',
+    'a directory still on disk proves nothing about death',
   );
 
   const overdue = formatRunStatus(active(180), LIVE);
@@ -1122,17 +1255,17 @@ test("an overdue operation is classified without being called dead", () => {
   assert.doesNotMatch(unwatched, /controller is still polling/);
 });
 
-test("no recovery classification names a controller internal", async () => {
+test('no recovery classification names a controller internal', async () => {
   // Scraped from source, not from a shape table, so a branch added later cannot
   // reintroduce the vocabulary. Every quote style, or such a branch could evade
   // the guard with a template literal.
   const source = await readFile(
-    new URL("../src/index.ts", import.meta.url),
-    "utf8",
+    new URL('../src/index.ts', import.meta.url),
+    'utf8',
   );
   const classifications = [
     ...source.matchAll(/classification:\s*(?:"([^"]+)"|'([^']+)'|`([^`]+)`)/g),
-  ].map((match) => match[1] ?? match[2] ?? match[3] ?? "");
+  ].map((match) => match[1] ?? match[2] ?? match[3] ?? '');
   assert.ok(
     classifications.length >= 15,
     `expected the classification literals to be found, got ${classifications.length}`,
@@ -1145,56 +1278,56 @@ test("no recovery classification names a controller internal", async () => {
     );
 });
 
-test("every recovery classification ends at a primary verb", () => {
+test('every recovery classification ends at a primary verb', () => {
   const withoutOperation = (overrides: Partial<PlanExecRun>): PlanExecRun => {
     const shape = run(overrides);
     delete shape.activeOperation;
     return shape;
   };
   const launched = (
-    overrides: Partial<NonNullable<PlanExecRun["activeOperation"]>> = {},
-  ): NonNullable<PlanExecRun["activeOperation"]> => ({
-    operationId: "operation-1",
-    service: "bridge",
-    kind: "implementation",
+    overrides: Partial<NonNullable<PlanExecRun['activeOperation']>> = {},
+  ): NonNullable<PlanExecRun['activeOperation']> => ({
+    operationId: 'operation-1',
+    service: 'bridge',
+    kind: 'implementation',
     taskId: 1,
-    externalRunId: "worker-run-1",
+    externalRunId: 'worker-run-1',
     launchStartedAt: Date.now() - 180 * 60_000,
     ...overrides,
   });
   const unnamedOperation = run({
-    status: "failed",
-    error: "Bridge operation lookup is unresolved",
-    activeOperation: { operationId: "op", service: "bridge", kind: "review" },
+    status: 'failed',
+    error: 'Bridge operation lookup is unresolved',
+    activeOperation: { operationId: 'op', service: 'bridge', kind: 'review' },
   });
   const unnamedInFlight = run({
-    activeOperation: { operationId: "op", service: "bridge", kind: "review" },
+    activeOperation: { operationId: 'op', service: 'bridge', kind: 'review' },
   });
   const unobservable = run({
     activeOperation: launched({ statusFailures: 1 }),
   });
   const trackedFailure = run({
-    status: "failed",
-    error: "worker crashed",
+    status: 'failed',
+    error: 'worker crashed',
     activeOperation: launched(),
   });
   const untrackedFailure = withoutOperation({
-    status: "failed",
-    error: "worker crashed",
+    status: 'failed',
+    error: 'worker crashed',
   });
   const shapes: PlanExecRun[] = [
     retiredRun(),
     withoutOperation({ lease: DEAD_LEASE }),
     withoutOperation({
-      status: "failed",
-      error: "Execution directory is on feature/current, expected master.",
+      status: 'failed',
+      error: 'Execution directory is on feature/current, expected master.',
     }),
     withoutOperation({
-      status: "paused",
-      error: "Plan task structure changed outside checkbox completion.",
+      status: 'paused',
+      error: 'Plan task structure changed outside checkbox completion.',
     }),
-    run({ status: "skip_pending" }),
-    run({ status: "cancel_pending" }),
+    run({ status: 'skip_pending' }),
+    run({ status: 'cancel_pending' }),
     unnamedOperation,
     unnamedInFlight,
     unobservable,
@@ -1203,19 +1336,19 @@ test("every recovery classification ends at a primary verb", () => {
     run({
       activeOperation: launched({
         lastObservedAt: Date.now(),
-        workerSignal: { mode: "chain", activity: "active 12s ago" },
+        workerSignal: { mode: 'chain', activity: 'active 12s ago' },
       }),
     }),
-    withoutOperation({ status: "running" }),
-    withoutOperation({ status: "paused", stage: "comprehensive_review" }),
+    withoutOperation({ status: 'running' }),
+    withoutOperation({ status: 'paused', stage: 'comprehensive_review' }),
     withoutOperation({
-      status: "failed",
-      error: "Worker failed: invalid api key.",
+      status: 'failed',
+      error: 'Worker failed: invalid api key.',
     }),
     withoutOperation({
-      status: "failed",
-      taskAttempts: { "1": 2 },
-      error: "Task 1 exhausted its retry limit. Provider billing unavailable.",
+      status: 'failed',
+      taskAttempts: { '1': 2 },
+      error: 'Task 1 exhausted its retry limit. Provider billing unavailable.',
     }),
     trackedFailure,
     untrackedFailure,
@@ -1224,10 +1357,7 @@ test("every recovery classification ends at a primary verb", () => {
   // The gone branch needs live evidence, so it carries its own entry.
   const observed: Array<[PlanExecRun, AbandonmentEvidence | undefined]> = [
     ...shapes.map((shape) => [shape, undefined] as [PlanExecRun, undefined]),
-    [
-      run({ activeOperation: launched() }),
-      terminalEvidence("worker-run-1"),
-    ],
+    [run({ activeOperation: launched() }), terminalEvidence('worker-run-1')],
   ];
 
   for (const [shape, evidence] of observed) {
@@ -1260,12 +1390,12 @@ test("every recovery classification ends at a primary verb", () => {
   );
 });
 
-test("status guidance judges lease staleness the way claiming does", () => {
-  const { pid } = spawnSync("true");
-  assert.ok(pid, "spawnSync must report a child pid");
+test('status guidance judges lease staleness the way claiming does', () => {
+  const { pid } = spawnSync('true');
+  assert.ok(pid, 'spawnSync must report a child pid');
   const deadLocalOwner = run({
     lease: {
-      sessionId: "old-session",
+      sessionId: 'old-session',
       pid,
       heartbeatAt: Date.now(),
       hostname: hostname(),
@@ -1275,7 +1405,7 @@ test("status guidance judges lease staleness the way claiming does", () => {
 
   const liveLocalOwner = run({
     lease: {
-      sessionId: "old-session",
+      sessionId: 'old-session',
       pid: process.pid,
       heartbeatAt: Date.now(),
       hostname: hostname(),
@@ -1285,22 +1415,22 @@ test("status guidance judges lease staleness the way claiming does", () => {
 
   // No hostname is the on-disk shape of every existing run: heartbeat only.
   const legacyOwner = run({
-    lease: { sessionId: "old-session", pid, heartbeatAt: Date.now() },
+    lease: { sessionId: 'old-session', pid, heartbeatAt: Date.now() },
   });
   assert.doesNotMatch(formatRunStatus(legacyOwner), /owner: stale lease/);
 });
 
-test("resume output explains a required second plan-structure review", () => {
+test('resume output explains a required second plan-structure review', () => {
   const paused = run({
-    status: "paused",
-    error: "Plan task structure changed outside checkbox completion.",
+    status: 'paused',
+    error: 'Plan task structure changed outside checkbox completion.',
   });
   delete paused.activeOperation;
   const message = resumeResultMessage(paused);
   assert.match(message, /first resume only recorded the pause/);
   assert.match(message, /run interactive \/exec resume/);
 
-  const resumed = resumeResultMessage(run({ status: "running" }));
+  const resumed = resumeResultMessage(run({ status: 'running' }));
   assert.match(
     resumed,
     /already running; its tracked worker is being reconciled/,
@@ -1308,11 +1438,11 @@ test("resume output explains a required second plan-structure review", () => {
 
   const reconciling = resumeResultMessage(
     run({
-      status: "running",
+      status: 'running',
       activeOperation: {
-        operationId: "live-worker",
-        service: "bridge",
-        kind: "implementation",
+        operationId: 'live-worker',
+        service: 'bridge',
+        kind: 'implementation',
       },
     }),
   );
@@ -1323,17 +1453,17 @@ test("resume output explains a required second plan-structure review", () => {
   assert.doesNotMatch(resumed, /second resume/);
 });
 
-test("run status includes live operation, progress, and recovery hints", () => {
+test('run status includes live operation, progress, and recovery hints', () => {
   const status = formatRunStatus(
     run({
-      status: "failed",
-      error: "Plan structure changed",
+      status: 'failed',
+      error: 'Plan structure changed',
       activeOperation: {
-        operationId: "operation-1",
-        service: "bridge",
-        kind: "implementation",
+        operationId: 'operation-1',
+        service: 'bridge',
+        kind: 'implementation',
         taskId: 1,
-        externalRunId: "worker-run-1",
+        externalRunId: 'worker-run-1',
       },
     }),
   );
@@ -1347,39 +1477,39 @@ test("run status includes live operation, progress, and recovery hints", () => {
 
   const recoverable = formatRunStatus(
     run({
-      status: "failed",
-      error: "Plan task structure changed outside checkbox completion.",
+      status: 'failed',
+      error: 'Plan task structure changed outside checkbox completion.',
     }),
   );
   assert.match(recoverable, /interactive \/exec resume/);
 
   const failedWorker = run({
-    status: "failed",
-    error: "Worker run-2 ended as failed and left task 1 checkboxes unchecked.",
+    status: 'failed',
+    error: 'Worker run-2 ended as failed and left task 1 checkboxes unchecked.',
   });
   delete failedWorker.activeOperation;
   assert.match(formatRunStatus(failedWorker), /retries the same stage/);
 
   const paused = formatRunStatus(
     run({
-      status: "paused",
-      error: "Plan task structure changed outside checkbox completion.",
+      status: 'paused',
+      error: 'Plan task structure changed outside checkbox completion.',
     }),
   );
   assert.match(paused, /interactive \/exec resume/);
   assert.doesNotMatch(paused, /next: \/exec status/);
 
   const skippedRun = run({
-    status: "completed_with_findings",
-    stage: "complete",
+    status: 'completed_with_findings',
+    stage: 'complete',
     skippedStages: [
       {
-        stage: "comprehensive_review",
-        reason: "operator waiver",
+        stage: 'comprehensive_review',
+        reason: 'operator waiver',
         requestedAt: 1,
-        requestedBy: "session-1",
+        requestedBy: 'session-1',
         completedAt: 2,
-        terminalOperationState: "stopped",
+        terminalOperationState: 'stopped',
       },
     ],
   });
@@ -1389,16 +1519,16 @@ test("run status includes live operation, progress, and recovery hints", () => {
   assert.match(skipped, /operator waiver/);
 });
 
-test("run status distinguishes unavailable observation from normal polling", () => {
+test('run status distinguishes unavailable observation from normal polling', () => {
   const status = formatRunStatus(
     run({
       activeOperation: {
-        operationId: "operation-1",
-        service: "bridge",
-        kind: "implementation",
+        operationId: 'operation-1',
+        service: 'bridge',
+        kind: 'implementation',
         taskId: 1,
         statusFailures: 2,
-        lastStatusError: "bridge unavailable",
+        lastStatusError: 'bridge unavailable',
       },
     }),
   );
@@ -1406,35 +1536,35 @@ test("run status distinguishes unavailable observation from normal polling", () 
   assert.match(status, /bridge unavailable/);
 });
 
-test("resume keeps exact-worktree priority over a live isolated run", () => {
+test('resume keeps exact-worktree priority over a live isolated run', () => {
   const recoverableInPlace = run({
-    id: "11111111-1111-4111-8111-111111111111",
-    status: "failed",
-    error: "Plan task structure changed outside checkbox completion.",
-    worktreeCwd: "/repo",
+    id: '11111111-1111-4111-8111-111111111111',
+    status: 'failed',
+    error: 'Plan task structure changed outside checkbox completion.',
+    worktreeCwd: '/repo',
   });
   const pausedIsolated = run({
-    id: "22222222-2222-4222-8222-222222222222",
-    status: "paused",
-    worktreeCwd: "/tmp/execution-worktree",
+    id: '22222222-2222-4222-8222-222222222222',
+    status: 'paused',
+    worktreeCwd: '/tmp/execution-worktree',
   });
 
   assert.deepEqual(
-    prioritizeRunCandidates([recoverableInPlace, pausedIsolated], "/repo").map(
+    prioritizeRunCandidates([recoverableInPlace, pausedIsolated], '/repo').map(
       (candidate) => candidate.id,
     ),
     [recoverableInPlace.id],
   );
 });
 
-test("plan-structure recovery requires interactive adoption", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-index-"));
-  const planPath = join(root, "plan.md");
-  await writeFile(planPath, "### Task 1: Changed\n- [ ] New text\n");
+test('plan-structure recovery requires interactive adoption', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-index-'));
+  const planPath = join(root, 'plan.md');
+  await writeFile(planPath, '### Task 1: Changed\n- [ ] New text\n');
   const recoverable = run({
     planPath,
-    status: "failed",
-    error: "Plan task structure changed outside checkbox completion.",
+    status: 'failed',
+    error: 'Plan task structure changed outside checkbox completion.',
   });
 
   await assert.rejects(
@@ -1458,7 +1588,7 @@ test("plan-structure recovery requires interactive adoption", async () => {
   assert.equal(confirmed, true);
   assert.notEqual(adoptedHash, recoverable.planHash);
   assert.equal(
-    await reviewedPlanHashForResume(run({ status: "failed" }), {
+    await reviewedPlanHashForResume(run({ status: 'failed' }), {
       hasUI: false,
       ui: { confirm: async () => false },
     }),
@@ -1466,15 +1596,15 @@ test("plan-structure recovery requires interactive adoption", async () => {
   );
 });
 
-test("removable runs are terminal, past retention, and unheld", () => {
+test('removable runs are terminal, past retention, and unheld', () => {
   const liveLease = {
-    sessionId: "session-1",
+    sessionId: 'session-1',
     pid: process.pid,
     heartbeatAt: Date.now(),
     hostname: hostname(),
   };
   const staleLease = {
-    sessionId: "session-1",
+    sessionId: 'session-1',
     pid: reapedPid(),
     heartbeatAt: 0,
     hostname: hostname(),
@@ -1486,55 +1616,55 @@ test("removable runs are terminal, past retention, and unheld", () => {
     removable: boolean;
   }> = [
     {
-      name: "a retired completed run is removable",
+      name: 'a retired completed run is removable',
       run: retiredRun(),
       removable: true,
     },
     {
-      name: "completed_with_findings is removable",
-      run: retiredRun({ status: "completed_with_findings" }),
+      name: 'completed_with_findings is removable',
+      run: retiredRun({ status: 'completed_with_findings' }),
       removable: true,
     },
     {
-      name: "cancelled is removable",
-      run: retiredRun({ status: "cancelled" }),
+      name: 'cancelled is removable',
+      run: retiredRun({ status: 'cancelled' }),
       removable: true,
     },
     {
-      name: "failed is excluded by default so resume stays available",
-      run: retiredRun({ status: "failed", stage: "implementation" }),
+      name: 'failed is excluded by default so resume stays available',
+      run: retiredRun({ status: 'failed', stage: 'implementation' }),
       removable: false,
     },
     {
-      name: "failed is removable with --include-failed",
-      run: retiredRun({ status: "failed", stage: "implementation" }),
+      name: 'failed is removable with --include-failed',
+      run: retiredRun({ status: 'failed', stage: 'implementation' }),
       includeFailed: true,
       removable: true,
     },
     {
-      name: "inside the retention window nothing is removable",
+      name: 'inside the retention window nothing is removable',
       run: retiredRun({ updatedAt: INSIDE_RETENTION }),
       removable: false,
     },
     {
-      name: "a running run is never removable",
+      name: 'a running run is never removable',
       run: run({ updatedAt: PAST_RETENTION }),
       includeFailed: true,
       removable: false,
     },
     {
-      name: "cancel_pending is not terminal",
-      run: retiredRun({ status: "cancel_pending" }),
+      name: 'cancel_pending is not terminal',
+      run: retiredRun({ status: 'cancel_pending' }),
       includeFailed: true,
       removable: false,
     },
     {
-      name: "a live lease holds a retired run",
+      name: 'a live lease holds a retired run',
       run: retiredRun({ lease: liveLease }),
       removable: false,
     },
     {
-      name: "a stale lease does not hold it",
+      name: 'a stale lease does not hold it',
       run: retiredRun({ lease: staleLease }),
       removable: true,
     },
@@ -1548,32 +1678,32 @@ test("removable runs are terminal, past retention, and unheld", () => {
     );
 });
 
-test("cleanup arguments accept one run ID and the two flags", () => {
+test('cleanup arguments accept one run ID and the two flags', () => {
   assert.deepEqual(parseCleanupArguments([]), {
     runId: undefined,
     apply: false,
     includeFailed: false,
   });
   assert.deepEqual(
-    parseCleanupArguments(["run-id", "--apply", "--include-failed"]),
-    { runId: "run-id", apply: true, includeFailed: true },
+    parseCleanupArguments(['run-id', '--apply', '--include-failed']),
+    { runId: 'run-id', apply: true, includeFailed: true },
   );
-  assert.throws(() => parseCleanupArguments(["--force"]), /Usage/);
-  assert.throws(() => parseCleanupArguments(["one", "two"]), /Usage/);
+  assert.throws(() => parseCleanupArguments(['--force']), /Usage/);
+  assert.throws(() => parseCleanupArguments(['one', 'two']), /Usage/);
 });
 
-test("cleanup previews without deleting and names both escapes", async () => {
+test('cleanup previews without deleting and names both escapes', async () => {
   const removable = retiredRun({
-    id: "33333333-3333-4333-8333-333333333333",
+    id: '33333333-3333-4333-8333-333333333333',
   });
   const recent = retiredRun({
-    id: "44444444-4444-4444-8444-444444444444",
+    id: '44444444-4444-4444-8444-444444444444',
     updatedAt: INSIDE_RETENTION,
   });
   const failed = retiredRun({
-    id: "55555555-5555-4555-8555-555555555555",
-    status: "failed",
-    stage: "implementation",
+    id: '55555555-5555-4555-8555-555555555555',
+    status: 'failed',
+    stage: 'implementation',
   });
   const registry = await seedRegistry([removable, recent, failed]);
 
@@ -1592,22 +1722,22 @@ test("cleanup previews without deleting and names both escapes", async () => {
   assert.equal((await registry.list()).length, 3);
 });
 
-test("cleanup --apply removes only retired runs past retention", async () => {
+test('cleanup --apply removes only retired runs past retention', async () => {
   const removable = retiredRun({
-    id: "33333333-3333-4333-8333-333333333333",
+    id: '33333333-3333-4333-8333-333333333333',
   });
   const recent = retiredRun({
-    id: "44444444-4444-4444-8444-444444444444",
+    id: '44444444-4444-4444-8444-444444444444',
     updatedAt: INSIDE_RETENTION,
   });
   const failed = retiredRun({
-    id: "55555555-5555-4555-8555-555555555555",
-    status: "failed",
-    stage: "implementation",
+    id: '55555555-5555-4555-8555-555555555555',
+    status: 'failed',
+    stage: 'implementation',
   });
   const registry = await seedRegistry([removable, recent, failed]);
 
-  const applied = await execCleanup(registry, ["--apply"]);
+  const applied = await execCleanup(registry, ['--apply']);
 
   assert.match(applied, /Removed 1 plan execution run;/);
   assert.match(applied, /left in place/);
@@ -1617,11 +1747,11 @@ test("cleanup --apply removes only retired runs past retention", async () => {
   );
 });
 
-test("cleanup includes failed runs only when asked", async () => {
+test('cleanup includes failed runs only when asked', async () => {
   const failed = retiredRun({
-    id: "55555555-5555-4555-8555-555555555555",
-    status: "failed",
-    stage: "implementation",
+    id: '55555555-5555-4555-8555-555555555555',
+    status: 'failed',
+    stage: 'implementation',
   });
   const registry = await seedRegistry([failed]);
 
@@ -1629,30 +1759,30 @@ test("cleanup includes failed runs only when asked", async () => {
   assert.match(excluded, /No plan execution runs are removable/);
   assert.match(excluded, /7 days/);
 
-  const included = await execCleanup(registry, ["--include-failed"]);
+  const included = await execCleanup(registry, ['--include-failed']);
   assert.match(included, new RegExp(failed.id));
   assert.doesNotMatch(included, /Failed runs are excluded/);
 
-  await execCleanup(registry, ["--apply", "--include-failed"]);
+  await execCleanup(registry, ['--apply', '--include-failed']);
   assert.deepEqual(await registry.list(), []);
 });
 
-test("cleanup with a run ID removes just that run and refuses live ones", async () => {
+test('cleanup with a run ID removes just that run and refuses live ones', async () => {
   const recent = retiredRun({
-    id: "44444444-4444-4444-8444-444444444444",
+    id: '44444444-4444-4444-8444-444444444444',
     updatedAt: INSIDE_RETENTION,
   });
   const removable = retiredRun({
-    id: "33333333-3333-4333-8333-333333333333",
+    id: '33333333-3333-4333-8333-333333333333',
   });
   const active = run({
-    id: "66666666-6666-4666-8666-666666666666",
+    id: '66666666-6666-4666-8666-666666666666',
     updatedAt: PAST_RETENTION,
   });
   const held = retiredRun({
-    id: "77777777-7777-4777-8777-777777777777",
+    id: '77777777-7777-4777-8777-777777777777',
     lease: {
-      sessionId: "session-1",
+      sessionId: 'session-1',
       pid: process.pid,
       heartbeatAt: Date.now(),
       hostname: hostname(),
@@ -1660,48 +1790,48 @@ test("cleanup with a run ID removes just that run and refuses live ones", async 
   });
   const registry = await seedRegistry([recent, removable, active, held]);
 
-  const applied = await execCleanup(registry, [recent.id, "--apply"]);
+  const applied = await execCleanup(registry, [recent.id, '--apply']);
 
   assert.match(applied, /Removed 1 plan execution run;/);
   assert.equal(await registry.get(recent.id), undefined);
-  assert.ok(await registry.get(removable.id), "the sweep set is untouched");
+  assert.ok(await registry.get(removable.id), 'the sweep set is untouched');
   await assert.rejects(
-    () => execCleanup(registry, [active.id, "--apply"]),
+    () => execCleanup(registry, [active.id, '--apply']),
     /only a terminal run can be removed/,
   );
   await assert.rejects(
-    () => execCleanup(registry, [held.id, "--apply"]),
+    () => execCleanup(registry, [held.id, '--apply']),
     /held by a live lease/,
   );
   await assert.rejects(
-    () => execCleanup(registry, ["88888888-8888-4888-8888-888888888888"]),
+    () => execCleanup(registry, ['88888888-8888-4888-8888-888888888888']),
     /Plan execution run not found/,
   );
 });
 
-test("doctor argument parsing accepts only --reconcile", () => {
+test('doctor argument parsing accepts only --reconcile', () => {
   assert.deepEqual(parseDoctorArguments([]), { reconcile: false });
-  assert.deepEqual(parseDoctorArguments(["--reconcile"]), { reconcile: true });
-  assert.throws(() => parseDoctorArguments(["--apply"]), /Usage/);
-  assert.throws(() => parseDoctorArguments(["run-id"]), /Usage/);
+  assert.deepEqual(parseDoctorArguments(['--reconcile']), { reconcile: true });
+  assert.throws(() => parseDoctorArguments(['--apply']), /Usage/);
+  assert.throws(() => parseDoctorArguments(['run-id']), /Usage/);
 });
 
-test("doctor groups every in-flight claim and mutates nothing", async () => {
+test('doctor groups every in-flight claim and mutates nothing', async () => {
   const abandoned = abandonedRun();
   const ambiguous = abandonedRun({
-    id: "22222222-2222-4222-8222-222222222222",
+    id: '22222222-2222-4222-8222-222222222222',
     activeOperation: {
-      operationId: "operation-2",
-      service: "bridge",
-      kind: "implementation",
-      externalRunId: "external-2",
+      operationId: 'operation-2',
+      service: 'bridge',
+      kind: 'implementation',
+      externalRunId: 'external-2',
     },
   });
   const live = abandonedRun({
-    id: "33333333-3333-4333-8333-333333333333",
+    id: '33333333-3333-4333-8333-333333333333',
     lease: liveLease(),
   });
-  const settled = retiredRun({ id: "44444444-4444-4444-8444-444444444444" });
+  const settled = retiredRun({ id: '44444444-4444-4444-8444-444444444444' });
   const { registry, directory } = await seedDirectory([
     abandoned,
     ambiguous,
@@ -1711,9 +1841,9 @@ test("doctor groups every in-flight claim and mutates nothing", async () => {
   const before = await snapshotRuns(directory);
 
   const report =
-    (await execRead(registry, "doctor", [], {
+    (await execRead(registry, 'doctor', [], {
       probe: nativeTerminalProbe,
-    })) ?? "";
+    })) ?? '';
 
   assert.match(report, /Plan execution runs: 4 \(3 claiming work in flight\)/);
   assert.match(
@@ -1741,27 +1871,27 @@ test("doctor groups every in-flight claim and mutates nothing", async () => {
   assert.deepEqual(
     await snapshotRuns(directory),
     before,
-    "preview writes nothing",
+    'preview writes nothing',
   );
 });
 
-test("doctor --reconcile retains retired operations and leaves explicit stops intact", async () => {
+test('doctor --reconcile retains retired operations and leaves explicit stops intact', async () => {
   const abandoned = abandonedRun();
   const ambiguous = abandonedRun({
-    id: "22222222-2222-4222-8222-222222222222",
+    id: '22222222-2222-4222-8222-222222222222',
     activeOperation: {
-      operationId: "operation-2",
-      service: "bridge",
-      kind: "implementation",
+      operationId: 'operation-2',
+      service: 'bridge',
+      kind: 'implementation',
     },
   });
   const live = abandonedRun({
-    id: "33333333-3333-4333-8333-333333333333",
+    id: '33333333-3333-4333-8333-333333333333',
     lease: liveLease(),
   });
   const cancelling = abandonedRun({
-    id: "55555555-5555-4555-8555-555555555555",
-    status: "cancel_pending",
+    id: '55555555-5555-4555-8555-555555555555',
+    status: 'cancel_pending',
   });
   const { registry, directory } = await seedDirectory([
     abandoned,
@@ -1773,7 +1903,10 @@ test("doctor --reconcile retains retired operations and leaves explicit stops in
 
   const report = await execReconcile(registry, nativeTerminalProbe);
 
-  assert.match(report, /Reconciled 1 run with their existing operation identity\./);
+  assert.match(
+    report,
+    /Reconciled 1 run with their existing operation identity\./,
+  );
   assert.match(report, /no task attempt was consumed/);
   assert.match(
     report,
@@ -1784,60 +1917,66 @@ test("doctor --reconcile retains retired operations and leaves explicit stops in
     report,
     new RegExp(`- ${cancelling.id} [^\\n]*Next: /exec stop ${cancelling.id}`),
   );
-  assert.equal((await registry.get(cancelling.id))?.status, "cancel_pending");
+  assert.equal((await registry.get(cancelling.id))?.status, 'cancel_pending');
   assert.ok(
     (await registry.get(cancelling.id))?.activeOperation,
-    "the tracked operation survives too",
+    'the tracked operation survives too',
   );
 
   const reset = await registry.get(abandoned.id);
-  assert.equal(reset?.status, "running");
-  assert.equal(reset?.activeOperation?.operationId, abandoned.activeOperation?.operationId);
+  assert.equal(reset?.status, 'running');
+  assert.equal(
+    reset?.activeOperation?.operationId,
+    abandoned.activeOperation?.operationId,
+  );
   assert.equal(reset?.activeOperation?.processTreeExited, true);
   assert.deepEqual(reset?.taskAttempts, abandoned.taskAttempts);
-  assert.ok(reset?.reconciledAt, "the reset is stamped for audit");
-  assert.match(reset?.error ?? "", /lease was dead/);
-  assert.match(reset?.error ?? "", /operation directory is gone from disk/);
+  assert.ok(reset?.reconciledAt, 'the reset is stamped for audit');
+  assert.match(reset?.error ?? '', /lease was dead/);
+  assert.match(reset?.error ?? '', /operation directory is gone from disk/);
 
   const after = await snapshotRuns(directory);
   assert.equal(
     after[ambiguous.id],
     before[ambiguous.id],
-    "ambiguous untouched",
+    'ambiguous untouched',
   );
-  assert.equal(after[live.id], before[live.id], "live untouched");
+  assert.equal(after[live.id], before[live.id], 'live untouched');
 });
 
-test("doctor --reconcile skips a run reclaimed while the sweep ran", async () => {
+test('doctor --reconcile skips a run reclaimed while the sweep ran', async () => {
   const reclaimed = abandonedRun();
   const stalled = abandonedRun({
-    id: "22222222-2222-4222-8222-222222222222",
+    id: '22222222-2222-4222-8222-222222222222',
   });
   const { registry } = await seedDirectory([reclaimed, stalled]);
   const probe: EvidenceProbe = async (candidate) => {
     if (candidate.id === reclaimed.id) {
       const current = await registry.get(candidate.id);
-      await registry.update({ ...current!, lease: liveLease() });
+      await registry.update({ ...required(current), lease: liveLease() });
     }
     return {
       asyncDirPresent: false,
       processTerminalProof: observedTerminalProof(
-        candidate.activeOperation?.externalRunId ?? "external-unknown",
+        candidate.activeOperation?.externalRunId ?? 'external-unknown',
       ),
     };
   };
 
   const report = await execReconcile(registry, probe);
 
-  assert.match(report, /Reconciled 1 run with their existing operation identity\./);
+  assert.match(
+    report,
+    /Reconciled 1 run with their existing operation identity\./,
+  );
   assert.match(report, /Skipped 1 run reclaimed while the sweep ran/);
   assert.match(report, new RegExp(`- ${reclaimed.id} `));
-  assert.equal((await registry.get(reclaimed.id))?.status, "running");
+  assert.equal((await registry.get(reclaimed.id))?.status, 'running');
   assert.equal((await registry.get(reclaimed.id))?.reconciledAt, undefined);
-  assert.equal((await registry.get(stalled.id))?.status, "running");
+  assert.equal((await registry.get(stalled.id))?.status, 'running');
 });
 
-test("a reconciled run preserves its terminal operation for result recovery", async () => {
+test('a reconciled run preserves its terminal operation for result recovery', async () => {
   const abandoned = abandonedRun();
   const { registry } = await seedDirectory([abandoned]);
 
@@ -1845,52 +1984,55 @@ test("a reconciled run preserves its terminal operation for result recovery", as
   const reconciled = await registry.get(abandoned.id);
 
   assert.ok(reconciled);
-  assert.equal(isActionAllowed("resume", reconciled), true);
+  assert.equal(isActionAllowed('resume', reconciled), true);
   assert.equal(isRecoverableFailure(reconciled), false);
   const guidance = recoveryGuidance(reconciled);
-  assert.equal(guidance.classification, "the worker has finished and its result is ready to read");
+  assert.equal(
+    guidance.classification,
+    'the worker has finished and its result is ready to read',
+  );
   assert.match(guidance.action, new RegExp(`/exec resume ${abandoned.id}`));
-  assert.deepEqual(reconciled.taskAttempts, { "1": 2 });
+  assert.deepEqual(reconciled.taskAttempts, { '1': 2 });
 });
 
 test("reconcile records the retained operation in the run's own progress file", async () => {
   const progressPath = join(
-    await mkdtemp(join(tmpdir(), "pi-plan-exec-progress-")),
-    "progress.txt",
+    await mkdtemp(join(tmpdir(), 'pi-plan-exec-progress-')),
+    'progress.txt',
   );
   const abandoned = abandonedRun({ progressPath });
   const { registry } = await seedDirectory([abandoned]);
 
   await execReconcile(registry, nativeTerminalProbe);
 
-  const progress = await readFile(progressPath, "utf8");
+  const progress = await readFile(progressPath, 'utf8');
   assert.match(progress, /Reconciled by \/exec doctor/);
   assert.match(progress, /operation directory is gone from disk/);
   assert.match(progress, /task attempt counter was left unchanged/);
 });
 
-test("the bridge is asked even when the operation directory is missing", async () => {
-  const asyncDir = await mkdtemp(join(tmpdir(), "pi-plan-exec-async-"));
+test('the bridge is asked even when the operation directory is missing', async () => {
+  const asyncDir = await mkdtemp(join(tmpdir(), 'pi-plan-exec-async-'));
   const surviving = abandonedRun({
     activeOperation: {
-      operationId: "operation-surviving",
-      service: "bridge",
-      kind: "implementation",
-      externalRunId: "external-1",
+      operationId: 'operation-surviving',
+      service: 'bridge',
+      kind: 'implementation',
+      externalRunId: 'external-1',
       asyncDir,
     },
   });
   const wiped = abandonedRun({
-    id: "22222222-2222-4222-8222-222222222222",
+    id: '22222222-2222-4222-8222-222222222222',
   });
   const fused = abandonedRun({
-    id: "33333333-3333-4333-8333-333333333333",
-    stage: "fusion_review",
+    id: '33333333-3333-4333-8333-333333333333',
+    stage: 'fusion_review',
     activeOperation: {
-      operationId: "operation-fusion",
-      service: "fusion",
-      kind: "fusion",
-      externalRunId: "external-3",
+      operationId: 'operation-fusion',
+      service: 'fusion',
+      kind: 'fusion',
+      externalRunId: 'external-3',
       asyncDir,
     },
   });
@@ -1902,11 +2044,11 @@ test("the bridge is asked even when the operation directory is missing", async (
     abandonmentProbe(
       async (operationId) => {
         asked.push(operationId);
-        return "absent";
+        return 'absent';
       },
       async (operation) => ({
         processTerminalProof: observedTerminalProof(
-          operation.externalRunId ?? "external-unknown",
+          operation.externalRunId ?? 'external-unknown',
         ),
       }),
     ),
@@ -1914,25 +2056,28 @@ test("the bridge is asked even when the operation directory is missing", async (
 
   assert.deepEqual(
     asked.toSorted(),
-    ["operation-1", "operation-surviving"],
-    "directory absence is diagnostic; every bridge operation is still asked",
+    ['operation-1', 'operation-surviving'],
+    'directory absence is diagnostic; every bridge operation is still asked',
   );
-  assert.match(report, /Reconciled 2 runs with their existing operation identity\./);
   assert.match(
-    (await registry.get(surviving.id))?.error ?? "",
+    report,
+    /Reconciled 2 runs with their existing operation identity\./,
+  );
+  assert.match(
+    (await registry.get(surviving.id))?.error ?? '',
     /the bridge has no record of its operation/,
   );
-  assert.equal((await registry.get(fused.id))?.status, "running");
+  assert.equal((await registry.get(fused.id))?.status, 'running');
 });
 
-test("a bridge that cannot answer is not evidence the worker is gone", async () => {
-  const asyncDir = await mkdtemp(join(tmpdir(), "pi-plan-exec-async-"));
+test('a bridge that cannot answer is not evidence the worker is gone', async () => {
+  const asyncDir = await mkdtemp(join(tmpdir(), 'pi-plan-exec-async-'));
   const surviving = abandonedRun({
     activeOperation: {
-      operationId: "operation-surviving",
-      service: "bridge",
-      kind: "implementation",
-      externalRunId: "external-1",
+      operationId: 'operation-surviving',
+      service: 'bridge',
+      kind: 'implementation',
+      externalRunId: 'external-1',
       asyncDir,
     },
   });
@@ -1940,37 +2085,38 @@ test("a bridge that cannot answer is not evidence the worker is gone", async () 
 
   const report = await execReconcile(
     registry,
-    abandonmentProbe(() => Promise.reject(new Error("bridge is not loaded"))),
+    abandonmentProbe(() => Promise.reject(new Error('bridge is not loaded'))),
   );
 
   assert.match(report, /No run is provably abandoned, so nothing was reset\./);
-  assert.equal((await registry.get(surviving.id))?.status, "running");
+  assert.equal((await registry.get(surviving.id))?.status, 'running');
 });
 
-test("startup says one line about abandoned runs, or nothing", async () => {
+test('startup says one line about abandoned runs, or nothing', async () => {
   const { registry } = await seedDirectory([
     abandonedRun(),
-    abandonedRun({ id: "22222222-2222-4222-8222-222222222222" }),
+    abandonedRun({ id: '22222222-2222-4222-8222-222222222222' }),
   ]);
   const { registry: quiet } = await seedDirectory([retiredRun()]);
 
   assert.equal(
     abandonedRunsNotice(await sweepAbandonment(registry, nativeTerminalProbe)),
-    "2 plan execution runs claim to be running with no worker. Use /exec status.",
+    '2 plan execution runs claim to be running with no worker. Use /exec status.',
   );
   assert.equal(abandonedRunsNotice(await sweepAbandonment(quiet)), undefined);
 
   const { registry: single } = await seedDirectory([abandonedRun()]);
   assert.match(
-    abandonedRunsNotice(await sweepAbandonment(single, nativeTerminalProbe)) ?? "",
+    abandonedRunsNotice(await sweepAbandonment(single, nativeTerminalProbe)) ??
+      '',
     /^1 plan execution run claims to be running/,
   );
 });
 
-test("the startup sweep classifies without writing anything", async () => {
+test('the startup sweep classifies without writing anything', async () => {
   const abandoned = abandonedRun();
   const live = abandonedRun({
-    id: "22222222-2222-4222-8222-222222222222",
+    id: '22222222-2222-4222-8222-222222222222',
     lease: liveLease(),
   });
   const { registry, directory } = await seedDirectory([abandoned, live]);
@@ -1980,18 +2126,18 @@ test("the startup sweep classifies without writing anything", async () => {
 
   assert.deepEqual(
     sweep.diagnoses.map((diagnosis) => diagnosis.classification).sort(),
-    ["abandoned", "live"],
+    ['abandoned', 'live'],
   );
   assert.deepEqual(await snapshotRuns(directory), before);
 });
 
-test("cleanup removes a run record the registry cannot parse", async () => {
-  const corruptId = "99999999-9999-4999-8999-999999999999";
+test('cleanup removes a run record the registry cannot parse', async () => {
+  const corruptId = '99999999-9999-4999-8999-999999999999';
   const { registry, directory } = await seedDirectory([retiredRun()]);
   await mkdir(join(directory, corruptId), { recursive: true });
-  await writeFile(join(directory, corruptId, "run.json"), "{not-json\n");
+  await writeFile(join(directory, corruptId, 'run.json'), '{not-json\n');
 
-  const doctored = (await execRead(registry, "doctor", [])) ?? "";
+  const doctored = (await execRead(registry, 'doctor', [])) ?? '';
   assert.match(
     doctored,
     new RegExp(
@@ -2003,38 +2149,38 @@ test("cleanup removes a run record the registry cannot parse", async () => {
   assert.match(preview, /nothing was deleted/);
   assert.ok(await registry.listWithErrors().then((it) => it.errors.length));
 
-  const applied = await execCleanup(registry, [corruptId, "--apply"]);
+  const applied = await execCleanup(registry, [corruptId, '--apply']);
   assert.match(applied, /Removed 1 unreadable plan execution run record/);
   assert.deepEqual((await registry.listWithErrors()).errors, []);
 });
 
-test("settled runs group by what they need and hide stale terminal rows", () => {
+test('settled runs group by what they need and hide stale terminal rows', () => {
   const paused = run({
-    id: "11111111-1111-4111-8111-111111111111",
-    status: "paused",
+    id: '11111111-1111-4111-8111-111111111111',
+    status: 'paused',
     updatedAt: Date.now() - HOUR_MS,
   });
   const failed = run({
-    id: "22222222-2222-4222-8222-222222222222",
-    status: "failed",
+    id: '22222222-2222-4222-8222-222222222222',
+    status: 'failed',
     updatedAt: Date.now() - HOUR_MS,
   });
   // Retired an hour ago: the archive stamp does not hide a run, age does.
   const justArchived = retiredRun({
-    id: "33333333-3333-4333-8333-333333333333",
+    id: '33333333-3333-4333-8333-333333333333',
     updatedAt: Date.now() - HOUR_MS,
     retiredAt: Date.now() - HOUR_MS,
   });
   const oldCompleted = retiredRun({
-    id: "44444444-4444-4444-8444-444444444444",
+    id: '44444444-4444-4444-8444-444444444444',
   });
   const oldCancelled = retiredRun({
-    id: "55555555-5555-4555-8555-555555555555",
-    status: "cancelled",
+    id: '55555555-5555-4555-8555-555555555555',
+    status: 'cancelled',
   });
   const runs = [paused, failed, justArchived, oldCompleted, oldCancelled];
 
-  const lines = settledRunLines(runs).join("\n");
+  const lines = settledRunLines(runs).join('\n');
 
   assert.match(
     lines,
@@ -2052,27 +2198,27 @@ test("settled runs group by what they need and hide stale terminal rows", () => 
       `finished:\\n- ${justArchived.id} [^\\n]*Next: /exec cleanup ${justArchived.id}`,
     ),
   );
-  assert.ok(!lines.includes(oldCompleted.id), "an old terminal run is hidden");
-  assert.ok(!lines.includes(oldCancelled.id), "an old terminal run is hidden");
+  assert.ok(!lines.includes(oldCompleted.id), 'an old terminal run is hidden');
+  assert.ok(!lines.includes(oldCancelled.id), 'an old terminal run is hidden');
   assert.match(
     lines,
     /2 older terminal runs hidden\. \/exec status --all to show, \/exec cleanup to remove\./,
   );
 
-  const all = settledRunLines(runs, true).join("\n");
+  const all = settledRunLines(runs, true).join('\n');
 
   for (const shown of runs) assert.ok(all.includes(shown.id), shown.id);
-  assert.doesNotMatch(all, /hidden/, "--all hides nothing, so no footer");
+  assert.doesNotMatch(all, /hidden/, '--all hides nothing, so no footer');
 });
 
-test("status answers what is going on in one pass", async () => {
+test('status answers what is going on in one pass', async () => {
   const abandoned = abandonedRun();
   const paused = run({
-    id: "22222222-2222-4222-8222-222222222222",
-    status: "paused",
+    id: '22222222-2222-4222-8222-222222222222',
+    status: 'paused',
     updatedAt: Date.now() - HOUR_MS,
   });
-  const stale = retiredRun({ id: "33333333-3333-4333-8333-333333333333" });
+  const stale = retiredRun({ id: '33333333-3333-4333-8333-333333333333' });
   const registry = await seedRegistry([abandoned, paused, stale]);
 
   const report = await execStatus(registry, { probe: nativeTerminalProbe });
@@ -2084,27 +2230,27 @@ test("status answers what is going on in one pass", async () => {
       `abandoned — no worker is running:\\n- ${abandoned.id} [^\\n]*Next: /exec resume ${abandoned.id}`,
     ),
   );
-  assert.doesNotMatch(report, /--reconcile/, "the retired flag is not offered");
+  assert.doesNotMatch(report, /--reconcile/, 'the retired flag is not offered');
   assert.match(
     report,
     new RegExp(`- ${paused.id} [^\\n]*Next: /exec resume ${paused.id}`),
   );
-  assert.ok(!report.includes(stale.id), "an old terminal run needs --all");
+  assert.ok(!report.includes(stale.id), 'an old terminal run needs --all');
   assert.match(report, /1 older terminal run hidden\./);
 
   const zoomed = await execStatus(registry, {
     all: true,
     probe: nativeTerminalProbe,
   });
-  assert.ok(zoomed.includes(stale.id), "--all is the zoom control");
+  assert.ok(zoomed.includes(stale.id), '--all is the zoom control');
   assert.doesNotMatch(zoomed, /hidden/);
 });
 
-test("status reports a missing package with its install commands", async () => {
+test('status reports a missing package with its install commands', async () => {
   const registry = await seedRegistry([]);
 
   const report = await execStatus(registry, {
-    problems: ["missing: pi-subagents"],
+    problems: ['missing: pi-subagents'],
   });
 
   assert.match(report, /Plan-exec prerequisites — missing: pi-subagents\./);
@@ -2113,99 +2259,102 @@ test("status reports a missing package with its install commands", async () => {
   assert.match(report, /No plan execution runs\. Start one with \/exec\./);
   assert.equal(
     await execStatus(registry),
-    "No plan execution runs. Start one with /exec.",
+    'No plan execution runs. Start one with /exec.',
   );
 });
 
-test("status arguments take one run ID or the --all zoom, never both", () => {
+test('status arguments take one run ID or the --all zoom, never both', () => {
   assert.deepEqual(parseStatusArguments([]), {
     selector: undefined,
     all: false,
   });
-  assert.deepEqual(parseStatusArguments(["run-id"]), {
-    selector: "run-id",
+  assert.deepEqual(parseStatusArguments(['run-id']), {
+    selector: 'run-id',
     all: false,
   });
-  assert.deepEqual(parseStatusArguments(["--all"]), {
+  assert.deepEqual(parseStatusArguments(['--all']), {
     selector: undefined,
     all: true,
   });
   assert.throws(
-    () => parseStatusArguments(["run-id", "--all"]),
+    () => parseStatusArguments(['run-id', '--all']),
     /cannot be combined/,
   );
   assert.throws(
-    () => parseStatusArguments(["--reconcile"]),
+    () => parseStatusArguments(['--reconcile']),
     /\/exec status never writes\. \/exec resume <run-id> resets/,
   );
-  assert.throws(() => parseStatusArguments(["one", "two"]), /Usage/);
+  assert.throws(() => parseStatusArguments(['one', 'two']), /Usage/);
 });
 
-test("the retired read verbs still work and name their replacement", async () => {
+test('the retired read verbs still work and name their replacement', async () => {
   const abandoned = abandonedRun();
-  const stale = retiredRun({ id: "33333333-3333-4333-8333-333333333333" });
+  const stale = retiredRun({ id: '33333333-3333-4333-8333-333333333333' });
   const registry = await seedRegistry([abandoned, stale]);
 
-  const runs = await execRead(registry, "runs", []);
-  assert.match(runs ?? "", /Plan execution runs: 2/);
-  assert.match(runs ?? "", new RegExp(`- ${abandoned.id} `));
+  const runs = await execRead(registry, 'runs', []);
+  assert.match(runs ?? '', /Plan execution runs: 2/);
+  assert.match(runs ?? '', new RegExp(`- ${abandoned.id} `));
   assert.equal(
     (runs?.match(/\/exec runs is now \/exec status/g) ?? []).length,
     1,
-    "the replacement is named once",
+    'the replacement is named once',
   );
 
-  const zoomed = await execRead(registry, "runs", ["--all"]);
-  assert.ok(zoomed?.includes(stale.id), "--all still zooms through the alias");
+  const zoomed = await execRead(registry, 'runs', ['--all']);
+  assert.ok(zoomed?.includes(stale.id), '--all still zooms through the alias');
 
-  const doctor = await execRead(registry, "doctor", []);
-  assert.match(doctor ?? "", new RegExp(`- ${abandoned.id} `));
-  assert.match(doctor ?? "", /\/exec doctor is now \/exec status/);
+  const doctor = await execRead(registry, 'doctor', []);
+  assert.match(doctor ?? '', new RegExp(`- ${abandoned.id} `));
+  assert.match(doctor ?? '', /\/exec doctor is now \/exec status/);
 
-  const setup = await execRead(registry, "setup", []);
-  assert.match(setup ?? "", /^pi install -l npm:pi-subagents@\^0\.70\.1$/m);
-  assert.match(setup ?? "", /\/exec setup is now part of \/exec status/);
+  const setup = await execRead(registry, 'setup', []);
+  assert.match(setup ?? '', /^pi install -l npm:pi-subagents@\^0\.70\.1$/m);
+  assert.match(setup ?? '', /\/exec setup is now part of \/exec status/);
 
-  assert.equal(await execRead(registry, "resume", []), undefined);
-  assert.equal(await execRead(registry, "status", ["run-id"]), undefined);
+  assert.equal(await execRead(registry, 'resume', []), undefined);
+  assert.equal(await execRead(registry, 'status', ['run-id']), undefined);
 });
 
-test("the doctor alias keeps --reconcile for scripted callers", async () => {
+test('the doctor alias keeps --reconcile for scripted callers', async () => {
   const abandoned = abandonedRun();
   const { registry, directory } = await seedDirectory([abandoned]);
   const before = await snapshotRuns(directory);
 
-  assert.equal(await execRead(registry, "doctor", ["--reconcile"]), undefined);
-  assert.deepEqual(await snapshotRuns(directory), before, "no read wrote");
+  assert.equal(await execRead(registry, 'doctor', ['--reconcile']), undefined);
+  assert.deepEqual(await snapshotRuns(directory), before, 'no read wrote');
 
   const report = await execReconcile(registry, nativeTerminalProbe);
 
-  assert.match(report, /Reconciled 1 run with their existing operation identity\./);
-  assert.equal((await registry.get(abandoned.id))?.status, "running");
+  assert.match(
+    report,
+    /Reconciled 1 run with their existing operation identity\./,
+  );
+  assert.equal((await registry.get(abandoned.id))?.status, 'running');
 });
 
-test("the start subcommand is gone", () => {
+test('the start subcommand is gone', () => {
   assert.ok(
-    !(Object.values(EXEC_ACTION) as string[]).includes("start"),
-    "start is not a subcommand",
+    !(Object.values(EXEC_ACTION) as string[]).includes('start'),
+    'start is not a subcommand',
   );
   assert.doesNotMatch(execHelp(), /\/exec start/);
   assert.equal(
-    (getExecArgumentCompletions("") ?? []).find(
-      (item) => item.value === "start",
+    (getExecArgumentCompletions('') ?? []).find(
+      (item) => item.value === 'start',
     ),
     undefined,
   );
 });
 
-test("the exec-plan skill documents exactly the subcommands /exec implements", async () => {
-  const skill = fileURLToPath(new URL("../skills/exec-plan/", import.meta.url));
+test('the exec-plan skill documents exactly the subcommands /exec implements', async () => {
+  const skill = fileURLToPath(new URL('../skills/exec-plan/', import.meta.url));
   const prose = (
     await Promise.all([
-      readFile(join(skill, "SKILL.md"), "utf8"),
-      readFile(join(skill, "references", "recovery.md"), "utf8"),
+      readFile(join(skill, 'SKILL.md'), 'utf8'),
+      readFile(join(skill, 'references', 'recovery.md'), 'utf8'),
     ])
-  ).join("\n");
+  ).join('\n');
   // A subcommand token must start with a letter, so `--all`, `--apply`,
   // `--reconcile`, and `--include-failed` are flags and never match.
   const documented = new Set(
@@ -2216,7 +2365,7 @@ test("the exec-plan skill documents exactly the subcommands /exec implements", a
   const actions = new Set<string>(Object.values(EXEC_ACTION));
   const aliases = new Set<string>(EXEC_ALIAS_ACTIONS);
 
-  assert.ok(documented.size > 0, "no /exec subcommand was found in the skill");
+  assert.ok(documented.size > 0, 'no /exec subcommand was found in the skill');
   for (const token of documented)
     assert.ok(actions.has(token), `skill documents unknown: /exec ${token}`);
   // A hidden alias may appear in the skill but is never required there.
@@ -2228,58 +2377,58 @@ test("the exec-plan skill documents exactly the subcommands /exec implements", a
       );
 });
 
-test("resume takes over a lease whose session is provably gone", () => {
+test('resume takes over a lease whose session is provably gone', () => {
   // DEAD_LEASE names the caller: a Pi restarted under the same session ID must
   // not be locked out of the run the sweep just told it to resume.
-  const stranded = run({ status: "skip_pending", lease: DEAD_LEASE });
-  assert.equal(isActionAllowed("resume", stranded), true);
+  const stranded = run({ status: 'skip_pending', lease: DEAD_LEASE });
+  assert.equal(isActionAllowed('resume', stranded), true);
 
-  const held = run({ status: "skip_pending", lease: liveLease() });
-  assert.equal(isActionAllowed("resume", held), false);
+  const held = run({ status: 'skip_pending', lease: liveLease() });
+  assert.equal(isActionAllowed('resume', held), false);
   // No lease at all: a handoff that failed between release and claim leaves
   // one of these, and it must not be a dead end.
-  const unheld = run({ status: "skip_pending" });
-  assert.equal(isActionAllowed("resume", unheld), true);
-  const done = run({ status: "completed", stage: "complete" });
-  assert.equal(isActionAllowed("resume", done), false);
+  const unheld = run({ status: 'skip_pending' });
+  assert.equal(isActionAllowed('resume', unheld), true);
+  const done = run({ status: 'completed', stage: 'complete' });
+  assert.equal(isActionAllowed('resume', done), false);
 });
 
-test("a live foreign lease still blocks a second worker", async () => {
-  const held = run({ status: "running", lease: liveLease() });
+test('a live foreign lease still blocks a second worker', async () => {
+  const held = run({ status: 'running', lease: liveLease() });
   const registry = await seedRegistry([held]);
 
   // Reachable by status; the claim is what refuses it.
-  assert.equal(isActionAllowed("resume", held), true);
+  assert.equal(isActionAllowed('resume', held), true);
   await assert.rejects(
-    registry.claim(held, "session-new"),
+    registry.claim(held, 'session-new'),
     /controlled by another active Pi session/,
   );
 });
 
-test("the retired adopt verb runs resume and names it once", () => {
-  assert.deepEqual(runActionFor("adopt"), {
-    action: "resume",
-    note: "/exec adopt is now /exec resume; the old name still works.",
+test('the retired adopt verb runs resume and names it once', () => {
+  assert.deepEqual(runActionFor('adopt'), {
+    action: 'resume',
+    note: '/exec adopt is now /exec resume; the old name still works.',
   });
-  assert.deepEqual(runActionFor("resume"), { action: "resume" });
-  assert.deepEqual(runActionFor("skip"), { action: "skip" });
-  assert.equal(runActionFor("status"), undefined);
-  assert.equal(runActionFor("cleanup"), undefined);
+  assert.deepEqual(runActionFor('resume'), { action: 'resume' });
+  assert.deepEqual(runActionFor('skip'), { action: 'skip' });
+  assert.equal(runActionFor('status'), undefined);
+  assert.equal(runActionFor('cleanup'), undefined);
   assert.equal(runActionFor(undefined), undefined);
   assert.ok(
     (EXEC_ALIAS_ACTIONS as readonly string[]).includes(EXEC_ACTION.ADOPT),
-    "adopt is a hidden alias",
+    'adopt is a hidden alias',
   );
 });
 
-test("help drops both interactive flags but keeps them working", () => {
+test('help drops both interactive flags but keeps them working', () => {
   const help = execHelp();
   assert.doesNotMatch(help, /--adopt-current-branch/);
   assert.doesNotMatch(help, /--retry-task/);
   assert.match(help, /--model current\|provider\/model/);
   // Both flags stay parseable for a caller with no human to ask.
   assert.deepEqual(
-    parseResumeOptions(["--adopt-current-branch", "--retry-task"]),
+    parseResumeOptions(['--adopt-current-branch', '--retry-task']),
     {
       adoptCurrentBranch: true,
       retryTask: true,
@@ -2287,22 +2436,22 @@ test("help drops both interactive flags but keeps them working", () => {
       model: undefined,
     },
   );
-  assert.deepEqual(parseResumeOptions(["--same-machine"]), {
+  assert.deepEqual(parseResumeOptions(['--same-machine']), {
     adoptCurrentBranch: false,
     retryTask: false,
     sameMachine: true,
     model: undefined,
   });
   assert.throws(
-    () => parseResumeOptions(["--same-host"]),
+    () => parseResumeOptions(['--same-host']),
     /Usage: \/exec resume/,
   );
 });
 
-test("resume reconciles a provably abandoned run, then continues", async () => {
+test('resume reconciles a provably abandoned run, then continues', async () => {
   const progressPath = join(
-    await mkdtemp(join(tmpdir(), "pi-plan-exec-resume-")),
-    "progress.txt",
+    await mkdtemp(join(tmpdir(), 'pi-plan-exec-resume-')),
+    'progress.txt',
   );
   const abandoned = abandonedRun({ progressPath });
   const registry = await seedRegistry([abandoned]);
@@ -2313,36 +2462,42 @@ test("resume reconciles a provably abandoned run, then continues", async () => {
     nativeTerminalProbe,
   );
 
-  assert.equal(recovered.run.status, "running");
-  assert.equal(recovered.run.activeOperation?.operationId, abandoned.activeOperation?.operationId);
+  assert.equal(recovered.run.status, 'running');
+  assert.equal(
+    recovered.run.activeOperation?.operationId,
+    abandoned.activeOperation?.operationId,
+  );
   assert.deepEqual(recovered.run.taskAttempts, abandoned.taskAttempts);
-  assert.ok(recovered.run.reconciledAt, "the reset is stamped for audit");
-  assert.match(recovered.note ?? "", /existing operation and candidate were preserved/);
-  assert.match(recovered.note ?? "", /No task attempt was consumed/);
+  assert.ok(recovered.run.reconciledAt, 'the reset is stamped for audit');
   assert.match(
-    (await registry.get(abandoned.id))?.error ?? "",
+    recovered.note ?? '',
+    /existing operation and candidate were preserved/,
+  );
+  assert.match(recovered.note ?? '', /No task attempt was consumed/);
+  assert.match(
+    (await registry.get(abandoned.id))?.error ?? '',
     /Reconciled by \/exec resume/,
   );
   assert.match(
-    await readFile(progressPath, "utf8"),
+    await readFile(progressPath, 'utf8'),
     /Reconciled by \/exec resume[\s\S]*attempt counter was left unchanged/,
   );
   assert.equal(isRecoverableFailure(recovered.run), false);
   assert.equal(
-    isActionAllowed("resume", recovered.run),
+    isActionAllowed('resume', recovered.run),
     true,
-    "the reconciled run is resumable",
+    'the reconciled run is resumable',
   );
 });
 
-test("resume refuses a run whose worker cannot be proven gone", async () => {
-  const asyncDir = await mkdtemp(join(tmpdir(), "pi-plan-exec-async-live-"));
+test('resume refuses a run whose worker cannot be proven gone', async () => {
+  const asyncDir = await mkdtemp(join(tmpdir(), 'pi-plan-exec-async-live-'));
   const ambiguous = abandonedRun({
     activeOperation: {
-      operationId: "operation-1",
-      service: "bridge",
-      kind: "implementation",
-      externalRunId: "external-1",
+      operationId: 'operation-1',
+      service: 'bridge',
+      kind: 'implementation',
+      externalRunId: 'external-1',
       asyncDir,
     },
   });
@@ -2356,23 +2511,23 @@ test("resume refuses a run whose worker cannot be proven gone", async () => {
   assert.deepEqual(
     await snapshotRuns(directory),
     before,
-    "an ambiguous run is reported, never reset",
+    'an ambiguous run is reported, never reset',
   );
 });
 
-test("resume refuses a run whose operation directory cannot be read", async () => {
-  const parent = await mkdtemp(join(tmpdir(), "pi-plan-exec-async-denied-"));
-  const asyncDir = join(parent, "operation");
+test('resume refuses a run whose operation directory cannot be read', async () => {
+  const parent = await mkdtemp(join(tmpdir(), 'pi-plan-exec-async-denied-'));
+  const asyncDir = join(parent, 'operation');
   await mkdir(asyncDir);
   // Mode 000 on the parent makes access() fail with EACCES instead of ENOENT.
   // It needs no root and destroys nothing.
   await chmod(parent, 0o000);
   const unreadable = abandonedRun({
     activeOperation: {
-      operationId: "operation-1",
-      service: "bridge",
-      kind: "implementation",
-      externalRunId: "external-1",
+      operationId: 'operation-1',
+      service: 'bridge',
+      kind: 'implementation',
+      externalRunId: 'external-1',
       asyncDir,
     },
   });
@@ -2384,12 +2539,12 @@ test("resume refuses a run whose operation directory cannot be read", async () =
     assert.equal(
       evidence.asyncDirPresent,
       undefined,
-      "a check that failed is not proof the directory is gone",
+      'a check that failed is not proof the directory is gone',
     );
     await assert.rejects(
       reconcileForResume(registry, unreadable),
       /evidence is incomplete/,
-      "an unreadable directory must not license a reset",
+      'an unreadable directory must not license a reset',
     );
     assert.deepEqual(await snapshotRuns(directory), before);
   } finally {
@@ -2397,19 +2552,19 @@ test("resume refuses a run whose operation directory cannot be read", async () =
   }
 });
 
-test("resume passes through what it has no evidence against", async () => {
+test('resume passes through what it has no evidence against', async () => {
   const registry = await seedRegistry([]);
-  const untracked = run({ status: "running", lease: DEAD_LEASE });
+  const untracked = run({ status: 'running', lease: DEAD_LEASE });
   delete untracked.activeOperation;
   const own = abandonedRun({ lease: liveLease() });
-  const cancelling = abandonedRun({ status: "cancel_pending" });
-  const failed = abandonedRun({ status: "failed" });
+  const cancelling = abandonedRun({ status: 'cancel_pending' });
+  const failed = abandonedRun({ status: 'failed' });
 
   for (const [label, candidate] of [
-    ["nothing tracked, so nothing can double-write", untracked],
-    ["a live lease holds it", own],
-    ["cancellation must survive, not be reset", cancelling],
-    ["resume already recovers a failure", failed],
+    ['nothing tracked, so nothing can double-write', untracked],
+    ['a live lease holds it', own],
+    ['cancellation must survive, not be reset', cancelling],
+    ['resume already recovers a failure', failed],
   ] as const) {
     const recovered = await reconcileForResume(registry, candidate);
     assert.equal(recovered.run, candidate, label);
@@ -2417,16 +2572,16 @@ test("resume passes through what it has no evidence against", async () => {
   }
 });
 
-test("resume skips a run reclaimed while it was being diagnosed", async () => {
+test('resume skips a run reclaimed while it was being diagnosed', async () => {
   const abandoned = abandonedRun();
   const registry = await seedRegistry([abandoned]);
   const probe: EvidenceProbe = async () => {
     const current = await registry.get(abandoned.id);
-    await registry.update({ ...current!, lease: liveLease() });
+    await registry.update({ ...required(current), lease: liveLease() });
     return {
       asyncDirPresent: false,
       processTerminalProof: observedTerminalProof(
-        abandoned.activeOperation?.externalRunId ?? "external-unknown",
+        abandoned.activeOperation?.externalRunId ?? 'external-unknown',
       ),
     };
   };
@@ -2435,11 +2590,11 @@ test("resume skips a run reclaimed while it was being diagnosed", async () => {
     reconcileForResume(registry, abandoned, probe),
     /reclaimed while it was being diagnosed/,
   );
-  assert.equal((await registry.get(abandoned.id))?.status, "running");
+  assert.equal((await registry.get(abandoned.id))?.status, 'running');
   assert.equal((await registry.get(abandoned.id))?.reconciledAt, undefined);
 });
 
-test("every run whose guidance names resume survives the resume gate", async () => {
+test('every run whose guidance names resume survives the resume gate', async () => {
   const abandoned = abandonedRun();
   const registry = await seedRegistry([abandoned]);
   const withoutOperation = (overrides: Partial<PlanExecRun>): PlanExecRun => {
@@ -2451,14 +2606,14 @@ test("every run whose guidance names resume survives the resume gate", async () 
   // unobservable-worker branch first and the loop tests nothing.
   const shapes: Array<[PlanExecRun, AbandonmentEvidence | undefined]> = [
     [
-      withoutOperation({ status: "paused", stage: "comprehensive_review" }),
+      withoutOperation({ status: 'paused', stage: 'comprehensive_review' }),
       undefined,
     ],
     [
-      withoutOperation({ status: "failed", error: "worker crashed" }),
+      withoutOperation({ status: 'failed', error: 'worker crashed' }),
       undefined,
     ],
-    [withoutOperation({ status: "running", lease: DEAD_LEASE }), undefined],
+    [withoutOperation({ status: 'running', lease: DEAD_LEASE }), undefined],
     // The only shape the gate writes for, so the only one seeded.
     [abandoned, terminalEvidence()],
   ];
@@ -2476,11 +2631,11 @@ test("every run whose guidance names resume survives the resume gate", async () 
       `guidance recommends resume but the gate refuses it: ${guidance.classification}`,
     );
   }
-  assert.equal(exercised, shapes.length, "every shape must reach the gate");
+  assert.equal(exercised, shapes.length, 'every shape must reach the gate');
 
   // The counter-case: with no evidence, the same run is not offered resume.
   assert.doesNotMatch(recoveryGuidance(abandonedRun()).action, /\/exec resume/);
-  const stranded = withoutOperation({ status: "running", lease: DEAD_LEASE });
+  const stranded = withoutOperation({ status: 'running', lease: DEAD_LEASE });
   assert.equal(
     recoveryGuidance(stranded).classification,
     "someone else's session was holding this run, and it is gone",
@@ -2494,14 +2649,14 @@ function namedVerbs(text: string): string[] {
   );
 }
 
-test("every surface names the same next command for one run", async () => {
+test('every surface names the same next command for one run', async () => {
   const foreignLease = {
-    sessionId: "session-remote",
+    sessionId: 'session-remote',
     pid: 12345,
-    hostname: "buildbox.corp.example",
+    hostname: 'buildbox.corp.example',
     heartbeatAt: Date.now() - 10 * 60_000,
   };
-  const leases: Array<PlanExecRun["lease"] | undefined> = [
+  const leases: Array<PlanExecRun['lease'] | undefined> = [
     undefined,
     liveLease(),
     { ...DEAD_LEASE, heartbeatAt: Date.now(), pid: 4194303 },
@@ -2511,30 +2666,30 @@ test("every surface names the same next command for one run", async () => {
     // beats reads live here, and no local probe may contradict it.
     { ...foreignLease, heartbeatAt: Date.now() },
   ];
-  const operations: Array<PlanExecRun["activeOperation"] | undefined> = [
+  const operations: Array<PlanExecRun['activeOperation'] | undefined> = [
     undefined,
     {
-      operationId: "op",
-      service: "bridge",
-      kind: "implementation",
+      operationId: 'op',
+      service: 'bridge',
+      kind: 'implementation',
       taskId: 1,
-      externalRunId: "x",
+      externalRunId: 'x',
       asyncDir: process.cwd(),
       launchStartedAt: Date.now() - 60_000,
     },
     {
-      operationId: "op",
-      service: "bridge",
-      kind: "implementation",
+      operationId: 'op',
+      service: 'bridge',
+      kind: 'implementation',
       taskId: 1,
-      externalRunId: "x",
+      externalRunId: 'x',
       asyncDir: MISSING_ASYNC_DIR,
       launchStartedAt: Date.now() - 60_000,
     },
     {
-      operationId: "op",
-      service: "bridge",
-      kind: "implementation",
+      operationId: 'op',
+      service: 'bridge',
+      kind: 'implementation',
       taskId: 1,
       asyncDir: process.cwd(),
       launchStartedAt: Date.now() - 60_000,
@@ -2542,12 +2697,12 @@ test("every surface names the same next command for one run", async () => {
   ];
   const shapes: PlanExecRun[] = [];
   for (const status of [
-    "running",
-    "starting",
-    "skip_pending",
-    "cancel_pending",
-    "paused",
-    "failed",
+    'running',
+    'starting',
+    'skip_pending',
+    'cancel_pending',
+    'paused',
+    'failed',
   ] as const)
     for (const lease of leases)
       for (const activeOperation of operations) {
@@ -2555,20 +2710,20 @@ test("every surface names the same next command for one run", async () => {
           id: randomUUID(),
           status,
           stage:
-            status === "skip_pending"
-              ? "comprehensive_review"
-              : "implementation",
+            status === 'skip_pending'
+              ? 'comprehensive_review'
+              : 'implementation',
           ...(lease ? { lease } : {}),
-          ...(status === "skip_pending"
+          ...(status === 'skip_pending'
             ? { config: { ...config, reviewRequired: false } }
             : {}),
-          ...(status === "skip_pending"
+          ...(status === 'skip_pending'
             ? {
                 pendingStageSkip: {
-                  stage: "comprehensive_review",
-                  reason: "accepted",
+                  stage: 'comprehensive_review',
+                  reason: 'accepted',
                   requestedAt: Date.now() - 60_000,
-                  requestedBy: "session-old",
+                  requestedBy: 'session-old',
                 },
               }
             : {}),
@@ -2577,8 +2732,8 @@ test("every surface names the same next command for one run", async () => {
         // stage, and a waived run sits on a review stage.
         if (activeOperation)
           shape.activeOperation =
-            status === "skip_pending"
-              ? { ...activeOperation, kind: "review" }
+            status === 'skip_pending'
+              ? { ...activeOperation, kind: 'review' }
               : activeOperation;
         else delete shape.activeOperation;
         shapes.push(shape);
@@ -2589,15 +2744,15 @@ test("every surface names the same next command for one run", async () => {
   const report = await execStatus(registry, { probe, all: true });
   const rows = new Map(
     report
-      .split("\n")
-      .filter((line) => line.includes("Next: /exec"))
-      .map((line) => [line.slice(2, 38), line.split("Next: ")[1] as string]),
+      .split('\n')
+      .filter((line) => line.includes('Next: /exec'))
+      .map((line) => [line.slice(2, 38), line.split('Next: ')[1] as string]),
   );
 
   for (const shape of shapes) {
     const evidence = await runEvidence(shape, probe);
     const verdict = recoveryGuidance(shape, evidence);
-    const label = `${shape.status} lease=${shape.lease?.sessionId ?? "none"}@${shape.lease?.hostname ?? "-"} op=${shape.activeOperation?.externalRunId ?? shape.activeOperation?.operationId ?? "none"}`;
+    const label = `${shape.status} lease=${shape.lease?.sessionId ?? 'none'}@${shape.lease?.hostname ?? '-'} op=${shape.activeOperation?.externalRunId ?? shape.activeOperation?.operationId ?? 'none'}`;
 
     // The list row — the sweep for an in-flight claim, the settled group
     // otherwise — must be the command the detail view names.
@@ -2610,7 +2765,7 @@ test("every surface names the same next command for one run", async () => {
     );
     // And one the run will accept.
     const verb = namedVerbs(verdict.command)[0] as string;
-    if (verb === "resume" || verb === "stop" || verb === "skip")
+    if (verb === 'resume' || verb === 'stop' || verb === 'skip')
       assert.equal(
         isActionAllowed(verb, shape),
         true,
@@ -2619,11 +2774,11 @@ test("every surface names the same next command for one run", async () => {
     // Nothing may report a worker as watched when no lease proves it.
     if (!evidence.leaseLive)
       for (const claim of [
-        "the controller is polling",
-        "controller is still polling",
-        "reported activity",
-        "polling continues",
-        "; retrying",
+        'the controller is polling',
+        'controller is still polling',
+        'reported activity',
+        'polling continues',
+        '; retrying',
       ])
         assert.ok(
           !formatRunStatus(shape, evidence).includes(claim),
@@ -2647,7 +2802,7 @@ test("a finished run's list row names the command its detail view names", async 
   // The statuses the loop above cannot reach: every in-flight and paused shape
   // is covered there, and only a terminal non-failed run reaches `finished`.
   const finished = (
-    ["completed", "completed_with_findings", "cancelled"] as const
+    ['completed', 'completed_with_findings', 'cancelled'] as const
   ).map((status) =>
     retiredRun({ id: randomUUID(), status, updatedAt: Date.now() }),
   );
@@ -2655,32 +2810,32 @@ test("a finished run's list row names the command its detail view names", async 
   const report = await execStatus(registry, { probe: abandonmentProbe() });
 
   for (const record of finished) {
-    const row = report.split("\n").find((line) => line.includes(record.id));
+    const row = report.split('\n').find((line) => line.includes(record.id));
     assert.equal(
-      row?.split("Next: ")[1],
+      row?.split('Next: ')[1],
       recoveryGuidance(record).command,
       `list row disagrees with the detail view: ${record.status}`,
     );
   }
 });
 
-test("a waived stage nothing can observe names the waiver, not another read", async () => {
+test('a waived stage nothing can observe names the waiver, not another read', async () => {
   const waived = run({
     id: randomUUID(),
-    status: "skip_pending",
-    stage: "comprehensive_review",
+    status: 'skip_pending',
+    stage: 'comprehensive_review',
     config: { ...config, reviewRequired: false },
     lease: DEAD_LEASE,
     activeOperation: {
-      operationId: "operation-1",
-      service: "bridge",
-      kind: "review",
+      operationId: 'operation-1',
+      service: 'bridge',
+      kind: 'review',
     },
     pendingStageSkip: {
-      stage: "comprehensive_review",
-      reason: "accepted",
+      stage: 'comprehensive_review',
+      reason: 'accepted',
       requestedAt: Date.now() - 60_000,
-      requestedBy: "session-old",
+      requestedBy: 'session-old',
     },
   });
   const probe = abandonmentProbe();
@@ -2697,33 +2852,33 @@ test("a waived stage nothing can observe names the waiver, not another read", as
 
   const guidance = recoveryGuidance(waived, evidence);
   assert.equal(isStageWaiverAvailable(waived), true);
-  assert.equal(namedVerbs(guidance.command)[0], "skip");
-  assert.equal(namedVerbs(guidance.action)[0], "skip");
+  assert.equal(namedVerbs(guidance.command)[0], 'skip');
+  assert.equal(namedVerbs(guidance.action)[0], 'skip');
   const registry = await seedRegistry([waived]);
   const row = (await execStatus(registry, { probe }))
-    .split("\n")
+    .split('\n')
     .find((line) => line.includes(waived.id));
-  assert.equal(row?.split("Next: ")[1], guidance.command);
+  assert.equal(row?.split('Next: ')[1], guidance.command);
 });
 
-test("--same-machine verifies local proof before taking a foreign lease", async () => {
+test('--same-machine verifies local proof before taking a foreign lease', async () => {
   // A1: the machine was renamed and its worker died 5s ago. A2: the machine is
   // genuinely remote and its worker is alive. A human assertion permits local
   // evidence gathering, but stale heartbeat alone decides neither case.
   const beating = (sessionId: string, pid: number) => ({
     sessionId,
     pid,
-    hostname: "buildbox.corp.example",
+    hostname: 'buildbox.corp.example',
     heartbeatAt: Date.now() - 5_000,
   });
   const cases: Array<[string, PlanExecRun]> = [
     [
-      "A1 renamed machine, worker dead",
-      abandonedRun({ lease: beating("session-old", reapedPid()) }),
+      'A1 renamed machine, worker dead',
+      abandonedRun({ lease: beating('session-old', reapedPid()) }),
     ],
     [
-      "A2 remote machine, worker alive",
-      abandonedRun({ lease: beating("session-remote", reapedPid()) }),
+      'A2 remote machine, worker alive',
+      abandonedRun({ lease: beating('session-remote', reapedPid()) }),
     ],
   ];
 
@@ -2742,7 +2897,7 @@ test("--same-machine verifies local proof before taking a foreign lease", async 
   }
 });
 
-test("status counts a hidden-only registry instead of reporting an empty one", async () => {
+test('status counts a hidden-only registry instead of reporting an empty one', async () => {
   const registry = await seedRegistry([retiredRun()]);
 
   const report = await execStatus(registry);
@@ -2752,8 +2907,8 @@ test("status counts a hidden-only registry instead of reporting an empty one", a
   assert.match(report, /1 older terminal run hidden\./);
 });
 
-test("stop reaches both outcomes and asks for the one it takes", async () => {
-  const running = run({ status: "running" });
+test('stop reaches both outcomes and asks for the one it takes', async () => {
+  const running = run({ status: 'running' });
   const asked: Array<{ title: string; options: string[] }> = [];
   const pick = (index: number) => ({
     hasUI: true,
@@ -2767,10 +2922,16 @@ test("stop reaches both outcomes and asks for the one it takes", async () => {
 
   assert.equal(await chooseStopOutcome(running, pick(0)), EXEC_ACTION.PAUSE);
   assert.equal(await chooseStopOutcome(running, pick(1)), EXEC_ACTION.CANCEL);
-  assert.equal(asked.length, 2, "each stop asks before it acts");
-  assert.match(asked[0]!.title, new RegExp(running.id.slice(0, 8)));
-  assert.match(asked[0]!.options[0]!, /^Pause — .*\/exec resume continues/);
-  assert.match(asked[0]!.options[1]!, /^Cancel — final.*worktree is preserved/);
+  assert.equal(asked.length, 2, 'each stop asks before it acts');
+  assert.match(asked[0]?.title ?? '', new RegExp(running.id.slice(0, 8)));
+  assert.match(
+    required(asked[0]?.options[0]),
+    /^Pause — .*\/exec resume continues/,
+  );
+  assert.match(
+    required(asked[0]?.options[1]),
+    /^Cancel — final.*worktree is preserved/,
+  );
 
   await assert.rejects(
     chooseStopOutcome(running, {
@@ -2781,24 +2942,20 @@ test("stop reaches both outcomes and asks for the one it takes", async () => {
   );
 });
 
-test("pause and cancel persist a stop fence before later recovery can run", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-plan-exec-stop-fence-"));
-  const registry = new RunRegistry(join(root, "runs"));
+test('pause and cancel persist a stop fence before later recovery can run', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-stop-fence-'));
+  const registry = new RunRegistry(join(root, 'runs'));
   const stored = await registry.create(
-    run({ status: "running", stopGeneration: 4 }),
+    run({ status: 'running', stopGeneration: 4 }),
   );
 
   const paused = await requestStatus(stored, EXEC_ACTION.PAUSE, registry);
-  assert.equal(paused.status, "paused");
+  assert.equal(paused.status, 'paused');
   assert.equal(paused.userStopped, true);
   assert.equal(paused.stopGeneration, 5);
 
-  const cancelled = await requestStatus(
-    paused,
-    EXEC_ACTION.CANCEL,
-    registry,
-  );
-  assert.equal(cancelled.status, "cancel_pending");
+  const cancelled = await requestStatus(paused, EXEC_ACTION.CANCEL, registry);
+  assert.equal(cancelled.status, 'cancel_pending');
   assert.equal(cancelled.userStopped, true);
   assert.equal(cancelled.stopGeneration, 6);
   const persisted = await registry.get(stored.id);
@@ -2808,39 +2965,38 @@ test("pause and cancel persist a stop fence before later recovery can run", asyn
       userStopped: persisted.userStopped,
       stopGeneration: persisted.stopGeneration,
     },
-    { status: "cancel_pending", userStopped: true, stopGeneration: 6 },
+    { status: 'cancel_pending', userStopped: true, stopGeneration: 6 },
   );
 });
 
-test("paused runs keep the background probe while a child exit is unconfirmed", () => {
-  const settledPause = run({ status: "paused" });
+test('paused runs keep the background probe while a child exit is unconfirmed', () => {
+  const settledPause = run({ status: 'paused' });
   delete settledPause.activeOperation;
-  assert.equal(
-    shouldStopBackgroundController(settledPause),
-    true,
-  );
+  assert.equal(shouldStopBackgroundController(settledPause), true);
   assert.equal(
     shouldStopBackgroundController(
       run({
-        status: "paused",
+        status: 'paused',
         activeOperation: {
-          operationId: "pause-child",
-          service: "bridge",
-          kind: "implementation",
-          externalRunId: "child-1",
+          operationId: 'pause-child',
+          service: 'bridge',
+          kind: 'implementation',
+          externalRunId: 'child-1',
         },
       }),
     ),
     false,
   );
   assert.equal(
-    shouldStopBackgroundController(run({ status: "completed", stage: "complete" })),
+    shouldStopBackgroundController(
+      run({ status: 'completed', stage: 'complete' }),
+    ),
     true,
   );
 });
 
-test("stop offers only the outcomes a run can still take, and still asks", async () => {
-  const paused = run({ status: "paused", stage: "comprehensive_review" });
+test('stop offers only the outcomes a run can still take, and still asks', async () => {
+  const paused = run({ status: 'paused', stage: 'comprehensive_review' });
   let offered: string[] = [];
 
   const outcome = await chooseStopOutcome(paused, {
@@ -2856,23 +3012,23 @@ test("stop offers only the outcomes a run can still take, and still asks", async
   assert.equal(
     outcome,
     EXEC_ACTION.CANCEL,
-    "a paused run has nothing to pause",
+    'a paused run has nothing to pause',
   );
   assert.equal(offered.length, 1);
   // One option is still a question: a final cancel is never assumed.
-  assert.match(offered[0]!, /^Cancel — final/);
-  assert.equal(isActionAllowed("stop", paused), true);
+  assert.match(required(offered[0]), /^Cancel — final/);
+  assert.equal(isActionAllowed('stop', paused), true);
   assert.equal(
-    isActionAllowed("stop", run({ status: "completed", stage: "complete" })),
+    isActionAllowed('stop', run({ status: 'completed', stage: 'complete' })),
     false,
   );
 });
 
-test("stop refuses without a human and names both scripted verbs", async () => {
+test('stop refuses without a human and names both scripted verbs', async () => {
   await assert.rejects(
-    chooseStopOutcome(run({ status: "running" }), {
+    chooseStopOutcome(run({ status: 'running' }), {
       hasUI: false,
-      ui: { select: async () => "Pause" },
+      ui: { select: async () => 'Pause' },
     }),
     (error: Error) => {
       assert.match(error.message, /\/exec pause <run-id>/);
@@ -2884,48 +3040,48 @@ test("stop refuses without a human and names both scripted verbs", async () => {
   );
 });
 
-test("the retired pause and cancel verbs still work and name their replacement", () => {
-  assert.deepEqual(runActionFor("stop"), { action: "stop" });
-  assert.deepEqual(runActionFor("pause"), {
-    action: "pause",
-    note: "/exec pause is now /exec stop; the old name still works and is the way to pause without a human to ask.",
+test('the retired pause and cancel verbs still work and name their replacement', () => {
+  assert.deepEqual(runActionFor('stop'), { action: 'stop' });
+  assert.deepEqual(runActionFor('pause'), {
+    action: 'pause',
+    note: '/exec pause is now /exec stop; the old name still works and is the way to pause without a human to ask.',
   });
-  assert.deepEqual(runActionFor("cancel"), {
-    action: "cancel",
-    note: "/exec cancel is now /exec stop; the old name still works and is the way to cancel without a human to ask.",
+  assert.deepEqual(runActionFor('cancel'), {
+    action: 'cancel',
+    note: '/exec cancel is now /exec stop; the old name still works and is the way to cancel without a human to ask.',
   });
-  for (const alias of ["pause", "cancel"])
+  for (const alias of ['pause', 'cancel'])
     assert.ok(
       (EXEC_ALIAS_ACTIONS as readonly string[]).includes(alias),
       `${alias} is a hidden alias`,
     );
   assert.match(execHelp(), /\/exec stop \[run-id\]/);
   assert.ok(
-    (getExecArgumentCompletions("") ?? []).some(
-      (item) => item.value === "stop",
+    (getExecArgumentCompletions('') ?? []).some(
+      (item) => item.value === 'stop',
     ),
-    "stop completes",
+    'stop completes',
   );
 });
 
-test("status hands a blocked stage its skip command with the run ID filled in", async () => {
+test('status hands a blocked stage its skip command with the run ID filled in', async () => {
   const blocked = run({
-    status: "failed",
-    stage: "critical_review",
-    error: "reviewer could not pass the stage",
+    status: 'failed',
+    stage: 'critical_review',
+    error: 'reviewer could not pass the stage',
     updatedAt: Date.now() - HOUR_MS,
     config: { ...config, reviewRequired: false },
   });
   delete blocked.activeOperation;
   const implementing = run({
-    id: "22222222-2222-4222-8222-222222222222",
-    status: "paused",
-    stage: "implementation",
+    id: '22222222-2222-4222-8222-222222222222',
+    status: 'paused',
+    stage: 'implementation',
     updatedAt: Date.now() - HOUR_MS,
   });
   const registry = await seedRegistry([blocked, implementing]);
 
-  const report = (await execRead(registry, "status", [])) ?? "";
+  const report = (await execRead(registry, 'status', [])) ?? '';
 
   assert.match(
     report,
@@ -2939,44 +3095,51 @@ test("status hands a blocked stage its skip command with the run ID filled in", 
   assert.equal(isStageWaiverAvailable(implementing), false);
 });
 
-test("required review and finalize stages never suggest force-skip", () => {
-  for (const status of ["failed", "paused", "skip_pending"] as const) {
-    const required = run({ status, stage: "finalize", config: { ...config, finalizeEnabled: false } });
+test('required review and finalize stages never suggest force-skip', () => {
+  for (const status of ['failed', 'paused', 'skip_pending'] as const) {
+    const required = run({
+      status,
+      stage: 'finalize',
+      config: { ...config, finalizeEnabled: false },
+    });
     assert.equal(isStageWaiverAvailable(required), false);
     assert.doesNotMatch(recoveryGuidance(required).action, /\/exec skip/);
   }
-  for (const stage of ["comprehensive_review", "finalize"] as const) {
+  for (const stage of ['comprehensive_review', 'finalize'] as const) {
     const required = run({
-      status: "failed",
+      status: 'failed',
       stage,
-      error: "required stage is blocked",
+      error: 'required stage is blocked',
     });
     delete required.activeOperation;
     assert.equal(isStageWaiverAvailable(required), false, stage);
     assert.doesNotMatch(recoveryGuidance(required).action, /\/exec skip/);
     const invalidPending = run({
-      status: "skip_pending",
+      status: 'skip_pending',
       stage,
       pendingStageSkip: {
         stage,
-        reason: "legacy waiver",
+        reason: 'legacy waiver',
         requestedAt: 1,
-        requestedBy: "old-session",
+        requestedBy: 'old-session',
       },
     });
-    assert.equal(recoveryGuidance(invalidPending).command, `/exec status ${invalidPending.id}`);
+    assert.equal(
+      recoveryGuidance(invalidPending).command,
+      `/exec status ${invalidPending.id}`,
+    );
     assert.doesNotMatch(recoveryGuidance(invalidPending).action, /\/exec skip/);
   }
   const optionalReview = run({
-    status: "failed",
-    stage: "comprehensive_review",
+    status: 'failed',
+    stage: 'comprehensive_review',
     config: { ...config, reviewRequired: false },
   });
   delete optionalReview.activeOperation;
   assert.equal(isStageWaiverAvailable(optionalReview), true);
 });
 
-test("help lists every primary verb and no retired alias", () => {
+test('help lists every primary verb and no retired alias', () => {
   const help = execHelp();
   const aliases = new Set<string>(EXEC_ALIAS_ACTIONS);
   const primary = Object.values(EXEC_ACTION).filter(
@@ -2992,24 +3155,24 @@ test("help lists every primary verb and no retired alias", () => {
   for (const alias of aliases)
     assert.doesNotMatch(help, new RegExp(`/exec ${alias}`), alias);
   assert.deepEqual(
-    (getExecArgumentCompletions("") ?? []).map((item) => item.value).sort(),
+    (getExecArgumentCompletions('') ?? []).map((item) => item.value).sort(),
     [...primary].sort(),
   );
 });
 
-test("what help drops, the skill keeps for scripted callers", async () => {
+test('what help drops, the skill keeps for scripted callers', async () => {
   const help = execHelp();
   const skill = await readFile(
-    fileURLToPath(new URL("../skills/exec-plan/SKILL.md", import.meta.url)),
-    "utf8",
+    fileURLToPath(new URL('../skills/exec-plan/SKILL.md', import.meta.url)),
+    'utf8',
   );
   // Retired names and prompt-answering flags leave help, never the docs.
   const scripted = [
-    "--all",
-    "--include-failed",
-    "--reconcile",
-    "--retry-task",
-    "--adopt-current-branch",
+    '--all',
+    '--include-failed',
+    '--reconcile',
+    '--retry-task',
+    '--adopt-current-branch',
   ];
 
   assert.match(help, /--apply/);
@@ -3024,19 +3187,19 @@ test("what help drops, the skill keeps for scripted callers", async () => {
     assert.match(skill, new RegExp(`/exec ${alias}`), `skill drops ${alias}`);
 });
 
-test("the detail view checks the worker itself instead of trusting the record", async () => {
+test('the detail view checks the worker itself instead of trusting the record', async () => {
   // Three hours in, so the elapsed bound would answer if the decisive evidence
   // did not.
   const abandoned = abandonedRun({
     activeOperation: {
-      operationId: "operation-1",
-      service: "bridge",
-      kind: "implementation",
-      externalRunId: "external-1",
+      operationId: 'operation-1',
+      service: 'bridge',
+      kind: 'implementation',
+      externalRunId: 'external-1',
       asyncDir: MISSING_ASYNC_DIR,
       launchStartedAt: Date.now() - 180 * 60_000,
       lastObservedAt: Date.now() - 180 * 60_000,
-      workerSignal: { mode: "workflow" },
+      workerSignal: { mode: 'workflow' },
     },
   });
   const registry = await seedRegistry([abandoned]);
@@ -3084,30 +3247,30 @@ test("the two views judge a lease the same way, including this session's own", a
   assert.match(sweep, /abandoned — no worker is running/);
   assert.match(sweep, new RegExp(`Next: /exec resume ${mine.id}`));
   assert.equal(
-    isActionAllowed("resume", mine),
+    isActionAllowed('resume', mine),
     true,
-    "the sweep must not print a next command its own gate refuses",
+    'the sweep must not print a next command its own gate refuses',
   );
   assert.equal(
     (await reconcileForResume(registry, mine, nativeTerminalProbe)).run.status,
-    "running",
-    "the gate must preserve the retired operation for result reconciliation",
+    'running',
+    'the gate must preserve the retired operation for result reconciliation',
   );
 });
 
 /** Every one names a wait, and every wait needs something still running. */
 const PREEMPTING_SHAPES: Array<[string, Partial<PlanExecRun>]> = [
   [
-    "the provider stopped answering",
+    'the provider stopped answering',
     {
       activeOperation: {
-        operationId: "operation-1",
-        service: "bridge",
-        kind: "implementation",
-        externalRunId: "external-1",
+        operationId: 'operation-1',
+        service: 'bridge',
+        kind: 'implementation',
+        externalRunId: 'external-1',
         asyncDir: MISSING_ASYNC_DIR,
         statusFailures: 2,
-        lastStatusError: "bridge status failed: ENOENT",
+        lastStatusError: 'bridge status failed: ENOENT',
       },
     },
   ],
@@ -3115,38 +3278,38 @@ const PREEMPTING_SHAPES: Array<[string, Partial<PlanExecRun>]> = [
     "the worker's name was never learned",
     {
       activeOperation: {
-        operationId: "operation-1",
-        service: "bridge",
-        kind: "implementation",
+        operationId: 'operation-1',
+        service: 'bridge',
+        kind: 'implementation',
         asyncDir: MISSING_ASYNC_DIR,
       },
     },
   ],
   [
-    "a stage was waived",
+    'a stage was waived',
     {
-      status: "skip_pending",
-      stage: "comprehensive_review",
+      status: 'skip_pending',
+      stage: 'comprehensive_review',
       activeOperation: {
-        operationId: "operation-1",
-        service: "bridge",
-        kind: "review",
-        externalRunId: "external-1",
+        operationId: 'operation-1',
+        service: 'bridge',
+        kind: 'review',
+        externalRunId: 'external-1',
         reviewIteration: 1,
         asyncDir: MISSING_ASYNC_DIR,
       },
       pendingStageSkip: {
-        stage: "comprehensive_review",
-        reason: "waived",
+        stage: 'comprehensive_review',
+        reason: 'waived',
         requestedAt: Date.now() - 6 * 60_000,
-        requestedBy: "operator",
+        requestedBy: 'operator',
       },
     },
   ],
-  ["a stop was requested", { status: "cancel_pending" }],
+  ['a stop was requested', { status: 'cancel_pending' }],
 ];
 
-test("decisive evidence outranks every claim that would say wait", async () => {
+test('decisive evidence outranks every claim that would say wait', async () => {
   for (const [label, overrides] of PREEMPTING_SHAPES) {
     const gone = abandonedRun(overrides);
     const registry = await seedRegistry([gone]);
@@ -3155,22 +3318,28 @@ test("decisive evidence outranks every claim that would say wait", async () => {
     const sweep = await execStatus(registry, { probe: durableTerminalProbe });
     // The command the sweep prints for this row; the detail view must match it.
     const next =
-      gone.status === "cancel_pending"
+      gone.status === 'cancel_pending'
         ? `/exec stop ${gone.id}`
         : `/exec resume ${gone.id}`;
 
-    assert.match(guidance.classification, gone.activeOperation?.externalRunId ? /^the worker is gone/ : /pending launch can be checked/, label);
+    assert.match(
+      guidance.classification,
+      gone.activeOperation?.externalRunId
+        ? /^the worker is gone/
+        : /pending launch can be checked/,
+      label,
+    );
     assert.doesNotMatch(
       guidance.action,
       /Do not resume|Do not start another|moves on by itself|until it reads cancelled|polling picks up/,
       `${label}: guidance still tells the reader to wait for a dead worker`,
     );
     assert.ok(guidance.action.includes(next), `${label}: names ${next}`);
-    assert.match(sweep, new RegExp(`Next: ${next.replace("/", "\\/")}`), label);
+    assert.match(sweep, new RegExp(`Next: ${next.replace('/', '\\/')}`), label);
     // Including for the session named on the dead lease.
     assert.equal(
       isActionAllowed(
-        gone.status === "cancel_pending" ? "stop" : "resume",
+        gone.status === 'cancel_pending' ? 'stop' : 'resume',
         gone,
       ),
       true,
@@ -3179,7 +3348,7 @@ test("decisive evidence outranks every claim that would say wait", async () => {
   }
 });
 
-test("a live lease keeps every one of those claims exactly as it was", async () => {
+test('a live lease keeps every one of those claims exactly as it was', async () => {
   const waits = [
     /cannot check on the worker right now/,
     /cannot check on the worker right now/,
@@ -3189,7 +3358,7 @@ test("a live lease keeps every one of those claims exactly as it was", async () 
   for (const [index, [label, overrides]] of PREEMPTING_SHAPES.entries()) {
     const held = abandonedRun({
       ...overrides,
-      ...(label === "a stage was waived"
+      ...(label === 'a stage was waived'
         ? { config: { ...config, reviewRequired: false } }
         : {}),
       lease: liveLease(),
@@ -3198,20 +3367,20 @@ test("a live lease keeps every one of those claims exactly as it was", async () 
       held,
       await runEvidence(held, abandonmentProbe()),
     );
-    assert.match(guidance.classification, waits[index]!, label);
+    assert.match(guidance.classification, required(waits[index]), label);
   }
 });
 
-test("nothing claims a poll loop that no live lease was observed for", async () => {
+test('nothing claims a poll loop that no live lease was observed for', async () => {
   const stalled = abandonedRun({
     activeOperation: {
-      operationId: "operation-1",
-      service: "bridge",
-      kind: "implementation",
-      externalRunId: "external-1",
+      operationId: 'operation-1',
+      service: 'bridge',
+      kind: 'implementation',
+      externalRunId: 'external-1',
       asyncDir: MISSING_ASYNC_DIR,
       statusFailures: 2,
-      lastStatusError: "bridge status failed: ENOENT",
+      lastStatusError: 'bridge status failed: ENOENT',
     },
   });
   const dead = formatRunStatus(
@@ -3240,10 +3409,10 @@ test("nothing claims a poll loop that no live lease was observed for", async () 
   assert.doesNotMatch(formatRunStatus(polling), /polling continues/);
 });
 
-test("the abandoned group promises a reset only where one happens", async () => {
+test('the abandoned group promises a reset only where one happens', async () => {
   const stopping = abandonedRun({
-    id: "22222222-2222-4222-8222-222222222222",
-    status: "cancel_pending",
+    id: '22222222-2222-4222-8222-222222222222',
+    status: 'cancel_pending',
   });
   const resettable = abandonedRun();
   const footer =
@@ -3263,30 +3432,29 @@ test("the abandoned group promises a reset only where one happens", async () => 
     footer,
   );
 
-  const mixed = await execStatus(
-    await seedRegistry([stopping, resettable]),
-    { probe: nativeTerminalProbe },
-  );
+  const mixed = await execStatus(await seedRegistry([stopping, resettable]), {
+    probe: nativeTerminalProbe,
+  });
   assert.match(
     mixed,
     /except the ones already told to stop, which keep that request/,
   );
 });
 
-test("the sweep reports how far past its budget a run has gone", async () => {
+test('the sweep reports how far past its budget a run has gone', async () => {
   const overdue = abandonedRun({
     lease: liveLease(),
     config: {
       ...config,
-      executionLifetime: { mode: "bounded", timeoutMs: 100 * 60_000 },
+      executionLifetime: { mode: 'bounded', timeoutMs: 100 * 60_000 },
     },
     activeOperation: {
-      operationId: "operation-1",
-      service: "bridge",
-      kind: "implementation",
-      externalRunId: "external-1",
+      operationId: 'operation-1',
+      service: 'bridge',
+      kind: 'implementation',
+      externalRunId: 'external-1',
       launchStartedAt: Date.now() - 180 * 60_000,
-      expectedLifetime: { mode: "bounded", timeoutMs: 100 * 60_000 },
+      expectedLifetime: { mode: 'bounded', timeoutMs: 100 * 60_000 },
     },
   });
   const registry = await seedRegistry([overdue]);
@@ -3296,27 +3464,37 @@ test("the sweep reports how far past its budget a run has gone", async () => {
   assert.match(report, /past the explicit 100m compatibility deadline/);
 });
 
-test("widget shows a grown active compatibility budget rather than the frozen base", () => {
-  const active = run({ config: { ...config, executionLifetime: { mode: "bounded", timeoutMs: 60_000 } },
-    activeOperation: { operationId: "grown", service: "bridge", kind: "implementation", taskId: 1,
-      expectedLifetime: { mode: "bounded", timeoutMs: 240_000 }, effectiveLifetime: { mode: "bounded", timeoutMs: 240_000 } },
-    tasks: { "1": { taskId: 1, dependsOn: [], state: "running", attempts: 3 } },
+test('widget shows a grown active compatibility budget rather than the frozen base', () => {
+  const active = run({
+    config: {
+      ...config,
+      executionLifetime: { mode: 'bounded', timeoutMs: 60_000 },
+    },
+    activeOperation: {
+      operationId: 'grown',
+      service: 'bridge',
+      kind: 'implementation',
+      taskId: 1,
+      expectedLifetime: { mode: 'bounded', timeoutMs: 240_000 },
+      effectiveLifetime: { mode: 'bounded', timeoutMs: 240_000 },
+    },
+    tasks: { '1': { taskId: 1, dependsOn: [], state: 'running', attempts: 3 } },
   });
-  const widget = formatRunWidget(active).join("\n");
+  const widget = formatRunWidget(active).join('\n');
   assert.match(widget, /deadline 4m compatibility mode/);
   assert.match(widget, /Lifetime: 4m compatibility mode/);
   assert.doesNotMatch(widget, /1m compatibility mode/);
 });
 
-test("a run on another host stays live until its owner releases it", async () => {
+test('a run on another host stays live until its owner releases it', async () => {
   const remote = abandonedRun({
-    lease: { ...DEAD_LEASE, hostname: "another-host" },
+    lease: { ...DEAD_LEASE, hostname: 'another-host' },
   });
   const { registry } = await seedDirectory([remote]);
   const asked: string[] = [];
   const probe = abandonmentProbe(async (operationId) => {
     asked.push(operationId);
-    return "absent";
+    return 'absent';
   });
 
   // The probe gathers nothing: an absence measured on this machine's disk would
@@ -3328,16 +3506,16 @@ test("a run on another host stays live until its owner releases it", async () =>
   assert.match(
     report,
     /lease names another-host, not this machine/,
-    "the doctor report names the blocker rather than an unexplained unknown",
+    'the doctor report names the blocker rather than an unexplained unknown',
   );
-  assert.equal((await registry.get(remote.id))?.status, "running");
-  assert.deepEqual(asked, [], "no local bridge lookup for a remote worker");
+  assert.equal((await registry.get(remote.id))?.status, 'running');
+  assert.deepEqual(asked, [], 'no local bridge lookup for a remote worker');
   const kept = await reconcileForResume(registry, remote, probe);
-  assert.equal(kept.run.status, "running");
+  assert.equal(kept.run.status, 'running');
   assert.equal(kept.note, undefined);
 });
 
-test("a renamed machine keeps the remote lease protected and explains the assertion", async () => {
+test('a renamed machine keeps the remote lease protected and explains the assertion', async () => {
   // A DHCP rename: the lease names something no probe can connect back here.
   const renamed = abandonedRun({
     lease: { ...DEAD_LEASE, hostname: `${thisHost()}-corp-dhcp` },
@@ -3351,14 +3529,17 @@ test("a renamed machine keeps the remote lease protected and explains the assert
   assert.match(guidance.action, /--same-machine/);
   const status = formatRunStatus(renamed, await runEvidence(renamed));
   assert.match(status, /--same-machine/);
-  assert.doesNotMatch(status, /polling continues|controller is polling|; retrying|holds a live lease/);
+  assert.doesNotMatch(
+    status,
+    /polling continues|controller is polling|; retrying|holds a live lease/,
+  );
   const stillOwned = await reconcileForResume(registry, renamed);
-  assert.equal(stillOwned.run.status, "running");
+  assert.equal(stillOwned.run.status, 'running');
   assert.equal(stillOwned.note, undefined);
   assert.deepEqual(
     await snapshotRuns(directory),
     before,
-    "a refused resume writes nothing",
+    'a refused resume writes nothing',
   );
 
   const stillOwnedAfterOverride = await reconcileForResume(
@@ -3368,19 +3549,25 @@ test("a renamed machine keeps the remote lease protected and explains the assert
     true,
   );
 
-  assert.equal(stillOwnedAfterOverride.run.status, "running");
-  assert.equal(stillOwnedAfterOverride.run.activeOperation?.operationId, renamed.activeOperation?.operationId);
-  assert.match(stillOwnedAfterOverride.note ?? "", /existing operation and candidate were preserved/);
+  assert.equal(stillOwnedAfterOverride.run.status, 'running');
+  assert.equal(
+    stillOwnedAfterOverride.run.activeOperation?.operationId,
+    renamed.activeOperation?.operationId,
+  );
+  assert.match(
+    stillOwnedAfterOverride.note ?? '',
+    /existing operation and candidate were preserved/,
+  );
   assert.equal(
     (await registry.get(renamed.id))?.lease?.hostname,
     hostname(),
-    "the proven local handoff rebinds the lease host before the next claim",
+    'the proven local handoff rebinds the lease host before the next claim',
   );
   const claimed = await registry.claim(
-    (await registry.get(renamed.id))!,
-    "session-after-same-machine-proof",
+    required(await registry.get(renamed.id)),
+    'session-after-same-machine-proof',
   );
-  assert.equal(claimed.lease?.sessionId, "session-after-same-machine-proof");
+  assert.equal(claimed.lease?.sessionId, 'session-after-same-machine-proof');
 });
 
 test("a machine that shares this one's first label keeps its live worker", async () => {
@@ -3388,7 +3575,7 @@ test("a machine that shares this one's first label keeps its live worker", async
   // two machines the same first label and the other one is alive and beating.
   const collided = abandonedRun({
     lease: {
-      sessionId: "session-on-the-other-machine",
+      sessionId: 'session-on-the-other-machine',
       pid: process.pid,
       heartbeatAt: Date.now(),
       hostname: `${thisHost()}.b.corp.example`,
@@ -3399,13 +3586,13 @@ test("a machine that shares this one's first label keeps its live worker", async
   const asked: string[] = [];
   const probe = abandonmentProbe(async (operationId) => {
     asked.push(operationId);
-    return "absent";
+    return 'absent';
   });
 
   assert.deepEqual(
     await runEvidence(collided, probe),
     { leaseLive: true },
-    "a fresh remote heartbeat is not for a local pid lookup to contradict",
+    'a fresh remote heartbeat is not for a local pid lookup to contradict',
   );
   assert.deepEqual(
     await probe(collided),
@@ -3416,16 +3603,16 @@ test("a machine that shares this one's first label keeps its live worker", async
 
   const kept = await reconcileForResume(registry, collided, probe);
 
-  assert.equal(kept.run.status, "running");
-  assert.equal(kept.note, undefined, "no reset, so nothing to report");
+  assert.equal(kept.run.status, 'running');
+  assert.equal(kept.note, undefined, 'no reset, so nothing to report');
   assert.deepEqual(
     await snapshotRuns(directory),
     before,
-    "a live remote worker keeps the worktree it is writing to",
+    'a live remote worker keeps the worktree it is writing to',
   );
 });
 
-test("a stale lease from a colliding name stays live, never abandoned", async () => {
+test('a stale lease from a colliding name stays live, never abandoned', async () => {
   const collided = abandonedRun({
     lease: { ...DEAD_LEASE, hostname: `${thisHost()}.b.corp.example` },
   });
@@ -3435,12 +3622,12 @@ test("a stale lease from a colliding name stays live, never abandoned", async ()
   // A silent heartbeat proves nothing about a remote worker. The remote lease
   // remains live until its owner releases it or supplies a durable handoff.
   const kept = await reconcileForResume(registry, collided);
-  assert.equal(kept.run.status, "running");
+  assert.equal(kept.run.status, 'running');
   assert.equal(kept.note, undefined);
   assert.deepEqual(await snapshotRuns(directory), before);
 });
 
-test("a network rename cannot override a live remote lease", async () => {
+test('a network rename cannot override a live remote lease', async () => {
   const churned = abandonedRun({
     lease: { ...DEAD_LEASE, hostname: `${thisHost()}.lan` },
   });
@@ -3450,7 +3637,7 @@ test("a network rename cannot override a live remote lease", async () => {
   // Indistinguishable by name from the colliding machine above, so ordinary
   // reconciliation remains protected by the remote lease.
   const kept = await reconcileForResume(registry, churned);
-  assert.equal(kept.run.status, "running");
+  assert.equal(kept.run.status, 'running');
   assert.equal(kept.note, undefined);
   assert.deepEqual(await snapshotRuns(directory), before);
   assert.equal(sameMachineRefusal(churned), undefined);
@@ -3462,20 +3649,23 @@ test("a network rename cannot override a live remote lease", async () => {
     true,
   );
 
-  assert.equal(stillOwned.run.status, "running");
-  assert.equal(stillOwned.run.activeOperation?.operationId, churned.activeOperation?.operationId);
+  assert.equal(stillOwned.run.status, 'running');
+  assert.equal(
+    stillOwned.run.activeOperation?.operationId,
+    churned.activeOperation?.operationId,
+  );
 });
 
-test("--same-machine supplies a machine, never a verdict", async () => {
-  const asyncDir = await mkdtemp(join(tmpdir(), "pi-plan-exec-async-alive-"));
+test('--same-machine supplies a machine, never a verdict', async () => {
+  const asyncDir = await mkdtemp(join(tmpdir(), 'pi-plan-exec-async-alive-'));
   const foreignLease = { ...DEAD_LEASE, hostname: `${thisHost()}-corp-dhcp` };
   const stillWriting = abandonedRun({
     lease: foreignLease,
     activeOperation: {
-      operationId: "operation-1",
-      service: "bridge",
-      kind: "implementation",
-      externalRunId: "external-1",
+      operationId: 'operation-1',
+      service: 'bridge',
+      kind: 'implementation',
+      externalRunId: 'external-1',
       asyncDir,
     },
   });
@@ -3494,10 +3684,10 @@ test("--same-machine supplies a machine, never a verdict", async () => {
   const bridgeKnowsIt = abandonedRun({
     lease: foreignLease,
     activeOperation: {
-      operationId: "operation-1",
-      service: "bridge",
-      kind: "implementation",
-      externalRunId: "external-1",
+      operationId: 'operation-1',
+      service: 'bridge',
+      kind: 'implementation',
+      externalRunId: 'external-1',
     },
   });
   const seeded = await seedDirectory([bridgeKnowsIt]);
@@ -3506,27 +3696,40 @@ test("--same-machine supplies a machine, never a verdict", async () => {
     reconcileForResume(
       seeded.registry,
       bridgeKnowsIt,
-      abandonmentProbe(async () => "running"),
+      abandonmentProbe(async () => 'running'),
       true,
     ),
     /evidence is incomplete/,
   );
   assert.equal(
     (await seeded.registry.get(bridgeKnowsIt.id))?.status,
-    "running",
+    'running',
   );
   assert.match(
-    sameMachineRefusal(abandonedRun()) ?? "",
+    sameMachineRefusal(abandonedRun()) ?? '',
     /only applies to a run whose lease names another host/,
   );
-  assert.equal(sameMachineRefusal(abandonedRun({ lease: foreignLease })), undefined);
+  assert.equal(
+    sameMachineRefusal(abandonedRun({ lease: foreignLease })),
+    undefined,
+  );
 });
 
-test("same-machine rebinds settled and between-step leases without discarding ownership or stop state", async () => {
-  for (const status of ["running", "starting", "failed", "paused", "cancel_pending"] as const) {
-    const held = run({ status, lease: { ...DEAD_LEASE, hostname: "former-host" },
-      userStopped: status === "paused" || status === "cancel_pending",
-      stopGeneration: 4, localOperationActive: true });
+test('same-machine rebinds settled and between-step leases without discarding ownership or stop state', async () => {
+  for (const status of [
+    'running',
+    'starting',
+    'failed',
+    'paused',
+    'cancel_pending',
+  ] as const) {
+    const held = run({
+      status,
+      lease: { ...DEAD_LEASE, hostname: 'former-host' },
+      userStopped: status === 'paused' || status === 'cancel_pending',
+      stopGeneration: 4,
+      localOperationActive: true,
+    });
     delete held.activeOperation;
     const registry = await seedRegistry([held]);
     const recovered = await reconcileForResume(registry, held, undefined, true);
@@ -3535,22 +3738,34 @@ test("same-machine rebinds settled and between-step leases without discarding ow
     assert.equal(recovered.run.userStopped, held.userStopped);
     assert.equal(recovered.run.stopGeneration, 4);
     assert.equal(recovered.run.localOperationActive, true);
-    const claimed = await registry.claim(recovered.run, "new-session");
-    assert.equal(claimed.lease?.sessionId, "new-session");
+    const claimed = await registry.claim(recovered.run, 'new-session');
+    assert.equal(claimed.lease?.sessionId, 'new-session');
     assert.equal(claimed.localOperationActive, true);
     assert.match(recoveryGuidance(held).command, /--same-machine/);
   }
 });
 
-test("same-machine preserves a settled tracked operation and requires proof for unknown workers", async () => {
-  for (const status of ["failed", "paused", "cancel_pending"] as const) {
-    const held = abandonedRun({ status, lease: { ...DEAD_LEASE, hostname: "former-host" },
-      userStopped: true, stopGeneration: 2 });
+test('same-machine preserves a settled tracked operation and requires proof for unknown workers', async () => {
+  for (const status of ['failed', 'paused', 'cancel_pending'] as const) {
+    const held = abandonedRun({
+      status,
+      lease: { ...DEAD_LEASE, hostname: 'former-host' },
+      userStopped: true,
+      stopGeneration: 2,
+    });
     const { registry, directory } = await seedDirectory([held]);
     const before = await snapshotRuns(directory);
-    await assert.rejects(reconcileForResume(registry, held, abandonmentProbe(), true), /evidence is incomplete/);
+    await assert.rejects(
+      reconcileForResume(registry, held, abandonmentProbe(), true),
+      /evidence is incomplete/,
+    );
     assert.deepEqual(await snapshotRuns(directory), before);
-    const recovered = await reconcileForResume(registry, held, nativeTerminalProbe, true);
+    const recovered = await reconcileForResume(
+      registry,
+      held,
+      nativeTerminalProbe,
+      true,
+    );
     assert.equal(recovered.run.status, status);
     assert.equal(recovered.run.lease?.hostname, hostname());
     assert.deepEqual(recovered.run.activeOperation, held.activeOperation);
@@ -3559,105 +3774,205 @@ test("same-machine preserves a settled tracked operation and requires proof for 
   }
 });
 
-test("same-machine never steals an actual live local PID under a foreign hostname", async () => {
-  for (const status of ["running", "failed", "paused", "cancel_pending"] as const) {
+test('same-machine never steals an actual live local PID under a foreign hostname', async () => {
+  for (const status of [
+    'running',
+    'failed',
+    'paused',
+    'cancel_pending',
+  ] as const) {
     for (const tracked of [true, false]) {
-      const held = abandonedRun({ status, lease: { ...DEAD_LEASE, hostname: "former-host", pid: process.pid } });
+      const held = abandonedRun({
+        status,
+        lease: { ...DEAD_LEASE, hostname: 'former-host', pid: process.pid },
+      });
       if (!tracked) delete held.activeOperation;
       const { registry, directory } = await seedDirectory([held]);
       const before = await snapshotRuns(directory);
-      const recovered = await reconcileForResume(registry, held, async () => {
-        assert.fail("A live local controller must fence evidence gathering.");
-      }, true);
+      const recovered = await reconcileForResume(
+        registry,
+        held,
+        async () => {
+          assert.fail('A live local controller must fence evidence gathering.');
+        },
+        true,
+      );
       assert.equal(recovered.run, held);
       assert.deepEqual(await snapshotRuns(directory), before);
-      await assert.rejects(registry.claim(recovered.run, "replacement-session"), /controlled by another active Pi session/);
+      await assert.rejects(
+        registry.claim(recovered.run, 'replacement-session'),
+        /controlled by another active Pi session/,
+      );
     }
   }
 });
 
-test("same-machine cannot overwrite a stop recorded while checking a settled run", async () => {
-  const held = abandonedRun({ status: "failed", lease: { ...DEAD_LEASE, hostname: "former-host" } });
+test('same-machine cannot overwrite a stop recorded while checking a settled run', async () => {
+  const held = abandonedRun({
+    status: 'failed',
+    lease: { ...DEAD_LEASE, hostname: 'former-host' },
+  });
   const registry = await seedRegistry([held]);
-  await assert.rejects(reconcileForResume(registry, held, async (subject) => {
-    await registry.update({ ...held, status: "cancel_pending", userStopped: true, stopGeneration: 1 });
-    return nativeTerminalProbe(subject);
-  }, true), /changed while its asserted host was being recorded/);
+  await assert.rejects(
+    reconcileForResume(
+      registry,
+      held,
+      async (subject) => {
+        await registry.update({
+          ...held,
+          status: 'cancel_pending',
+          userStopped: true,
+          stopGeneration: 1,
+        });
+        return nativeTerminalProbe(subject);
+      },
+      true,
+    ),
+    /changed while its asserted host was being recorded/,
+  );
   const current = await registry.get(held.id);
-  assert.equal(current?.lease?.hostname, "former-host");
-  assert.equal(current?.status, "cancel_pending");
+  assert.equal(current?.lease?.hostname, 'former-host');
+  assert.equal(current?.status, 'cancel_pending');
   assert.equal(current?.userStopped, true);
   assert.equal(current?.stopGeneration, 1);
 });
 
-test("a saved session waits for durable Git lane creation and recovers creation failures automatically", async (t) => {
+test('a saved session waits for durable Git lane creation and recovers creation failures automatically', async (t) => {
   const initialCwd = process.cwd();
-  const root = await realpath(await mkdtemp(join(tmpdir(), "exec-saved-session-")));
+  const root = await realpath(
+    await mkdtemp(join(tmpdir(), 'exec-saved-session-')),
+  );
   t.after(() => rm(root, { recursive: true, force: true }));
-  const source = join(root, "source");
+  const source = join(root, 'source');
   await mkdir(source);
   const command = async (program: string, args: string[], cwd: string) => {
-    const result = spawnSync(program, args, { cwd, encoding: "utf8" });
-    return { stdout: result.stdout ?? "", stderr: result.stderr ?? "", code: result.status ?? 1 };
+    const result = spawnSync(program, args, { cwd, encoding: 'utf8' });
+    return {
+      stdout: result.stdout ?? '',
+      stderr: result.stderr ?? '',
+      code: result.status ?? 1,
+    };
   };
-  for (const args of [["init", "-b", "main"], ["-c", "user.name=Test", "-c", "user.email=test@example.org",
-    "-c", "commit.gpgSign=false", "-c", "core.hooksPath=/dev/null", "commit", "--allow-empty", "-m", "initial"]]) {
-    const result = await command("git", args, source);
+  for (const args of [
+    ['init', '-b', 'main'],
+    [
+      '-c',
+      'user.name=Test',
+      '-c',
+      'user.email=test@example.org',
+      '-c',
+      'commit.gpgSign=false',
+      '-c',
+      'core.hooksPath=/dev/null',
+      'commit',
+      '--allow-empty',
+      '-m',
+      'initial',
+    ],
+  ]) {
+    const result = await command('git', args, source);
     assert.equal(result.code, 0, result.stderr);
   }
-  await writeFile(join(source, "plan.md"), "### Task 1: Implement\n- [ ] Do the work\n");
-  const sourceSession = persistedSession(source, join(root, "sessions", "source"));
+  await writeFile(
+    join(source, 'plan.md'),
+    '### Task 1: Implement\n- [ ] Do the work\n',
+  );
+  const sourceSession = persistedSession(
+    source,
+    join(root, 'sessions', 'source'),
+  );
   const sourceSessionFile = sourceSession.getSessionFile();
   assert.ok(sourceSessionFile);
   await access(sourceSessionFile);
-  const targetSessionDirectory = join(root, "sessions", "target");
-  const registry = new RunRegistry(join(root, "runs"));
-  const unavailable = async (): Promise<never> => { throw new Error("No worker should start before handoff."); };
+  const targetSessionDirectory = join(root, 'sessions', 'target');
+  const registry = new RunRegistry(join(root, 'runs'));
+  const unavailable = async (): Promise<never> => {
+    throw new Error('No worker should start before handoff.');
+  };
   let releaseCreation!: () => void;
-  const creationBarrier = new Promise<void>((resolve) => { releaseCreation = resolve; });
+  const creationBarrier = new Promise<void>((resolve) => {
+    releaseCreation = resolve;
+  });
   let attempted = 0;
   const localExecutor = createControllerLocalExecutor();
   const creationOperations = new Set<string>();
   const createdPaths = new Set<string>();
-  t.after(() => Promise.all([...createdPaths].map((path) => rm(path, { recursive: true, force: true }))));
-  const controller = new PlanExecController(registry,
-    { spawn: unavailable, operation: unavailable, status: unavailable, result: unavailable, adopt: unavailable, stop: unavailable },
-    { start: unavailable, status: unavailable, result: unavailable, adopt: unavailable, cancel: unavailable }, command,
+  t.after(() =>
+    Promise.all(
+      [...createdPaths].map((path) =>
+        rm(path, { recursive: true, force: true }),
+      ),
+    ),
+  );
+  const controller = new PlanExecController(
+    registry,
+    {
+      spawn: unavailable,
+      operation: unavailable,
+      status: unavailable,
+      result: unavailable,
+      adopt: unavailable,
+      stop: unavailable,
+    },
+    {
+      start: unavailable,
+      status: unavailable,
+      result: unavailable,
+      adopt: unavailable,
+      cancel: unavailable,
+    },
+    command,
     async (cwd, commands, options) => {
       assert.equal(await options.isAuthorized(), true);
-      if (options.operationId.startsWith("git:worktree:") && !creationOperations.has(options.operationId)) {
+      if (
+        options.operationId.startsWith('git:worktree:') &&
+        !creationOperations.has(options.operationId)
+      ) {
         creationOperations.add(options.operationId);
-        createdPaths.add(options.operationId.slice("git:worktree:".length));
+        createdPaths.add(options.operationId.slice('git:worktree:'.length));
         attempted++;
         if (attempted === 1) {
           await creationBarrier;
-          throw new LocalOperationFailedError("temporary checkout failure");
+          throw new LocalOperationFailedError('temporary checkout failure');
         }
       }
       await localExecutor(cwd, commands, options);
-    });
-  const ctx = { cwd: source, hasUI: true,
-    ui: { select: async () => "Worktree (isolated)" },
+    },
+  );
+  const ctx = {
+    cwd: source,
+    hasUI: true,
+    ui: { select: async () => 'Worktree (isolated)' },
     sessionManager: sourceSession,
   } as unknown as ExtensionCommandContext;
   let started: PlanExecRun | undefined;
   let afterTick: ((run: PlanExecRun) => Promise<boolean>) | undefined;
   let forks = 0;
-  const response = await handleCommand("plan.md", ctx, {
+  const response = await handleCommand('plan.md', ctx, {
     controller,
-    startBackgroundController: (run, _sessionId, _cwd, _ctx, handoff) => { started = run; afterTick = handoff; },
+    startBackgroundController: (run, _sessionId, _cwd, _ctx, handoff) => {
+      started = run;
+      afterTick = handoff;
+    },
     syncProjection: async (run) => run,
     checkRuntime: async () => undefined,
     runtimeProblems: async () => [],
     doctorProbe: async () => ({}),
     handoff: async (_ctx, run) => {
       await access(run.worktreeCwd);
-      assert.equal(run.lanePreparation?.state, "bootstrap");
+      assert.equal(run.lanePreparation?.state, 'bootstrap');
       assert.equal(_ctx.sessionManager.getSessionFile(), sourceSessionFile);
-      const targetSession = SessionManager.forkFrom(sourceSessionFile, run.worktreeCwd, targetSessionDirectory);
+      const targetSession = SessionManager.forkFrom(
+        sourceSessionFile,
+        run.worktreeCwd,
+        targetSessionDirectory,
+      );
       assert.equal(targetSession.getCwd(), run.worktreeCwd);
       assert.equal(targetSession.getSessionDir(), targetSessionDirectory);
-      assert.notEqual(targetSession.getSessionId(), sourceSession.getSessionId());
+      assert.notEqual(
+        targetSession.getSessionId(),
+        sourceSession.getSessionId(),
+      );
       assert.equal(targetSession.getHeader()?.parentSession, sourceSessionFile);
       assert.deepEqual(targetSession.getEntries(), sourceSession.getEntries());
       const targetSessionFile = targetSession.getSessionFile();
@@ -3668,37 +3983,61 @@ test("a saved session waits for durable Git lane creation and recovers creation 
       return true;
     },
   });
-  assert.match(response ?? "", /started/);
+  assert.match(response ?? '', /started/);
   assert.ok(started);
   assert.ok(afterTick);
   assert.equal(forks, 0);
   await assert.rejects(access(started.worktreeCwd));
   assert.equal(await afterTick(started), false);
   await mkdir(started.worktreeCwd, { recursive: true });
-  await writeFile(join(started.worktreeCwd, "unowned.txt"), "keep this directory");
+  await writeFile(
+    join(started.worktreeCwd, 'unowned.txt'),
+    'keep this directory',
+  );
   assert.equal(await afterTick(started), false);
   const firstTick = controller.tick(started.id, sourceSession.getSessionId());
   releaseCreation();
   let current = await firstTick;
-  assert.equal(current.lanePreparation?.state, "create");
+  assert.equal(current.lanePreparation?.state, 'create');
   assert.equal(await afterTick(current), false);
   current = await registry.update({ ...current, nextAttemptAt: 0 });
-  for (let tick = 0; tick < 5 && current.lanePreparation?.state === "create"; tick++) {
+  for (
+    let tick = 0;
+    tick < 5 && current.lanePreparation?.state === 'create';
+    tick++
+  ) {
     assert.equal(await afterTick(current), false);
     current = await controller.tick(current.id, sourceSession.getSessionId());
   }
-  assert.equal(current.lanePreparation?.state, "bootstrap", current.error ?? current.wakeReason ?? "The lane must finish creation.");
-  assert.equal(await afterTick({ ...current, status: "paused", userStopped: true }), false);
-  assert.equal(await afterTick({ ...current, status: "cancel_pending", userStopped: true }), false);
+  assert.equal(
+    current.lanePreparation?.state,
+    'bootstrap',
+    current.error ?? current.wakeReason ?? 'The lane must finish creation.',
+  );
+  assert.equal(
+    await afterTick({ ...current, status: 'paused', userStopped: true }),
+    false,
+  );
+  assert.equal(
+    await afterTick({
+      ...current,
+      status: 'cancel_pending',
+      userStopped: true,
+    }),
+    false,
+  );
   assert.equal(await afterTick(current), true);
   assert.equal(forks, 1);
   assert.equal(attempted, 2);
-  assert.equal(await readFile(join(started.worktreeCwd, "unowned.txt"), "utf8"), "keep this directory");
+  assert.equal(
+    await readFile(join(started.worktreeCwd, 'unowned.txt'), 'utf8'),
+    'keep this directory',
+  );
   assert.equal((await readdir(targetSessionDirectory)).length, 1);
   assert.equal(process.cwd(), initialCwd);
 });
 
-test("a live lease is decisive on its own and nothing else is probed", async () => {
+test('a live lease is decisive on its own and nothing else is probed', async () => {
   const held = abandonedRun({ lease: liveLease() });
   const registry = await seedRegistry([held]);
   let probed = 0;
@@ -3709,58 +4048,122 @@ test("a live lease is decisive on its own and nothing else is probed", async () 
 
   const sweep = await sweepAbandonment(registry, probe);
 
-  assert.equal(sweep.diagnoses[0]?.classification, "live");
-  assert.equal(probed, 0, "a live lease short-circuits the probe");
+  assert.equal(sweep.diagnoses[0]?.classification, 'live');
+  assert.equal(probed, 0, 'a live lease short-circuits the probe');
   assert.deepEqual(await runEvidence(held, probe), { leaseLive: true });
 });
 
-test("explicit pause from an unrelated session polls a dead owner's worker until owned exit", { timeout: 5_000 }, async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "exec-unrelated-pause-"));
+test("explicit pause from an unrelated session polls a dead owner's worker until owned exit", {
+  timeout: 5_000,
+}, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'exec-unrelated-pause-'));
   t.after(() => rm(root, { recursive: true, force: true }));
-  const registry = new RunRegistry(join(root, "runs"));
-  const held = await registry.create(run({
-    repositoryRoot: join(root, "original"), worktreeCwd: join(root, "original"),
-    planPath: join(root, "original", "plan.md"), progressPath: join(root, "original", "progress.txt"),
-    lease: DEAD_LEASE,
-    activeOperation: { operationId: "owned-operation", externalRunId: "owned-worker", requestDigest: "owned-digest",
-      service: "bridge", kind: "implementation", taskId: 1,
-      expectedLifetime: { mode: "unbounded" }, effectiveLifetime: { mode: "unbounded" } },
-  }));
-  t.mock.method(RunRegistry.prototype, "get", registry.get.bind(registry));
-  t.mock.method(RunRegistry.prototype, "claim", registry.claim.bind(registry));
-  t.mock.method(RunRegistry.prototype, "updateIfCurrent", registry.updateIfCurrent.bind(registry));
-  const proof = { version: 1, state: "observed", runId: "owned-worker", runnerProcessInstanceId: "fixture", observedAt: Date.now(),
+  const registry = new RunRegistry(join(root, 'runs'));
+  const held = await registry.create(
+    run({
+      repositoryRoot: join(root, 'original'),
+      worktreeCwd: join(root, 'original'),
+      planPath: join(root, 'original', 'plan.md'),
+      progressPath: join(root, 'original', 'progress.txt'),
+      lease: DEAD_LEASE,
+      activeOperation: {
+        operationId: 'owned-operation',
+        externalRunId: 'owned-worker',
+        requestDigest: 'owned-digest',
+        service: 'bridge',
+        kind: 'implementation',
+        taskId: 1,
+        expectedLifetime: { mode: 'unbounded' },
+        effectiveLifetime: { mode: 'unbounded' },
+      },
+    }),
+  );
+  t.mock.method(RunRegistry.prototype, 'get', registry.get.bind(registry));
+  t.mock.method(RunRegistry.prototype, 'claim', registry.claim.bind(registry));
+  t.mock.method(
+    RunRegistry.prototype,
+    'updateIfCurrent',
+    registry.updateIfCurrent.bind(registry),
+  );
+  const proof = {
+    version: 1,
+    state: 'observed',
+    runId: 'owned-worker',
+    runnerProcessInstanceId: 'fixture',
+    observedAt: Date.now(),
     processTreeOwnership: OWNED_PROCESS_TREE,
-    callerBinding: { operationId: "owned-operation", requestDigest: "owned-digest" }, instances: [] };
+    callerBinding: {
+      operationId: 'owned-operation',
+      requestDigest: 'owned-digest',
+    },
+    instances: [],
+  };
   let stopCalls = 0;
-  const unavailable = async (): Promise<never> => { throw new Error("Pause must not dispatch implementation or consume a result."); };
+  const unavailable = async (): Promise<never> => {
+    throw new Error(
+      'Pause must not dispatch implementation or consume a result.',
+    );
+  };
   const bridge = {
-    spawn: unavailable, result: unavailable, adopt: unavailable, status: unavailable,
-    operation: async () => ({ success: true as const, data: { runId: "owned-worker", requestDigest: "owned-digest",
-      state: "found", status: stopCalls ? "stopped" : "running", ...(stopCalls ? { processTerminalProof: proof } : {}) } }),
+    spawn: unavailable,
+    result: unavailable,
+    adopt: unavailable,
+    status: unavailable,
+    operation: async () => ({
+      success: true as const,
+      data: {
+        runId: 'owned-worker',
+        requestDigest: 'owned-digest',
+        state: 'found',
+        status: stopCalls ? 'stopped' : 'running',
+        ...(stopCalls ? { processTerminalProof: proof } : {}),
+      },
+    }),
     stop: async (runId: string) => {
-      assert.equal(runId, "owned-worker");
+      assert.equal(runId, 'owned-worker');
       stopCalls++;
-      return { success: true as const, data: { state: "stopping" } };
+      return { success: true as const, data: { state: 'stopping' } };
     },
   };
-  const controller = new PlanExecController(registry, bridge,
-    { start: unavailable, status: unavailable, result: unavailable, adopt: unavailable, cancel: unavailable }, unavailable);
-  assert.equal((await bridge.operation()).data.status, "running");
-  const cwd = join(root, "unrelated");
+  const controller = new PlanExecController(
+    registry,
+    bridge,
+    {
+      start: unavailable,
+      status: unavailable,
+      result: unavailable,
+      adopt: unavailable,
+      cancel: unavailable,
+    },
+    unavailable,
+  );
+  assert.equal((await bridge.operation()).data.status, 'running');
+  const cwd = join(root, 'unrelated');
   await mkdir(cwd);
-  const sessionId = "new-unrelated-session";
-  const ctx = { cwd, hasUI: false, sessionManager: { getSessionId: () => sessionId } } as unknown as ExtensionCommandContext;
+  const sessionId = 'new-unrelated-session';
+  const ctx = {
+    cwd,
+    hasUI: false,
+    sessionManager: { getSessionId: () => sessionId },
+  } as unknown as ExtensionCommandContext;
   let timer: ReturnType<typeof setInterval> | undefined;
-  t.after(() => { if (timer) clearInterval(timer); });
+  t.after(() => {
+    if (timer) clearInterval(timer);
+  });
   let finish!: (run: PlanExecRun) => void;
   let fail!: (error: unknown) => void;
-  const exited = new Promise<PlanExecRun>((resolve, reject) => { finish = resolve; fail = reject; });
+  const exited = new Promise<PlanExecRun>((resolve, reject) => {
+    finish = resolve;
+    fail = reject;
+  });
   const response = await handleCommand(`pause ${held.id}`, ctx, {
-    controller, syncProjection: async (run) => run, checkRuntime: async () => undefined,
-    runtimeProblems: async () => [], doctorProbe: async () => ({}),
+    controller,
+    syncProjection: async (run) => run,
+    checkRuntime: async () => undefined,
+    runtimeProblems: async () => [],
+    doctorProbe: async () => ({}),
     startBackgroundController: (paused, owner, controllerCwd) => {
-      assert.equal(paused.status, "paused");
+      assert.equal(paused.status, 'paused');
       assert.equal(paused.userStopped, true);
       assert.equal(paused.lease?.sessionId, sessionId);
       assert.equal(owner, sessionId);
@@ -3769,107 +4172,215 @@ test("explicit pause from an unrelated session polls a dead owner's worker until
       timer = setInterval(() => {
         if (ticking) return;
         ticking = true;
-        void controller.tick(paused.id, owner).then((current) => {
-          if (shouldStopBackgroundController(current)) {
-            clearInterval(timer);
-            finish(current);
-          }
-        }).catch(fail).finally(() => { ticking = false; });
+        void controller
+          .tick(paused.id, owner)
+          .then((current) => {
+            if (shouldStopBackgroundController(current)) {
+              clearInterval(timer);
+              finish(current);
+            }
+          })
+          .catch(fail)
+          .finally(() => {
+            ticking = false;
+          });
       }, 5);
     },
   });
-  assert.match(response ?? "", /paused; its current attempt is stopping/);
-  assert.ok(timer, "Pause must attach a controller before returning, even outside the run's repository.");
+  assert.match(response ?? '', /paused; its current attempt is stopping/);
+  assert.ok(
+    timer,
+    "Pause must attach a controller before returning, even outside the run's repository.",
+  );
   const current = await exited;
   assert.equal(stopCalls, 1);
-  assert.equal(current.status, "paused");
+  assert.equal(current.status, 'paused');
   assert.equal(current.userStopped, true);
   assert.equal(current.stopGeneration, 1);
-  assert.equal(current.activeOperation?.operationId, "owned-operation");
+  assert.equal(current.activeOperation?.operationId, 'owned-operation');
   assert.equal(current.activeOperation?.processTreeExited, true);
   assert.deepEqual(current.taskAttempts, held.taskAttempts);
 });
 
-for (const phase of ["before-create", "published", "claimed-failure"] as const) {
-  test(`pending start retires its late allocation at ${phase} across session replacement`, { timeout: 10_000 }, async (t) => {
-    const root = await realpath(await mkdtemp(join(tmpdir(), "exec-pending-start-")));
-    const registry = new RunRegistry(join(root, "runs"));
-    const source = join(root, "repository");
+for (const phase of [
+  'before-create',
+  'published',
+  'claimed-failure',
+] as const) {
+  test(`pending start retires its late allocation at ${phase} across session replacement`, {
+    timeout: 10_000,
+  }, async (t) => {
+    const root = await realpath(
+      await mkdtemp(join(tmpdir(), 'exec-pending-start-')),
+    );
+    const registry = new RunRegistry(join(root, 'runs'));
+    const source = join(root, 'repository');
     await mkdir(source);
-    for (const args of [["init", "-b", "main"], ["-c", "user.name=Test", "-c", "user.email=test@example.org",
-      "-c", "commit.gpgSign=false", "-c", "core.hooksPath=/dev/null", "commit", "--allow-empty", "-m", "initial"],
-      ["checkout", "-b", "feature"]]) {
-      const result = spawnSync("git", args, { cwd: source, encoding: "utf8" });
+    for (const args of [
+      ['init', '-b', 'main'],
+      [
+        '-c',
+        'user.name=Test',
+        '-c',
+        'user.email=test@example.org',
+        '-c',
+        'commit.gpgSign=false',
+        '-c',
+        'core.hooksPath=/dev/null',
+        'commit',
+        '--allow-empty',
+        '-m',
+        'initial',
+      ],
+      ['checkout', '-b', 'feature'],
+    ]) {
+      const result = spawnSync('git', args, { cwd: source, encoding: 'utf8' });
       assert.equal(result.status, 0, result.stderr);
     }
-    await writeFile(join(source, "plan.md"), "### Task 1: Implement\n- [ ] Do the work\n");
-    const sessionA = "pending-start-source";
-    const sessionB = phase === "published" ? sessionA : "pending-start-replacement";
+    await writeFile(
+      join(source, 'plan.md'),
+      '### Task 1: Implement\n- [ ] Do the work\n',
+    );
+    const sessionA = 'pending-start-source';
+    const sessionB =
+      phase === 'published' ? sessionA : 'pending-start-replacement';
     let release!: () => void;
-    const gate = new Promise<void>((resolve) => { release = resolve; });
-    let reached!: () => void;
-    const checkpoint = new Promise<void>((resolve) => { reached = resolve; });
-    const create = registry.create.bind(registry);
-    t.mock.method(RunRegistry.prototype, "create", async (candidate: Parameters<RunRegistry["create"]>[0], options?: Parameters<RunRegistry["create"]>[1]) => {
-      if (phase === "before-create") { reached(); await gate; }
-      return create(candidate, options);
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
     });
-    if (phase === "published") {
-      const writer = registry as unknown as { write(run: PlanExecRun): Promise<void> };
+    let reached!: () => void;
+    const checkpoint = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    const create = registry.create.bind(registry);
+    t.mock.method(
+      RunRegistry.prototype,
+      'create',
+      async (
+        candidate: Parameters<RunRegistry['create']>[0],
+        options?: Parameters<RunRegistry['create']>[1],
+      ) => {
+        if (phase === 'before-create') {
+          reached();
+          await gate;
+        }
+        return create(candidate, options);
+      },
+    );
+    if (phase === 'published') {
+      const writer = registry as unknown as {
+        write(run: PlanExecRun): Promise<void>;
+      };
       const write = writer.write.bind(registry);
-      t.mock.method(writer, "write", async (candidate: PlanExecRun) => { await write(candidate); reached(); await gate; });
-    }
-    t.mock.method(RunRegistry.prototype, "get", registry.get.bind(registry));
-    t.mock.method(RunRegistry.prototype, "listWithErrors", registry.listWithErrors.bind(registry));
-    t.mock.method(RunRegistry.prototype, "withControllerLock", registry.withControllerLock.bind(registry));
-    const claim = registry.claim.bind(registry);
-    let failedClaim = false;
-    t.mock.method(RunRegistry.prototype, "claim", async (candidate: PlanExecRun, owner: string) => {
-      const claimed = await claim(candidate, owner);
-      if (phase === "claimed-failure" && owner === sessionA && !failedClaim) {
-        failedClaim = true;
+      t.mock.method(writer, 'write', async (candidate: PlanExecRun) => {
+        await write(candidate);
         reached();
         await gate;
-        throw new Error("Start failed after durable allocation and claim.");
-      }
-      return claimed;
-    });
+      });
+    }
+    t.mock.method(RunRegistry.prototype, 'get', registry.get.bind(registry));
+    t.mock.method(
+      RunRegistry.prototype,
+      'listWithErrors',
+      registry.listWithErrors.bind(registry),
+    );
+    t.mock.method(
+      RunRegistry.prototype,
+      'withControllerLock',
+      registry.withControllerLock.bind(registry),
+    );
+    const claim = registry.claim.bind(registry);
+    let failedClaim = false;
+    t.mock.method(
+      RunRegistry.prototype,
+      'claim',
+      async (candidate: PlanExecRun, owner: string) => {
+        const claimed = await claim(candidate, owner);
+        if (phase === 'claimed-failure' && owner === sessionA && !failedClaim) {
+          failedClaim = true;
+          reached();
+          await gate;
+          throw new Error('Start failed after durable allocation and claim.');
+        }
+        return claimed;
+      },
+    );
     const update = registry.updateIfCurrent.bind(registry);
     let failedRetirement = false;
-    t.mock.method(RunRegistry.prototype, "updateIfCurrent", async (candidate: PlanExecRun, revision: number, preserveRevision?: boolean) => {
-      if (!candidate.lease && !failedRetirement && phase === "before-create") {
-        failedRetirement = true;
-        throw new Error("Transient retirement write failure.");
-      }
-      return update(candidate, revision, preserveRevision);
-    });
-    t.mock.method(TaskProjector.prototype, "sync", async (current: PlanExecRun) => current);
+    t.mock.method(
+      RunRegistry.prototype,
+      'updateIfCurrent',
+      async (
+        candidate: PlanExecRun,
+        revision: number,
+        preserveRevision?: boolean,
+      ) => {
+        if (
+          !candidate.lease &&
+          !failedRetirement &&
+          phase === 'before-create'
+        ) {
+          failedRetirement = true;
+          throw new Error('Transient retirement write failure.');
+        }
+        return update(candidate, revision, preserveRevision);
+      },
+    );
+    t.mock.method(
+      TaskProjector.prototype,
+      'sync',
+      async (current: PlanExecRun) => current,
+    );
     const tick = PlanExecController.prototype.tick;
     const owners: string[] = [];
-    t.mock.method(PlanExecController.prototype, "tick", async function (this: PlanExecController, runId: string, owner: string) {
-      owners.push(owner);
-      assert.equal(owner, sessionB);
-      if (phase === "claimed-failure") return tick.call(this, runId, owner);
-      return registry.claim((await registry.get(runId))!, owner);
-    });
-    t.mock.timers.enable({ apis: ["setInterval", "setTimeout"] });
+    t.mock.method(
+      PlanExecController.prototype,
+      'tick',
+      async function (this: PlanExecController, runId: string, owner: string) {
+        owners.push(owner);
+        assert.equal(owner, sessionB);
+        if (phase === 'claimed-failure') return tick.call(this, runId, owner);
+        return registry.claim(required(await registry.get(runId)), owner);
+      },
+    );
+    t.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
     const first = executionHarness(source, sessionA);
-    const start = first.command("plan.md");
-    await Promise.race([checkpoint, start.then(() => assert.fail(first.notifications.join("\n") || "Start returned before its fault checkpoint."))]);
-    const closing = first.emit("session_shutdown", { reason: phase === "published" ? "reload" : "new" });
+    const start = first.command('plan.md');
+    await Promise.race([
+      checkpoint,
+      start.then(() =>
+        assert.fail(
+          first.notifications.join('\n') ||
+            'Start returned before its fault checkpoint.',
+        ),
+      ),
+    ]);
+    const closing = first.emit('session_shutdown', {
+      reason: phase === 'published' ? 'reload' : 'new',
+    });
     await new Promise<void>((resolve) => setImmediate(resolve));
     t.mock.timers.tick(1_500);
     await closing;
     const notificationsBefore = first.notifications.length;
-    const second = executionHarness(phase === "claimed-failure" ? join(root, "unrelated") : source, sessionB);
-    t.after(async () => { release(); await start; await second.emit("session_shutdown"); await rm(root, { recursive: true, force: true }); });
-    await second.emit("session_start");
+    const second = executionHarness(
+      phase === 'claimed-failure' ? join(root, 'unrelated') : source,
+      sessionB,
+    );
+    t.after(async () => {
+      release();
+      await start;
+      await second.emit('session_shutdown');
+      await rm(root, { recursive: true, force: true });
+    });
+    await second.emit('session_start');
     t.mock.timers.tick(1_000);
     await new Promise<void>((resolve) => setImmediate(resolve));
     assert.deepEqual(owners, []);
-    if (phase !== "before-create") {
-      const current = (await registry.list())[0]!;
-      await second.command(`${phase === "published" ? "pause" : "cancel"} ${current.id}`);
+    if (phase !== 'before-create') {
+      const current = required((await registry.list())[0]);
+      await second.command(
+        `${phase === 'published' ? 'pause' : 'cancel'} ${current.id}`,
+      );
       assert.equal((await registry.get(current.id))?.userStopped, true);
     }
     release();
@@ -3880,18 +4391,24 @@ for (const phase of ["before-create", "published", "claimed-failure"] as const) 
       await new Promise<void>((resolve) => setImmediate(resolve));
       t.mock.timers.tick(1_000);
       current = (await registry.list())[0];
-      if (phase === "published" ? current?.status === "paused" && !current.lease
-        : phase === "claimed-failure" ? current?.status === "cancelled" && !current.lease : current?.lease?.sessionId === sessionB) break;
+      if (
+        phase === 'published'
+          ? current?.status === 'paused' && !current.lease
+          : phase === 'claimed-failure'
+            ? current?.status === 'cancelled' && !current.lease
+            : current?.lease?.sessionId === sessionB
+      )
+        break;
     }
     assert.ok(current);
     assert.equal(first.notifications.length, notificationsBefore);
-    if (phase === "published") {
-      assert.equal(current.status, "paused");
+    if (phase === 'published') {
+      assert.equal(current.status, 'paused');
       assert.equal(current.userStopped, true);
       assert.equal(current.lease, undefined);
       assert.deepEqual(owners, []);
-    } else if (phase === "claimed-failure") {
-      assert.equal(current.status, "cancelled");
+    } else if (phase === 'claimed-failure') {
+      assert.equal(current.status, 'cancelled');
       assert.equal(current.userStopped, true);
       assert.equal(current.lease, undefined);
       assert.ok(owners.length > 0);
@@ -3903,40 +4420,67 @@ for (const phase of ["before-create", "published", "claimed-failure"] as const) 
   });
 }
 
-test("a queued resume from another directory cannot override a replacement session's pause", { timeout: 5_000 }, async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "exec-queued-resume-"));
-  const registry = new RunRegistry(join(root, "runs"));
-  const planPath = join(root, "plan.md");
-  await writeFile(planPath, "### Task 1: Implement\n- [ ] Do the work\n");
-  const initial = run({ repositoryRoot: root, worktreeCwd: root, planPath, stage: "resolve",
-    lease: { ...liveLease(), sessionId: "resume-source" } });
+test("a queued resume from another directory cannot override a replacement session's pause", {
+  timeout: 5_000,
+}, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'exec-queued-resume-'));
+  const registry = new RunRegistry(join(root, 'runs'));
+  const planPath = join(root, 'plan.md');
+  await writeFile(planPath, '### Task 1: Implement\n- [ ] Do the work\n');
+  const initial = run({
+    repositoryRoot: root,
+    worktreeCwd: root,
+    planPath,
+    stage: 'resolve',
+    lease: { ...liveLease(), sessionId: 'resume-source' },
+  });
   delete initial.activeOperation;
   const held = await registry.create(initial);
-  t.mock.method(RunRegistry.prototype, "get", registry.get.bind(registry));
-  t.mock.method(RunRegistry.prototype, "listWithErrors", registry.listWithErrors.bind(registry));
-  t.mock.method(RunRegistry.prototype, "claim", registry.claim.bind(registry));
-  t.mock.method(RunRegistry.prototype, "updateIfCurrent", registry.updateIfCurrent.bind(registry));
-  t.mock.method(TaskProjector.prototype, "sync", async (current: PlanExecRun) => current);
+  t.mock.method(RunRegistry.prototype, 'get', registry.get.bind(registry));
+  t.mock.method(
+    RunRegistry.prototype,
+    'listWithErrors',
+    registry.listWithErrors.bind(registry),
+  );
+  t.mock.method(RunRegistry.prototype, 'claim', registry.claim.bind(registry));
+  t.mock.method(
+    RunRegistry.prototype,
+    'updateIfCurrent',
+    registry.updateIfCurrent.bind(registry),
+  );
+  t.mock.method(
+    TaskProjector.prototype,
+    'sync',
+    async (current: PlanExecRun) => current,
+  );
   let release!: () => void;
-  const lockBlocked = new Promise<void>((resolve) => { release = resolve; });
-  let waiting!: () => void;
-  const lockRequested = new Promise<void>((resolve) => { waiting = resolve; });
-  const withLock = registry.withControllerLock.bind(registry);
-  t.mock.method(RunRegistry.prototype, "withControllerLock", async <T>(runId: string, callback: () => Promise<T>) => {
-    waiting();
-    await lockBlocked;
-    return withLock(runId, callback);
+  const lockBlocked = new Promise<void>((resolve) => {
+    release = resolve;
   });
-  t.mock.timers.enable({ apis: ["setInterval", "setTimeout"] });
-  const first = executionHarness(join(root, "unrelated"), "resume-source");
+  let waiting!: () => void;
+  const lockRequested = new Promise<void>((resolve) => {
+    waiting = resolve;
+  });
+  const withLock = registry.withControllerLock.bind(registry);
+  t.mock.method(
+    RunRegistry.prototype,
+    'withControllerLock',
+    async <T>(runId: string, callback: () => Promise<T>) => {
+      waiting();
+      await lockBlocked;
+      return withLock(runId, callback);
+    },
+  );
+  t.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  const first = executionHarness(join(root, 'unrelated'), 'resume-source');
   const pending = first.command(`resume ${held.id}`);
   await lockRequested;
-  const closing = first.emit("session_shutdown");
+  const closing = first.emit('session_shutdown');
   await new Promise<void>((resolve) => setImmediate(resolve));
   t.mock.timers.tick(1_500);
   await closing;
-  const second = executionHarness(root, "resume-replacement");
-  await second.emit("session_start");
+  const second = executionHarness(root, 'resume-replacement');
+  await second.emit('session_start');
   await second.command(`pause ${held.id}`);
   assert.equal((await registry.get(held.id))?.userStopped, true);
   release();
@@ -3947,229 +4491,454 @@ test("a queued resume from another directory cannot override a replacement sessi
     await new Promise<void>((resolve) => setImmediate(resolve));
     current = await registry.get(held.id);
   }
-  assert.equal(current?.status, "paused");
+  assert.equal(current?.status, 'paused');
   assert.equal(current?.userStopped, true);
   assert.equal(current?.stopGeneration, 1);
   assert.equal(current?.lease, undefined);
-  await second.emit("session_shutdown");
+  await second.emit('session_shutdown');
   await rm(root, { recursive: true, force: true });
 });
 
-test("a hanging stop dialog cannot delay retirement or mutate after session replacement", { timeout: 5_000 }, async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "exec-pending-dialog-"));
-  const registry = new RunRegistry(join(root, "runs"));
-  const held = await registry.create(run({ repositoryRoot: root, worktreeCwd: root,
-    lease: { ...liveLease(), sessionId: "dialog-source" } }));
-  t.mock.method(RunRegistry.prototype, "get", registry.get.bind(registry));
-  t.mock.method(RunRegistry.prototype, "listWithErrors", registry.listWithErrors.bind(registry));
-  t.mock.method(RunRegistry.prototype, "updateIfCurrent", registry.updateIfCurrent.bind(registry));
-  t.mock.method(RunRegistry.prototype, "claim", registry.claim.bind(registry));
-  t.mock.method(TaskProjector.prototype, "sync", async (current: PlanExecRun) => current);
-  const first = executionHarness(root, "dialog-source");
+test('a hanging stop dialog cannot delay retirement or mutate after session replacement', {
+  timeout: 5_000,
+}, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'exec-pending-dialog-'));
+  const registry = new RunRegistry(join(root, 'runs'));
+  const held = await registry.create(
+    run({
+      repositoryRoot: root,
+      worktreeCwd: root,
+      lease: { ...liveLease(), sessionId: 'dialog-source' },
+    }),
+  );
+  t.mock.method(RunRegistry.prototype, 'get', registry.get.bind(registry));
+  t.mock.method(
+    RunRegistry.prototype,
+    'listWithErrors',
+    registry.listWithErrors.bind(registry),
+  );
+  t.mock.method(
+    RunRegistry.prototype,
+    'updateIfCurrent',
+    registry.updateIfCurrent.bind(registry),
+  );
+  t.mock.method(RunRegistry.prototype, 'claim', registry.claim.bind(registry));
+  t.mock.method(
+    TaskProjector.prototype,
+    'sync',
+    async (current: PlanExecRun) => current,
+  );
+  const first = executionHarness(root, 'dialog-source');
   let choose!: (label: string) => void;
   let shown!: () => void;
-  const dialogShown = new Promise<void>((resolve) => { shown = resolve; });
-  let pauseLabel = "";
-  first.ctx.ui.select = async (_title, options) => { pauseLabel = options[0]!; shown(); return new Promise<string>((resolve) => { choose = resolve; }); };
+  const dialogShown = new Promise<void>((resolve) => {
+    shown = resolve;
+  });
+  let pauseLabel = '';
+  first.ctx.ui.select = async (_title, options) => {
+    pauseLabel = required(options[0]);
+    shown();
+    return new Promise<string>((resolve) => {
+      choose = resolve;
+    });
+  };
   const command = first.command(`stop ${held.id}`);
   await dialogShown;
-  await first.emit("session_shutdown");
+  await first.emit('session_shutdown');
   assert.equal((await registry.get(held.id))?.lease, undefined);
-  const replacement = await registry.claim((await registry.get(held.id))!, "dialog-replacement");
+  const replacement = await registry.claim(
+    required(await registry.get(held.id)),
+    'dialog-replacement',
+  );
   choose(pauseLabel);
   await command;
   const current = await registry.get(held.id);
-  assert.equal(current?.status, "running");
+  assert.equal(current?.status, 'running');
   assert.equal(current?.userStopped, undefined);
   assert.deepEqual(current?.lease, replacement.lease);
   await rm(root, { recursive: true, force: true });
 });
 
-for (const interruption of ["shutdown", "new-owner", "own-switch"] as const) {
-  test(`worktree handoff fences ${interruption} without waiting for projection or reclaiming another lease`, { timeout: 5_000 }, async (t) => {
+for (const interruption of ['shutdown', 'new-owner', 'own-switch'] as const) {
+  test(`worktree handoff fences ${interruption} without waiting for projection or reclaiming another lease`, {
+    timeout: 5_000,
+  }, async (t) => {
     const initialCwd = process.cwd();
-    const root = await mkdtemp(join(tmpdir(), "exec-handoff-retirement-"));
+    const root = await mkdtemp(join(tmpdir(), 'exec-handoff-retirement-'));
     t.after(() => rm(root, { recursive: true, force: true }));
-    const target = join(root, "worktree");
+    const target = join(root, 'worktree');
     await mkdir(target);
-    const source = persistedSession(root, join(root, "sessions", "source"));
+    const source = persistedSession(root, join(root, 'sessions', 'source'));
     const fork = SessionManager.forkFrom.bind(SessionManager);
-    t.mock.method(SessionManager, "forkFrom", (file: string, cwd: string) => fork(file, cwd, join(root, "sessions", "target")));
-    const registry = new RunRegistry(join(root, "runs"));
-    const held = await registry.create(run({ repositoryRoot: root, worktreeCwd: target,
-      planPath: join(target, "plan.md"), lease: { ...liveLease(), sessionId: source.getSessionId() } }));
-    t.mock.method(RunRegistry.prototype, "get", registry.get.bind(registry));
-    t.mock.method(RunRegistry.prototype, "updateIfCurrent", registry.updateIfCurrent.bind(registry));
+    t.mock.method(SessionManager, 'forkFrom', (file: string, cwd: string) =>
+      fork(file, cwd, join(root, 'sessions', 'target')),
+    );
+    const registry = new RunRegistry(join(root, 'runs'));
+    const held = await registry.create(
+      run({
+        repositoryRoot: root,
+        worktreeCwd: target,
+        planPath: join(target, 'plan.md'),
+        lease: { ...liveLease(), sessionId: source.getSessionId() },
+      }),
+    );
+    t.mock.method(RunRegistry.prototype, 'get', registry.get.bind(registry));
+    t.mock.method(
+      RunRegistry.prototype,
+      'updateIfCurrent',
+      registry.updateIfCurrent.bind(registry),
+    );
     const claim = registry.claim.bind(registry);
     let targetClaimed!: () => void;
-    const claimedTarget = new Promise<void>((resolve) => { targetClaimed = resolve; });
-    let releaseClaim!: () => void;
-    const pendingClaim = new Promise<void>((resolve) => { releaseClaim = resolve; });
-    t.after(releaseClaim);
-    t.mock.method(RunRegistry.prototype, "claim", async (candidate: PlanExecRun, sessionId: string) => {
-      const claimed = await claim(candidate, sessionId);
-      if (sessionId !== source.getSessionId()) { targetClaimed(); await pendingClaim; }
-      return claimed;
+    const claimedTarget = new Promise<void>((resolve) => {
+      targetClaimed = resolve;
     });
-    t.mock.method(PlanExecController.prototype, "start", async () => held);
-    t.mock.method(PlanExecController.prototype, "tick", async () => { assert.fail("The source must not restart after handoff shutdown."); });
+    let releaseClaim!: () => void;
+    const pendingClaim = new Promise<void>((resolve) => {
+      releaseClaim = resolve;
+    });
+    t.after(releaseClaim);
+    t.mock.method(
+      RunRegistry.prototype,
+      'claim',
+      async (candidate: PlanExecRun, sessionId: string) => {
+        const claimed = await claim(candidate, sessionId);
+        if (sessionId !== source.getSessionId()) {
+          targetClaimed();
+          await pendingClaim;
+        }
+        return claimed;
+      },
+    );
+    t.mock.method(PlanExecController.prototype, 'start', async () => held);
+    t.mock.method(PlanExecController.prototype, 'tick', async () => {
+      assert.fail('The source must not restart after handoff shutdown.');
+    });
     let projectionCalls = 0;
     let releaseProjection!: () => void;
-    const projection = new Promise<void>((resolve) => { releaseProjection = resolve; });
-    t.after(releaseProjection);
-    t.mock.method(TaskProjector.prototype, "sync", async (current: PlanExecRun) => {
-      projectionCalls++;
-      await projection;
-      return current;
+    const projection = new Promise<void>((resolve) => {
+      releaseProjection = resolve;
     });
-    type Handler = (event: unknown, ctx: ExtensionCommandContext) => Promise<unknown>;
+    t.after(releaseProjection);
+    t.mock.method(
+      TaskProjector.prototype,
+      'sync',
+      async (current: PlanExecRun) => {
+        projectionCalls++;
+        await projection;
+        return current;
+      },
+    );
+    type Handler = (
+      event: unknown,
+      ctx: ExtensionCommandContext,
+    ) => Promise<unknown>;
     const events = new Map<string, Handler[]>();
-    const commands = new Map<string, { handler(args: string, ctx: ExtensionCommandContext): Promise<void> }>();
+    const commands = new Map<
+      string,
+      { handler(args: string, ctx: ExtensionCommandContext): Promise<void> }
+    >();
     const errors: string[] = [];
-    const pi = { events: { on() {}, emit() {} },
-      on(name: string, handler: Handler) { events.set(name, [...events.get(name) ?? [], handler]); },
-      registerCommand(name: string, command: { handler(args: string, ctx: ExtensionCommandContext): Promise<void> }) { commands.set(name, command); },
-      registerTool() {}, getAllTools() { return []; }, getActiveTools() { return []; }, setActiveTools() {},
+    const pi = {
+      events: { on() {}, emit() {} },
+      on(name: string, handler: Handler) {
+        events.set(name, [...(events.get(name) ?? []), handler]);
+      },
+      registerCommand(
+        name: string,
+        command: {
+          handler(args: string, ctx: ExtensionCommandContext): Promise<void>;
+        },
+      ) {
+        commands.set(name, command);
+      },
+      registerTool() {},
+      getAllTools() {
+        return [];
+      },
+      getActiveTools() {
+        return [];
+      },
+      setActiveTools() {},
     } as unknown as ExtensionAPI;
     const shutdown = async (reason: string, targetSessionFile?: string) => {
-      for (const handler of events.get("session_shutdown") ?? [])
-        await handler({ type: "session_shutdown", reason, targetSessionFile }, ctx);
+      for (const handler of events.get('session_shutdown') ?? [])
+        await handler(
+          { type: 'session_shutdown', reason, targetSessionFile },
+          ctx,
+        );
     };
     let switchCalls = 0;
-    const ctx = { cwd: root, hasUI: true, sessionManager: source,
-      ui: { select: async () => "Worktree (isolated)",
-        notify(message: string, level: string) { if (level === "error") errors.push(message); },
-        setStatus() {}, setWidget() {},
+    const ctx = {
+      cwd: root,
+      hasUI: true,
+      sessionManager: source,
+      ui: {
+        select: async () => 'Worktree (isolated)',
+        notify(message: string, level: string) {
+          if (level === 'error') errors.push(message);
+        },
+        setStatus() {},
+        setWidget() {},
       },
       switchSession: async (sessionFile: string) => {
         switchCalls++;
-        await shutdown("resume", sessionFile);
+        await shutdown('resume', sessionFile);
         return { cancelled: false };
       },
     } as unknown as ExtensionCommandContext;
-    t.mock.timers.enable({ apis: ["setInterval", "setTimeout"] });
+    t.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
     planExecExtension(pi);
-    const command = commands.get("exec")!.handler("plan.md", ctx);
+    const command = commands.get('exec')?.handler('plan.md', ctx);
     await claimedTarget;
     const targetOwner = (await registry.get(held.id))?.lease;
     assert.ok(targetOwner);
     assert.notEqual(targetOwner.sessionId, source.getSessionId());
-    if (interruption !== "own-switch") {
-      const closing = shutdown("new");
+    if (interruption !== 'own-switch') {
+      const closing = shutdown('new');
       await new Promise<void>((resolve) => setImmediate(resolve));
       t.mock.timers.tick(1_500);
       await closing;
     }
-    if (interruption === "new-owner") {
-      const current = (await registry.get(held.id))!;
-      await registry.update({ ...current, lease: { ...liveLease(), sessionId: "replacement-owner" } });
+    if (interruption === 'new-owner') {
+      const current = required(await registry.get(held.id));
+      await registry.update({
+        ...current,
+        lease: { ...liveLease(), sessionId: 'replacement-owner' },
+      });
     }
     releaseClaim();
     await command;
     const current = await registry.get(held.id);
-    assert.equal(current?.lease?.sessionId, interruption === "shutdown" ? undefined
-      : interruption === "new-owner" ? "replacement-owner" : targetOwner.sessionId);
-    assert.equal(switchCalls, interruption === "own-switch" ? 1 : 0);
-    assert.equal(projectionCalls, interruption === "own-switch" ? 1 : 0);
+    assert.equal(
+      current?.lease?.sessionId,
+      interruption === 'shutdown'
+        ? undefined
+        : interruption === 'new-owner'
+          ? 'replacement-owner'
+          : targetOwner.sessionId,
+    );
+    assert.equal(switchCalls, interruption === 'own-switch' ? 1 : 0);
+    assert.equal(projectionCalls, interruption === 'own-switch' ? 1 : 0);
     assert.deepEqual(errors, []);
     assert.equal(process.cwd(), initialCwd);
   });
 }
 
-for (const reason of ["new", "reload"] as const) {
-  test(`${reason} retires only its drained controller and restores the next extension instance`, { timeout: 10_000 }, async (t) => {
-    const root = await mkdtemp(join(tmpdir(), "exec-session-retirement-"));
-    const registry = new RunRegistry(join(root, "runs"));
-    const sessionA = "outgoing-session";
-    const sessionB = reason === "reload" ? sessionA : "replacement-session";
-    const held = await registry.create(run({ repositoryRoot: root, worktreeCwd: root,
-      planPath: join(root, "plan.md"), lease: { ...liveLease(), sessionId: sessionA },
-      activeOperation: { operationId: "preserved-operation", service: "bridge", kind: "implementation", externalRunId: "preserved-worker" } }));
-    const other = await registry.create(run({ repositoryRoot: join(root, "other"), worktreeCwd: join(root, "other"),
-      lease: { ...liveLease(), sessionId: "another-live-controller" } }));
+for (const reason of ['new', 'reload'] as const) {
+  test(`${reason} retires only its drained controller and restores the next extension instance`, {
+    timeout: 10_000,
+  }, async (t) => {
+    const root = await mkdtemp(join(tmpdir(), 'exec-session-retirement-'));
+    const registry = new RunRegistry(join(root, 'runs'));
+    const sessionA = 'outgoing-session';
+    const sessionB = reason === 'reload' ? sessionA : 'replacement-session';
+    const held = await registry.create(
+      run({
+        repositoryRoot: root,
+        worktreeCwd: root,
+        planPath: join(root, 'plan.md'),
+        lease: { ...liveLease(), sessionId: sessionA },
+        activeOperation: {
+          operationId: 'preserved-operation',
+          service: 'bridge',
+          kind: 'implementation',
+          externalRunId: 'preserved-worker',
+        },
+      }),
+    );
+    const other = await registry.create(
+      run({
+        repositoryRoot: join(root, 'other'),
+        worktreeCwd: join(root, 'other'),
+        lease: { ...liveLease(), sessionId: 'another-live-controller' },
+      }),
+    );
     const lookup = registry.get.bind(registry);
-    let restorationReadFailures = reason === "new" ? 2 : 1;
-    t.mock.method(RunRegistry.prototype, "get", async (runId: string) => {
+    let restorationReadFailures = reason === 'new' ? 2 : 1;
+    t.mock.method(RunRegistry.prototype, 'get', async (runId: string) => {
       const current = await lookup(runId);
-      if (runId === held.id && current && !current.lease && restorationReadFailures > 0) {
+      if (
+        runId === held.id &&
+        current &&
+        !current.lease &&
+        restorationReadFailures > 0
+      ) {
         restorationReadFailures--;
-        throw new Error("Temporary restoration read failure.");
+        throw new Error('Temporary restoration read failure.');
       }
       return current;
     });
-    t.mock.method(RunRegistry.prototype, "listWithErrors", registry.listWithErrors.bind(registry));
-    t.mock.method(RunRegistry.prototype, "claim", registry.claim.bind(registry));
+    t.mock.method(
+      RunRegistry.prototype,
+      'listWithErrors',
+      registry.listWithErrors.bind(registry),
+    );
+    t.mock.method(
+      RunRegistry.prototype,
+      'claim',
+      registry.claim.bind(registry),
+    );
     const update = registry.updateIfCurrent.bind(registry);
     let rejectRetirement = true;
     let retirementFailed!: () => void;
-    const failedRetirement = new Promise<void>((resolve) => { retirementFailed = resolve; });
-    t.mock.method(RunRegistry.prototype, "updateIfCurrent", async (candidate: PlanExecRun, revision: number, preserveRevision?: boolean) => {
-      if (candidate.id === held.id && !candidate.lease && rejectRetirement) {
-        rejectRetirement = false;
-        retirementFailed();
-        throw new Error("Temporary registry write failure.");
-      }
-      return update(candidate, revision, preserveRevision);
+    const failedRetirement = new Promise<void>((resolve) => {
+      retirementFailed = resolve;
     });
-    t.mock.method(TaskProjector.prototype, "sync", async (current: PlanExecRun) => current);
+    t.mock.method(
+      RunRegistry.prototype,
+      'updateIfCurrent',
+      async (
+        candidate: PlanExecRun,
+        revision: number,
+        preserveRevision?: boolean,
+      ) => {
+        if (candidate.id === held.id && !candidate.lease && rejectRetirement) {
+          rejectRetirement = false;
+          retirementFailed();
+          throw new Error('Temporary registry write failure.');
+        }
+        return update(candidate, revision, preserveRevision);
+      },
+    );
+    t.mock.method(
+      TaskProjector.prototype,
+      'sync',
+      async (current: PlanExecRun) => current,
+    );
     let releaseTick!: () => void;
-    const pendingTick = new Promise<void>((resolve) => { releaseTick = resolve; });
+    const pendingTick = new Promise<void>((resolve) => {
+      releaseTick = resolve;
+    });
     let tickStarted!: () => void;
-    const startedTick = new Promise<void>((resolve) => { tickStarted = resolve; });
+    const startedTick = new Promise<void>((resolve) => {
+      tickStarted = resolve;
+    });
     let replacementTicked!: () => void;
-    const replacementTick = new Promise<void>((resolve) => { replacementTicked = resolve; });
+    const replacementTick = new Promise<void>((resolve) => {
+      replacementTicked = resolve;
+    });
     const ticks: string[] = [];
     let activeTicks = 0;
-    t.mock.method(PlanExecController.prototype, "tick", async (runId: string, owner: string) => {
-      assert.equal(activeTicks++, 0, "Session replacement must never overlap controller ticks.");
-      try {
-        const current = await registry.get(runId);
-        assert.ok(current);
-        const claimed = await registry.claim(current, owner);
-        ticks.push(owner);
-        if (ticks.length === 1) {
-          tickStarted();
-          await pendingTick;
-          return (await update({ ...claimed, wakeReason: "late outgoing observation" }, claimed.updatedAt)).run;
+    t.mock.method(
+      PlanExecController.prototype,
+      'tick',
+      async (runId: string, owner: string) => {
+        assert.equal(
+          activeTicks++,
+          0,
+          'Session replacement must never overlap controller ticks.',
+        );
+        try {
+          const current = await registry.get(runId);
+          assert.ok(current);
+          const claimed = await registry.claim(current, owner);
+          ticks.push(owner);
+          if (ticks.length === 1) {
+            tickStarted();
+            await pendingTick;
+            return (
+              await update(
+                { ...claimed, wakeReason: 'late outgoing observation' },
+                claimed.updatedAt,
+              )
+            ).run;
+          }
+          const next =
+            reason === 'new' && claimed.activeOperation
+              ? (
+                  await update(
+                    {
+                      ...claimed,
+                      activeOperation: {
+                        ...claimed.activeOperation,
+                        processTreeExited: true,
+                      },
+                    },
+                    claimed.updatedAt,
+                  )
+                ).run
+              : claimed;
+          replacementTicked();
+          return next;
+        } finally {
+          activeTicks--;
         }
-        const next = reason === "new" && claimed.activeOperation
-          ? (await update({ ...claimed, activeOperation: { ...claimed.activeOperation, processTreeExited: true } }, claimed.updatedAt)).run
-          : claimed;
-        replacementTicked();
-        return next;
-      } finally {
-        activeTicks--;
-      }
-    });
-    type Handler = (event: unknown, ctx: ExtensionCommandContext) => Promise<unknown>;
+      },
+    );
+    type Handler = (
+      event: unknown,
+      ctx: ExtensionCommandContext,
+    ) => Promise<unknown>;
     const harness = (sessionId: string) => {
       const events = new Map<string, Handler[]>();
-      const commands = new Map<string, { handler(args: string, ctx: ExtensionCommandContext): Promise<void> }>();
+      const commands = new Map<
+        string,
+        { handler(args: string, ctx: ExtensionCommandContext): Promise<void> }
+      >();
       let uiCalls = 0;
-      const pi = { events: { on() {}, emit() {} },
-        on(name: string, handler: Handler) { events.set(name, [...events.get(name) ?? [], handler]); },
-        registerCommand(name: string, command: { handler(args: string, ctx: ExtensionCommandContext): Promise<void> }) { commands.set(name, command); },
-        registerTool() {}, getAllTools() { return []; }, getActiveTools() { return []; }, setActiveTools() {},
+      const pi = {
+        events: { on() {}, emit() {} },
+        on(name: string, handler: Handler) {
+          events.set(name, [...(events.get(name) ?? []), handler]);
+        },
+        registerCommand(
+          name: string,
+          command: {
+            handler(args: string, ctx: ExtensionCommandContext): Promise<void>;
+          },
+        ) {
+          commands.set(name, command);
+        },
+        registerTool() {},
+        getAllTools() {
+          return [];
+        },
+        getActiveTools() {
+          return [];
+        },
+        setActiveTools() {},
       } as unknown as ExtensionAPI;
-      const ctx = { cwd: root, hasUI: true, sessionManager: { getSessionId: () => sessionId },
-        ui: { setStatus() { uiCalls++; }, setWidget() { uiCalls++; }, notify() { uiCalls++; } },
+      const ctx = {
+        cwd: root,
+        hasUI: true,
+        sessionManager: { getSessionId: () => sessionId },
+        ui: {
+          setStatus() {
+            uiCalls++;
+          },
+          setWidget() {
+            uiCalls++;
+          },
+          notify() {
+            uiCalls++;
+          },
+        },
       } as unknown as ExtensionCommandContext;
       planExecExtension(pi);
-      return { commands, ctx, uiCalls: () => uiCalls,
-        emit: async (name: string) => { for (const handler of events.get(name) ?? []) await handler({ type: name, reason }, ctx); } };
+      return {
+        commands,
+        ctx,
+        uiCalls: () => uiCalls,
+        emit: async (name: string) => {
+          for (const handler of events.get(name) ?? [])
+            await handler({ type: name, reason }, ctx);
+        },
+      };
     };
-    t.mock.timers.enable({ apis: ["setInterval", "setTimeout"] });
+    t.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
     const first = harness(sessionA);
     const replacements: Array<ReturnType<typeof harness>> = [];
     t.after(async () => {
       releaseTick();
-      for (const replacement of replacements) await replacement.emit("session_shutdown");
+      for (const replacement of replacements)
+        await replacement.emit('session_shutdown');
       await rm(root, { recursive: true, force: true });
     });
-    await first.emit("session_start");
+    await first.emit('session_start');
     t.mock.timers.tick(1_000);
     await startedTick;
-    const shutdown = first.emit("session_shutdown");
+    const shutdown = first.emit('session_shutdown');
     await new Promise<void>((resolve) => setImmediate(resolve));
     t.mock.timers.tick(1_500);
     await shutdown;
@@ -4178,15 +4947,17 @@ for (const reason of ["new", "reload"] as const) {
     assert.equal(activeTicks, 1);
     const second = harness(sessionB);
     replacements.push(second);
-    await second.emit("session_start");
+    await second.emit('session_start');
     t.mock.timers.tick(1_000);
     await new Promise<void>((resolve) => setImmediate(resolve));
     assert.deepEqual(ticks, [sessionA]);
-    if (reason === "new") {
-      await second.commands.get("exec")!.handler(`pause ${held.id}`, second.ctx);
+    if (reason === 'new') {
+      await second.commands
+        .get('exec')
+        ?.handler(`pause ${held.id}`, second.ctx);
       const paused = await registry.get(held.id);
       assert.equal(paused?.userStopped, true);
-      assert.equal(paused?.status, "paused");
+      assert.equal(paused?.status, 'paused');
       assert.equal(paused?.stopGeneration, 1);
       assert.equal(paused?.lease?.sessionId, sessionA);
     }
@@ -4201,13 +4972,20 @@ for (const reason of ["new", "reload"] as const) {
       await new Promise<void>((resolve) => setImmediate(resolve));
       t.mock.timers.tick(1_000);
     }
-    assert.equal(ticks.length, 2, "The replacement must automatically restore after retirement succeeds.");
+    assert.equal(
+      ticks.length,
+      2,
+      'The replacement must automatically restore after retirement succeeds.',
+    );
     await replacementTick;
     const recovered = await registry.get(held.id);
     assert.equal(recovered?.lease?.sessionId, sessionB);
-    assert.equal(recovered?.activeOperation?.operationId, "preserved-operation");
-    assert.equal(recovered?.status, reason === "new" ? "paused" : "running");
-    if (reason === "new") assert.equal(recovered?.userStopped, true);
+    assert.equal(
+      recovered?.activeOperation?.operationId,
+      'preserved-operation',
+    );
+    assert.equal(recovered?.status, reason === 'new' ? 'paused' : 'running');
+    if (reason === 'new') assert.equal(recovered?.userStopped, true);
     assert.deepEqual(ticks, [sessionA, sessionB]);
     assert.equal(restorationReadFailures, 0);
     assert.equal(first.uiCalls(), outgoingUICalls);
@@ -4215,9 +4993,9 @@ for (const reason of ["new", "reload"] as const) {
   });
 }
 
-test("cleanup reports every outcome instead of stopping at the first refusal", async () => {
-  const first = retiredRun({ id: "33333333-3333-4333-8333-333333333333" });
-  const second = retiredRun({ id: "44444444-4444-4444-8444-444444444444" });
+test('cleanup reports every outcome instead of stopping at the first refusal', async () => {
+  const first = retiredRun({ id: '33333333-3333-4333-8333-333333333333' });
+  const second = retiredRun({ id: '44444444-4444-4444-8444-444444444444' });
   const { directory } = await seedDirectory([first, second]);
   // Stands in for the registry's own re-check under its lock, which can refuse
   // a target the listing snapshotted.
@@ -4230,21 +5008,21 @@ test("cleanup reports every outcome instead of stopping at the first refusal", a
   }
   const registry = new RefusingRegistry(directory);
 
-  const report = await execCleanup(registry, ["--apply"]);
+  const report = await execCleanup(registry, ['--apply']);
 
   assert.match(report, /Removed 1 plan execution run;/);
-  assert.match(report, new RegExp(`^${first.id} `, "m"));
+  assert.match(report, new RegExp(`^${first.id} `, 'm'));
   assert.match(report, /Kept 1 run the registry refused:/);
   assert.match(report, new RegExp(`- ${second.id} [^\\n]*live lease`));
   assert.equal(await registry.get(first.id), undefined);
-  assert.ok(await registry.get(second.id), "the refused run is still there");
+  assert.ok(await registry.get(second.id), 'the refused run is still there');
 });
 
-test("cleanup does not offer --include-failed to a caller naming one run", async () => {
+test('cleanup does not offer --include-failed to a caller naming one run', async () => {
   const failed = retiredRun({
-    id: "55555555-5555-4555-8555-555555555555",
-    status: "failed",
-    stage: "implementation",
+    id: '55555555-5555-4555-8555-555555555555',
+    status: 'failed',
+    stage: 'implementation',
     updatedAt: INSIDE_RETENTION,
   });
   const registry = await seedRegistry([failed]);
@@ -4257,11 +5035,11 @@ test("cleanup does not offer --include-failed to a caller naming one run", async
   assert.match(
     preview,
     new RegExp(`/exec cleanup ${failed.id} --apply`),
-    "the apply line repeats only what was actually used",
+    'the apply line repeats only what was actually used',
   );
 });
 
-test("retention is measured from when a run finished, not from its last write", () => {
+test('retention is measured from when a run finished, not from its last write', () => {
   // A lease release writes the record after the run is over, so `updatedAt`
   // would restart the clock.
   assert.equal(
@@ -4279,23 +5057,23 @@ test("retention is measured from when a run finished, not from its last write", 
   assert.equal(
     isRemovableRun(retiredRun({ updatedAt: PAST_RETENTION })),
     true,
-    "a record with no stamp falls back to its last write",
+    'a record with no stamp falls back to its last write',
   );
 });
 
-test("the settled listing hides a terminal run the moment it is a day old", () => {
+test('the settled listing hides a terminal run the moment it is a day old', () => {
   const justInside = retiredRun({
-    id: "33333333-3333-4333-8333-333333333333",
+    id: '33333333-3333-4333-8333-333333333333',
     updatedAt: Date.now() - 23 * HOUR_MS,
   });
   const justOutside = retiredRun({
-    id: "44444444-4444-4444-8444-444444444444",
+    id: '44444444-4444-4444-8444-444444444444',
     updatedAt: Date.now() - 25 * HOUR_MS,
   });
 
-  const lines = settledRunLines([justInside, justOutside]).join("\n");
+  const lines = settledRunLines([justInside, justOutside]).join('\n');
 
-  assert.ok(lines.includes(justInside.id), "23 hours old is still news");
-  assert.ok(!lines.includes(justOutside.id), "25 hours old is not");
+  assert.ok(lines.includes(justInside.id), '23 hours old is still news');
+  assert.ok(!lines.includes(justOutside.id), '25 hours old is not');
   assert.match(lines, /1 older terminal run hidden\./);
 });

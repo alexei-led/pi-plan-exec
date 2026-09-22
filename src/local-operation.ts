@@ -1,22 +1,30 @@
-import { createHash, randomUUID } from "node:crypto";
-import { mkdir, open, readFile, readdir, rename, link, unlink } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
-import { setTimeout as delay } from "node:timers/promises";
+import { createHash, randomUUID } from 'node:crypto';
+import {
+  link,
+  mkdir,
+  open,
+  readdir,
+  readFile,
+  rename,
+  unlink,
+} from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
+import { fileURLToPath } from 'node:url';
 import {
   cancelOwnedProcess,
   launchOwnedProcess,
+  type OwnedProcessBinding,
+  type OwnedProcessRequest,
   observeOwnedProcess,
   ownedProcessBindingMatches,
   ownedProcessTerminal,
   prepareOwnedProcess,
   reconcileOwnedProcess,
   requestOwnedProcessCancellation,
-  type OwnedProcessBinding,
-  type OwnedProcessRequest,
-} from "./owned-process.js";
-import { EXTERNAL_OPERATION_STATE } from "./types.js";
-import { workspaceEnvironment } from "./workspace-environment.js";
+} from './owned-process.js';
+import { EXTERNAL_OPERATION_STATE } from './types.js';
+import { workspaceEnvironment } from './workspace-environment.js';
 
 const POLL_MS = 100;
 const RPC_TIMEOUT_MS = 15_000;
@@ -56,7 +64,10 @@ export class LocalOperationCancelledError extends Error {}
 export class LocalOperationFailedError extends Error {
   constructor(
     message: string,
-    readonly details?: { code?: number | null | undefined; outputTail?: string | undefined },
+    readonly details?: {
+      code?: number | null | undefined;
+      outputTail?: string | undefined;
+    },
   ) {
     super(message);
   }
@@ -73,288 +84,656 @@ interface LocalOperationIndex {
 }
 
 async function activeEntries(directory: string): Promise<string[]> {
-  try { return (await readdir(directory)).filter(name => /^[a-f0-9]{64}\.json$/.test(name)).sort(); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
+  try {
+    return (await readdir(directory))
+      .filter((name) => /^[a-f0-9]{64}\.json$/.test(name))
+      .sort();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw error;
+  }
 }
 
-export async function hasActiveLocalOperations(directory: string): Promise<boolean> {
-  try { return (await activeEntries(directory)).length > 0; }
-  catch { return true; }
+export async function hasActiveLocalOperations(
+  directory: string,
+): Promise<boolean> {
+  try {
+    return (await activeEntries(directory)).length > 0;
+  } catch {
+    return true;
+  }
 }
 
 async function removeActiveEntry(path: string): Promise<void> {
-  try { await unlink(path); await syncDirectory(dirname(path)); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  try {
+    await unlink(path);
+    await syncDirectory(dirname(path));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
 }
 
-export async function cancelActiveLocalOperations(directory: string, runId: string, generation: number): Promise<{
+export async function cancelActiveLocalOperations(
+  directory: string,
+  runId: string,
+  generation: number,
+): Promise<{
   pending: boolean;
   reason?: string;
 }> {
   try {
     const names = await activeEntries(directory);
     if (!names.length) return { pending: false };
-    const cursorPath = join(directory, "cursor.json");
+    const cursorPath = join(directory, 'cursor.json');
     let cursor: unknown;
-    try { cursor = await json(cursorPath); } catch { cursor = undefined; }
-    const previous = record(cursor) && cursor.generation === generation && typeof cursor.name === "string" ? cursor.name : "";
-    const after = names.findIndex(name => name > previous);
+    try {
+      cursor = await json(cursorPath);
+    } catch {
+      cursor = undefined;
+    }
+    const previous =
+      record(cursor) &&
+      cursor.generation === generation &&
+      typeof cursor.name === 'string'
+        ? cursor.name
+        : '';
+    const after = names.findIndex((name) => name > previous);
     const offset = after < 0 ? 0 : after;
-    const ordered = [...names.slice(offset), ...names.slice(0, offset)].slice(0, CANCELLATION_BATCH_SIZE);
+    const ordered = [...names.slice(offset), ...names.slice(0, offset)].slice(
+      0,
+      CANCELLATION_BATCH_SIZE,
+    );
     let reason: string | undefined;
     for (const name of ordered) {
       try {
         const entryPath = join(directory, name);
         const raw = await json(entryPath);
         if (raw === undefined) continue;
-        if (!record(raw) || raw.version !== 2 || raw.runId !== runId || typeof raw.operationId !== "string" ||
-          typeof raw.directory !== "string" || typeof raw.digest !== "string" ||
-          !Number.isSafeInteger(raw.generation) || typeof raw.generation !== "number" || raw.generation > generation)
-          throw new LocalOperationUnknownError("Local operation cancellation index is unresolved.");
+        if (
+          !record(raw) ||
+          raw.version !== 2 ||
+          raw.runId !== runId ||
+          typeof raw.operationId !== 'string' ||
+          typeof raw.directory !== 'string' ||
+          typeof raw.digest !== 'string' ||
+          !Number.isSafeInteger(raw.generation) ||
+          typeof raw.generation !== 'number' ||
+          raw.generation > generation
+        )
+          throw new LocalOperationUnknownError(
+            'Local operation cancellation index is unresolved.',
+          );
         const entry = raw as unknown as LocalOperationIndex;
-        const intent = readIntent(await json(join(entry.directory, "intent.json")));
+        const intent = readIntent(
+          await json(join(entry.directory, 'intent.json')),
+        );
         const binding = readBinding(entry.binding);
-        if (intent.runId !== runId || intent.operationId !== entry.operationId || intent.digest !== entry.digest ||
-          (intent.authorization?.stopGeneration ?? 0) !== entry.generation)
-          throw new LocalOperationUnknownError("Local operation cancellation identity changed.");
-        const operationDirectory = join(entry.directory, "owned-process");
+        if (
+          intent.runId !== runId ||
+          intent.operationId !== entry.operationId ||
+          intent.digest !== entry.digest ||
+          (intent.authorization?.stopGeneration ?? 0) !== entry.generation
+        )
+          throw new LocalOperationUnknownError(
+            'Local operation cancellation identity changed.',
+          );
+        const operationDirectory = join(entry.directory, 'owned-process');
         let observation = await observeOwnedProcess(operationDirectory);
         if (!ownedProcessTerminal(observation, binding)) {
-          await durableJson(join(entry.directory, "stop.json"), { digest: intent.digest });
-          observation = await cancelOwnedProcess(operationDirectory, { deadlineMs: CANCEL_PROBE_MS, cancelled: true });
+          await durableJson(join(entry.directory, 'stop.json'), {
+            digest: intent.digest,
+          });
+          observation = await cancelOwnedProcess(operationDirectory, {
+            deadlineMs: CANCEL_PROBE_MS,
+            cancelled: true,
+          });
         }
-        if (ownedProcessTerminal(observation, binding)) await removeActiveEntry(entryPath);
-        else reason = observation.reason ?? "Local command process-tree exit remains unconfirmed.";
-      } catch (error) { reason = error instanceof Error ? error.message : String(error); }
+        if (ownedProcessTerminal(observation, binding))
+          await removeActiveEntry(entryPath);
+        else
+          reason =
+            observation.reason ??
+            'Local command process-tree exit remains unconfirmed.';
+      } catch (error) {
+        reason = error instanceof Error ? error.message : String(error);
+      }
       await durableJson(cursorPath, { generation, name });
     }
-    return { pending: await hasActiveLocalOperations(directory), ...(reason ? { reason } : {}) };
-  } catch (error) { return { pending: true, reason: error instanceof Error ? error.message : String(error) }; }
+    return {
+      pending: await hasActiveLocalOperations(directory),
+      ...(reason ? { reason } : {}),
+    };
+  } catch (error) {
+    return {
+      pending: true,
+      reason: error instanceof Error ? error.message : String(error),
+    };
+  }
 }
 
 async function syncDirectory(directory: string): Promise<void> {
-  const file = await open(directory, "r");
-  try { await file.sync(); } finally { await file.close(); }
+  const file = await open(directory, 'r');
+  try {
+    await file.sync();
+  } finally {
+    await file.close();
+  }
 }
 
 export async function durableJson(path: string, value: unknown): Promise<void> {
   const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
-  const file = await open(temporary, "w", JOURNAL_FILE_MODE);
-  try { await file.writeFile(JSON.stringify(value)); await file.sync(); }
-  finally { await file.close(); }
+  const file = await open(temporary, 'w', JOURNAL_FILE_MODE);
+  try {
+    await file.writeFile(JSON.stringify(value));
+    await file.sync();
+  } finally {
+    await file.close();
+  }
   await rename(temporary, path);
   await syncDirectory(dirname(path));
 }
 
 function record(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
+  return typeof value === 'object' && value !== null;
 }
 
 async function json(path: string): Promise<unknown> {
-  try { return JSON.parse(await readFile(path, "utf8")) as unknown; }
-  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw new LocalOperationUnknownError(`Unreadable local operation journal: ${path}`); }
+  try {
+    return JSON.parse(await readFile(path, 'utf8')) as unknown;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw new LocalOperationUnknownError(
+      `Unreadable local operation journal: ${path}`,
+    );
+  }
 }
 
 async function bounded<T>(operation: Promise<T>): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    return await Promise.race([operation, new Promise<never>((_resolve, reject) => {
-      timer = setTimeout(() => reject(new LocalOperationUnknownError("Local command control request timed out; its operation remains fenced.")), RPC_TIMEOUT_MS);
-    })]);
-  } finally { if (timer) clearTimeout(timer); }
+    return await Promise.race([
+      operation,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(
+          () =>
+            reject(
+              new LocalOperationUnknownError(
+                'Local command control request timed out; its operation remains fenced.',
+              ),
+            ),
+          RPC_TIMEOUT_MS,
+        );
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 /** The immutable request identity is also the cancellation and result fence. */
-export function localOperationDirectory(options: Pick<LocalOperationOptions, "journalRoot" | "runId" | "operationId" | "authorization">): string {
-  const key = createHash("sha256").update(JSON.stringify([options.runId, options.operationId])).digest("hex");
-  return join(options.journalRoot, "local-operations", key, `generation-${options.authorization?.stopGeneration ?? 0}`);
+export function localOperationDirectory(
+  options: Pick<
+    LocalOperationOptions,
+    'journalRoot' | 'runId' | 'operationId' | 'authorization'
+  >,
+): string {
+  const key = createHash('sha256')
+    .update(JSON.stringify([options.runId, options.operationId]))
+    .digest('hex');
+  return join(
+    options.journalRoot,
+    'local-operations',
+    key,
+    `generation-${options.authorization?.stopGeneration ?? 0}`,
+  );
 }
 
 async function immutableJson(path: string, value: unknown): Promise<unknown> {
   const pending = `${path}.${randomUUID()}.tmp`;
-  const file = await open(pending, "wx", JOURNAL_FILE_MODE);
-  try { await file.writeFile(JSON.stringify(value)); await file.sync(); } finally { await file.close(); }
-  try { await link(pending, path); await syncDirectory(dirname(path)); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
-  finally { await unlink(pending); }
+  const file = await open(pending, 'wx', JOURNAL_FILE_MODE);
+  try {
+    await file.writeFile(JSON.stringify(value));
+    await file.sync();
+  } finally {
+    await file.close();
+  }
+  try {
+    await link(pending, path);
+    await syncDirectory(dirname(path));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+  } finally {
+    await unlink(pending);
+  }
   return json(path);
 }
 
 function readIntent(value: unknown): LocalOperationIntent {
-  if (!record(value) || value.version !== LOCAL_OPERATION_INTENT_VERSION || typeof value.digest !== "string" || typeof value.runId !== "string" ||
-      typeof value.operationId !== "string" || (value.candidate !== null && typeof value.candidate !== "string") ||
-      typeof value.cwd !== "string" || typeof value.executable !== "string" || typeof value.worker !== "string" || !Array.isArray(value.commands) ||
-      value.commands.some((command: unknown) => !Array.isArray(command) || !command.length || command.some((arg: unknown) => typeof arg !== "string")) ||
-      !record(value.environment) || Object.values(value.environment).some(entry => typeof entry !== "string") ||
-      (value.authorization !== null && (!record(value.authorization) || typeof value.authorization.path !== "string" || !Number.isSafeInteger(value.authorization.stopGeneration)))) {
-    throw new LocalOperationUnknownError("Malformed local operation intent; ownership remains fenced.");
+  if (
+    !record(value) ||
+    value.version !== LOCAL_OPERATION_INTENT_VERSION ||
+    typeof value.digest !== 'string' ||
+    typeof value.runId !== 'string' ||
+    typeof value.operationId !== 'string' ||
+    (value.candidate !== null && typeof value.candidate !== 'string') ||
+    typeof value.cwd !== 'string' ||
+    typeof value.executable !== 'string' ||
+    typeof value.worker !== 'string' ||
+    !Array.isArray(value.commands) ||
+    value.commands.some(
+      (command: unknown) =>
+        !Array.isArray(command) ||
+        !command.length ||
+        command.some((arg: unknown) => typeof arg !== 'string'),
+    ) ||
+    !record(value.environment) ||
+    Object.values(value.environment).some(
+      (entry) => typeof entry !== 'string',
+    ) ||
+    (value.authorization !== null &&
+      (!record(value.authorization) ||
+        typeof value.authorization.path !== 'string' ||
+        !Number.isSafeInteger(value.authorization.stopGeneration)))
+  ) {
+    throw new LocalOperationUnknownError(
+      'Malformed local operation intent; ownership remains fenced.',
+    );
   }
   const intent = value as unknown as LocalOperationIntent;
   const { digest, ...request } = intent;
-  if (createHash("sha256").update(JSON.stringify(request)).digest("hex") !== digest) throw new LocalOperationUnknownError("Local operation intent digest mismatch.");
+  if (
+    createHash('sha256').update(JSON.stringify(request)).digest('hex') !==
+    digest
+  )
+    throw new LocalOperationUnknownError(
+      'Local operation intent digest mismatch.',
+    );
   return intent;
 }
 
 function readBinding(value: unknown): OwnedProcessBinding {
-  if (!record(value) || [value.operationId, value.requestDigest, value.hostId, value.bootId].some(entry => typeof entry !== "string" || !entry)) {
-    throw new LocalOperationUnknownError("Missing local command ownership binding.");
+  if (
+    !record(value) ||
+    [value.operationId, value.requestDigest, value.hostId, value.bootId].some(
+      (entry) => typeof entry !== 'string' || !entry,
+    )
+  ) {
+    throw new LocalOperationUnknownError(
+      'Missing local command ownership binding.',
+    );
   }
   return value as unknown as OwnedProcessBinding;
 }
 
-function generationStopMatches(value: unknown, runId: string, operationId: string, generation: number): boolean {
-  return record(value) && value.version === 1 && value.kind === "generation-cancelled" &&
-    value.runId === runId && value.operationId === operationId && value.generation === generation;
+function generationStopMatches(
+  value: unknown,
+  runId: string,
+  operationId: string,
+  generation: number,
+): boolean {
+  return (
+    record(value) &&
+    value.version === 1 &&
+    value.kind === 'generation-cancelled' &&
+    value.runId === runId &&
+    value.operationId === operationId &&
+    value.generation === generation
+  );
 }
 
 function stopMatches(value: unknown, intent: LocalOperationIntent): boolean {
-  return record(value) && value.digest === intent.digest ||
-    generationStopMatches(value, intent.runId, intent.operationId, intent.authorization?.stopGeneration ?? 0);
+  return (
+    (record(value) && value.digest === intent.digest) ||
+    generationStopMatches(
+      value,
+      intent.runId,
+      intent.operationId,
+      intent.authorization?.stopGeneration ?? 0,
+    )
+  );
 }
 
-function ownedRequestFor(directory: string, intent: LocalOperationIntent): OwnedProcessRequest {
+function ownedRequestFor(
+  directory: string,
+  intent: LocalOperationIntent,
+): OwnedProcessRequest {
   return {
-    operationDirectory: join(directory, "owned-process"),
-    argv: [intent.executable, intent.worker, directory, intent.digest], cwd: intent.cwd,
-    env: intent.environment, lifetime: { kind: "unbounded" },
+    operationDirectory: join(directory, 'owned-process'),
+    argv: [intent.executable, intent.worker, directory, intent.digest],
+    cwd: intent.cwd,
+    env: intent.environment,
+    lifetime: { kind: 'unbounded' },
   };
 }
 
-async function runOwnedOperation(cwd: string, commands: string[][], options: LocalOperationOptions): Promise<void> {
-  if (commands.some(command => !command.length || !command[0] || command.some(arg => typeof arg !== "string"))) throw new Error("An empty verification/bootstrap command is invalid.");
+async function runOwnedOperation(
+  cwd: string,
+  commands: string[][],
+  options: LocalOperationOptions,
+): Promise<void> {
+  if (
+    commands.some(
+      (command) =>
+        !command.length ||
+        !command[0] ||
+        command.some((arg) => typeof arg !== 'string'),
+    )
+  )
+    throw new Error('An empty verification/bootstrap command is invalid.');
   const directory = localOperationDirectory(options);
-  await mkdir(dirname(directory), { recursive: true, mode: JOURNAL_DIRECTORY_MODE });
-  const generations = await readdir(dirname(directory), { withFileTypes: true });
+  await mkdir(dirname(directory), {
+    recursive: true,
+    mode: JOURNAL_DIRECTORY_MODE,
+  });
+  const generations = await readdir(dirname(directory), {
+    withFileTypes: true,
+  });
   if (!commands.length && !generations.length) return;
   const generation = options.authorization?.stopGeneration ?? 0;
   for (const previous of generations) {
     const prior = join(dirname(directory), previous.name);
     if (prior === directory) {
-      if (!commands.length) throw new LocalOperationUnknownError("An empty batch cannot replace an existing local operation in the same generation.");
+      if (!commands.length)
+        throw new LocalOperationUnknownError(
+          'An empty batch cannot replace an existing local operation in the same generation.',
+        );
       continue;
     }
-    if (!previous.isDirectory() || !/^generation-\d+$/.test(previous.name)) throw new LocalOperationUnknownError("Unrecognized local command generation journal.");
-    const priorGeneration = Number(previous.name.slice("generation-".length));
-    if (!Number.isSafeInteger(priorGeneration)) throw new LocalOperationUnknownError("Invalid local command generation.");
-    if (priorGeneration >= generation) throw new LocalOperationCancelledError("Local operation was superseded by a newer stop generation.");
+    if (!previous.isDirectory() || !/^generation-\d+$/.test(previous.name))
+      throw new LocalOperationUnknownError(
+        'Unrecognized local command generation journal.',
+      );
+    const priorGeneration = Number(previous.name.slice('generation-'.length));
+    if (!Number.isSafeInteger(priorGeneration))
+      throw new LocalOperationUnknownError('Invalid local command generation.');
+    if (priorGeneration >= generation)
+      throw new LocalOperationCancelledError(
+        'Local operation was superseded by a newer stop generation.',
+      );
     // Publish the launch fence before deciding that an interrupted intent never started.
-    const priorStop = await immutableJson(join(prior, "stop.json"), {
-      version: 1, kind: "generation-cancelled", runId: options.runId, operationId: options.operationId, generation: priorGeneration,
+    const priorStop = await immutableJson(join(prior, 'stop.json'), {
+      version: 1,
+      kind: 'generation-cancelled',
+      runId: options.runId,
+      operationId: options.operationId,
+      generation: priorGeneration,
     });
-    let priorRaw = await json(join(prior, "intent.json"));
+    let priorRaw = await json(join(prior, 'intent.json'));
     if (priorRaw === undefined) {
       const artifacts = await readdir(prior);
-      priorRaw = await json(join(prior, "intent.json"));
+      priorRaw = await json(join(prior, 'intent.json'));
       if (priorRaw === undefined) {
-        const activeEntry = options.activeDirectory ? await json(join(options.activeDirectory, `${createHash("sha256").update(prior).digest("hex")}.json`)) : undefined;
-        if (!generationStopMatches(priorStop, options.runId, options.operationId, priorGeneration) ||
-            activeEntry !== undefined ||
-            artifacts.some(name => name !== "stop.json" && !/^(intent|stop)\.json\.[a-f0-9-]+\.tmp$/.test(name))) {
-          throw new LocalOperationUnknownError("Incomplete previous local command intent has unresolved launch evidence.");
+        const activeEntry = options.activeDirectory
+          ? await json(
+              join(
+                options.activeDirectory,
+                `${createHash('sha256').update(prior).digest('hex')}.json`,
+              ),
+            )
+          : undefined;
+        if (
+          !generationStopMatches(
+            priorStop,
+            options.runId,
+            options.operationId,
+            priorGeneration,
+          ) ||
+          activeEntry !== undefined ||
+          artifacts.some(
+            (name) =>
+              name !== 'stop.json' &&
+              !/^(intent|stop)\.json\.[a-f0-9-]+\.tmp$/.test(name),
+          )
+        ) {
+          throw new LocalOperationUnknownError(
+            'Incomplete previous local command intent has unresolved launch evidence.',
+          );
         }
         continue;
       }
     }
     const priorIntent = readIntent(priorRaw);
-    if (priorIntent.runId !== options.runId || priorIntent.operationId !== options.operationId ||
-        (priorIntent.authorization?.stopGeneration ?? 0) !== priorGeneration || !stopMatches(priorStop, priorIntent)) {
-      throw new LocalOperationUnknownError("Previous local command generation identity changed.");
+    if (
+      priorIntent.runId !== options.runId ||
+      priorIntent.operationId !== options.operationId ||
+      (priorIntent.authorization?.stopGeneration ?? 0) !== priorGeneration ||
+      !stopMatches(priorStop, priorIntent)
+    ) {
+      throw new LocalOperationUnknownError(
+        'Previous local command generation identity changed.',
+      );
     }
-    const priorPrepared = await bounded(prepareOwnedProcess(ownedRequestFor(prior, priorIntent)));
-    const priorBinding = readBinding(await immutableJson(join(prior, "binding.json"), priorPrepared));
-    if (!ownedProcessBindingMatches(priorBinding, priorPrepared)) throw new LocalOperationUnknownError("Previous local command ownership binding changed.");
-    const observation = await cancelOwnedProcess(join(prior, "owned-process"), { deadlineMs: CANCEL_PROBE_MS, cancelled: true });
+    const priorPrepared = await bounded(
+      prepareOwnedProcess(ownedRequestFor(prior, priorIntent)),
+    );
+    const priorBinding = readBinding(
+      await immutableJson(join(prior, 'binding.json'), priorPrepared),
+    );
+    if (!ownedProcessBindingMatches(priorBinding, priorPrepared))
+      throw new LocalOperationUnknownError(
+        'Previous local command ownership binding changed.',
+      );
+    const observation = await cancelOwnedProcess(join(prior, 'owned-process'), {
+      deadlineMs: CANCEL_PROBE_MS,
+      cancelled: true,
+    });
     if (!ownedProcessTerminal(observation, priorBinding)) {
-      throw new LocalOperationUnknownError("Previous local command generation has not proven exit; replacement remains fenced.");
+      throw new LocalOperationUnknownError(
+        'Previous local command generation has not proven exit; replacement remains fenced.',
+      );
     }
-    if (options.activeDirectory) await removeActiveEntry(join(options.activeDirectory, `${createHash("sha256").update(prior).digest("hex")}.json`));
+    if (options.activeDirectory)
+      await removeActiveEntry(
+        join(
+          options.activeDirectory,
+          `${createHash('sha256').update(prior).digest('hex')}.json`,
+        ),
+      );
   }
   if (!commands.length) return;
   await mkdir(directory, { recursive: true, mode: JOURNAL_DIRECTORY_MODE });
-  const logical = { version: LOCAL_OPERATION_INTENT_VERSION, runId: options.runId, operationId: options.operationId, candidate: options.candidate ?? null, cwd: resolve(cwd), commands, authorization: options.authorization ?? null };
-  let raw = await json(join(directory, "intent.json"));
+  const logical = {
+    version: LOCAL_OPERATION_INTENT_VERSION,
+    runId: options.runId,
+    operationId: options.operationId,
+    candidate: options.candidate ?? null,
+    cwd: resolve(cwd),
+    commands,
+    authorization: options.authorization ?? null,
+  };
+  let raw = await json(join(directory, 'intent.json'));
   if (raw === undefined) {
     const environment = workspaceEnvironment();
-    const request = { ...logical, environment, executable: process.execPath, worker: fileURLToPath(new URL("./local-operation-worker.mjs", import.meta.url)) };
-    raw = await immutableJson(join(directory, "intent.json"), { ...request, digest: createHash("sha256").update(JSON.stringify(request)).digest("hex") });
+    const request = {
+      ...logical,
+      environment,
+      executable: process.execPath,
+      worker: fileURLToPath(
+        new URL('./local-operation-worker.mjs', import.meta.url),
+      ),
+    };
+    raw = await immutableJson(join(directory, 'intent.json'), {
+      ...request,
+      digest: createHash('sha256')
+        .update(JSON.stringify(request))
+        .digest('hex'),
+    });
   }
   const intent = readIntent(raw);
-  if (Object.entries(logical).some(([key, value]) => JSON.stringify(Reflect.get(intent, key)) !== JSON.stringify(value))) {
-    throw new LocalOperationUnknownError("Local operation request changed; the original operation remains fenced.");
+  if (
+    Object.entries(logical).some(
+      ([key, value]) =>
+        JSON.stringify(Reflect.get(intent, key)) !== JSON.stringify(value),
+    )
+  ) {
+    throw new LocalOperationUnknownError(
+      'Local operation request changed; the original operation remains fenced.',
+    );
   }
   const ownedRequest = ownedRequestFor(directory, intent);
   const prepared = await bounded(prepareOwnedProcess(ownedRequest));
-  const binding = readBinding(await immutableJson(join(directory, "binding.json"), prepared));
-  if (!ownedProcessBindingMatches(binding, prepared)) throw new LocalOperationUnknownError("Local command ownership binding changed.");
+  const binding = readBinding(
+    await immutableJson(join(directory, 'binding.json'), prepared),
+  );
+  if (!ownedProcessBindingMatches(binding, prepared))
+    throw new LocalOperationUnknownError(
+      'Local command ownership binding changed.',
+    );
   let activePath: string | undefined;
   if (options.activeDirectory) {
-    await mkdir(options.activeDirectory, { recursive: true, mode: JOURNAL_DIRECTORY_MODE });
-    activePath = join(options.activeDirectory, `${createHash("sha256").update(directory).digest("hex")}.json`);
-    const entry: LocalOperationIndex = { version: 2, runId: options.runId, operationId: options.operationId,
-      generation: options.authorization?.stopGeneration ?? 0, directory, digest: intent.digest, binding };
+    await mkdir(options.activeDirectory, {
+      recursive: true,
+      mode: JOURNAL_DIRECTORY_MODE,
+    });
+    activePath = join(
+      options.activeDirectory,
+      `${createHash('sha256').update(directory).digest('hex')}.json`,
+    );
+    const entry: LocalOperationIndex = {
+      version: 2,
+      runId: options.runId,
+      operationId: options.operationId,
+      generation: options.authorization?.stopGeneration ?? 0,
+      directory,
+      digest: intent.digest,
+      binding,
+    };
     const existing = await immutableJson(activePath, entry);
-    if (JSON.stringify(existing) !== JSON.stringify(entry)) throw new LocalOperationUnknownError("Local operation cancellation index changed.");
+    if (JSON.stringify(existing) !== JSON.stringify(entry))
+      throw new LocalOperationUnknownError(
+        'Local operation cancellation index changed.',
+      );
   }
   const stop = async (): Promise<void> => {
-    await durableJson(join(directory, "stop.json"), { digest: intent.digest });
+    await durableJson(join(directory, 'stop.json'), { digest: intent.digest });
     await requestOwnedProcessCancellation(ownedRequest.operationDirectory);
   };
   if (!(await bounded(options.isAuthorized()))) await stop();
-  if (await json(join(directory, "stop.json")) === undefined) await bounded(launchOwnedProcess(ownedRequest));
+  if ((await json(join(directory, 'stop.json'))) === undefined)
+    await bounded(launchOwnedProcess(ownedRequest));
   for (;;) {
     if (!(await bounded(options.isAuthorized()))) await stop();
-    let stopped = await json(join(directory, "stop.json"));
-    if (stopped !== undefined && !stopMatches(stopped, intent)) throw new LocalOperationUnknownError("Local command cancellation identity mismatch.");
-    let observation = stopped === undefined
-      ? await observeOwnedProcess(ownedRequest.operationDirectory)
-      : await cancelOwnedProcess(ownedRequest.operationDirectory, { deadlineMs: CANCEL_PROBE_MS, cancelled: true });
-    if (stopped === undefined && observation.status === EXTERNAL_OPERATION_STATE.PENDING) {
-      const lateStop = await json(join(directory, "stop.json"));
-      if (lateStop !== undefined && !stopMatches(lateStop, intent)) throw new LocalOperationUnknownError("Local command cancellation identity mismatch.");
+    let stopped = await json(join(directory, 'stop.json'));
+    if (stopped !== undefined && !stopMatches(stopped, intent))
+      throw new LocalOperationUnknownError(
+        'Local command cancellation identity mismatch.',
+      );
+    let observation =
+      stopped === undefined
+        ? await observeOwnedProcess(ownedRequest.operationDirectory)
+        : await cancelOwnedProcess(ownedRequest.operationDirectory, {
+            deadlineMs: CANCEL_PROBE_MS,
+            cancelled: true,
+          });
+    if (
+      stopped === undefined &&
+      observation.status === EXTERNAL_OPERATION_STATE.PENDING
+    ) {
+      const lateStop = await json(join(directory, 'stop.json'));
+      if (lateStop !== undefined && !stopMatches(lateStop, intent))
+        throw new LocalOperationUnknownError(
+          'Local command cancellation identity mismatch.',
+        );
       if (!(await bounded(options.isAuthorized())) || lateStop !== undefined) {
         await stop();
         stopped = { digest: intent.digest };
-        observation = await cancelOwnedProcess(ownedRequest.operationDirectory, { deadlineMs: CANCEL_PROBE_MS, cancelled: true });
+        observation = await cancelOwnedProcess(
+          ownedRequest.operationDirectory,
+          { deadlineMs: CANCEL_PROBE_MS, cancelled: true },
+        );
       } else {
-        observation = await reconcileOwnedProcess(ownedRequest.operationDirectory);
+        observation = await reconcileOwnedProcess(
+          ownedRequest.operationDirectory,
+        );
       }
     }
-    if (observation.status === EXTERNAL_OPERATION_STATE.UNKNOWN) throw new LocalOperationUnknownError(observation.reason ?? "Local command ownership is unknown.");
+    if (observation.status === EXTERNAL_OPERATION_STATE.UNKNOWN)
+      throw new LocalOperationUnknownError(
+        observation.reason ?? 'Local command ownership is unknown.',
+      );
     if (ownedProcessTerminal(observation, binding)) {
       if (activePath) await removeActiveEntry(activePath);
       // A concurrent generation fence may land between the stop read and the
       // retirement observation; re-read it so a cancelled run never reports as
       // a lost result.
-      if (stopped === undefined) stopped = await json(join(directory, "stop.json"));
-      if (stopped !== undefined && !stopMatches(stopped, intent)) throw new LocalOperationUnknownError("Local command cancellation identity mismatch.");
-      if (stopped !== undefined || !(await bounded(options.isAuthorized()))) throw new LocalOperationCancelledError("Local operation was cancelled after confirmed process-tree exit.");
-      const result = await json(join(directory, "result.json"));
-      if (result === undefined) throw new LocalOperationFailedError("Local command failed: lost-result-after-exit.");
-      if (!record(result) || result.digest !== intent.digest || typeof result.cancelled !== "boolean" || (result.code !== null && !Number.isSafeInteger(result.code))) {
-        throw new LocalOperationUnknownError("Local command result identity is malformed.");
+      if (stopped === undefined)
+        stopped = await json(join(directory, 'stop.json'));
+      if (stopped !== undefined && !stopMatches(stopped, intent))
+        throw new LocalOperationUnknownError(
+          'Local command cancellation identity mismatch.',
+        );
+      if (stopped !== undefined || !(await bounded(options.isAuthorized())))
+        throw new LocalOperationCancelledError(
+          'Local operation was cancelled after confirmed process-tree exit.',
+        );
+      const result = await json(join(directory, 'result.json'));
+      if (result === undefined)
+        throw new LocalOperationFailedError(
+          'Local command failed: lost-result-after-exit.',
+        );
+      if (
+        !record(result) ||
+        result.digest !== intent.digest ||
+        typeof result.cancelled !== 'boolean' ||
+        (result.code !== null && !Number.isSafeInteger(result.code))
+      ) {
+        throw new LocalOperationUnknownError(
+          'Local command result identity is malformed.',
+        );
       }
-      if (result.cancelled || observation.status === "never-started") throw new LocalOperationCancelledError("Local operation was cancelled.");
+      if (result.cancelled || observation.status === 'never-started')
+        throw new LocalOperationCancelledError(
+          'Local operation was cancelled.',
+        );
       if (result.code !== 0 || observation.exitCode !== 0) {
-        const code = typeof result.code === "number" || result.code === null ? result.code : observation.exitCode;
-        throw new LocalOperationFailedError(`Local command failed (exit ${String(code)}): ${String(result.error ?? directory)}`, {
-          code,
-          outputTail: await readOutputTail(join(directory, "output.log")),
-        });
+        const code =
+          typeof result.code === 'number' || result.code === null
+            ? result.code
+            : observation.exitCode;
+        throw new LocalOperationFailedError(
+          `Local command failed (exit ${String(code)}): ${String(result.error ?? directory)}`,
+          {
+            code,
+            outputTail: await readOutputTail(join(directory, 'output.log')),
+          },
+        );
       }
       return;
     }
-    if (observation.status === "retired" || observation.status === "never-started") throw new LocalOperationUnknownError("Local command terminal proof does not match its durable binding.");
+    if (
+      observation.status === 'retired' ||
+      observation.status === 'never-started'
+    )
+      throw new LocalOperationUnknownError(
+        'Local command terminal proof does not match its durable binding.',
+      );
     if (observation.exitCode !== undefined) {
-      const result = await json(join(directory, "result.json"));
-      if (result === undefined || record(result) && result.digest === intent.digest && result.code !== 0) {
+      const result = await json(join(directory, 'result.json'));
+      if (
+        result === undefined ||
+        (record(result) && result.digest === intent.digest && result.code !== 0)
+      ) {
         await requestOwnedProcessCancellation(ownedRequest.operationDirectory);
       }
     }
-    const request = await json(join(directory, "request.json"));
+    const request = await json(join(directory, 'request.json'));
     if (request !== undefined) {
-      if (!record(request) || request.digest !== intent.digest || typeof request.index !== "number" || !Number.isSafeInteger(request.index) || request.index < 0 || request.index >= commands.length) throw new LocalOperationUnknownError("Malformed local command launch request.");
-      if (stopped === undefined && await bounded(options.isAuthorized())) {
-        await immutableJson(join(directory, `grant-${request.index}.json`), { digest: intent.digest, index: request.index });
+      if (
+        !record(request) ||
+        request.digest !== intent.digest ||
+        typeof request.index !== 'number' ||
+        !Number.isSafeInteger(request.index) ||
+        request.index < 0 ||
+        request.index >= commands.length
+      )
+        throw new LocalOperationUnknownError(
+          'Malformed local command launch request.',
+        );
+      if (stopped === undefined && (await bounded(options.isAuthorized()))) {
+        await immutableJson(join(directory, `grant-${request.index}.json`), {
+          digest: intent.digest,
+          index: request.index,
+        });
       } else await stop();
     }
     await delay(POLL_MS);
@@ -363,18 +742,32 @@ async function runOwnedOperation(cwd: string, commands: string[][], options: Loc
 
 async function readOutputTail(path: string): Promise<string | undefined> {
   try {
-    const content = await readFile(path, "utf8");
-    return content.length <= OUTPUT_TAIL_LIMIT ? content : content.slice(-OUTPUT_TAIL_LIMIT);
+    const content = await readFile(path, 'utf8');
+    return content.length <= OUTPUT_TAIL_LIMIT
+      ? content
+      : content.slice(-OUTPUT_TAIL_LIMIT);
   } catch {
     return undefined;
   }
 }
 
 /** Reconciles one immutable unbounded batch, including descendants that detach or outlive its wrapper. */
-export async function runLocalOperation(cwd: string, commands: string[][], options: LocalOperationOptions): Promise<void> {
-  try { await runOwnedOperation(cwd, commands, options); }
-  catch (error) {
-    if (error instanceof LocalOperationUnknownError || error instanceof LocalOperationCancelledError || error instanceof LocalOperationFailedError) throw error;
-    throw new LocalOperationUnknownError(`Local operation reconciliation failed: ${error instanceof Error ? error.message : String(error)}`);
+export async function runLocalOperation(
+  cwd: string,
+  commands: string[][],
+  options: LocalOperationOptions,
+): Promise<void> {
+  try {
+    await runOwnedOperation(cwd, commands, options);
+  } catch (error) {
+    if (
+      error instanceof LocalOperationUnknownError ||
+      error instanceof LocalOperationCancelledError ||
+      error instanceof LocalOperationFailedError
+    )
+      throw error;
+    throw new LocalOperationUnknownError(
+      `Local operation reconciliation failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
   }
 }

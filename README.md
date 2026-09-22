@@ -16,8 +16,8 @@ second writer after a restart. This extension moves task order, automatic
 recovery, worktree checks, commit acceptance, and provider reconciliation out of
 prompt prose into durable controller state.
 The controller keeps polling and reconciles durable operations after a restart.
-The pinned providers implement the strict runtime contract on supported macOS
-hosts with the prerequisites documented below.
+The released providers implement the strict runtime contract on POSIX hosts
+with the prerequisites documented below.
 
 It executes ready checked-list tasks in a Git checkout you choose, then runs
 the required review and fix stages with fresh Pi subagents or an explicitly

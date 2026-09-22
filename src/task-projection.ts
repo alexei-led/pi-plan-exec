@@ -1,33 +1,39 @@
-import { createRequire } from "node:module";
-import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
-import type { TaskStore } from "@tintinweb/pi-tasks/dist/task-store.js";
-import type { Task, TaskStatus } from "@tintinweb/pi-tasks/dist/types.js";
-import { PIPELINE_STAGES, isGoalRun, isTerminalStatus, requirePlanPath, stageIndex } from "./lifecycle.js";
-import { readPlan } from "./plan.js";
-import { RunRegistry } from "./registry.js";
+import { createRequire } from 'node:module';
+import { homedir } from 'node:os';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
+import type { TaskStore } from '@tintinweb/pi-tasks/dist/task-store.js';
+import type { Task, TaskStatus } from '@tintinweb/pi-tasks/dist/types.js';
+import {
+  isGoalRun,
+  isTerminalStatus,
+  PIPELINE_STAGES,
+  requirePlanPath,
+  stageIndex,
+} from './lifecycle.js';
+import { readPlan } from './plan.js';
+import type { RunRegistry } from './registry.js';
 import {
   COMPLETED_PLANS_DIRECTORY,
-  RUN_STAGE,
-  RUN_STATUS,
-  type TaskExecution,
   type PlanExecRun,
   type PlanTask,
+  RUN_STAGE,
+  RUN_STATUS,
   type RunStage,
-} from "./types.js";
+  type TaskExecution,
+} from './types.js';
 
 const TASK_PROJECTION_VERSION = 1 as const;
-const TASK_PROJECTION_OWNER = "pi-plan-exec" as const;
+const TASK_PROJECTION_OWNER = 'pi-plan-exec' as const;
 const SUPPORTED_PI_TASKS_VERSION = /^0\.9\.\d+(?:[-+].*)?$/;
 
 const STAGE_SUBJECT: Record<(typeof PIPELINE_STAGES)[number], string> = {
-  [RUN_STAGE.COMPREHENSIVE_REVIEW]: "Run comprehensive review",
-  [RUN_STAGE.SMELLS_REVIEW]: "Run smells review",
-  [RUN_STAGE.FUSION_REVIEW]: "Run Fusion review",
-  [RUN_STAGE.CRITICAL_REVIEW]: "Run critical review",
-  [RUN_STAGE.FINALIZE]: "Finalize branch",
-  [RUN_STAGE.STATS]: "Collect execution statistics",
-  [RUN_STAGE.ARCHIVE]: "Archive completed plan",
+  [RUN_STAGE.COMPREHENSIVE_REVIEW]: 'Run comprehensive review',
+  [RUN_STAGE.SMELLS_REVIEW]: 'Run smells review',
+  [RUN_STAGE.FUSION_REVIEW]: 'Run Fusion review',
+  [RUN_STAGE.CRITICAL_REVIEW]: 'Run critical review',
+  [RUN_STAGE.FINALIZE]: 'Finalize branch',
+  [RUN_STAGE.STATS]: 'Collect execution statistics',
+  [RUN_STAGE.ARCHIVE]: 'Archive completed plan',
 };
 
 const PIPELINE = PIPELINE_STAGES.map((key) => ({
@@ -37,21 +43,21 @@ const PIPELINE = PIPELINE_STAGES.map((key) => ({
 
 const TASK_PROJECTION_KIND = {
   IMPLEMENTATION: RUN_STAGE.IMPLEMENTATION,
-  STAGE: "stage",
+  STAGE: 'stage',
 } as const;
 
 export const TASK_EXECUTION_STATE = {
-  READY: "ready",
-  RUNNING: "running",
-  VERIFYING: "verifying",
-  RETRY_WAIT: "retry_wait",
-  WAITING_DEPENDENCY: "waiting_dependency",
-  WAITING_EXTERNAL: "waiting_external",
-  ACCEPTED: "accepted",
+  READY: 'ready',
+  RUNNING: 'running',
+  VERIFYING: 'verifying',
+  RETRY_WAIT: 'retry_wait',
+  WAITING_DEPENDENCY: 'waiting_dependency',
+  WAITING_EXTERNAL: 'waiting_external',
+  ACCEPTED: 'accepted',
 } as const;
 
 type ProjectionScope = Exclude<
-  NonNullable<PlanExecRun["taskProjection"]>["scope"],
+  NonNullable<PlanExecRun['taskProjection']>['scope'],
   undefined
 >;
 
@@ -205,27 +211,23 @@ export class TaskProjector {
 
       for (const task of plan.tasks) {
         const key = implementationKey(task.id);
-        const projected = store.get(taskIds[key] ?? "");
+        const projected = store.get(taskIds[key] ?? '');
         if (projected)
           updateStatus(
             store,
             projected,
-            implementationStatus(
-              run,
-              task,
-              task.unchecked.length === 0,
-            ),
+            implementationStatus(run, task, task.unchecked.length === 0),
           );
       }
       for (const entry of PIPELINE) {
-        const projected = store.get(taskIds[entry.key] ?? "");
+        const projected = store.get(taskIds[entry.key] ?? '');
         if (projected)
           updateStatus(store, projected, stageStatus(run, entry.key));
       }
 
       return this.persistState(run, {
         version: TASK_PROJECTION_VERSION,
-        state: "ready",
+        state: 'ready',
         owner: TASK_PROJECTION_OWNER,
         sessionId: options.sessionId,
         scope: target.scope,
@@ -237,7 +239,7 @@ export class TaskProjector {
     } catch (error: unknown) {
       return this.persistState(run, {
         version: TASK_PROJECTION_VERSION,
-        state: "degraded",
+        state: 'degraded',
         owner: TASK_PROJECTION_OWNER,
         sessionId: options.sessionId,
         revision: run.revision ?? 1,
@@ -249,7 +251,7 @@ export class TaskProjector {
 
   private async persistState(
     run: PlanExecRun,
-    taskProjection: NonNullable<PlanExecRun["taskProjection"]>,
+    taskProjection: NonNullable<PlanExecRun['taskProjection']>,
   ): Promise<PlanExecRun> {
     if (sameProjection(run.taskProjection, taskProjection)) return run;
     return this.registry.updateTaskProjection(run, taskProjection);
@@ -258,15 +260,15 @@ export class TaskProjector {
 
 export function sessionTaskPath(cwd: string, sessionId: string): string {
   if (!sessionId.trim())
-    throw new Error("Pi session ID is required for pi-tasks projection.");
-  return join(cwd, ".pi", "tasks", `tasks-${sessionId}.json`);
+    throw new Error('Pi session ID is required for pi-tasks projection.');
+  return join(cwd, '.pi', 'tasks', `tasks-${sessionId}.json`);
 }
 
 async function resolveProjectionTarget(
   options: TaskProjectionOptions,
 ): Promise<ProjectionTarget> {
   if (!options.sessionId.trim())
-    throw new Error("Pi session ID is required for pi-tasks projection.");
+    throw new Error('Pi session ID is required for pi-tasks projection.');
   const packageVersion = piTasksPackageVersion();
   if (!SUPPORTED_PI_TASKS_VERSION.test(packageVersion))
     throw new Error(
@@ -275,20 +277,22 @@ async function resolveProjectionTarget(
 
   const configured = process.env.PI_TASKS;
   const expectedPath = sessionTaskPath(options.cwd, options.sessionId);
-  if (configured === "off")
-    throw new Error("PI_TASKS=off selects memory scope; no durable projection path exists.");
+  if (configured === 'off')
+    throw new Error(
+      'PI_TASKS=off selects memory scope; no durable projection path exists.',
+    );
   if (configured) {
     const configuredPath = isAbsolute(configured)
       ? configured
-      : configured.startsWith(".")
+      : configured.startsWith('.')
         ? resolve(options.cwd, configured)
-        : join(homedir(), ".pi", "tasks", `${configured}.json`);
+        : join(homedir(), '.pi', 'tasks', `${configured}.json`);
     if (resolve(configuredPath) !== resolve(expectedPath))
       throw new Error(
         `PI_TASKS selects ${configuredPath}; plan-exec requires the session path ${expectedPath}.`,
       );
     return {
-      scope: "session",
+      scope: 'session',
       listPath: expectedPath,
       storeTarget: expectedPath,
       packageVersion,
@@ -296,15 +300,15 @@ async function resolveProjectionTarget(
   }
 
   const [{ loadTasksConfig }] = await Promise.all([
-    import("@tintinweb/pi-tasks/dist/tasks-config.js"),
+    import('@tintinweb/pi-tasks/dist/tasks-config.js'),
   ]);
-  const scope = loadTasksConfig(options.cwd).taskScope ?? "session";
-  if (scope !== "session")
+  const scope = loadTasksConfig(options.cwd).taskScope ?? 'session';
+  if (scope !== 'session')
     throw new Error(
       `pi-tasks scope ${scope} is unsupported; plan-exec requires session scope.`,
     );
   return {
-    scope: "session",
+    scope: 'session',
     listPath: expectedPath,
     storeTarget: expectedPath,
     packageVersion,
@@ -313,20 +317,20 @@ async function resolveProjectionTarget(
 
 function piTasksPackageVersion(): string {
   const require = createRequire(import.meta.url);
-  const packageJson: unknown = require("@tintinweb/pi-tasks/package.json");
+  const packageJson: unknown = require('@tintinweb/pi-tasks/package.json');
   if (
-    typeof packageJson !== "object" ||
+    typeof packageJson !== 'object' ||
     packageJson === null ||
-    !("version" in packageJson) ||
-    typeof packageJson.version !== "string"
+    !('version' in packageJson) ||
+    typeof packageJson.version !== 'string'
   )
-    throw new Error("Installed pi-tasks package has no readable version.");
+    throw new Error('Installed pi-tasks package has no readable version.');
   return packageJson.version;
 }
 
 function sameProjection(
-  left: PlanExecRun["taskProjection"],
-  right: PlanExecRun["taskProjection"],
+  left: PlanExecRun['taskProjection'],
+  right: PlanExecRun['taskProjection'],
 ): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }
@@ -340,7 +344,7 @@ function deduplicateOwnedTasks(
   for (const task of tasks) {
     if (!isOwnedTask(task, run)) continue;
     const key = task.metadata.planExecKey;
-    if (typeof key !== "string" || !key) {
+    if (typeof key !== 'string' || !key) {
       store.delete(task.id);
       continue;
     }
@@ -373,35 +377,32 @@ async function readProjectionPlan(run: PlanExecRun) {
   try {
     return await readPlan(planPath);
   } catch (error: unknown) {
-    if (!isTerminalStatus(run.status) || !isNodeError(error, "ENOENT"))
+    if (!isTerminalStatus(run.status) || !isNodeError(error, 'ENOENT'))
       throw error;
     return readPlan(
-      join(
-        dirname(planPath),
-        COMPLETED_PLANS_DIRECTORY,
-        basename(planPath),
-      ),
+      join(dirname(planPath), COMPLETED_PLANS_DIRECTORY, basename(planPath)),
     );
   }
 }
 
 async function openCompatibleStore(path: string): Promise<TaskStore> {
-  const { TaskStore: TaskStoreConstructor } =
-    await import("@tintinweb/pi-tasks/dist/task-store.js");
+  const { TaskStore: TaskStoreConstructor } = await import(
+    '@tintinweb/pi-tasks/dist/task-store.js'
+  );
   const store: unknown = new TaskStoreConstructor(path);
   if (!hasTaskStoreContract(store)) {
     throw new Error(
-      "Installed pi-tasks TaskStore is incompatible with plan-exec projection.",
+      'Installed pi-tasks TaskStore is incompatible with plan-exec projection.',
     );
   }
   return store;
 }
 
 function hasTaskStoreContract(value: unknown): value is TaskStore {
-  if (typeof value !== "object" || value === null) return false;
+  if (typeof value !== 'object' || value === null) return false;
   const candidate = value as Record<string, unknown>;
-  return ["create", "delete", "get", "list", "update"].every(
-    (name) => typeof candidate[name] === "function",
+  return ['create', 'delete', 'get', 'list', 'update'].every(
+    (name) => typeof candidate[name] === 'function',
   );
 }
 
@@ -460,14 +461,14 @@ function implementationStatus(
 ): TaskStatus {
   const execution = taskExecution(run, task.id);
   if (execution?.state === TASK_EXECUTION_STATE.ACCEPTED)
-    return complete ? "completed" : "pending";
-  if (!execution && complete) return "completed";
+    return complete ? 'completed' : 'pending';
+  if (!execution && complete) return 'completed';
   if (run.status !== RUN_STATUS.STARTING && run.status !== RUN_STATUS.RUNNING)
-    return "pending";
+    return 'pending';
   const current = run.activeOperation?.taskId;
   return run.stage === RUN_STAGE.IMPLEMENTATION && current === task.id
-    ? "in_progress"
-    : "pending";
+    ? 'in_progress'
+    : 'pending';
 }
 
 function stageStatus(run: PlanExecRun, stage: RunStage): TaskStatus {
@@ -477,21 +478,21 @@ function stageStatus(run: PlanExecRun, stage: RunStage): TaskStatus {
     run.status === RUN_STATUS.COMPLETED ||
     run.status === RUN_STATUS.COMPLETED_WITH_FINDINGS
   )
-    return "completed";
-  if (currentIndex > projectedIndex) return "completed";
+    return 'completed';
+  if (currentIndex > projectedIndex) return 'completed';
   if (run.status === RUN_STATUS.SKIP_PENDING && run.stage === stage)
-    return "in_progress";
+    return 'in_progress';
   if (run.status !== RUN_STATUS.STARTING && run.status !== RUN_STATUS.RUNNING)
-    return "pending";
-  if (run.stage === stage) return "in_progress";
-  return "pending";
+    return 'pending';
+  if (run.stage === stage) return 'in_progress';
+  return 'pending';
 }
 
 function isNodeError(error: unknown, code: string): boolean {
   return (
-    typeof error === "object" &&
+    typeof error === 'object' &&
     error !== null &&
-    "code" in error &&
+    'code' in error &&
     error.code === code
   );
 }
@@ -502,20 +503,25 @@ function implementationDescription(
   isCurrent: boolean,
   execution?: TaskExecution,
 ): string {
-  const description = items.map((item) => `- [ ] ${item}`).join("\n");
+  const description = items.map((item) => `- [ ] ${item}`).join('\n');
   const details = execution ? taskExecutionDescription(execution) : undefined;
   if (isCurrent && run.status === RUN_STATUS.FAILED && run.error)
-    return `${description}\n\nPlan-exec failed: ${run.error}${details ? `\n${details}` : ""}`;
+    return `${description}\n\nPlan-exec failed: ${run.error}${details ? `\n${details}` : ''}`;
   if (isCurrent && run.status === RUN_STATUS.CANCELLED)
-    return `${description}\n\nPlan-exec cancelled; its worktree is preserved.${details ? `\n${details}` : ""}`;
+    return `${description}\n\nPlan-exec cancelled; its worktree is preserved.${details ? `\n${details}` : ''}`;
   return details ? `${description}\n\n${details}` : description;
 }
 
-function taskExecution(run: PlanExecRun, taskId: number): TaskExecution | undefined {
+function taskExecution(
+  run: PlanExecRun,
+  taskId: number,
+): TaskExecution | undefined {
   return run.tasks?.[String(taskId)];
 }
 
-function taskExecutionMetadata(execution: TaskExecution): Record<string, unknown> {
+function taskExecutionMetadata(
+  execution: TaskExecution,
+): Record<string, unknown> {
   return {
     planExecTaskState: execution.state,
     planExecAttempts: execution.attempts,
@@ -536,13 +542,17 @@ function taskExecutionDescription(execution: TaskExecution): string {
     `Attempts: ${execution.attempts}`,
     ...(execution.reason ? [`Reason: ${execution.reason}`] : []),
     ...(execution.nextAttemptAt !== undefined
-      ? [`Next automatic attempt: ${new Date(execution.nextAttemptAt).toISOString()}`]
+      ? [
+          `Next automatic attempt: ${new Date(execution.nextAttemptAt).toISOString()}`,
+        ]
       : []),
     ...(execution.lastVerifiedActivityAt !== undefined
-      ? [`Last verified activity: ${new Date(execution.lastVerifiedActivityAt).toISOString()}`]
+      ? [
+          `Last verified activity: ${new Date(execution.lastVerifiedActivityAt).toISOString()}`,
+        ]
       : []),
   ];
-  return details.join("\n");
+  return details.join('\n');
 }
 
 function stageDescription(run: PlanExecRun, stage: RunStage): string {

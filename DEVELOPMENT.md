@@ -14,23 +14,28 @@ Reload Pi after changing the extension:
 /reload
 ```
 
-The draft runtime contracts are pinned to immutable Git commits in the lockfile.
-Use npm 12.0.2: the project permits only directly declared Git dependencies via
-`allow-git=root`; npm 11.12.1 misclassifies their normalized URLs during a clean
-install. No global npm configuration change is required. Strict execution uses
-the pinned macOS runtime and requires its GUI launchd/compiler prerequisites;
-see [runtime contracts](docs/runtime-contracts.md) before attempting an execution.
+Use npm 12.0.2. Strict execution installs released packages only; see
+[runtime contracts](docs/runtime-contracts.md) before attempting an execution.
+
+Tooling: TypeScript 7, Biome (lint and format, replacing ESLint), and Vitest.
+`npm test` runs Vitest over `test/**/*.test.ts`. `test/index.test.ts` still runs
+under `node:test` because its session-lifecycle mocks depend on node:test's
+timer/mock semantics that Vitest does not reproduce yet; the script runs both
+runners. `test/autonomous-runtime-smoke.mjs` stays a separate `node --test`
+script (`npm run test:runtime-smoke`).
 
 ## Validation
 
 ```bash
-npm run lint
 npm run check
 npm test
+npm run test:runtime-smoke
 npm run pack:dry
 ```
 
-`npm run test:all` is the local gate used by CI and the release workflow.
+`npm run check` runs Biome and `tsc`; `npm run lint` and `npm run format` are
+available for focused runs. `npm run test:all` is the local gate used by CI and
+the release workflow.
 `npm run pack:dry` checks the final npm tarball against a runtime-only allowlist;
 the release workflow checks npm before it performs an actual publish.
 

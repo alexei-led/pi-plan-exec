@@ -1,7 +1,15 @@
-import { createHash } from "node:crypto";
-import { access, realpath, stat } from "node:fs/promises";
-import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { createHash } from 'node:crypto';
+import { access, realpath, stat } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  relative,
+  resolve,
+  sep,
+} from 'node:path';
+import { required } from './required.js';
 
 const PLAN_BRANCH_HASH_LENGTH = 8;
 const REPOSITORY_HASH_LENGTH = 12;
@@ -20,18 +28,23 @@ export type RunCommand = (
 
 export function parsePorcelainPaths(output: string): string[] {
   if (!output) return [];
-  if (!output.endsWith("\0")) throw new Error("Git status omitted its NUL record terminator.");
-  const entries = output.slice(0, -1).split("\0");
+  if (!output.endsWith('\0'))
+    throw new Error('Git status omitted its NUL record terminator.');
+  const entries = output.slice(0, -1).split('\0');
   const paths: string[] = [];
   for (let index = 0; index < entries.length; index++) {
-    const entry = entries[index]!;
-    if (entry.length < PORCELAIN_PATH_OFFSET + 1 || entry[PORCELAIN_PATH_OFFSET - 1] !== " ")
-      throw new Error("Git status returned a malformed path record.");
+    const entry = required(entries[index]);
+    if (
+      entry.length < PORCELAIN_PATH_OFFSET + 1 ||
+      entry[PORCELAIN_PATH_OFFSET - 1] !== ' '
+    )
+      throw new Error('Git status returned a malformed path record.');
     paths.push(entry.slice(PORCELAIN_PATH_OFFSET));
     const status = entry.slice(0, PORCELAIN_PATH_OFFSET - 1);
-    if (status.includes("R") || status.includes("C")) {
+    if (status.includes('R') || status.includes('C')) {
       const source = entries[++index];
-      if (!source) throw new Error("Git status omitted a rename or copy source path.");
+      if (!source)
+        throw new Error('Git status omitted a rename or copy source path.');
       paths.push(source);
     }
   }
@@ -40,9 +53,19 @@ export function parsePorcelainPaths(output: string): string[] {
 
 const PORCELAIN_PATH_OFFSET = 3;
 
-export async function worktreeChanges(run: RunCommand, cwd: string): Promise<string[]> {
-  const result = await run("git", ["status", "--porcelain", "-z", "--untracked-files=all"], cwd);
-  if (result.code !== 0) throw new Error(result.stderr.trim() || "Cannot inspect the worktree state.");
+export async function worktreeChanges(
+  run: RunCommand,
+  cwd: string,
+): Promise<string[]> {
+  const result = await run(
+    'git',
+    ['status', '--porcelain', '-z', '--untracked-files=all'],
+    cwd,
+  );
+  if (result.code !== 0)
+    throw new Error(
+      result.stderr.trim() || 'Cannot inspect the worktree state.',
+    );
   return parsePorcelainPaths(result.stdout);
 }
 
@@ -50,17 +73,22 @@ export async function requireGitRepository(
   run: RunCommand,
   cwd: string,
 ): Promise<string> {
-  const result = await run("git", ["rev-parse", "--show-toplevel"], cwd);
+  const result = await run('git', ['rev-parse', '--show-toplevel'], cwd);
   if (result.code !== 0)
-    throw new Error("/exec supports Git repositories only.");
+    throw new Error('/exec supports Git repositories only.');
   return result.stdout.trim();
 }
 
-export async function gitCheckoutRoot(run: RunCommand, cwd: string): Promise<string> {
-  const result = await run("git", ["rev-parse", "--show-cdup"], cwd);
+export async function gitCheckoutRoot(
+  run: RunCommand,
+  cwd: string,
+): Promise<string> {
+  const result = await run('git', ['rev-parse', '--show-cdup'], cwd);
   const upward = result.stdout.trim();
   if (result.code !== 0 || !/^(?:\.\.\/)*$/.test(upward))
-    throw new Error(result.stderr.trim() || "Cannot determine the execution checkout root.");
+    throw new Error(
+      result.stderr.trim() || 'Cannot determine the execution checkout root.',
+    );
   return resolve(cwd, upward);
 }
 
@@ -69,33 +97,33 @@ export async function defaultBranch(
   cwd: string,
 ): Promise<string> {
   const remote = await run(
-    "git",
-    ["symbolic-ref", "refs/remotes/origin/HEAD", "--short"],
+    'git',
+    ['symbolic-ref', 'refs/remotes/origin/HEAD', '--short'],
     cwd,
   );
   if (remote.code === 0) {
-    const branch = remote.stdout.trim().replace(/^origin\//, "");
+    const branch = remote.stdout.trim().replace(/^origin\//, '');
     if (branch) return branch;
   }
-  for (const branch of ["main", "master", "trunk"]) {
+  for (const branch of ['main', 'master', 'trunk']) {
     const exists = await run(
-      "git",
-      ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`],
+      'git',
+      ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`],
       cwd,
     );
     if (exists.code === 0) return branch;
   }
-  throw new Error("Could not determine the default Git branch.");
+  throw new Error('Could not determine the default Git branch.');
 }
 
 export async function currentBranch(
   run: RunCommand,
   cwd: string,
 ): Promise<string> {
-  const result = await run("git", ["branch", "--show-current"], cwd);
+  const result = await run('git', ['branch', '--show-current'], cwd);
   const branch = result.stdout.trim();
   if (result.code !== 0 || !branch)
-    throw new Error("Detached HEAD is not supported by /exec.");
+    throw new Error('Detached HEAD is not supported by /exec.');
   return branch;
 }
 
@@ -104,10 +132,10 @@ export async function ensureCleanForWorktree(
   cwd: string,
   planPath: string,
 ): Promise<void> {
-  const status = await run("git", ["status", "--porcelain"], cwd);
+  const status = await run('git', ['status', '--porcelain'], cwd);
   if (status.code !== 0)
-    throw new Error("Unable to inspect Git working tree state.");
-  const dirty = status.stdout.trim().split("\n").filter(Boolean);
+    throw new Error('Unable to inspect Git working tree state.');
+  const dirty = status.stdout.trim().split('\n').filter(Boolean);
   if (dirty.length === 0) return;
   const relativePlan = resolve(planPath).startsWith(resolve(cwd))
     ? resolve(planPath).slice(resolve(cwd).length + 1)
@@ -116,23 +144,23 @@ export async function ensureCleanForWorktree(
     dirty.length === 1 && dirty[0] === `?? ${relativePlan}`;
   if (!onlyUntrackedPlan) {
     throw new Error(
-      "Current working tree has changes. Choose in-place execution or commit/stash changes before using a worktree.",
+      'Current working tree has changes. Choose in-place execution or commit/stash changes before using a worktree.',
     );
   }
 }
 
 export function branchNameFromPlan(planPath: string): string {
   const stem = basename(planPath)
-    .replace(/\.md$/i, "")
-    .replace(/^\d{8}-/, "");
+    .replace(/\.md$/i, '')
+    .replace(/^\d{8}-/, '');
   const branch = stem
     .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-|-$/g, "");
-  if (!branch) throw new Error("Plan filename cannot produce a branch name.");
-  const identity = createHash("sha256")
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '');
+  if (!branch) throw new Error('Plan filename cannot produce a branch name.');
+  const identity = createHash('sha256')
     .update(resolve(planPath))
-    .digest("hex")
+    .digest('hex')
     .slice(0, PLAN_BRANCH_HASH_LENGTH);
   return `${branch}-${identity}`;
 }
@@ -141,15 +169,15 @@ export function executionWorktreePath(
   repositoryRoot: string,
   branch: string,
 ): string {
-  const repositoryId = createHash("sha256")
+  const repositoryId = createHash('sha256')
     .update(resolve(repositoryRoot))
-    .digest("hex")
+    .digest('hex')
     .slice(0, REPOSITORY_HASH_LENGTH);
   return resolve(
     homedir(),
-    ".pi",
-    "plan-exec",
-    "worktrees",
+    '.pi',
+    'plan-exec',
+    'worktrees',
     `${basename(repositoryRoot)}-${repositoryId}-${branch}`,
   );
 }
@@ -161,17 +189,16 @@ export async function verifyExistingWorktree(
 ): Promise<string> {
   const normalizedTarget = await realpath(worktreeCwd);
   const listed = await run(
-    "git",
-    ["worktree", "list", "--porcelain", "-z"],
+    'git',
+    ['worktree', 'list', '--porcelain', '-z'],
     repositoryRoot,
   );
-  if (listed.code !== 0)
-    throw new Error("Unable to inspect Git worktrees.");
+  if (listed.code !== 0) throw new Error('Unable to inspect Git worktrees.');
   const registeredPaths = await Promise.all(
     listed.stdout
-      .split("\0")
-      .filter((field) => field.startsWith("worktree "))
-      .map((field) => canonicalPath(field.slice("worktree ".length))),
+      .split('\0')
+      .filter((field) => field.startsWith('worktree '))
+      .map((field) => canonicalPath(field.slice('worktree '.length))),
   );
   const registered = registeredPaths.includes(normalizedTarget);
   if (!registered)
@@ -194,7 +221,7 @@ export async function verifyExecutionRepository(
   );
   if (commonDirectory !== expectedCommonDirectory) {
     throw new Error(
-      "Execution directory no longer belongs to the expected repository.",
+      'Execution directory no longer belongs to the expected repository.',
     );
   }
 }
@@ -219,12 +246,12 @@ async function gitCommonDirectory(
   cwd: string,
 ): Promise<string> {
   const result = await run(
-    "git",
-    ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    'git',
+    ['rev-parse', '--path-format=absolute', '--git-common-dir'],
     cwd,
   );
   if (result.code !== 0 || !result.stdout.trim()) {
-    throw new Error("Unable to identify the Git common directory.");
+    throw new Error('Unable to identify the Git common directory.');
   }
   return canonicalPath(result.stdout.trim());
 }
@@ -234,7 +261,8 @@ export async function canonicalPath(path: string): Promise<string> {
   try {
     return await realpath(path);
   } catch (error: unknown) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return resolve(path);
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT')
+      return resolve(path);
     throw error;
   }
 }
@@ -245,15 +273,15 @@ export async function worktreeIdentity(cwd: string): Promise<string> {
   try {
     if (!(await stat(canonical)).isDirectory()) return canonical;
   } catch (error: unknown) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return canonical;
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return canonical;
     throw error;
   }
   for (let directory = canonical; ; directory = dirname(directory)) {
     try {
-      await access(resolve(directory, ".git"));
+      await access(resolve(directory, '.git'));
       return directory;
     } catch (error: unknown) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
     if (dirname(directory) === directory) return canonical;
   }
@@ -261,8 +289,10 @@ export async function worktreeIdentity(cwd: string): Promise<string> {
 
 export function isPathWithin(root: string, path: string): boolean {
   const child = relative(resolve(root), resolve(path));
-  return child === "" ||
-    (!isAbsolute(child) && !child.startsWith(`..${sep}`) && child !== "..");
+  return (
+    child === '' ||
+    (!isAbsolute(child) && !child.startsWith(`..${sep}`) && child !== '..')
+  );
 }
 
 export function worktreePlanPath(
@@ -271,7 +301,7 @@ export function worktreePlanPath(
   planPath: string,
 ): string {
   if (!isPathWithin(repositoryRoot, planPath))
-    throw new Error("Plan must be inside the Git repository.");
+    throw new Error('Plan must be inside the Git repository.');
   return resolve(
     worktreeCwd,
     relative(resolve(repositoryRoot), resolve(planPath)),

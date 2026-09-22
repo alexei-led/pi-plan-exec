@@ -1,20 +1,25 @@
-import { requestRpc, type EventBus } from "./rpc.js";
-import { executionLifetimeCapabilities, processTreeOwnershipCapabilities, supportsOwnedProcessTree, type ProcessTreeOwnership } from "./bridge.js";
-import type { ExecutionLifetime } from "./types.js";
-import { isAbsolute } from "node:path";
+import { isAbsolute } from 'node:path';
+import {
+  executionLifetimeCapabilities,
+  type ProcessTreeOwnership,
+  processTreeOwnershipCapabilities,
+  supportsOwnedProcessTree,
+} from './bridge.js';
+import { type EventBus, requestRpc } from './rpc.js';
+import type { ExecutionLifetime } from './types.js';
 
-export const FUSION_REQUEST_EVENT = "fusion:rpc:v1:request";
-export const PLAN_REVIEW_OUTPUT_CONTRACT = "plan-review-v1" as const;
-const FUSION_REPLY_PREFIX = "fusion:rpc:v1:reply:";
+export const FUSION_REQUEST_EVENT = 'fusion:rpc:v1:request';
+export const PLAN_REVIEW_OUTPUT_CONTRACT = 'plan-review-v1' as const;
+const FUSION_REPLY_PREFIX = 'fusion:rpc:v1:reply:';
 const DEFAULT_FUSION_TIMEOUT_MS = 30_000;
 
 export const FUSION_PHASE = {
-  CHAIN: "chain",
-  PANEL: "panel",
-  JUDGE: "judge",
-  DONE: "done",
-  FAILED: "failed",
-  CANCELLED: "cancelled",
+  CHAIN: 'chain',
+  PANEL: 'panel',
+  JUDGE: 'judge',
+  DONE: 'done',
+  FAILED: 'failed',
+  CANCELLED: 'cancelled',
 } as const;
 
 export type FusionPhase = (typeof FUSION_PHASE)[keyof typeof FUSION_PHASE];
@@ -45,7 +50,7 @@ export interface FusionCapabilities {
   processTerminalProofVersion?: number;
   workflowTerminalProofVersion?: 1;
   executionLifetimeVersion?: 1;
-  executionLifetimeModes?: readonly ExecutionLifetime["mode"][];
+  executionLifetimeModes?: readonly ExecutionLifetime['mode'][];
   processTreeOwnership?: ProcessTreeOwnership;
 }
 
@@ -62,24 +67,33 @@ export class FusionClient {
   ) {}
 
   ping(): Promise<FusionResult> {
-    return this.request("ping", {});
+    return this.request('ping', {});
   }
 
   async capabilities(): Promise<FusionCapabilities> {
     const reply = await this.ping();
     if (!reply.success || !isRecord(reply.data.capabilities)) {
-      this.negotiated = { healthy: reply.success, durableOperationLookup: false };
+      this.negotiated = {
+        healthy: reply.success,
+        durableOperationLookup: false,
+      };
       return this.negotiated;
     }
     const capabilities = reply.data.capabilities;
     this.negotiated = {
       healthy: true,
-      durableOperationLookup: capabilities.durableOperationLookup === true ||
-        (isRecord(capabilities.durableOperationLookup) && capabilities.durableOperationLookup.version === 1),
-      ...(isRecord(capabilities.processTerminalProof) && capabilities.processTerminalProof.version === 1
-        ? { processTerminalProofVersion: 1 } : {}),
-      ...(isRecord(capabilities.workflowTerminalProof) && capabilities.workflowTerminalProof.version === 1
-        ? { workflowTerminalProofVersion: 1 as const } : {}),
+      durableOperationLookup:
+        capabilities.durableOperationLookup === true ||
+        (isRecord(capabilities.durableOperationLookup) &&
+          capabilities.durableOperationLookup.version === 1),
+      ...(isRecord(capabilities.processTerminalProof) &&
+      capabilities.processTerminalProof.version === 1
+        ? { processTerminalProofVersion: 1 }
+        : {}),
+      ...(isRecord(capabilities.workflowTerminalProof) &&
+      capabilities.workflowTerminalProof.version === 1
+        ? { workflowTerminalProofVersion: 1 as const }
+        : {}),
       ...executionLifetimeCapabilities(capabilities.executionLifetime),
       ...processTreeOwnershipCapabilities(capabilities.processTreeOwnership),
     };
@@ -94,45 +108,67 @@ export class FusionClient {
     digest?: string,
     context?: ReviewExecutionContext,
   ): Promise<FusionResult> {
-    if (executionLifetime && (!supportsOwnedProcessTree(this.negotiated) ||
-      !this.negotiated?.executionLifetimeModes?.includes(executionLifetime.mode)))
-      return Promise.resolve({ success: false, error: { code: "unsupported",
-        message: "Fusion has not advertised the requested explicit execution lifetime and full owned-process-tree containment." } });
-    if ((context !== undefined && !validReviewContext(context)) ||
-      (executionLifetime !== undefined && (!validReviewContext(context) || !digest?.trim())))
-      return Promise.resolve({ success: false, error: { code: "invalid_request",
-        message: "Strict Fusion review requires an immutable digest, absolute worktree cwd, and reviewed commit." } });
-    return this.request("start", {
+    if (
+      executionLifetime &&
+      (!supportsOwnedProcessTree(this.negotiated) ||
+        !this.negotiated?.executionLifetimeModes?.includes(
+          executionLifetime.mode,
+        ))
+    )
+      return Promise.resolve({
+        success: false,
+        error: {
+          code: 'unsupported',
+          message:
+            'Fusion has not advertised the requested explicit execution lifetime and full owned-process-tree containment.',
+        },
+      });
+    if (
+      (context !== undefined && !validReviewContext(context)) ||
+      (executionLifetime !== undefined &&
+        (!validReviewContext(context) || !digest?.trim()))
+    )
+      return Promise.resolve({
+        success: false,
+        error: {
+          code: 'invalid_request',
+          message:
+            'Strict Fusion review requires an immutable digest, absolute worktree cwd, and reviewed commit.',
+        },
+      });
+    return this.request('start', {
       params: {
         operationId,
         prompt,
         ...(profile ? { profile } : {}),
         ...(executionLifetime ? { executionLifetime } : {}),
         ...(digest ? { digest } : {}),
-        ...(context ? { cwd: context.cwd, reviewedCommit: context.reviewedCommit } : {}),
+        ...(context
+          ? { cwd: context.cwd, reviewedCommit: context.reviewedCommit }
+          : {}),
         outputContract: PLAN_REVIEW_OUTPUT_CONTRACT,
       },
     });
   }
 
   status(runId?: string, operationId?: string): Promise<FusionResult> {
-    return this.select("status", runId, operationId);
+    return this.select('status', runId, operationId);
   }
 
   result(runId?: string, operationId?: string): Promise<FusionResult> {
-    return this.select("result", runId, operationId);
+    return this.select('result', runId, operationId);
   }
 
   adopt(runId: string): Promise<FusionResult> {
-    return this.request("adopt", { params: { runId } });
+    return this.request('adopt', { params: { runId } });
   }
 
   cancel(runId?: string, operationId?: string): Promise<FusionResult> {
-    return this.select("cancel", runId, operationId);
+    return this.select('cancel', runId, operationId);
   }
 
   private select(
-    method: "status" | "result" | "cancel",
+    method: 'status' | 'result' | 'cancel',
     runId?: string,
     operationId?: string,
   ): Promise<FusionResult> {
@@ -140,8 +176,8 @@ export class FusionClient {
       return Promise.resolve({
         success: false,
         error: {
-          code: "invalid_request",
-          message: "Specify runId or operationId, not both.",
+          code: 'invalid_request',
+          message: 'Specify runId or operationId, not both.',
         },
       });
     }
@@ -175,8 +211,13 @@ export class FusionClient {
 }
 
 function validReviewContext(value: unknown): value is ReviewExecutionContext {
-  return isRecord(value) && typeof value.cwd === "string" && isAbsolute(value.cwd) &&
-    typeof value.reviewedCommit === "string" && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(value.reviewedCommit);
+  return (
+    isRecord(value) &&
+    typeof value.cwd === 'string' &&
+    isAbsolute(value.cwd) &&
+    typeof value.reviewedCommit === 'string' &&
+    /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(value.reviewedCommit)
+  );
 }
 
 export function parseFusionCallerOutput(
@@ -185,7 +226,7 @@ export function parseFusionCallerOutput(
   if (
     !isRecord(value) ||
     value.contract !== PLAN_REVIEW_OUTPUT_CONTRACT ||
-    typeof value.output !== "string"
+    typeof value.output !== 'string'
   )
     return undefined;
   return value.output.trim()
@@ -204,7 +245,7 @@ export function fusionState(value: unknown): FusionRunState | undefined {
     !runId ||
     !phase ||
     !isFusionPhase(phase) ||
-    typeof run.terminal !== "boolean"
+    typeof run.terminal !== 'boolean'
   ) {
     return undefined;
   }
@@ -218,12 +259,12 @@ export function fusionState(value: unknown): FusionRunState | undefined {
 }
 
 function parseReply(value: unknown): FusionResult {
-  if (!isRecord(value) || typeof value.success !== "boolean") {
+  if (!isRecord(value) || typeof value.success !== 'boolean') {
     return {
       success: false,
       error: {
-        code: "malformed",
-        message: "Fusion returned a malformed reply.",
+        code: 'malformed',
+        message: 'Fusion returned a malformed reply.',
       },
     };
   }
@@ -233,8 +274,8 @@ function parseReply(value: unknown): FusionResult {
       : {
           success: false,
           error: {
-            code: "malformed",
-            message: "Fusion returned non-object data.",
+            code: 'malformed',
+            message: 'Fusion returned non-object data.',
           },
         };
   }
@@ -244,7 +285,7 @@ function parseReply(value: unknown): FusionResult {
     success: false,
     error: {
       ...(code ? { code } : {}),
-      message: text(error.message) ?? "Fusion request failed.",
+      message: text(error.message) ?? 'Fusion request failed.',
     },
   };
 }
@@ -254,9 +295,9 @@ function isFusionPhase(value: string): value is FusionPhase {
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function text(value: unknown): string | undefined {
-  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }

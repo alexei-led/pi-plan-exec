@@ -1,16 +1,18 @@
 import {
   EXTERNAL_OPERATION_STATE,
-  RUN_STAGE,
-  RUN_STATUS,
-  MAX_EXECUTION_TIMEOUT_MS,
   type ExecutionLifetime,
   type GoalState,
+  MAX_EXECUTION_TIMEOUT_MS,
   type PlanExecRun,
+  RUN_STAGE,
+  RUN_STATUS,
   type RunStage,
   type RunStatus,
-} from "./types.js";
+} from './types.js';
 
-export function isGoalRun(run: PlanExecRun): run is PlanExecRun & { goal: GoalState } {
+export function isGoalRun(
+  run: PlanExecRun,
+): run is PlanExecRun & { goal: GoalState } {
   return run.goal !== undefined;
 }
 
@@ -19,7 +21,7 @@ export function assertPlanRun(
   run: PlanExecRun,
 ): asserts run is PlanExecRun & { planPath: string; planHash: string } {
   if (run.planPath === undefined || run.planHash === undefined)
-    throw new Error("This execution path requires a plan run.");
+    throw new Error('This execution path requires a plan run.');
 }
 
 export function requirePlanPath(run: PlanExecRun): string {
@@ -129,10 +131,7 @@ export function longRunningOperation(
 ): { elapsedMs: number; boundMs: number; maxTurns?: never } | undefined {
   const operation = run.activeOperation;
   const lifetime = activeExecutionLifetime(run);
-  if (
-    !operation?.launchStartedAt ||
-    lifetime?.mode !== "bounded"
-  )
+  if (!operation?.launchStartedAt || lifetime?.mode !== 'bounded')
     return undefined;
   const boundMs = lifetime.timeoutMs;
   const elapsedMs = now - operation.launchStartedAt;
@@ -140,34 +139,43 @@ export function longRunningOperation(
 }
 
 /** Existing operations use their persisted request or attestation, never a new base policy. */
-export function activeExecutionLifetime(run: PlanExecRun): ExecutionLifetime | undefined {
+export function activeExecutionLifetime(
+  run: PlanExecRun,
+): ExecutionLifetime | undefined {
   const operation = run.activeOperation;
   if (!operation) return run.config.executionLifetime;
   if (operation.effectiveLifetime) return operation.effectiveLifetime;
   if (operation.expectedLifetime) return operation.expectedLifetime;
   const params = operation.params?.executionLifetime;
-  if (!params || typeof params !== "object" || !("mode" in params)) return undefined;
-  if (params.mode === "unbounded") return { mode: "unbounded" };
-  if (params.mode === "bounded" && "timeoutMs" in params && typeof params.timeoutMs === "number" &&
-    Number.isSafeInteger(params.timeoutMs) && params.timeoutMs > 0 && params.timeoutMs <= MAX_EXECUTION_TIMEOUT_MS)
-    return { mode: "bounded", timeoutMs: params.timeoutMs };
+  if (!params || typeof params !== 'object' || !('mode' in params))
+    return undefined;
+  if (params.mode === 'unbounded') return { mode: 'unbounded' };
+  if (
+    params.mode === 'bounded' &&
+    'timeoutMs' in params &&
+    typeof params.timeoutMs === 'number' &&
+    Number.isSafeInteger(params.timeoutMs) &&
+    params.timeoutMs > 0 &&
+    params.timeoutMs <= MAX_EXECUTION_TIMEOUT_MS
+  )
+    return { mode: 'bounded', timeoutMs: params.timeoutMs };
   return undefined;
 }
 
 export const ABANDONMENT = {
-  LIVE: "live",
-  ABANDONED: "abandoned",
-  RECONCILABLE: "reconcilable",
-  AMBIGUOUS: "ambiguous",
+  LIVE: 'live',
+  ABANDONED: 'abandoned',
+  RECONCILABLE: 'reconcilable',
+  AMBIGUOUS: 'ambiguous',
 } as const;
 
 export type Abandonment = (typeof ABANDONMENT)[keyof typeof ABANDONMENT];
 
 export const PROCESS_TERMINAL_STATE = {
-  PENDING: "pending",
-  NOT_STARTED: "not-started",
-  OBSERVED: "observed",
-  UNKNOWN: "unknown",
+  PENDING: 'pending',
+  NOT_STARTED: 'not-started',
+  OBSERVED: 'observed',
+  UNKNOWN: 'unknown',
 } as const;
 
 export interface ProcessTerminalProof {
@@ -203,14 +211,17 @@ export function classifyAbandonment(
     return ABANDONMENT.AMBIGUOUS;
   const terminalObserved =
     evidence.processTerminalProof?.version === 1 &&
-    evidence.processTerminalProof.state === "observed" &&
+    evidence.processTerminalProof.state === 'observed' &&
     evidence.processTerminalProof.runId === run.activeOperation?.externalRunId;
   const replaySafeAbsence =
     !run.activeOperation.externalRunId &&
     evidence.durableOperationLookup === true &&
     evidence.replaySafe === true &&
     evidence.bridgeState === EXTERNAL_OPERATION_STATE.ABSENT;
-  return terminalObserved || (evidence.durableOperationLookup === true && evidence.neverStarted === true)
+  return terminalObserved ||
+    (evidence.durableOperationLookup === true && evidence.neverStarted === true)
     ? ABANDONMENT.ABANDONED
-    : replaySafeAbsence ? ABANDONMENT.RECONCILABLE : ABANDONMENT.AMBIGUOUS;
+    : replaySafeAbsence
+      ? ABANDONMENT.RECONCILABLE
+      : ABANDONMENT.AMBIGUOUS;
 }
