@@ -18,7 +18,7 @@ export async function initializeProgress(run: PlanExecRun): Promise<string> {
   await writeFile(
     path,
     [
-      `# Plan execution: ${basename(run.planPath)}`,
+      `# Plan execution: ${run.planPath !== undefined ? basename(run.planPath) : `Goal: ${run.goal?.text ?? run.id}`}`,
       `Run: ${run.id}`,
       `Branch: ${run.branch}`,
       `Worktree: ${run.worktreeCwd}`,
@@ -185,6 +185,8 @@ function delay(ms: number): Promise<void> {
 }
 
 function progressPath(run: PlanExecRun): string {
-  const stem = basename(run.planPath).replace(/\.md$/i, "");
+  const stem = run.planPath !== undefined
+    ? basename(run.planPath).replace(/\.md$/i, "")
+    : `goal-${run.goal?.hash ?? run.id}`;
   return join(run.worktreeCwd, ".ralphex", "progress", `progress-${stem}.txt`);
 }

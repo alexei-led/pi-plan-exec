@@ -82,27 +82,31 @@ and CI use npm 12.0.2. The repository `.npmrc` uses `allow-git=root`; a packed
 consumer must use a project-local `allow-git=all` for transitive Git refs. Do
 not change global npm configuration.
 
-Reload Pi. From an interactive session in a Git repository, prepare a short goal
-or run an existing executable plan:
+Reload Pi. From an interactive session in a Git repository, start a goal or run
+an existing executable plan:
 
 ```text
 /reload
-/goal Add a greeting endpoint
+/goal Fix the failing tests
+/goal Add a greeting endpoint --check "npm test"
 /exec docs/plans/20260713-add-greeting.md
 /exec --worktree ../project-feature docs/plans/20260713-add-greeting.md
 ```
 
-`/goal <short goal>` uses the current Pi session for read-only repository
-exploration (with an enforced maximum of 12 `read` tool calls), then permits
-only the extension-owned `finalize_goal_plan` tool to
-publish a researched Markdown plan under `docs/plans/`. The finalizer validates
-the executable-plan parser contract, repository evidence, exact goal binding,
-and stable `goal_id`, `goal_hash`, `plan_hash`, and `document_hash` metadata.
-It atomically creates a complete file without overwriting an existing one. It
-never creates a run, worktree, task projection, or child. A ready retry reuses
-an unchanged validated file; an edited or incomplete file is refused. A turn
-that ends before finalization is reported as interrupted and publishes no plan.
-The ready result has exactly one next action: `/exec <path>`.
+`/goal <goal text>` pursues a goal autonomously in place on the current branch
+and needs no plan file or checkbox list. It requires a clean worktree and at
+least one required check, auto-detected from the project or supplied with
+`--check "<command>"`. The controller runs one worker turn per iteration through
+the same owned runtime, registry, leases, stop fences, and recovery as `/exec`:
+the worker inspects the state, chooses and executes the next useful action, and
+commits. An ordinary turn summary is an intermediate answer and the controller
+schedules the next turn automatically. A completion claim only starts
+verification: the required checks, then the configured review and final
+verification, must pass on the committed work. Deleting test files or adding
+`skip`/`only` markers pauses completion for confirmation; three turns without
+progress pause the goal with a recorded reason, and a blocker pauses it until
+`/goal resume <run-id>`. `/goal status`, `/goal pause`, `/goal cancel`, and
+`/goal help` manage the run.
 
 While an execution runs, Pi shows the execution-worktree path, branch, stage, and worker.
 Four verbs cover everything after the start:

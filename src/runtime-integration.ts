@@ -220,7 +220,7 @@ function externalRecord(
     id,
     sessionId,
     source: EXTERNAL_SOURCE,
-    label: `PlanExec ${basename(run.planPath)}`,
+    label: `PlanExec ${run.planPath !== undefined ? basename(run.planPath) : `goal ${run.goal?.hash ?? run.id}`}`,
     state: externalState(run),
     currentAction: run.stage,
     preview: projectionError

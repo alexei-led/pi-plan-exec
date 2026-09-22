@@ -38,8 +38,14 @@ const RUN_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 type RunLease = NonNullable<PlanExecRun["lease"]>;
-type RunReservations = Pick<PlanExecRun, "worktreeCwd" | "planPath"> &
-  Partial<Pick<PlanExecRun, "id" | "outputTarget" | "lanePreparation" | "tasks">>;
+type RunReservations = Pick<PlanExecRun, "worktreeCwd"> &
+  Partial<Pick<PlanExecRun, "id" | "planPath" | "goal" | "outputTarget" | "lanePreparation" | "tasks">>;
+
+/** A goal reserves its goal hash; a plan reserves its plan file. */
+async function reservationKey(run: RunReservations): Promise<string | undefined> {
+  if (run.goal) return `goal:${run.goal.hash}`;
+  return run.planPath === undefined ? undefined : canonicalReservationPath(run.planPath);
+}
 
 /** Pending lanes retain their own identity while resolving existing parent aliases. */
 async function canonicalReservationPath(path: string): Promise<string> {
@@ -211,7 +217,7 @@ export class RunRegistry {
     if (errors.length)
       throw new Error(`Cannot verify execution ownership: unreadable run ${errors[0]!.runId}. Use /exec status.`);
     const worktrees = await reservedCheckouts(run);
-    const plan = await canonicalReservationPath(run.planPath);
+    const key = await reservationKey(run);
     for (const existing of runs) {
       if (existing.id === run.id) continue;
       if (isTerminalStatus(existing.status) &&
@@ -220,10 +226,10 @@ export class RunRegistry {
           !existing.localOperationActive &&
           !(existing.lease && isLeaseLive(existing.lease))) continue;
       const sameWorktree = [...await reservedCheckouts(existing)].some(path => worktrees.has(path));
-      const samePlan = await canonicalReservationPath(existing.planPath) === plan;
-      if (sameWorktree || samePlan)
+      const sameSubject = key !== undefined && key === await reservationKey(existing);
+      if (sameWorktree || sameSubject)
         throw new Error(
-          `Plan execution already exists for ${sameWorktree ? "worktree" : "plan"}: ${existing.id}. Use /exec status ${existing.id} or /exec resume ${existing.id}.`,
+          `Plan execution already exists for ${sameWorktree ? "worktree" : run.goal ? "goal" : "plan"}: ${existing.id}. Use /exec status ${existing.id} or /exec resume ${existing.id}.`,
         );
     }
   }
@@ -570,8 +576,15 @@ function parseRun(raw: string, runId: string): PlanExecRun {
 function migrateLegacyRun(value: Record<string, unknown>): PlanExecRun {
   const stage = value.stage === "tasks" ? RUN_STAGE.PROJECT_TASKS : value.stage;
   const config = isRecord(value.config) ? value.config : {};
-  return {
-    ...(value as unknown as PlanExecRun),
+  const legacy = value as unknown as PlanExecRun & { blockedTask?: unknown };
+  const blocked = legacy.blocked ?? (isRecord(legacy.blockedTask)
+    ? {
+        reason: stringOr(legacy.blockedTask.reason, ""),
+        ...(typeof legacy.blockedTask.taskId === "number" ? { taskId: legacy.blockedTask.taskId } : {}),
+      }
+    : undefined);
+  const migrated: PlanExecRun = {
+    ...legacy,
     revision:
       typeof value.revision === "number" && Number.isInteger(value.revision)
         ? value.revision
@@ -650,7 +663,10 @@ function migrateLegacyRun(value: Record<string, unknown>): PlanExecRun {
         DEFAULT_FROZEN_RUN_CONFIG.statsMaxTurns,
       ),
     } as PlanExecRun["config"],
+    ...(blocked === undefined ? {} : { blocked }),
   };
+  delete (migrated as { blockedTask?: unknown }).blockedTask;
+  return migrated;
 }
 
 function assertRun(run: PlanExecRun): void {
@@ -664,6 +680,7 @@ function assertRun(run: PlanExecRun): void {
     !Number.isFinite(run.updatedAt) ||
     !isFrozenConfig(run.config) ||
     !isAutonomousState(run) ||
+    !isRunSubject(run) ||
     !isPlanSnapshots(run) ||
     (run.localOperationActive !== undefined && typeof run.localOperationActive !== "boolean") ||
     !Array.isArray(run.skippedStages) ||
@@ -683,12 +700,12 @@ function assertRun(run: PlanExecRun): void {
           run.status !== RUN_STATUS.PAUSED))) ||
     (run.status === RUN_STATUS.SKIP_PENDING &&
       run.pendingStageSkip === undefined) ||
-    (run.blockedTask !== undefined &&
-      (!isRecord(run.blockedTask) ||
-        !Number.isInteger(run.blockedTask.taskId) ||
-        run.blockedTask.taskId < 1 ||
-        typeof run.blockedTask.reason !== "string" ||
-        !run.blockedTask.reason.trim())) ||
+    (run.blocked !== undefined &&
+      (!isRecord(run.blocked) ||
+        (run.blocked.taskId !== undefined &&
+          (!Number.isInteger(run.blocked.taskId) || run.blocked.taskId < 1)) ||
+        typeof run.blocked.reason !== "string" ||
+        !run.blocked.reason.trim())) ||
     !isValidOperationForStage(run.activeOperation, run.stage) ||
     !isValidOperationForStage(run.failedOperation, run.stage)
   ) {
@@ -696,7 +713,32 @@ function assertRun(run: PlanExecRun): void {
   }
 }
 
+function isRunSubject(run: PlanExecRun): boolean {
+  if (run.goal !== undefined)
+    return (
+      run.planPath === undefined &&
+      run.planHash === undefined &&
+      typeof run.goal.text === "string" && Boolean(run.goal.text.trim()) &&
+      typeof run.goal.hash === "string" && /^[a-f0-9]{12}$/.test(run.goal.hash) &&
+      Number.isInteger(run.goal.iteration) && run.goal.iteration >= 0 &&
+      Number.isInteger(run.goal.noProgress) && run.goal.noProgress >= 0 &&
+      (run.goal.lastOutcome === undefined || typeof run.goal.lastOutcome === "string") &&
+      (run.goal.lastCheck === undefined ||
+        (isRecord(run.goal.lastCheck) &&
+          typeof run.goal.lastCheck.fingerprint === "string" &&
+          typeof run.goal.lastCheck.failures === "string" &&
+          typeof run.goal.lastCheck.head === "string" &&
+          typeof run.goal.lastCheck.at === "number"))
+    );
+  return (
+    typeof run.planPath === "string" && run.planPath.length > 0 &&
+    typeof run.planHash === "string" && run.planHash.length > 0
+  );
+}
+
 function isPlanSnapshots(run: PlanExecRun): boolean {
+  if (run.planPath === undefined || run.planHash === undefined)
+    return run.initialPlan === undefined && run.approvedPlan === undefined;
   for (const snapshot of [run.initialPlan, run.approvedPlan]) {
     if (snapshot === undefined) continue;
     if (!isRecord(snapshot) || typeof snapshot.content !== "string" || typeof snapshot.hash !== "string") return false;
@@ -792,7 +834,8 @@ function isAutonomousState(run: PlanExecRun): boolean {
     (!isRecord(run.outputTarget) || typeof run.outputTarget.cwd !== "string" || !run.outputTarget.cwd ||
       typeof run.outputTarget.branch !== "string" || !run.outputTarget.branch ||
       typeof run.outputTarget.initialHead !== "string" || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(run.outputTarget.initialHead) ||
-      typeof run.outputTarget.planRelativePath !== "string" || !run.outputTarget.planRelativePath ||
+      typeof run.outputTarget.planRelativePath !== "string" ||
+      (run.goal === undefined && !run.outputTarget.planRelativePath) ||
       (run.outputTarget.progressRelativePath !== undefined && typeof run.outputTarget.progressRelativePath !== "string"))) return false;
   if (run.outputPromotion !== undefined &&
     (!isRecord(run.outputPromotion) || typeof run.outputPromotion.candidate !== "string" ||

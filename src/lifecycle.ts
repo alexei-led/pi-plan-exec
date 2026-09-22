@@ -4,10 +4,28 @@ import {
   RUN_STATUS,
   MAX_EXECUTION_TIMEOUT_MS,
   type ExecutionLifetime,
+  type GoalState,
   type PlanExecRun,
   type RunStage,
   type RunStatus,
 } from "./types.js";
+
+export function isGoalRun(run: PlanExecRun): run is PlanExecRun & { goal: GoalState } {
+  return run.goal !== undefined;
+}
+
+/** Plan-only code paths call this at their entry so a goal run fails loudly. */
+export function assertPlanRun(
+  run: PlanExecRun,
+): asserts run is PlanExecRun & { planPath: string; planHash: string } {
+  if (run.planPath === undefined || run.planHash === undefined)
+    throw new Error("This execution path requires a plan run.");
+}
+
+export function requirePlanPath(run: PlanExecRun): string {
+  assertPlanRun(run);
+  return run.planPath;
+}
 
 export const PIPELINE_STAGES = [
   RUN_STAGE.COMPREHENSIVE_REVIEW,

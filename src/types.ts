@@ -355,14 +355,35 @@ export interface TaskRecoverySource {
   checkpointCommit?: string;
 }
 
+export interface GoalCheckEvidence {
+  fingerprint: string;
+  /** Normalized tail of the failing check output, fed to the next goal turn. */
+  failures: string;
+  head: string;
+  at: number;
+}
+
+/** Presence of `goal` marks a planless goal run on the shared controller loop. */
+export interface GoalState {
+  text: string;
+  hash: string;
+  iteration: number;
+  noProgress: number;
+  lastOutcome?: string;
+  lastCheck?: GoalCheckEvidence;
+}
+
 export interface PlanExecRun {
   schemaVersion: 1;
   id: string;
   /** Monotonic durable-state revision. Missing only on legacy v1 records. */
   revision?: number;
+  goal?: GoalState;
   repositoryRoot: string;
-  planPath: string;
-  planHash: string;
+  /** Absent on goal runs; required by `requirePlan` on plan runs. */
+  planPath?: string;
+  /** Absent on goal runs; required by `requirePlan` on plan runs. */
+  planHash?: string;
   initialPlan?: { hash: string; content: string };
   approvedPlan?: { hash: string; content: string };
   worktreeCwd: string;
@@ -429,8 +450,8 @@ export interface PlanExecRun {
   };
   activeOperation?: ActiveOperation;
   failedOperation?: ActiveOperation;
-  /** Explicit worker stop: incomplete task, no automatic retry, resumable after confirmation. */
-  blockedTask?: { taskId: number; reason: string };
+  /** Explicit stop: incomplete task or unmet goal, no automatic retry, resumable after confirmation. */
+  blocked?: { taskId?: number; reason: string };
   /** One recovery launch only; consumed when the replacement child is recorded. */
   recoveryModel?: string;
   config: FrozenRunConfig;
