@@ -9,7 +9,7 @@ import { EXTERNAL_OPERATION_STATE } from "./types.js";
 import { workspaceEnvironment } from "./workspace-environment.js";
 
 const POLL_MS = 100;
-const RPC_TIMEOUT_MS = 15_000;
+const OUTPUT_TAIL_LIMIT = 2_000;const RPC_TIMEOUT_MS = 15_000;
 const CANCEL_PROBE_MS = 2_000;
 const JOURNAL_FILE_MODE = 0o600;
 const JOURNAL_DIRECTORY_MODE = 0o700;
@@ -45,7 +45,14 @@ interface LocalOperationIntent {
 
 export class LocalOperationUnknownError extends Error {}
 export class LocalOperationCancelledError extends Error {}
-export class LocalOperationFailedError extends Error {}
+export class LocalOperationFailedError extends Error {
+  constructor(
+    message: string,
+    readonly details?: { code?: number | null | undefined; outputTail?: string | undefined },
+  ) {
+    super(message);
+  }
+}
 
 interface LocalOperationIndex {
   version: 1;
@@ -329,7 +336,13 @@ async function runOwnedOperation(cwd: string, commands: string[][], options: Loc
         throw new LocalOperationUnknownError("Local command result identity is malformed.");
       }
       if (result.cancelled || observation.status === "never-started") throw new LocalOperationCancelledError("Local operation was cancelled.");
-      if (result.code !== 0 || observation.exitCode !== 0) throw new LocalOperationFailedError(`Local command failed (exit ${String(result.code ?? observation.exitCode)}): ${String(result.error ?? directory)}`);
+      if (result.code !== 0 || observation.exitCode !== 0) {
+        const code = typeof result.code === "number" || result.code === null ? result.code : observation.exitCode;
+        throw new LocalOperationFailedError(`Local command failed (exit ${String(code)}): ${String(result.error ?? directory)}`, {
+          code,
+          outputTail: await readOutputTail(join(directory, "output.log")),
+        });
+      }
       return;
     }
     if (observation.status === "retired" || observation.status === "never-started") throw new LocalOperationUnknownError("Local command terminal proof does not match its durable binding.");
@@ -347,6 +360,15 @@ async function runOwnedOperation(cwd: string, commands: string[][], options: Loc
       } else await stop();
     }
     await delay(POLL_MS);
+  }
+}
+
+async function readOutputTail(path: string): Promise<string | undefined> {
+  try {
+    const content = await readFile(path, "utf8");
+    return content.length <= OUTPUT_TAIL_LIMIT ? content : content.slice(-OUTPUT_TAIL_LIMIT);
+  } catch {
+    return undefined;
   }
 }
 

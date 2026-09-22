@@ -64,6 +64,7 @@ import {
   requirePlanPath,
 } from "./lifecycle.js";
 import {
+  GOAL_CHECK_OUTPUT_LIMIT,
   GOAL_DISABLED_SAMPLE_LIMIT,
   GOAL_FINGERPRINT_LENGTH,
   GOAL_NO_PROGRESS_LIMIT,
@@ -310,7 +311,7 @@ export class PlanExecController {
       throw new Error("A goal run works in place and refuses a dirty worktree; commit or stash changes first.");
     const configured = await resolveRunConfig(repositoryRoot);
     const config: FrozenRunConfig = { ...configured,
-      requiredChecks: await requiredChecks(options.cwd, options.checks ?? configured.requiredChecks),
+      requiredChecks: await requiredChecks(options.cwd, options.checks?.length ? options.checks : configured.requiredChecks),
     };
     if (!config.requiredChecks.length)
       throw new Error("A goal needs at least one required check to prove completion; add a test or build script, or pass --check <command>.");
@@ -320,7 +321,7 @@ export class PlanExecController {
     const run = await this.registry.create({
       schemaVersion: 1,
       repositoryRoot,
-      goal: { text, hash, iteration: 0, noProgress: 0 },
+      goal: { text, hash, iteration: 0, maxTurns: config.maxTaskIterations, noProgress: 0 },
       worktreeCwd: options.cwd,
       branch,
       defaultBranch: baseBranch,
@@ -426,6 +427,14 @@ export class PlanExecController {
         if (!normalized.applied) return normalized.run;
         prepared = normalized.run;
       }
+    }
+    if (explicit && isGoalRun(prepared) && prepared.goal.iteration >= prepared.goal.maxTurns) {
+      const granted = await this.registry.updateIfCurrent({
+        ...prepared,
+        goal: { ...prepared.goal, maxTurns: prepared.goal.maxTurns + prepared.config.maxTaskIterations },
+      }, prepared.updatedAt);
+      if (!granted.applied) return granted.run;
+      prepared = granted.run;
     }
     if (reviewedPlanHash !== undefined) {
       if (!explicit) throw new Error("Adopting a changed plan requires explicit resume.");
@@ -840,9 +849,9 @@ export class PlanExecController {
   private async advanceGoal(run: PlanExecRun): Promise<PlanExecRun> {
     if (!isGoalRun(run)) throw new Error("advanceGoal requires a goal run.");
     const goal = run.goal;
-    if (goal.iteration >= run.config.maxTaskIterations)
+    if (goal.iteration >= goal.maxTurns)
       return this.pauseGoal(run,
-        `Goal turn budget reached after ${goal.iteration} turns; run /goal resume ${run.id} to authorize more turns.`);
+        `Goal turn budget reached after ${goal.iteration} turns; run /goal resume ${run.id} to authorize ${run.config.maxTaskIterations} more turns.`);
     return this.launchBridge(run, {
       kind: OPERATION_KIND.IMPLEMENTATION,
       agent: run.config.workerAgent,
@@ -854,7 +863,6 @@ export class PlanExecController {
       }),
     });
   }
-
   private async recentGoalCommits(run: PlanExecRun): Promise<string | undefined> {
     const base = run.outputTarget?.initialHead;
     if (!base) return undefined;
@@ -876,16 +884,16 @@ export class PlanExecController {
       return this.pauseGoal(run, outcome.reason ?? terminalError ?? `Goal turn ended as ${state}.`);
     const head = await gitValue(this.runCommand, run.worktreeCwd, ["rev-parse", "HEAD"]);
     const failure = await this.goalCheckFailure(run, operation);
-    const fingerprint = failure ? `fail:${createHash("sha256").update(failure).digest("hex").slice(0, GOAL_FINGERPRINT_LENGTH)}` : "pass";
+    const fingerprint = failure?.fingerprint ?? "pass";
     const progressed = goal.lastCheck === undefined || head !== goal.lastCheck.head || fingerprint !== goal.lastCheck.fingerprint;
     const noProgress = progressed ? 0 : goal.noProgress + 1;
     const nextGoal = {
       ...goal,
       noProgress,
       lastOutcome: outcome.kind === GOAL_OUTCOME.DONE && failure
-        ? `Worker reported the goal achieved, but required checks failed: ${failure}\n${outcome.summary}`
+        ? `Worker reported the goal achieved, but required checks failed: ${failure.text}\n${outcome.summary}`
         : outcome.summary,
-      lastCheck: { fingerprint, failures: failure ?? "", head, at: Date.now() },
+      lastCheck: { fingerprint, failures: failure?.text ?? "", head, at: Date.now() },
     };
     if (noProgress >= GOAL_NO_PROGRESS_LIMIT)
       return this.pauseGoal({ ...run, goal: nextGoal },
@@ -906,7 +914,7 @@ export class PlanExecController {
       ...run,
       goal: nextGoal,
       nextAttemptAt: Date.now() + run.config.retryDelayMs,
-      wakeReason: failure ? `Goal checks failing: ${failure}` : "Goal turn completed; continuing.",
+      wakeReason: failure ? `Goal checks failing: ${failure.text}` : "Goal turn completed; continuing.",
     }), run.updatedAt);
     if (scheduled.applied)
       await appendProgressBestEffort(scheduled.run,
@@ -915,8 +923,9 @@ export class PlanExecController {
   }
 
   /** Run the required checks for one goal turn; a cancelled check aborts the run. */
-  private async goalCheckFailure(run: PlanExecRun, operation: ActiveOperation): Promise<string | undefined> {
+  private async goalCheckFailure(run: PlanExecRun, operation: ActiveOperation): Promise<{ text: string; fingerprint: string } | undefined> {
     const head = await gitValue(this.runCommand, run.worktreeCwd, ["rev-parse", "HEAD"]);
+    const commands = run.config.requiredChecks.map((command) => command.join(" "));
     const operationId = `goal:check:${run.goal?.iteration ?? 0}:${operation.operationId}`;
     try {
       await this.executeLocalCommands(run.worktreeCwd, run.config.requiredChecks,
@@ -924,7 +933,17 @@ export class PlanExecController {
       return undefined;
     } catch (error: unknown) {
       if (error instanceof LocalOperationUnknownError || error instanceof LocalOperationCancelledError) throw error;
-      return error instanceof Error ? error.message : String(error);
+      const details = error instanceof LocalOperationFailedError ? error.details : undefined;
+      const output = (details?.outputTail ?? "").replace(/\s+/gu, " ").trim().slice(0, GOAL_CHECK_OUTPUT_LIMIT);
+      const text = [
+        `checks: ${commands.join(" · ")}`,
+        `exit: ${details?.code ?? "unknown"}`,
+        output ? `output: ${output}` : `error: ${error instanceof Error ? error.message : String(error)}`,
+      ].join("\n");
+      const fingerprint = `fail:${details?.code ?? "unknown"}:${createHash("sha256")
+        .update(`${commands.join("\n")}\n${output || (error instanceof Error ? error.message : String(error))}`)
+        .digest("hex").slice(0, GOAL_FINGERPRINT_LENGTH)}`;
+      return { text, fingerprint };
     }
   }
 
@@ -936,8 +955,15 @@ export class PlanExecController {
     if (diff.code !== 0) return "Cannot verify the goal diff before completion.";
     const fields = diff.stdout.split("\0").filter(Boolean);
     const deletedTests: string[] = [];
-    for (let index = 0; index + 1 < fields.length; index += 2)
-      if (fields[index]!.startsWith("D") && isTestPath(fields[index + 1]!)) deletedTests.push(fields[index + 1]!);
+    for (let index = 0; index < fields.length;) {
+      const status = fields[index++] ?? "";
+      const first = fields[index++] ?? "";
+      const kind = status[0];
+      if (kind === "R" || kind === "C") {
+        const second = fields[index++] ?? "";
+        if (kind === "R" && isTestPath(first) && !isTestPath(second)) deletedTests.push(first);
+      } else if (kind === "D" && isTestPath(first)) deletedTests.push(first);
+    }
     if (deletedTests.length)
       return `Goal completion deleted test files: ${deletedTests.join(", ")}. Restore or justify them, then resume.`;
     const added = await this.runCommand("git", ["diff", "-U0", "--no-relative", base, "HEAD"], run.worktreeCwd);
@@ -2820,6 +2846,10 @@ export class PlanExecController {
   }
 
   private async complete(run: PlanExecRun): Promise<PlanExecRun> {
+    if (isGoalRun(run)) {
+      const violation = await this.goalCompletionGuard(run);
+      if (violation) return this.pauseGoal(run, violation);
+    }
     const unmet = await this.completionPrerequisite(run);
     if (unmet) return this.fail(run, unmet);
     const status = completionStatus(run);
@@ -3610,10 +3640,14 @@ function reviewerPrompt(run: PlanExecRun): string {
 
 function fusionPrompt(run: PlanExecRun): string {
   return [
-    "Perform an adversarial implementation review for this completed plan execution.",
-    `Plan: ${run.planPath}`,
+    run.goal
+      ? "Perform an adversarial implementation review for this completed goal run."
+      : "Perform an adversarial implementation review for this completed plan execution.",
+    run.goal ? `Goal: ${run.goal.text}` : `Plan: ${run.planPath}`,
     `Worktree: ${run.worktreeCwd}`,
-    `Default branch: ${run.defaultBranch}`,
+    run.goal
+      ? `Inspect the diff from ${run.outputTarget?.initialHead ?? "the goal start"} to HEAD.`
+      : `Default branch: ${run.defaultBranch}`,
     "Return findings using the exact review contract:",
     "NO_FINDINGS",
     "or FINDING: CRITICAL|MAJOR|MINOR | summary, followed by Evidence: and Fix: lines.",
@@ -3626,15 +3660,19 @@ function fixerPrompt(
   rawOutput: string,
 ): string {
   return [
-    "You are the sole worker fixing review findings in an existing plan execution.",
-    `Plan: ${run.planPath}`,
+    run.goal
+      ? "You are the sole worker fixing review findings in an existing goal run."
+      : "You are the sole worker fixing review findings in an existing plan execution.",
+    run.goal ? `Goal: ${run.goal.text}` : `Plan: ${run.planPath}`,
     `Stage: ${run.stage}`,
     ...(run.reviewRecovery && run.reviewRecovery.repeats > 1 ? [
       `The same normalized findings remain after ${run.reviewRecovery.repeats} reviews, including commit ${run.reviewRecovery.lastReviewedCommit ?? "unavailable"}. Commit creation has not resolved them.`,
       "Change the diagnosis before editing again: reproduce each blocking scenario, identify why the previous fix missed it, and validate a different repair against that reproduction. Do not repeat the same edit or dismiss the finding to finish.",
     ] : []),
     "Apply only justified findings, run relevant verification, and commit the fixes.",
-    "Do not modify plan task checkboxes unless the implementation task itself requires it.",
+    run.goal
+      ? "Do not weaken, delete, or skip tests to satisfy a finding; the goal completion guard checks the final commit."
+      : "Do not modify plan task checkboxes unless the implementation task itself requires it.",
     "Structured findings:",
     formatFindings(findings),
     "Raw reviewer output:",
@@ -3680,7 +3718,8 @@ function assertAcceptedCheckboxes(run: PlanExecRun, plan: ParsedPlan): void {
 function statsPrompt(run: PlanExecRun): string {
   return [
     "Produce compact execution statistics without editing files.",
-    `Plan: ${run.planPath}`,
+    run.goal ? `Goal: ${run.goal.text}` : `Plan: ${run.planPath}`,
+    ...(run.goal ? [`Turns: ${run.goal.iteration}/${run.goal.maxTurns}`, `Checks: ${run.goal.lastCheck?.failures ? "failing" : "passing"}`] : []),
     `Worktree: ${run.worktreeCwd}`,
     "Use git churn and available artifacts. Return concise Markdown with changed files, commits, verification, and residual findings.",
   ].join("\n");
