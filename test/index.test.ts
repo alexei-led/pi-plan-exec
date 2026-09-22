@@ -238,11 +238,13 @@ async function snapshotRuns(
   directory: string,
 ): Promise<Record<string, string>> {
   const snapshot: Record<string, string> = {};
-  for (const entry of await readdir(directory))
+  for (const entry of await readdir(directory)) {
+    if (entry.startsWith(".")) continue;
     snapshot[entry] = await readFile(
       join(directory, entry, "run.json"),
       "utf8",
     );
+  }
   return snapshot;
 }
 
@@ -2937,6 +2939,11 @@ test("status hands a blocked stage its skip command with the run ID filled in", 
 });
 
 test("required review and finalize stages never suggest force-skip", () => {
+  for (const status of ["failed", "paused", "skip_pending"] as const) {
+    const required = run({ status, stage: "finalize", config: { ...config, finalizeEnabled: false } });
+    assert.equal(isStageWaiverAvailable(required), false);
+    assert.doesNotMatch(recoveryGuidance(required).action, /\/exec skip/);
+  }
   for (const stage of ["comprehensive_review", "finalize"] as const) {
     const required = run({
       status: "failed",

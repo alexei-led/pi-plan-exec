@@ -322,7 +322,7 @@ full ID is always in front of you.
 /exec cleanup [full-run-id] [--apply]
                         Preview retired runs older than 7 days; --apply deletes their registry entries only
 /exec skip <full-run-id> --reason <text>
-                        Stop the tracked child, waive an optional review/finalize/stats stage, and continue
+                        Stop the tracked child, waive an optional review or statistics stage, and continue
 /exec help              Show this list
 ```
 
@@ -513,8 +513,9 @@ fence wins over a late diagnostic reply, and the same diagnostic action is
 reconciled after restart.
 
 `/exec skip` is a last-resort waiver, not a pass. It is available only while an
-optional review, finalization, or statistics stage is failed, paused, or already
-skip-pending. Required review and final verification cannot be skipped. If a
+optional review or statistics stage is failed, paused, or already
+skip-pending. Required review and final verification cannot be skipped, including
+when the legacy `finalizeEnabled` option is false. If a
 Bridge, Fusion, or Revmux operation is tracked, the controller requests
 stop and remains `skip_pending` until the provider proves that operation is
 terminal. The skipped stage remains visible in status and projected tasks, its

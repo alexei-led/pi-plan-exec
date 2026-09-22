@@ -519,7 +519,7 @@ export class PlanExecController {
     if (!isSkippableStage(claimed.stage))
       throw new Error(`Stage ${claimed.stage} cannot be force-skipped.`);
     if ((claimed.config.reviewRequired && isReviewStage(claimed.stage)) ||
-      (claimed.config.finalizeEnabled && claimed.stage === RUN_STAGE.FINALIZE))
+      claimed.stage === RUN_STAGE.FINALIZE)
       throw new Error(`Required ${claimed.stage} cannot be satisfied by skipping it.`);
     if (
       claimed.status !== RUN_STATUS.FAILED &&
@@ -2675,23 +2675,18 @@ export class PlanExecController {
 
     if (!operation.externalRunId) {
       if (operation.service === OPERATION_SERVICE.FUSION) {
-        const params = operation.params ?? {};
-        const prompt = text(params.prompt);
-        if (!prompt)
-          return this.recordStageSkipFailure(
-            run,
-            operation,
-            "Fusion recovery is missing its launch prompt during force-skip.",
-          );
         const launched = await (await this.reviewClient(run)).status(undefined, operation.operationId);
         if (!launched.success)
           return this.recordStageSkipFailure(run, operation, launched.error.message);
+        if (isFencedCancellation(launched.data, operation)) {
+          const fenced = await this.updateActiveOperation(run, operation.operationId, { launchFenced: true, stopAcknowledged: true });
+          return this.advanceStageSkip(fenced);
+        }
         const state = fusionState(launched.data);
-        if (
-          !state ||
-          state.phase === FUSION_PHASE.FAILED ||
-          state.phase === FUSION_PHASE.CANCELLED
-        )
+        const expectedLifetime = operationExpectedLifetime(operation);
+        if (!state || (operation.requestDigest && launched.data.requestDigest !== operation.requestDigest) ||
+          (launched.data.operationId !== undefined && launched.data.operationId !== operation.operationId) ||
+          (expectedLifetime && !sameLifetime(parseExecutionLifetime(launched.data.effectiveExecutionLifetime), expectedLifetime)))
           return this.recordStageSkipFailure(run, operation, "Fusion ownership is unresolved during skip.");
         const attached = await this.updateActiveOperation(
           run,
@@ -2703,13 +2698,18 @@ export class PlanExecController {
         );
         return this.advanceStageSkip(attached);
       }
-      const lookup = await this.bridge.operation(operation.operationId);
+      const owner = bridgeOperationOwner(run, operation);
+      const lookup = await this.bridge.operation(operation.operationId, owner);
       if (!lookup.success)
         return this.recordStageSkipFailure(
           run,
           operation,
           `Unable to look up bridge operation: ${lookup.error.message}`,
         );
+      if (isFencedCancellation(lookup.data, operation)) {
+        const fenced = await this.updateActiveOperation(run, operation.operationId, { launchFenced: true, stopAcknowledged: true });
+        return this.advanceStageSkip(fenced);
+      }
       const lookupState = text(lookup.data.state);
       if (lookupState === EXTERNAL_OPERATION_STATE.PENDING)
         return this.registry.heartbeat(run);
@@ -2728,6 +2728,11 @@ export class PlanExecController {
           operation,
           "Bridge operation lookup returned an invalid state during force-skip.",
         );
+      const expectedLifetime = operationExpectedLifetime(operation);
+      if ((owner && lookup.data.requestDigest !== owner.requestDigest) ||
+        (lookup.data.operationId !== undefined && lookup.data.operationId !== operation.operationId) ||
+        (expectedLifetime && !sameLifetime(parseExecutionLifetime(lookup.data.effectiveExecutionLifetime), expectedLifetime)))
+        return this.recordStageSkipFailure(run, operation, "Bridge ownership is unresolved during skip.");
       const externalRunId = text(lookup.data.runId);
       if (!externalRunId)
         return this.fail(
@@ -2750,7 +2755,7 @@ export class PlanExecController {
 
     const status =
       operation.service === OPERATION_SERVICE.BRIDGE
-        ? await this.bridge.status(operation.externalRunId, operation.asyncDir)
+        ? await this.bridgeStatus(run, operation)
         : await (await this.reviewClient(run)).status(operation.externalRunId);
     if (!status.success)
       return this.recordStageSkipFailure(
@@ -2834,7 +2839,8 @@ export class PlanExecController {
         (finding) => !existingFindingIds.has(finding.id),
       ),
     ];
-    const next = nextStage(request.stage);
+    const verificationRequired = request.stage === RUN_STAGE.FINALIZE;
+    const next = verificationRequired ? RUN_STAGE.FINALIZE : nextStage(request.stage);
     const ready = clearError(
       withoutOperation({
         ...run,
@@ -2844,7 +2850,7 @@ export class PlanExecController {
         nextAttemptAt: 0,
         reviewFindings: [],
         unresolvedFindings,
-        skippedStages: [
+        skippedStages: verificationRequired ? run.skippedStages : [
           ...run.skippedStages,
           {
             ...request,
@@ -2868,7 +2874,9 @@ export class PlanExecController {
     const persisted = completion.run;
     await appendProgressBestEffort(
       persisted,
-      `FORCE-SKIPPED ${request.stage} by ${request.requestedBy}: ${request.reason}\nOperation state: ${terminalOperationState}\nNext stage: ${next}`,
+      verificationRequired
+        ? "Retired the pending finalizer skip; continuing required candidate verification."
+        : `FORCE-SKIPPED ${request.stage} by ${request.requestedBy}: ${request.reason}\nOperation state: ${terminalOperationState}\nNext stage: ${next}`,
     );
     return this.advanceUnlocked(persisted);
   }

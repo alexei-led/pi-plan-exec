@@ -159,7 +159,7 @@ blocker wording does not create that classification.
 Task dependencies control eligibility, while plan-exec still runs one child at
 a time per controller and keeps one writer per lane. When a provider operation
 may still exist, plan-exec keeps its recorded operation ID and reconciles it
-before any retry. If an optional review, finalization, or statistics stage
+before any retry. If an optional review or statistics stage
 cannot recover, `/exec skip <full-run-id> --reason <text>` stops the tracked
 child before recording an explicit waiver and advancing. Required review and
 final verification cannot be skipped; implementation and archival never can.

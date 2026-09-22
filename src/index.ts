@@ -1503,8 +1503,7 @@ function sectionLines(
 }
 
 /**
- * A blocked review, finalize, or stats stage moves only by waiver, so the row
- * spells the waiver out with the run ID filled in.
+ * Show the explicit waiver command for a blocked optional stage.
  */
 function stageWaiverLines(run: PlanExecRun): string[] {
   if (!isStageWaiverAvailable(run)) return [];
@@ -3062,8 +3061,7 @@ export function isActionAllowed(
  */
 export function isStageWaiverAvailable(run: PlanExecRun): boolean {
   if (isReviewStage(run.stage) && run.config.reviewRequired) return false;
-  if (run.stage === RUN_STAGE.FINALIZE && run.config.finalizeEnabled)
-    return false;
+  if (run.stage === RUN_STAGE.FINALIZE) return false;
   return (
     isSkippableStage(run.stage) &&
     (run.status === RUN_STATUS.FAILED ||
@@ -3586,7 +3584,7 @@ export function execHelp(): string {
     `/exec cleanup [full-run-id] [${CLEANUP_APPLY_OPTION}]`,
     `                        Preview retired runs older than ${CLEANUP_RETENTION_DAYS} days; ${CLEANUP_APPLY_OPTION} deletes their registry entries only.`,
     "/exec skip <full-run-id> --reason <text>",
-    "                        Waiver of last resort: stop any tracked child, force-skip a review/finalize/stats stage that cannot pass, and record why.",
+    "                        Stop the tracked child, waive an optional review or statistics stage, and record why. Required review and final verification cannot be skipped.",
     "/exec help              Show this list.",
     "",
     "Hints:",

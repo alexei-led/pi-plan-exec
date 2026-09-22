@@ -28,6 +28,7 @@ import {
   takeoverRefusal,
 } from "../src/registry.js";
 import { DEFAULT_FROZEN_RUN_CONFIG, type PlanExecRun } from "../src/types.js";
+import { acquireLock } from "../src/registry-lock.js";
 import { workspaceEnvironment } from "../src/workspace-environment.js";
 
 type RunLease = NonNullable<PlanExecRun["lease"]>;
@@ -848,97 +849,28 @@ test("stale heartbeat preserves a newer cancellation request", async () => {
   assert.equal(observed.updatedAt, cancelling.updatedAt);
 });
 
-test("controller lock recovers an orphan from the same live Pi process", async () => {
+test("controller lock reuses a stable file after release", async (t) => {
   const { directory, registry } = await seedRegistry();
+  t.after(() => rm(directory, { recursive: true, force: true }));
   const run = await registry.create(runSeed());
-  const lockPath = join(directory, run.id, "run.json.controller.lock");
-  await writeFile(
-    lockPath,
-    `${JSON.stringify({
-      pid: process.pid,
-      createdAt: Date.now() - 180_000,
-      token: "orphaned-extension",
-    })}\n`,
-  );
-
-  const result = await registry.withControllerLock(run.id, async () => "ok");
-
-  assert.equal(result, "ok");
-  await assert.rejects(readFile(lockPath), /ENOENT/);
+  const lockPath = join(directory, ".locks", `${run.id}.controller.lock`);
+  assert.equal(await registry.withControllerLock(run.id, async () => "first"), "first");
+  const before = await stat(lockPath);
+  assert.equal(await registry.withControllerLock(run.id, async () => "second"), "second");
+  assert.equal((await stat(lockPath)).ino, before.ino);
 });
 
-test("controller lock treats fresh empty metadata as held", async () => {
+test("controller lock bounds contention without stealing a live lock", async (t) => {
   const { directory, registry } = await seedRegistry();
+  t.after(() => rm(directory, { recursive: true, force: true }));
   const run = await registry.create(runSeed());
-  const lockPath = join(directory, run.id, "run.json.controller.lock");
-  await writeFile(lockPath, "");
-
-  const result = await registry.withControllerLock(run.id, async () => "stolen");
-
-  assert.equal(result, undefined);
-  await rm(lockPath);
-});
-
-test("controller lock does not steal an old lock from a live local owner", async () => {
-  const { directory, registry } = await seedRegistry();
-  const run = await registry.create(runSeed());
-  const lockPath = join(directory, run.id, "run.json.controller.lock");
-  await writeFile(
-    lockPath,
-    `${JSON.stringify({
-      pid: process.pid,
-      hostname: hostname(),
-      createdAt: Date.now() - 180_000,
-      token: "slow-live-controller",
-    })}\n`,
-  );
-
-  const result = await registry.withControllerLock(run.id, async () => "stolen");
-
-  assert.equal(result, undefined);
-  assert.match(await readFile(lockPath, "utf8"), /slow-live-controller/);
-  await rm(lockPath);
-});
-
-test("controller lock fails closed for a foreign host", async () => {
-  const { directory, registry } = await seedRegistry();
-  const run = await registry.create(runSeed());
-  const lockPath = join(directory, run.id, "run.json.controller.lock");
-  await writeFile(
-    lockPath,
-    `${JSON.stringify({
-      pid: process.pid,
-      hostname: "other-host.example",
-      createdAt: Date.now() - 180_000,
-      token: "foreign-controller",
-    })}\n`,
-  );
-
-  const result = await registry.withControllerLock(run.id, async () => "stolen");
-
-  assert.equal(result, undefined);
-  assert.match(await readFile(lockPath, "utf8"), /foreign-controller/);
-  await rm(lockPath);
-});
-
-test("controller lock does not steal a fresh live provider request", async () => {
-  const { directory, registry } = await seedRegistry();
-  const run = await registry.create(runSeed());
-  const lockPath = join(directory, run.id, "run.json.controller.lock");
-  await writeFile(
-    lockPath,
-    `${JSON.stringify({
-      pid: process.pid,
-      createdAt: Date.now() - 60_000,
-      token: "live-provider-request",
-    })}\n`,
-  );
-
-  const result = await registry.withControllerLock(run.id, async () => "ok");
-
-  assert.equal(result, undefined);
-  assert.match(await readFile(lockPath, "utf8"), /live-provider-request/);
-  await rm(lockPath);
+  const lock = await acquireLock(join(directory, ".locks", `${run.id}.controller.lock`));
+  try {
+    assert.equal(await registry.withControllerLock(run.id, async () => "stolen"), undefined);
+  } finally {
+    await lock.release();
+  }
+  assert.equal(await registry.withControllerLock(run.id, async () => "released"), "released");
 });
 
 test("registry update timestamps are monotonic for compare-and-set safety", async () => {
@@ -1126,12 +1058,7 @@ test("remove refuses a record it cannot read for an I/O reason", async () => {
 test("remove decides refusal under the lock, not before it", async () => {
   const { directory, registry, run } = await seedRemovable();
   const path = join(directory, run.id, "run.json");
-  const lockPath = `${path}.lock`;
-  // Hold the run's lock the way a concurrent writer would.
-  await writeFile(
-    lockPath,
-    `${JSON.stringify({ pid: process.pid, createdAt: Date.now(), token: "held" })}\n`,
-  );
+  const lock = await acquireLock(join(directory, ".locks", `${run.id}.record.lock`));
 
   const removal = registry.remove(run.id);
   // Revived while the removal waits for the lock: a refusal decided before
@@ -1140,7 +1067,7 @@ test("remove decides refusal under the lock, not before it", async () => {
     path,
     `${JSON.stringify({ ...run, status: "running", stage: "implementation" })}\n`,
   );
-  await rm(lockPath);
+  await lock.release();
 
   await assert.rejects(removal, /only a terminal run can be removed/);
   assert.equal((await registry.get(run.id))?.status, "running");
@@ -1150,14 +1077,12 @@ test("remove refuses a run a controller is recovering", async () => {
   const { directory, registry, run } = await seedRemovable({
     status: "failed",
   });
-  // The controller lock as /exec resume holds it: this process, taken now, so
-  // the stale-lock breaker leaves it alone.
-  await writeFile(
-    join(directory, run.id, "run.json.controller.lock"),
-    `${JSON.stringify({ pid: process.pid, createdAt: Date.now(), token: "held" })}\n`,
-  );
-
-  await assert.rejects(registry.remove(run.id), /being recovered/);
+  const lock = await acquireLock(join(directory, ".locks", `${run.id}.controller.lock`));
+  try {
+    await assert.rejects(registry.remove(run.id), /being recovered/);
+  } finally {
+    await lock.release();
+  }
   assert.ok(
     await stat(join(directory, run.id, "run.json")),
     "a run under recovery survives",
