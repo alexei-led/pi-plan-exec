@@ -118,8 +118,10 @@ test('a retired operation with a stale claim still cancels as retired', async ()
     observation = await observeOwnedProcess(directory);
   }
   assert.equal(observation.status, 'retired');
+  // A successful launch keeps its claim as the durable launch lock.
+  await readFile(join(directory, 'launching.json'), 'utf8');
 
-  // Recreate a stale claim to simulate a launcher that never released it.
+  // Age the kept claim so the cancelled branch is exercised past the grace.
   await writeFile(
     join(directory, 'launching.json'),
     JSON.stringify({ version: 1, claimedAt: Date.now() - 10 * 60_000 }),
