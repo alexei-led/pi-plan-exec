@@ -1,16 +1,15 @@
 import { randomUUID } from "node:crypto";
 import {
   mkdir,
-  open,
   readFile,
   realpath,
   rename,
   rm,
-  stat,
   writeFile,
 } from "node:fs/promises";
 import { homedir, hostname } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { acquireLock, LockTimeoutError } from "./registry-lock.js";
 import { worktreeIdentity } from "./git.js";
 import { isSkippableStage, isTerminalStatus } from "./lifecycle.js";
 import { parseOperationActivity } from "./diagnostics.js";
@@ -33,11 +32,7 @@ import {
 const RUNS_DIRECTORY = join(homedir(), ".pi", "plan-exec", "runs");
 const INVALID_RUN_ENTRY = "Invalid plan-exec run registry entry";
 export const LEASE_STALE_MS = 30_000;
-const LOCK_RETRY_MS = 50;
-const LOCK_MAX_RETRIES = 100;
-const LOCK_STALE_MS = 10_000;
 const CONTROLLER_LOCK_MAX_RETRIES = 20;
-const CONTROLLER_LOCK_STALE_MS = 120_000;
 const CLAIM_CAS_RETRIES = 5;
 const RUN_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -204,7 +199,7 @@ export class RunRegistry {
       await this.write(created);
       return created;
     } finally {
-      await releaseLock(registryLockPath, registryLock);
+      await registryLock.release();
     }
   }
 
@@ -325,7 +320,7 @@ export class RunRegistry {
     run = { ...run, revision: run.revision ?? 1 };
     assertRun(run);
     const path = this.pathFor(run.id);
-    const lockPath = `${path}.lock`;
+    const lockPath = this.recordLockPath(run.id);
     const lock = await acquireLock(lockPath);
     try {
       let current: PlanExecRun;
@@ -350,7 +345,7 @@ export class RunRegistry {
       await writeLocked(path, updated);
       return { run: updated, applied: true };
     } finally {
-      await releaseLock(lockPath, lock);
+      await lock.release();
     }
   }
 
@@ -410,7 +405,6 @@ export class RunRegistry {
       lock = await acquireLock(
         path,
         CONTROLLER_LOCK_MAX_RETRIES,
-        CONTROLLER_LOCK_STALE_MS,
       );
     } catch (error: unknown) {
       if (error instanceof LockTimeoutError) return undefined;
@@ -419,7 +413,7 @@ export class RunRegistry {
     try {
       return await callback();
     } finally {
-      await releaseLock(path, lock);
+      await lock.release();
     }
   }
 
@@ -461,7 +455,6 @@ export class RunRegistry {
       controllerLock = await acquireLock(
         controllerPath,
         CONTROLLER_LOCK_MAX_RETRIES,
-        CONTROLLER_LOCK_STALE_MS,
       );
     } catch (error: unknown) {
       // No directory to lock is no directory to delete.
@@ -476,13 +469,13 @@ export class RunRegistry {
     try {
       return await this.removeLocked(runId);
     } finally {
-      await releaseLock(controllerPath, controllerLock);
+      await controllerLock.release();
     }
   }
 
   private async removeLocked(runId: string): Promise<boolean> {
     const path = this.pathFor(runId);
-    const lockPath = `${path}.lock`;
+    const lockPath = this.recordLockPath(runId);
     let lock;
     try {
       lock = await acquireLock(lockPath);
@@ -500,7 +493,7 @@ export class RunRegistry {
       await rm(dirname(path), { recursive: true, force: true });
       return true;
     } finally {
-      await releaseLock(lockPath, lock);
+      await lock.release();
     }
   }
 
@@ -534,18 +527,24 @@ export class RunRegistry {
   }
 
   private controllerLockPath(runId: string): string {
-    return `${this.pathFor(runId)}.controller.lock`;
+    assertRunId(runId);
+    return join(this.directory, ".locks", `${runId}.controller.lock`);
+  }
+
+  private recordLockPath(runId: string): string {
+    assertRunId(runId);
+    return join(this.directory, ".locks", `${runId}.record.lock`);
   }
 
   private async write(run: PlanExecRun): Promise<void> {
     const path = this.pathFor(run.id);
     await mkdir(dirname(path), { recursive: true });
-    const lockPath = `${path}.lock`;
+    const lockPath = this.recordLockPath(run.id);
     const lock = await acquireLock(lockPath);
     try {
       await writeLocked(path, run);
     } finally {
-      await releaseLock(lockPath, lock);
+      await lock.release();
     }
   }
 }
@@ -557,93 +556,6 @@ async function writeLocked(path: string, run: PlanExecRun): Promise<void> {
   await rename(temporary, path);
 }
 
-async function acquireLock(
-  path: string,
-  maxRetries = LOCK_MAX_RETRIES,
-  staleMs = LOCK_STALE_MS,
-) {
-  for (let attempt = 0; attempt < maxRetries; attempt += 1) {
-    try {
-      const handle = await open(path, "wx");
-      const token = randomUUID();
-      try {
-        await handle.writeFile(
-          `${JSON.stringify({
-            pid: process.pid,
-            hostname: hostname(),
-            createdAt: Date.now(),
-            token,
-          })}\n`,
-          "utf8",
-        );
-        return { handle, token };
-      } catch (error: unknown) {
-        await handle.close();
-        await rm(path, { force: true });
-        throw error;
-      }
-    } catch (error: unknown) {
-      if (!isNodeError(error, "EEXIST")) throw error;
-      await removeStaleLock(path, staleMs);
-      await delay(LOCK_RETRY_MS);
-    }
-  }
-  throw new LockTimeoutError(path);
-}
-
-class LockTimeoutError extends Error {
-  constructor(path: string) {
-    super(`Timed out acquiring plan-exec registry lock: ${path}`);
-  }
-}
-
-async function removeStaleLock(path: string, staleMs: number): Promise<void> {
-  try {
-    const raw = (await readFile(path, "utf8")).trim();
-    const parsed: unknown = raw.startsWith("{") ? JSON.parse(raw) : undefined;
-    const pid = isRecord(parsed)
-      ? numberOr(parsed.pid, 0)
-      : Number.parseInt(raw, 10);
-    const ownerHostname = isRecord(parsed) ? stringOr(parsed.hostname, "") : "";
-    if (ownerHostname) {
-      // Current locks fail closed across hosts and while their local owner is
-      // alive. Age alone cannot fence a controller that is still mutating Git.
-      if (!isThisHost(ownerHostname)) return;
-      if (Number.isSafeInteger(pid) && pid > 0 && isProcessRunning(pid)) return;
-      await rm(path, { force: true });
-      return;
-    }
-
-    // Legacy locks had no hostname. Preserve their bounded recovery behavior;
-    // new locks above require positive owner-death evidence instead.
-    const createdAt = isRecord(parsed)
-      ? numberOr(parsed.createdAt, 0)
-      : (await stat(path)).mtimeMs;
-    if (
-      (Number.isSafeInteger(pid) && pid > 0 && !isProcessRunning(pid)) ||
-      (createdAt > 0 && Date.now() - createdAt > staleMs)
-    )
-      await rm(path, { force: true });
-  } catch (error: unknown) {
-    if (!isNodeError(error, "ENOENT")) throw error;
-  }
-}
-
-async function releaseLock(
-  path: string,
-  lock: { handle: Awaited<ReturnType<typeof open>>; token: string },
-): Promise<void> {
-  await lock.handle.close();
-  try {
-    const parsed: unknown = JSON.parse(await readFile(path, "utf8"));
-    if (isRecord(parsed) && parsed.token === lock.token)
-      await rm(path, { force: true });
-  } catch (error: unknown) {
-    if (!isNodeError(error, "ENOENT") && !(error instanceof SyntaxError))
-      throw error;
-  }
-}
-
 function isProcessRunning(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -651,10 +563,6 @@ function isProcessRunning(pid: number): boolean {
   } catch (error: unknown) {
     return (error as NodeJS.ErrnoException).code === "EPERM";
   }
-}
-
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function parseRun(raw: string, runId: string): PlanExecRun {

@@ -58,7 +58,7 @@ class Worker {
     if (this.loseSpawn) return { success: false, error: { message: "lost spawn reply" } };
     return ok({ runId: id, requestDigest: bridgeRequestDigest(params), effectiveExecutionLifetime: params.executionLifetime });
   }
-  async operation(id: string) {
+  async operation(id: string): Promise<BridgeResult> {
     const launch = this.launches.find((item) => item.id === id);
     return ok(launch ? { state: "found", runId: id, requestDigest: bridgeRequestDigest(launch.params), effectiveExecutionLifetime: launch.params.executionLifetime } : { state: "unknown" });
   }
@@ -1093,6 +1093,166 @@ test("required review cannot be waived by explicit skip", async (t) => {
   await assert.rejects(f.controller.skip(run.id, "session", "skip it"), /Required comprehensive_review/);
   assert.equal((await f.registry.get(run.id))?.stage, "comprehensive_review");
 });
+
+for (const finalizeEnabled of [true, false]) {
+  test(`final verification cannot be skipped with finalizeEnabled=${finalizeEnabled}`, async (t) => {
+    const f = await fixture(t, "### Task 1: A\n- [x] A\n");
+    const head = await f.git("rev-parse", "HEAD");
+    let run = await f.registry.update({ ...f.run, stage: "finalize", status: "paused", userStopped: true,
+      stopGeneration: 1, acceptedHead: head,
+      tasks: { "1": { taskId: 1, dependsOn: [], state: "accepted", attempts: 1, acceptedCommit: head } },
+      config: { ...f.run.config, reviewRequired: false, finalizeEnabled } });
+    await assert.rejects(f.controller.skip(run.id, "session", "Skip optional finalizer", 1), /Required finalize/);
+    run = (await f.registry.get(run.id))!;
+    assert.equal(run.stage, "finalize");
+    assert.equal(run.verifiedCommit, undefined);
+    assert.equal(run.skippedStages.length, 0);
+    run = await f.controller.resume(run.id, "session");
+    assert.equal(run.verifiedCommit, head);
+    for (let tick = 0; tick < 30 && run.status !== "completed"; tick++) run = await f.controller.tick(run.id, "session");
+    assert.equal(run.status, "completed");
+  });
+}
+
+test("restart of an older pending finalize skip retains mandatory verification", async (t) => {
+  const f = await fixture(t, "### Task 1: A\n- [x] A\n");
+  const head = await f.git("rev-parse", "HEAD");
+  let run = await f.registry.update({ ...f.run, stage: "finalize", status: "skip_pending", acceptedHead: head,
+    pendingStageSkip: { stage: "finalize", reason: "Older optional finalizer waiver", requestedAt: 1, requestedBy: "session" },
+    tasks: { "1": { taskId: 1, dependsOn: [], state: "accepted", attempts: 1, acceptedCommit: head } },
+    config: { ...f.run.config, reviewRequired: false, finalizeEnabled: false } });
+  run = await f.controller.tick(run.id, "session");
+  assert.equal(run.verifiedCommit, head);
+  assert.equal(run.pendingStageSkip, undefined);
+  assert.equal(run.skippedStages.length, 0);
+  for (let tick = 0; tick < 30 && run.status !== "completed"; tick++) run = await f.controller.tick(run.id, "session");
+  assert.equal(run.status, "completed");
+});
+
+for (const phase of ["cancelled", "failed"] as const) {
+  test(`lost optional review reply recovers ${phase} identity but waits for retirement across restart`, async (t) => {
+    const f = await fixture(t, "### Task 1: A\n- [x] A\n");
+    const head = await f.git("rev-parse", "HEAD");
+    const operationId = "lost-review";
+    const runId = "recovered-review";
+    const params = { prompt: "Review the candidate", backend: "fusion", cwd: f.root, reviewedCommit: head,
+      executionLifetime: { mode: "unbounded" } };
+    const digest = bridgeRequestDigest(params);
+    let retired = false;
+    let cancels = 0;
+    const backend = { ...fusion,
+      start: async () => { assert.fail("Skip cannot start another review"); },
+      cancel: async () => { cancels++; return ok({ runId, operationId, requestDigest: digest, cancellationRequested: true }); },
+      status: async () => ok({ operationId, requestDigest: digest, effectiveExecutionLifetime: params.executionLifetime,
+        run: { runId, phase, terminal: true },
+        ...(retired ? { processTerminalProof: { ...observedWorkerProof(runId, digest),
+          callerBinding: { operationId, requestDigest: digest } } } : {}) }),
+    };
+    let run = await f.registry.update({ ...f.run, stage: "critical_review", status: "paused", userStopped: true,
+      stopGeneration: 1, acceptedHead: head,
+      tasks: { "1": { taskId: 1, dependsOn: [], state: "accepted", attempts: 1, acceptedCommit: head } },
+      activeOperation: { operationId, service: "fusion", kind: "fusion", params, requestDigest: digest },
+      config: { ...f.run.config, reviewRequired: false } });
+    const controller = new PlanExecController(f.registry, f.worker, backend, command, f.localExecutor);
+    run = await controller.skip(run.id, "session", "Optional review waived", 1);
+    assert.equal(run.status, "skip_pending");
+    assert.equal(run.activeOperation?.externalRunId, runId);
+    assert.equal(run.skippedStages.length, 0);
+    assert.equal(cancels, 1);
+    assert.equal(f.worker.launches.length, 0);
+    retired = true;
+    const restarted = new PlanExecController(f.registry, f.worker, backend, command, f.localExecutor);
+    run = await restarted.tick(run.id, "session");
+    assert.equal(run.skippedStages[0]?.terminalOperationState, phase);
+    assert.equal(run.skippedStages[0]?.externalRunId, runId);
+    assert.equal(run.verifiedCommit, head);
+    for (let tick = 0; tick < 30 && run.status !== "completed_with_findings"; tick++) run = await restarted.tick(run.id, "session");
+    assert.equal(run.status, "completed_with_findings");
+    assert.equal(f.worker.launches.length, 0);
+  });
+}
+
+test("lost optional Bridge reply uses its owner to recover and retire the same worker", async (t) => {
+  const f = await fixture(t, "### Task 1: A\n- [x] A\n");
+  const head = await f.git("rev-parse", "HEAD");
+  const owners: BridgeOperationOwner[] = [];
+  const worker = new class extends Worker {
+    async operation(id: string, owner?: BridgeOperationOwner): Promise<BridgeResult> {
+      if (!owner) return { success: false, error: { message: "operation requires owner" } };
+      owners.push(owner);
+      assert.equal(owner.runId, f.run.id);
+      assert.equal(owner.key, id);
+      assert.equal(owner.requestDigest, bridgeRequestDigest(this.launches.find((launch) => launch.id === id)!.params));
+      return super.operation(id);
+    }
+    async cancelOperation(id: string, owner: BridgeOperationOwner) {
+      return ok({ operationId: id, requestDigest: owner.requestDigest, cancellationRequested: true, state: "stopping" });
+    }
+  }(join(f.root, ".git", "owned-result.json"));
+  worker.loseSpawn = true;
+  const controller = new PlanExecController(f.registry, worker, fusion, command, f.localExecutor);
+  let run = await f.registry.update({ ...f.run, stage: "stats", acceptedHead: head, verifiedCommit: head,
+    tasks: { "1": { taskId: 1, dependsOn: [], state: "accepted", attempts: 1, acceptedCommit: head } },
+    config: { ...f.run.config, reviewRequired: false, statsEnabled: true } });
+  run = await controller.tick(run.id, "session");
+  const operationId = run.activeOperation!.operationId;
+  assert.equal(run.activeOperation!.externalRunId, undefined);
+  run = await f.registry.update({ ...run, status: "paused", userStopped: true, stopGeneration: 1 });
+  run = await controller.skip(run.id, "session", "Optional stats waived", 1);
+  assert.equal(run.activeOperation?.externalRunId, operationId);
+  assert.equal(run.status, "skip_pending");
+  assert.equal(run.skippedStages.length, 0);
+  assert.ok(owners.length > 0);
+  worker.state = "stopped";
+  worker.proof = true;
+  const restarted = new PlanExecController(f.registry, worker, fusion, command, f.localExecutor);
+  for (let tick = 0; tick < 30 && run.status !== "completed_with_findings"; tick++) run = await restarted.tick(run.id, "session");
+  assert.equal(run.status, "completed_with_findings");
+  assert.equal(run.skippedStages[0]?.externalRunId, operationId);
+  assert.equal(worker.launches.length, 1);
+});
+
+for (const service of ["bridge", "fusion"] as const) {
+  for (const replyKind of ["fenced", "wrong operation", "wrong digest", "wrong lifetime"] as const) {
+    test(`optional ${service} skip reconciles ${replyKind} lookup after cancellation reply loss`, async (t) => {
+      const f = await fixture(t, "### Task 1: A\n- [x] A\n");
+      const head = await f.git("rev-parse", "HEAD");
+      const operationId = "unknown-review";
+      const params = { prompt: "Review", backend: "fusion", cwd: f.root, reviewedCommit: head,
+        executionLifetime: { mode: "unbounded" } };
+      const digest = bridgeRequestDigest(params);
+      const lostReply: BridgeResult = { success: false, error: { code: "timeout", message: "Cancellation reply lost" } };
+      const data = replyKind === "fenced"
+        ? { operationId, requestDigest: digest, state: "cancelled", cancellationRequested: true, neverStarted: true, replaySafe: false }
+        : { state: "found", runId: "untrusted-run", phase: "cancelled", terminal: true,
+          operationId: replyKind === "wrong operation" ? "another-operation" : operationId,
+          requestDigest: replyKind === "wrong digest" ? "another-digest" : digest,
+          effectiveExecutionLifetime: replyKind === "wrong lifetime" ? { mode: "bounded", timeoutMs: 1000 } : params.executionLifetime };
+      const worker = Object.assign(f.worker, {
+        cancelOperation: async () => lostReply,
+        operation: async (_id: string, owner?: BridgeOperationOwner) => { assert.equal(owner?.requestDigest, digest); return ok(data); },
+      });
+      const backend = { ...fusion, cancel: async () => lostReply, status: async () => ok(data) };
+      const controller = new PlanExecController(f.registry, worker, backend, command, f.localExecutor);
+      let run = await f.registry.update({ ...f.run, stage: "critical_review", status: "paused", userStopped: true,
+        stopGeneration: 1, acceptedHead: head,
+        tasks: { "1": { taskId: 1, dependsOn: [], state: "accepted", attempts: 1, acceptedCommit: head } },
+        activeOperation: { operationId, service, kind: service === "fusion" ? "fusion" : "review", params, requestDigest: digest },
+        config: { ...f.run.config, reviewRequired: false } });
+      run = await controller.skip(run.id, "session", "Optional review waived", 1);
+      if (replyKind === "fenced") {
+        assert.equal(run.skippedStages[0]?.terminalOperationState, "launch durably fenced before dispatch");
+        assert.equal(run.verifiedCommit, head);
+      } else {
+        assert.equal(run.status, "skip_pending");
+        assert.equal(run.activeOperation?.externalRunId, undefined);
+        assert.equal(run.skippedStages.length, 0);
+        assert.match(run.activeOperation?.lastSkipError ?? "", /ownership is unresolved/);
+      }
+      assert.equal(worker.launches.length, 0);
+    });
+  }
+}
 
 for (const stage of ["comprehensive_review", "stats"] as const) {
   test(`explicit skip of paused optional ${stage} continues automatically`, async (t) => {
