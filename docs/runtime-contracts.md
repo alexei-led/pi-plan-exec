@@ -152,7 +152,7 @@ The source pins currently under review are:
 
 - native `pi-subagents`: `e78595340ff36ad481e205c0872fadba9412227d`;
 - Bridge: `3e99ec2752a25c88cc75475db524c44f3157f69d`;
-- Fusion: `108c52cc3062076e3f721fcfb31061531000b73a`;
+- Fusion: `b113212469bb5d2d0ad7bb5ff98e7cec12e25c7e`;
 - Revmux: `988904f30da351e76c29d5779c6833a6bf890b51`;
 - Pi SDK: `0.86.1`.
 
@@ -160,7 +160,7 @@ Reported dependency checks are native 3337/3361 unit and 1101/1109 integration
 tests with the 10 unit and 1 integration failure reproduced unchanged on the
 prior revision as Darwin environment failures (`/var` canonicalization and
 unix-socket `EINVAL`), seven actual owned-worktree cases, Bridge 72 tests
-plus delayed-admission/restart/cancel and exact-checkout smoke, Fusion 256 unit,
+plus delayed-admission/restart/cancel and exact-checkout smoke, Fusion 258 unit,
 132 integration, and one E2E, and the Revmux full Go gates. These are dependency
 evidence, not a claim that the main product gate or full production pipeline is
 complete.

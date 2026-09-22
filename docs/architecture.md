@@ -141,7 +141,9 @@ Run records live at:
 ```
 
 Writes use compare-and-set updates under kernel `flock` locks plus temporary-file
-rename. Lock files live at stable paths under `<runs>/.locks/` and are never
+rename. Lock files live at stable paths — the registry-wide lock at
+`<runs>/registry.lock` and the per-run controller and record locks under
+`<runs>/.locks/` — and are never
 unlinked, so a lock's lifetime is the open file description's lifetime: a dead
 owner releases it when the kernel closes the descriptor. Controller transitions
 use a per-run lock; stale reload instances cannot
