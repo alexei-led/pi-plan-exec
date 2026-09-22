@@ -515,16 +515,16 @@ test("help and setup explain the installed command surface", () => {
     assert.doesNotMatch(execHelp(), new RegExp(`/exec ${alias}`), alias);
   assert.match(
     execSetup(),
-    /pi install -l git:github\.com\/alexei-led\/pi-subagents-bridge@[a-f0-9]{40}$/m,
+    /pi install -l npm:@alexeiled\/pi-subagents-bridge@\^0\.3\.2$/m,
   );
-  assert.match(execSetup(), /pi install -l git:github\.com\/alexei-led\/pi-fusion@[a-f0-9]{40}$/m);
+  assert.match(execSetup(), /pi install -l npm:@alexeiled\/pi-fusion@\^0\.9\.1$/m);
   assert.match(execSetup(), /Keep this plan-exec source build installed/);
 });
 
-test("setup installs exact project-local source pins rather than obsolete published runtime APIs", () => {
-  assert.doesNotMatch(execSetup(), /npm:[^\s]+@(?:\^|>=|<=|=|~)/);
+test("setup installs the released bridge and fusion pins with the pinned native revision", () => {
   assert.match(execSetup(), /^pi install -l git:github\.com\/alexei-led\/pi-subagents-codex-fix@[a-f0-9]{40}$/m);
-  assert.match(execSetup(), /^pi install -l git:github\.com\/alexei-led\/pi-subagents-bridge@[a-f0-9]{40}$/m);
+  assert.match(execSetup(), /^pi install -l npm:@alexeiled\/pi-subagents-bridge@\^0\.3\.2$/m);
+  assert.match(execSetup(), /^pi install -l npm:@alexeiled\/pi-fusion@\^0\.9\.1$/m);
   assert.doesNotMatch(execSetup(), /^pi install npm:(?:pi-subagents|@alexeiled\/pi-plan-exec)$/m);
   assert.match(execSetup(), /Optional task visibility \(not required for execution\)/);
 });

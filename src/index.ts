@@ -164,8 +164,11 @@ function sourceInstallCommand(packageName: string): string {
       const dependencies = isRecord(manifest.dependencies) ? manifest.dependencies : {};
       const development = isRecord(manifest.devDependencies) ? manifest.devDependencies : {};
       const reference = dependencies[packageName] ?? development[packageName];
-      const match = typeof reference === "string" ? reference.match(/^git\+https:\/\/github\.com\/([\w.-]+\/[\w.-]+)\.git#([a-f0-9]{40})$/i) : undefined;
-      if (match) return `pi install -l git:github.com/${match[1]}@${match[2]}`;
+      if (typeof reference === "string") {
+        const git = reference.match(/^git\+https:\/\/github\.com\/([\w.-]+\/[\w.-]+)\.git#([a-f0-9]{40})$/i);
+        if (git) return `pi install -l git:github.com/${git[1]}@${git[2]}`;
+        if (/^[\^~]?\d+\.\d+\.\d+/.test(reference)) return `pi install -l npm:${packageName}@${reference}`;
+      }
     }
   } catch { /* A missing manifest must not imply that old published APIs suffice. */ }
   return `Install ${packageName} from the matching source revision documented in docs/runtime-contracts.md.`;

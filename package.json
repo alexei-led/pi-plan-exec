@@ -51,8 +51,8 @@
     "image": "https://raw.githubusercontent.com/alexei-led/pi-plan-exec/main/assets/plan-exec-card.png"
   },
   "peerDependencies": {
-    "@alexeiled/pi-fusion": ">=0.7.0",
-    "@alexeiled/pi-subagents-bridge": ">=0.3.0",
+    "@alexeiled/pi-fusion": ">=0.9.1 <1.0.0",
+    "@alexeiled/pi-subagents-bridge": ">=0.3.2 <0.4.0",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
     "@tintinweb/pi-tasks": ">=0.9.0",
@@ -73,8 +73,8 @@
     "pi-subagents": "git+https://github.com/alexei-led/pi-subagents-codex-fix.git#e78595340ff36ad481e205c0872fadba9412227d"
   },
   "devDependencies": {
-    "@alexeiled/pi-fusion": "git+https://github.com/alexei-led/pi-fusion.git#b113212469bb5d2d0ad7bb5ff98e7cec12e25c7e",
-    "@alexeiled/pi-subagents-bridge": "git+https://github.com/alexei-led/pi-subagents-bridge.git#3e99ec2752a25c88cc75475db524c44f3157f69d",
+    "@alexeiled/pi-fusion": "^0.9.1",
+    "@alexeiled/pi-subagents-bridge": "^0.3.2",
     "@earendil-works/pi-coding-agent": "0.86.1",
     "@eslint/js": "^10.0.1",
     "@tintinweb/pi-tasks": "0.9.0",

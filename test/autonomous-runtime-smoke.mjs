@@ -32,12 +32,21 @@ process.env.NODE_OPTIONS = `--import=${preload}`;
 const manifest = JSON.parse(await readFile(join(project, "package.json"), "utf8"));
 const lock = JSON.parse(await readFile(join(project, "package-lock.json"), "utf8"));
 const installedLock = JSON.parse(await readFile(join(project, "node_modules/.package-lock.json"), "utf8"));
-for (const name of ["pi-subagents", "@alexeiled/pi-subagents-bridge"]) {
-  const dependency = manifest.dependencies?.[name] ?? manifest.devDependencies?.[name];
-  const revision = /#([a-f0-9]{40})$/.exec(dependency)?.[1];
-  assert.ok(revision, `${name} must use an immutable Git pin`);
-  assert.ok(lock.packages[`node_modules/${name}`].resolved.endsWith(`#${revision}`), `${name} installed lock must match the declared pin`);
-  assert.ok(installedLock.packages[`node_modules/${name}`].resolved.endsWith(`#${revision}`), `${name} installed package must match the declared pin`);
+const nativeRevision = /#([a-f0-9]{40})$/.exec(manifest.dependencies?.["pi-subagents"] ?? "")?.[1];
+assert.ok(nativeRevision, "pi-subagents must use an immutable Git pin");
+for (const source of [lock, installedLock]) {
+  assert.ok(source.packages["node_modules/pi-subagents"].resolved.endsWith(`#${nativeRevision}`), "pi-subagents installed package must match the declared pin");
+}
+for (const name of ["@alexeiled/pi-subagents-bridge", "@alexeiled/pi-fusion"]) {
+  const declared = manifest.devDependencies?.[name];
+  assert.match(declared ?? "", /^\^\d+\.\d+\.\d+$/, `${name} must use a released registry pin`);
+  const [major, minor, patch] = declared.slice(1).split(".").map(Number);
+  for (const source of [lock, installedLock]) {
+    const entry = source.packages[`node_modules/${name}`];
+    assert.match(entry.resolved, /^https:\/\/registry\.npmjs\.org\//, `${name} must resolve from the registry`);
+    const [installedMajor, installedMinor, installedPatch] = String(entry.version).split(".").map(Number);
+    assert.ok(installedMajor === major && installedMinor === minor && installedPatch >= patch, `${name} installed version must satisfy the declared range`);
+  }
 }
 const nativeRoot = join(project, "node_modules/pi-subagents");
 const bridgeRoot = join(project, "node_modules/@alexeiled/pi-subagents-bridge");
