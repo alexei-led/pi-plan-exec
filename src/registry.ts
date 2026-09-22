@@ -457,8 +457,6 @@ export class RunRegistry {
         CONTROLLER_LOCK_MAX_RETRIES,
       );
     } catch (error: unknown) {
-      // No directory to lock is no directory to delete.
-      if (isNodeError(error, "ENOENT")) return false;
       if (error instanceof LockTimeoutError)
         throw new Error(
           `Run ${runId} is being recovered by another controller; nothing was deleted.`,
@@ -476,13 +474,7 @@ export class RunRegistry {
   private async removeLocked(runId: string): Promise<boolean> {
     const path = this.pathFor(runId);
     const lockPath = this.recordLockPath(runId);
-    let lock;
-    try {
-      lock = await acquireLock(lockPath);
-    } catch (error: unknown) {
-      if (isNodeError(error, "ENOENT")) return false;
-      throw error;
-    }
+    const lock = await acquireLock(lockPath);
     try {
       if (await hasActiveLocalOperations(this.localOperationsPath(runId)))
         throw new Error(`Run ${runId} still has unconfirmed local command ownership.`);
