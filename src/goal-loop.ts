@@ -6,6 +6,7 @@ export const TASK_FAILED_MARKER = "<<<RALPHEX:TASK_FAILED>>>";
 export const GOAL_NO_PROGRESS_LIMIT = 3;
 export const GOAL_FINGERPRINT_LENGTH = 12;
 export const GOAL_DISABLED_SAMPLE_LIMIT = 3;
+export const GOAL_CHECK_OUTPUT_LIMIT = 1_200;
 export const GOAL_OUTCOME = {
   DONE: "done",
   CONTINUE: "continue",
@@ -88,26 +89,28 @@ function tail(value: string): string {
   return value.length <= GOAL_PROMPT_TAIL_LIMIT ? value : value.slice(-GOAL_PROMPT_TAIL_LIMIT);
 }
 
-/** Parse the worker's final answer; an unrecognized marker is never completion. */
+/** Parse the worker's final answer; markers count only as standalone lines. */
 export function parseGoalOutcome(output: string | undefined): GoalOutcome {
   const text = (output ?? "").trim();
-  if (text.includes(GOAL_DONE_MARKER))
-    return {
-      kind: "done",
-      summary: text.replace(GOAL_DONE_MARKER, "").trim() || "Worker reported the goal achieved.",
-    };
   const lines = text.split(/\r?\n/u);
-  const markerIndex = lines.findIndex((line) => line.trim() === TASK_FAILED_MARKER);
-  if (markerIndex >= 0) {
-    const blocker = lines.slice(markerIndex + 1)
+  const exact = (marker: string) => lines.findIndex((line) => line.trim() === marker);
+  const blockerIndex = exact(TASK_FAILED_MARKER);
+  if (blockerIndex >= 0) {
+    const blocker = lines.slice(blockerIndex + 1)
       .find((line) => /^Blocker:/iu.test(line.trim()))?.replace(/^Blocker:\s*/iu, "").trim();
-    const next = lines.slice(markerIndex + 1)
+    const next = lines.slice(blockerIndex + 1)
       .find((line) => /^Next step:/iu.test(line.trim()))?.replace(/^Next step:\s*/iu, "").trim();
     return {
-      kind: "blocked",
-      summary: text.replace(TASK_FAILED_MARKER, "").trim(),
+      kind: GOAL_OUTCOME.BLOCKED,
+      summary: lines.filter((_, index) => index !== blockerIndex).join("\n").trim(),
       reason: [blocker, next].filter(Boolean).join(" — ") || "Worker reported a blocker.",
     };
   }
-  return { kind: "continue", summary: text || "Worker ended without a summary." };
+  const doneIndex = exact(GOAL_DONE_MARKER);
+  if (doneIndex >= 0)
+    return {
+      kind: GOAL_OUTCOME.DONE,
+      summary: lines.filter((_, index) => index !== doneIndex).join("\n").trim() || "Worker reported the goal achieved.",
+    };
+  return { kind: GOAL_OUTCOME.CONTINUE, summary: text || "Worker ended without a summary." };
 }

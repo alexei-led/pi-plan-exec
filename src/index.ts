@@ -569,6 +569,27 @@ export default function planExecExtension(pi: ExtensionAPI): void {
     activeControllers.set(runId, timer);
   };
 
+  /** Track a run allocation so session retirement waits for it, exactly as /exec does. */
+  const withPendingMutation = async <T>(
+    operation: (recordRun: (run: PlanExecRun) => void) => Promise<T>,
+  ): Promise<T> => {
+    if (sessionClosed) throw new Error("The requesting Pi session has been replaced.");
+    let finish!: () => void;
+    const mutation: { settled: Promise<void>; retirementRunIds?: Set<string> } = {
+      settled: new Promise<void>((resolve) => { finish = resolve; }),
+    };
+    pendingMutations.add(mutation);
+    try {
+      return await operation((run) => {
+        ownedRuns.add(run.id);
+        mutation.retirementRunIds?.add(run.id);
+      });
+    } finally {
+      pendingMutations.delete(mutation);
+      finish();
+    }
+  };
+
   pi.registerCommand("exec", {
     description:
       "Execute a checked Markdown plan with worktree isolation, progress, reviews, and recovery; use /exec help for commands",
@@ -654,12 +675,13 @@ export default function planExecExtension(pi: ExtensionAPI): void {
             : `Goal ${shortRunId(requested.id)} cancellation requested.`, "info");
           return;
         }
-        const run = await controller.startGoal({
+        const run = await withPendingMutation((recordRun) => controller.startGoal({
           goal: parsed.goal,
           sessionId,
           cwd: ctx.cwd,
-          checks: parsed.checks,
-        });
+          ...(parsed.checks.length ? { checks: parsed.checks } : {}),
+          onRunAllocated: recordRun,
+        }));
         startBackgroundController(run, sessionId, ctx.cwd, ctx);
         notify(ctx, [
           `Goal ${shortRunId(run.id)} started: ${run.goal?.text ?? ""}`,

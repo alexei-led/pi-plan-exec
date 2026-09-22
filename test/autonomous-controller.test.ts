@@ -2411,7 +2411,7 @@ export async function reconcileKernelOwnedProcess(directory){return observeKerne
     run = await f.controller.advance(run);
     assert.equal(run.status, "cancel_pending");
     assert.equal(run.localOperationActive, true);
-    await assert.rejects(f.registry.assertExclusive({ worktreeCwd: f.root, planPath: f.planPath }), /already exists/);
+    await assert.rejects(f.registry.assertExclusive({ worktreeCwd: f.root, planPath: f.planPath, repositoryRoot: f.root }), /already exists/);
     await writeFile(retired, "yes");
     assert.ok(await running instanceof LocalOperationCancelledError);
     run = await new PlanExecController(f.registry, f.worker, fusion, command, f.localExecutor).advance((await f.registry.get(run.id))!);

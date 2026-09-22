@@ -38,12 +38,12 @@ const RUN_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 type RunLease = NonNullable<PlanExecRun["lease"]>;
-type RunReservations = Pick<PlanExecRun, "worktreeCwd"> &
+type RunReservations = Pick<PlanExecRun, "worktreeCwd" | "repositoryRoot"> &
   Partial<Pick<PlanExecRun, "id" | "planPath" | "goal" | "outputTarget" | "lanePreparation" | "tasks">>;
 
-/** A goal reserves its goal hash; a plan reserves its plan file. */
+/** A goal reserves its hash inside one repository; a plan reserves its plan file. */
 async function reservationKey(run: RunReservations): Promise<string | undefined> {
-  if (run.goal) return `goal:${run.goal.hash}`;
+  if (run.goal) return `goal:${await canonicalReservationPath(run.repositoryRoot)}:${run.goal.hash}`;
   return run.planPath === undefined ? undefined : canonicalReservationPath(run.planPath);
 }
 
@@ -666,6 +666,8 @@ function migrateLegacyRun(value: Record<string, unknown>): PlanExecRun {
     ...(blocked === undefined ? {} : { blocked }),
   };
   delete (migrated as { blockedTask?: unknown }).blockedTask;
+  if (migrated.goal !== undefined && !Number.isInteger(migrated.goal.maxTurns))
+    migrated.goal = { ...migrated.goal, maxTurns: migrated.config.maxTaskIterations };
   return migrated;
 }
 
@@ -721,6 +723,7 @@ function isRunSubject(run: PlanExecRun): boolean {
       typeof run.goal.text === "string" && Boolean(run.goal.text.trim()) &&
       typeof run.goal.hash === "string" && /^[a-f0-9]{12}$/.test(run.goal.hash) &&
       Number.isInteger(run.goal.iteration) && run.goal.iteration >= 0 &&
+      Number.isInteger(run.goal.maxTurns) && run.goal.maxTurns >= 1 &&
       Number.isInteger(run.goal.noProgress) && run.goal.noProgress >= 0 &&
       (run.goal.lastOutcome === undefined || typeof run.goal.lastOutcome === "string") &&
       (run.goal.lastCheck === undefined ||

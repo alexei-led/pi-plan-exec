@@ -9,6 +9,8 @@ import { bridgeRequestDigest } from "../src/bridge.js";
 import { PlanExecController } from "../src/controller.js";
 import type { RunCommand } from "../src/git.js";
 import { formatRunWidget, goalStatusText, parseGoalChecks, parseGoalCommand } from "../src/index.js";
+import { LocalOperationFailedError } from "../src/local-operation.js";
+import { parseGoalOutcome } from "../src/goal-loop.js";
 import { RunRegistry } from "../src/registry.js";
 import { type BridgeResult, type PlanExecRun } from "../src/types.js";
 import { createControllerLocalExecutor } from "./fixtures/controller-local-executor.js";
@@ -243,4 +245,105 @@ test("goal status and widget show the goal instead of plan tasks", async (t) => 
   const widget = formatRunWidget(run).join("\n");
   assert.match(widget, /Goal .*turn 1/);
   assert.doesNotMatch(widget, /accepted/);
+});
+
+test("markers count only as standalone lines and a blocker outranks a mention", () => {
+  assert.equal(parseGoalOutcome("I cannot emit <<<RALPHEX:GOAL_DONE>>> yet").kind, "continue");
+  assert.equal(parseGoalOutcome("<<<RALPHEX:GOAL_DONE>>>>").kind, "continue");
+  assert.equal(parseGoalOutcome("<<<RALPHEX:GOAL_DONE>>>\nextra").kind, "done");
+  const blocked = parseGoalOutcome("I cannot emit <<<RALPHEX:GOAL_DONE>>> yet\n<<<RALPHEX:TASK_FAILED>>>\nBlocker: need a token\nNext step: provide one");
+  assert.equal(blocked.kind, "blocked");
+  assert.match(blocked.reason ?? "", /need a token/);
+});
+
+test("a goal paused for its turn budget grants more turns on explicit resume", async (t) => {
+  const f = await fixture(t);
+  let run = await start(f);
+  run = await finishTurn(f, run, "Intermediate answer; continuing.");
+  run = await f.registry.update({ ...run, goal: { ...run.goal!, iteration: run.goal!.maxTurns } });
+  run = await f.controller.tick((await due(f, run)).id, "session");
+  assert.equal(run.status, "paused");
+  assert.match(run.blocked?.reason ?? "", /turn budget reached/);
+
+  const before = run.goal!.maxTurns;
+  run = await f.controller.resume(run.id, "session", true);
+  assert.equal(run.goal!.maxTurns, before + run.config.maxTaskIterations);
+  assert.equal(run.status, "running");
+  assert.equal(f.worker.launches.length, 2, "the granted budget must launch the next turn");
+});
+
+test("omitting --check keeps the configured required checks", async (t) => {
+  const f = await fixture(t);
+  await writeFile(join(f.root, ".pi", "plan-exec.json"), JSON.stringify({
+    reviewEnabled: false, reviewRequired: false, retryDelayMs: 10, maxTaskIterations: 20,
+    requiredChecks: [["configured", "check"]],
+  }));
+  await f.git("add", "--all");
+  await f.git("commit", "-m", "configure required checks");
+  const run = await f.controller.startGoal({ goal: "Fix the failing tests", sessionId: "session", cwd: f.root });
+  assert.deepEqual(run.config.requiredChecks, [["configured", "check"]]);
+});
+
+test("goal reservations are scoped to their repository", async (t) => {
+  const first = await fixture(t);
+  const second = await fixture(t);
+  const runA = await start(first);
+  const runB = await start(second);
+  assert.notEqual(runA.id, runB.id);
+});
+
+test("renaming a test away counts as deleting it", async (t) => {
+  const f = await fixture(t);
+  let run = await start(f);
+  await mkdir(join(f.root, "src"), { recursive: true });
+  await f.git("mv", "tests/sample.test.ts", "src/sample.ts");
+  await writeFile(join(f.root, "done.txt"), "fixed\n");
+  await f.git("add", "--all");
+  await f.git("commit", "-m", "move the test out of the suite");
+  run = await finishTurn(f, run, "<<<RALPHEX:GOAL_DONE>>>\nGreen now.");
+  assert.equal(run.status, "paused");
+  assert.match(run.blocked?.reason ?? "", /deleted test files/);
+});
+
+test("the final gate rechecks test weakening after a review-style fix commit", async (t) => {
+  const f = await fixture(t);
+  let run = await start(f);
+  await writeFile(join(f.root, "done.txt"), "fixed\n");
+  await f.git("add", "--all");
+  await f.git("commit", "-m", "fix failing tests");
+  run = await finishTurn(f, run, "<<<RALPHEX:GOAL_DONE>>>\nDone.");
+  assert.equal(run.stage, "finalize");
+
+  await rm(join(f.root, "tests", "sample.test.ts"));
+  await f.git("add", "--all");
+  await f.git("commit", "-m", "review fixer deletes the test");
+  run = await advanceToCompletion(f, run);
+  assert.equal(run.status, "paused");
+  assert.match(run.blocked?.reason ?? "", /deleted test files/);
+});
+
+test("a failing check reports its commands and output and keeps a stable fingerprint", async (t) => {
+  const f = await fixture(t);
+  const failing = async () => {
+    throw new LocalOperationFailedError("Local command failed (exit 1): /journal/local-operations/deadbeef/generation-1", {
+      code: 1,
+      outputTail: "AssertionError: expected 5 got 4",
+    });
+  };
+  const controller = new PlanExecController(f.registry, f.worker, fusion, command, failing);
+  let run = await controller.startGoal({ goal: "Fix the failing tests", sessionId: "session", cwd: f.root, checks: CHECK });
+  const finish = async (): Promise<PlanExecRun> => {
+    f.worker.state = "complete";
+    f.worker.proof = true;
+    f.worker.output = "<<<RALPHEX:GOAL_DONE>>>\nTrying.";
+    return controller.tick(run.id, "session");
+  };
+  run = await finish();
+  assert.match(run.goal!.lastCheck!.failures, /checks: test -f done.txt/);
+  assert.match(run.goal!.lastCheck!.failures, /AssertionError: expected 5 got 4/);
+  const fingerprint = run.goal!.lastCheck!.fingerprint;
+
+  run = await controller.tick((await due(f, run)).id, "session");
+  run = await finish();
+  assert.equal(run.goal!.lastCheck!.fingerprint, fingerprint, "an identical failure must not look like progress");
 });

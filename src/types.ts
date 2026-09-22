@@ -368,6 +368,7 @@ export interface GoalState {
   text: string;
   hash: string;
   iteration: number;
+  maxTurns: number;
   noProgress: number;
   lastOutcome?: string;
   lastCheck?: GoalCheckEvidence;
