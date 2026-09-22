@@ -89,17 +89,16 @@ function tail(value: string): string {
   return value.length <= GOAL_PROMPT_TAIL_LIMIT ? value : value.slice(-GOAL_PROMPT_TAIL_LIMIT);
 }
 
-/** Timing and identity noise must not look like new progress between turns. */
-const CHECK_TIMING_LINE = /\b(duration_ms|duration|start at|elapsed|passed in|took)\b/iu;
+/**
+ * Timing values must not look like new progress between turns. Replace values
+ * in place so real failure lines survive; only the volatile parts change.
+ */
 export function normalizeCheckOutput(output: string): string {
   return output
-    .split(/\r?\n/u)
-    .filter((line) => !CHECK_TIMING_LINE.test(line))
-    .map((line) => line
-      .replace(/\b\d+(?:\.\d+)?\s*(?:ms|s|m)\b/giu, "<time>")
-      .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/giu, "<uuid>")
-      .replace(/0x[0-9a-f]+/giu, "<addr>"))
-    .join("\n")
+    .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/giu, "<uuid>")
+    .replace(/0x[0-9a-f]+/giu, "<addr>")
+    .replace(/\b(duration_ms|duration|start at|elapsed|passed in|took)\b(\s*[:=]\s*|\s*)(\d\S*)/giu, "$1$2<time>")
+    .replace(/\b\d+(?:\.\d+)?\s*(?:ms|s|m)\b/giu, "<time>")
     .trim();
 }
 

@@ -935,8 +935,10 @@ export class PlanExecController {
     } catch (error: unknown) {
       if (error instanceof LocalOperationUnknownError || error instanceof LocalOperationCancelledError) throw error;
       const details = error instanceof LocalOperationFailedError ? error.details : undefined;
-      const output = normalizeCheckOutput(details?.outputTail ?? "").replace(/\s+/gu, " ").trim().slice(0, GOAL_CHECK_OUTPUT_LIMIT);
-      const summary = output || `exit ${details?.code ?? "unknown"}`;
+      const normalized = normalizeCheckOutput(details?.outputTail ?? "");
+      const digestTail = normalized.slice(-GOAL_CHECK_OUTPUT_LIMIT);
+      const output = digestTail.replace(/\s+/gu, " ").trim();
+      const summary = digestTail || `exit ${details?.code ?? "unknown"}`;
       const text = [
         `checks: ${commands.join(" · ")}`,
         `exit: ${details?.code ?? "unknown"}`,
