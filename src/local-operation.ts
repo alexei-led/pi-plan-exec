@@ -10,7 +10,7 @@ import { workspaceEnvironment } from "./workspace-environment.js";
 
 const POLL_MS = 100;
 const RPC_TIMEOUT_MS = 15_000;
-const OUTPUT_TAIL_LIMIT = 2_000;
+const OUTPUT_TAIL_LIMIT = 64_000; // Ceiling for retained check output; normalization runs before the display cut.
 const CANCEL_PROBE_MS = 2_000;
 const JOURNAL_FILE_MODE = 0o600;
 const JOURNAL_DIRECTORY_MODE = 0o700;

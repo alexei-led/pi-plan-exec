@@ -10,7 +10,7 @@ import { PlanExecController } from "../src/controller.js";
 import type { RunCommand } from "../src/git.js";
 import { formatRunWidget, goalStatusText, parseGoalChecks, parseGoalCommand } from "../src/index.js";
 import { LocalOperationFailedError } from "../src/local-operation.js";
-import { parseGoalOutcome } from "../src/goal-loop.js";
+import { normalizeCheckOutput, parseGoalOutcome } from "../src/goal-loop.js";
 import { RunRegistry } from "../src/registry.js";
 import { type BridgeResult, type PlanExecRun } from "../src/types.js";
 import { createControllerLocalExecutor } from "./fixtures/controller-local-executor.js";
@@ -347,7 +347,7 @@ test("a failing check reports its commands and output and keeps a stable fingerp
     attempt += 1;
     throw new LocalOperationFailedError("Local command failed (exit 1): /journal/local-operations/deadbeef/generation-1", {
       code: 1,
-      outputTail: `duration_ms: ${100 + attempt}\nStart at 12:0${attempt}\nAssertionError: expected 5 got 4`,
+      outputTail: `${"failure context line\n".repeat(200)}duration_ms: ${100 + attempt * 1000}\nStart at 12:0${attempt}\nAssertionError: expected 5 got 4`,
     });
   };
   const controller = new PlanExecController(f.registry, f.worker, fusion, command, failing);
@@ -366,5 +366,13 @@ test("a failing check reports its commands and output and keeps a stable fingerp
   run = await controller.tick((await due(f, run)).id, "session");
   run = await finish();
   assert.equal(run.goal!.lastCheck!.fingerprint, fingerprint, "test-runner timings must not look like progress");
-  assert.doesNotMatch(run.goal!.lastCheck!.failures, /duration_ms/);
+  assert.doesNotMatch(run.goal!.lastCheck!.failures, /duration_ms: \d/);
+});
+
+test("check-output normalization keeps real failure lines and replaces only timing values", () => {
+  const normalized = normalizeCheckOutput("AssertionError: duration must be positive\nduration_ms: 987.12\nfinished in 12.3ms\n0xdeadbeef");
+  assert.match(normalized, /AssertionError: duration must be positive/);
+  assert.match(normalized, /duration_ms: <time>/);
+  assert.match(normalized, /finished in <time>/);
+  assert.match(normalized, /<addr>/);
 });
