@@ -1,51 +1,64 @@
 # Autonomous runtime contracts
 
-A run is admitted
-only when the selected runtime advertises explicit lifetime support and full
-ownership of every operation-owned descendant. The current installed npm
-package does not provide the new public native contract. The pre-release source
-pins are recorded below; do not infer support from a latest npm release or an
-unpinned local checkout.
+A run is admitted only when the selected runtime advertises explicit lifetime
+support and ownership of every operation-owned descendant. Plan-exec 1.5 uses
+only released packages: `pi-subagents@0.70.1` as the installed runtime,
+`@alexeiled/pi-subagents-bridge@0.4.2`, and `@alexeiled/pi-fusion@0.9.2`. No Git
+pins are required.
 
-## Native production dependency
+## Owned-process runner
 
-The required native dependency is the public
-`pi-subagents/kernel-owned-process` module. Its production API is the durable
-kernel-owned process boundary used by local checks, bootstrap, Bridge/native
-workers, Fusion, and the Revmux adapter:
+Local checks, bootstrap commands, and the Revmux adapter run through
+`src/owned-process.ts`, a POSIX process-group runner owned by plan-exec:
 
-- `prepareKernelOwnedProcess(request)` returns an immutable operation binding;
-- `launchKernelOwnedProcess(request)` starts the already prepared operation;
-- `observeKernelOwnedProcess(operationDirectory)` reports a bound operation;
-- `reconcileKernelOwnedProcess(operationDirectory)` recovers the same prepared
-  operation without replacing its immutable identity;
-- `cancelKernelOwnedProcess(operationDirectory, { deadlineMs })` requests
-  retirement and returns proof or an unknown result;
-- `requestKernelOwnedProcessCancellation(operationDirectory)` records a durable
-  stop request.
+- `prepareOwnedProcess(request)` returns an immutable operation binding;
+- `launchOwnedProcess(request)` starts the prepared operation as a detached
+  process group and records the leader pid, start identity, host ID, and boot ID;
+- `observeOwnedProcess(operationDirectory)` reports `pending`, `running`,
+  `retired`, `never-started`, or `unknown`;
+- `cancelOwnedProcess(operationDirectory, { deadlineMs, cancelled })` sends
+  `SIGTERM` to the group, escalates to `SIGKILL`, and returns the observation;
+- `requestOwnedProcessCancellation(operationDirectory)` sends `SIGTERM` without
+  waiting.
 
-The request binds `operationDirectory`, artifact storage, immutable `argv`,
-`cwd`, captured `env`, and `lifetime: { kind: "unbounded" }` or
-`{ kind: "bounded", timeoutMs }`. The binding includes operation ID, request
-digest, host ID, and boot ID. A successful operation requires an authoritative
-kernel retirement proof for the same binding. Unknown, malformed, or changed
-bindings remain fenced and cannot be retried as a new writer.
+The request binds `operationDirectory`, immutable `argv`, `cwd`, captured `env`,
+and `lifetime: { kind: "unbounded" }` or `{ kind: "bounded", timeoutMs }`. The
+binding includes operation ID, request digest, host ID, and boot ID. Retirement
+proofs are `{ kind: "process-group-retired" }` for a dead group or
+`{ kind: "never-started" }` for an operation that never reached a launch record;
+both must match the binding. Malformed, changed, or host/boot-mismatched
+operations stay fenced.
 
-The supported native target is Darwin with a GUI launchd session and the
-compiler/toolchain prerequisites required by the native ownership module. The
-current branch does not claim Linux or headless Darwin support. The exact local
-or project installation path must preserve the pinned source refs and must not
-change global npm configuration; npm 12.0.2 is required for transitive Git refs.
-The repository checkout uses project-local `allow-git=root`; a packed consumer
-uses project-local `allow-git=all`.
-No published npm version should be treated as satisfying this contract.
+Liveness is ps-based: the recorded leader pid is checked with a zero signal and
+its `ps -o lstart=` identity. A child that calls `setsid` or double-forks out of
+the group escapes containment; that is the documented best-effort ceiling, and
+the same ceiling the released runtime carries. The supported platform is any
+POSIX host (Darwin or Linux).
+
+## Released runtime and Bridge dependency
+
+Bridge v2 requires `singleAgentSpawn: true`, explicit lifetime support, durable
+operation lookup, terminal-proof support, and
+`processTreeOwnership: { scope: "owned-process-tree", escapedDescendants:
+"best-effort" }`.
+
+The released `pi-subagents` runtime executes an async agent task as a
+**persistent workflow host**: the parent run publishes no writer-exit proof, and
+only child runs write `process-terminal.json`. Bridge 0.4.2 therefore
+synthesizes a workflow terminal proof when the status reply carries a
+`workflowChildren` summary with a matching `workflowRunId`,
+`inventoryComplete: true`, a terminal `workflowState` (`completed`, `failed`, or
+`stopped`), and every child has an attested process-terminal proof. Child proofs
+come from the cached `subagent:process-terminal` event or, on a cache miss, from
+the child's `process-terminal.json` next to the parent's async directory. A
+partial or open inventory yields no proof and plan-exec keeps polling.
 
 ## Lifetime and recovery
 
 The frozen run policy is either `{ "mode": "unbounded" }` or
 `{ "mode": "bounded", "timeoutMs": <positive integer> }`. Unbounded means no
 wall-clock deadline. Local verification and bootstrap commands always use an
-unbounded kernel-owned operation and remain user-stoppable, even when the run's
+unbounded owned-process operation and remain user-stoppable, even when the run's
 model/review policy selects bounded compatibility mode.
 
 For Bridge, native review, Fusion, and Revmux operations, bounded mode is an
@@ -67,23 +80,21 @@ cannot downgrade an owned run to the legacy launcher. Continuation uses a fresh
 correlated owned operation after predecessor retirement. Owner-bound Bridge
 lookup and cancellation use v2 even before a new client negotiates capabilities.
 
-## Caller, native, and kernel identities
+## Caller, native, and process identities
 
 These identity namespaces are separate and must never be equated:
 
 - the plan-exec caller digest covers the controller request and is sent through
   the provider owner/caller binding;
 - the native operation has its own operation ID and native request digest;
-- the kernel binding has operation ID, request digest, host ID, and boot ID, and
-  its retirement proof must match that binding.
+- the owned-process binding has operation ID, request digest, host ID, and boot
+  ID, and its retirement proof must match that binding.
 
-Bridge v2 requires `singleAgentSpawn: true`, explicit lifetime support, durable
-operation lookup, terminal proof support, and
-`processTreeOwnership: { scope: "owned-process-tree", escapedDescendants:
-"contained" }`.
 The owner DTO is `{ kind: "pi-plan-exec", runId, key, requestDigest }`; the
-request digest is the canonical digest of `{ cwd, params }`. A Bridge proof must
-bind the caller, native operation, and kernel retirement evidence.
+request digest is the canonical digest of `{ cwd, params }`. A synthesized
+workflow proof binds the parent run to the attested writer-exit proofs of its
+children; the direct native process-terminal proof, when the runtime publishes
+one, takes precedence.
 
 ## Review backends
 
@@ -102,22 +113,24 @@ remain visible and fenced rather than being discarded or replaced by age.
 
 Revmux must support the explicit `--execution-lifetime=unbounded|bounded`
 selection from [Revmux commit 988904f](https://github.com/umputun/revmux/pull/35/commits/988904f30da351e76c29d5779c6833a6bf890b51),
-and the plan-exec adapter must wrap it in the outer kernel-owned process
-boundary. Revmux's internal process-group proof is narrower and cannot satisfy
-the full ownership contract by itself. Its report remains invalid unless source
-coverage, agent health, findings, and unresolved questions all validate.
+and the plan-exec adapter wraps it in the outer owned-process group. Revmux's
+internal process-group proof is narrower and cannot satisfy the full ownership
+contract by itself. Its report remains invalid unless source coverage, agent
+health, findings, and unresolved questions all validate.
 
 ## Local commands and task prerequisites
 
-Local required checks and bootstrap execute sequentially through the same kernel
-boundary. They use immutable environment/argv, durable command grants, the
-run's authorization and stop generation, and a kernel retirement proof before
-success or failure is accepted. A missing result after confirmed retirement is
-a confirmed command failure and may retry; malformed identity or unknown
-retirement remains fenced. Controller Git commands route through owned workspace
-commands with injected environment cleared at the boundary; observations disable
-fsmonitor and optional index writes. The local active-operation index keeps
-cancellation, cleanup, and exclusivity fenced until kernel retirement is proven.
+Local required checks and bootstrap execute sequentially through the same
+owned-process runner. They use immutable environment/argv, durable command
+grants, the run's authorization and stop generation, and a process-group
+retirement proof before success or failure is accepted. A missing result after
+confirmed retirement is a confirmed command failure and may retry; malformed
+identity or unknown retirement remains fenced. Controller Git commands route
+through owned workspace commands with injected environment cleared at the
+boundary; observations disable fsmonitor and optional index writes. The local
+active-operation index keeps cancellation, cleanup, and exclusivity fenced until
+process retirement is proven. The run registry itself uses an OS `flock` on a
+compiled helper, not the process-group runner.
 
 When a worker reports `<<<RALPHEX:TASK_FAILED>>>`, only an observed
 `Prerequisite: credentials|permission|missing_executable|runtime` together with
@@ -131,45 +144,29 @@ Native status, the Pi widget, pi-tasks, and Fleet are advisory projections of
 ownership decisions.
 
 `npm run test:runtime-smoke` is the declared host-boundary smoke check. Its
-model turns are scripted; a passing smoke run is not a live-LLM guarantee. A
-Darwin host with the native GUI/compiler prerequisites is required for the
-supported path. The full pipeline passed on the final dependency pins. The
-main full gate passed all 537 tests, lint, TypeScript and package validation,
-including optional skip races and frozen candidate checkouts, and
-`npm run test:runtime-smoke` passed the installed controller, Bridge/native RPC,
-owned workers, required review, promotion and archive. The cumulative Revmux
-confirmation passed on the corrected pins: round `12-final` reported four of
-four sources, no degradation and no findings on main `091d499`, native
-`e785953`, Fusion `b113212`, Bridge `3e99ec2` and Revmux `988904f`.
+model turns are scripted; a passing smoke run is not a live-LLM guarantee. It
+runs on any POSIX host, and its scripted worker is executed by a detached
+released-runtime runner so the bridge must synthesize the workflow terminal
+proof for the run to complete. The main full gate covers the controller, Bridge
+RPC, owned-process runner, required review, promotion, and archive.
 
 ## Source and review tracking
 
 - Main draft: [pi-plan-exec #8](https://github.com/alexei-led/pi-plan-exec/pull/8).
 - Revmux adapter evidence: [revmux #35](https://github.com/umputun/revmux/pull/35).
 - Fusion dependency: [pi-fusion #12](https://github.com/alexei-led/pi-fusion/pull/12).
-- Native runtime: [pi-subagents #2376](https://github.com/nicobailon/pi-subagents/pull/2376).
-- Bridge dependency: [pi-subagents-bridge #2](https://github.com/alexei-led/pi-subagents-bridge/pull/2).
+- Bridge dependency: [pi-subagents-bridge #2](https://github.com/alexei-led/pi-subagents-bridge/pull/2)
+  and the workflow-proof synthesis in
+  [pi-subagents-bridge #4](https://github.com/alexei-led/pi-subagents-bridge/pull/4).
 
 The dependency pins are:
 
-- native `pi-subagents`: `e78595340ff36ad481e205c0872fadba9412227d` (upstream PR pending);
-- Bridge: released `@alexeiled/pi-subagents-bridge@0.3.2`;
-- Fusion: released `@alexeiled/pi-fusion@0.9.1`;
+- native `pi-subagents`: released `^0.70.1`;
+- Bridge: released `@alexeiled/pi-subagents-bridge@^0.4.2`;
+- Fusion: released `@alexeiled/pi-fusion@^0.9.2`;
 - Revmux: `988904f30da351e76c29d5779c6833a6bf890b51`;
 - Pi SDK: `0.86.1`.
 
-Reported dependency checks are native 3337/3361 unit and 1101/1109 integration
-tests with the 10 unit and 1 integration failure reproduced unchanged on the
-prior revision as Darwin environment failures (`/var` canonicalization and
-unix-socket `EINVAL`), seven actual owned-worktree cases, Bridge 72 tests
-plus delayed-admission/restart/cancel and exact-checkout smoke, Fusion 258 unit,
-132 integration, and one E2E, and the Revmux full Go gates. These are dependency
-evidence, not a claim that the main product gate or full production pipeline is
-complete.
-
-Local project checks have passed. Revmux's upstream Ubuntu CI requires
-maintainer approval and has executed no jobs; its Linux path is
-compile-verified, while Darwin runtime tests passed. The
-cumulative Revmux confirmation is still pending. The
-implementation remains draft; no release or production support claim follows
-from host smoke checks or dependency test results alone.
+These are dependency evidence, not a claim that the full production pipeline is
+complete. The implementation remains a release candidate; no production support
+claim follows from host smoke checks or dependency test results alone.

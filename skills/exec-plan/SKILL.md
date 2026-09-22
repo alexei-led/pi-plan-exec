@@ -317,16 +317,15 @@ record, worktree, active-operation evidence, and approval or runtime fix needed.
 
 ## Prerequisites
 
-`pi-plan-exec` requires compatible installations of `pi-subagents` and
-`@alexeiled/pi-subagents-bridge`, plus the pending
-public `pi-subagents/kernel-owned-process` Darwin dependency. Fusion and Revmux
+`pi-plan-exec` requires released installations of `pi-subagents` and
+`@alexeiled/pi-subagents-bridge`. Fusion and Revmux
 are optional explicit review backends; `@tintinweb/pi-tasks` is an optional
 projection cache. The strict controller requires explicit
-lifetime support and full owned-process-tree containment. Unknown native APIs,
-kernel bindings, or retirement evidence remain fenced. Read [runtime
-contracts](../../docs/runtime-contracts.md) for the exact API, Darwin
-prerequisites, and dependency PR links; installing the latest npm package does
-not provide this contract.
+lifetime support and a healthy owned-process capability; released Bridge
+advertises best-effort descendant containment. Unknown APIs,
+process bindings, or retirement evidence remain fenced. Read [runtime
+contracts](../../docs/runtime-contracts.md) for the exact APIs, released pins,
+and dependency PR links.
 
 The development checkout and CI use npm 12.0.2 with repository `.npmrc`
 `allow-git=root`. A packed consumer needs a project-local `allow-git=all` for

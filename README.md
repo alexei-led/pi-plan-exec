@@ -25,15 +25,15 @@ selected review backend. A worker saying “done” is not enough: the plan’s
 checked items, accepted commit, required checks, and a clean worktree with no
 uncommitted or untracked non-ignored files are the implementation record.
 
-> Pre-release feature. The strict controller requires the pinned
-> `pi-subagents/kernel-owned-process` Darwin runtime and matching Bridge,
-> Fusion, and Revmux ownership contracts. The installed-runtime smoke passes;
-> unsupported APIs and unknown ownership remain fenced. Do not treat the latest
-> npm package as ready for autonomous production runs; see [runtime contracts](docs/runtime-contracts.md).
+> Pre-release feature. The strict controller requires the released
+> `pi-subagents` runtime plus the matching Bridge and Fusion releases. A worker
+> or host that cannot prove process retirement remains fenced; see
+> [runtime contracts](docs/runtime-contracts.md).
 
-Local bootstrap and required-check batches run through the same kernel-owned
-executor, with unbounded user-stoppable lifetime and durable retirement proof.
-They remain unavailable when the exact native dependency is missing.
+Local bootstrap and required-check batches run through plan-exec's owned POSIX
+process-group runner, with unbounded user-stoppable lifetime and durable
+writer-exit retirement proof. Detached descendants that leave the process group
+are best-effort, matching the released runtime.
 
 ## What it does
 
