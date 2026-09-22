@@ -35,6 +35,17 @@ the group escapes containment; that is the documented best-effort ceiling, and
 the same ceiling the released runtime carries. The supported platform is any
 POSIX host (Darwin or Linux).
 
+Signal paths (`cancel`, cooperative cancellation, and the bounded-lifetime
+timer) first prove the binding still belongs to this host and boot, that no
+retirement was already persisted, and that the recorded leader identity is not
+a reused pid. Retirement is persisted once observed and short-circuits every
+later signal. A successful launch keeps `launching.json` as the durable launch
+lock, so a concurrent launcher observes instead of spawning a second group. An
+unresolved claim with no launch record is `pending` while fresh and fenced as
+`unknown` once stale; it is never reported as `never-started`. A failed spawn
+records `launch-failed.json`, releases the claim, and lets a later attempt
+launch again.
+
 ## Released runtime and Bridge dependency
 
 Bridge v2 requires `singleAgentSpawn: true`, explicit lifetime support, durable

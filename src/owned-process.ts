@@ -757,11 +757,6 @@ export async function launchOwnedProcess(
     startIdentity: await startIdentity(pid),
   };
   await publish(join(directory, 'launch.json'), launch);
-  try {
-    await unlink(join(directory, 'launching.json'));
-  } catch {
-    // A missing claim needs no release.
-  }
   child.unref();
   if (request.lifetime.kind === 'bounded') {
     const timer = setTimeout(() => {
@@ -821,19 +816,11 @@ export async function cancelOwnedProcess(
         (await pathExists(join(operationDirectory, 'retired.json')))
       )
         return observeOwnedProcess(operationDirectory);
-      const claim = await json(join(operationDirectory, 'launching.json'));
-      if (record(claim) && recordValue && binding) {
-        const claimedAt =
-          typeof claim.claimedAt === 'number' ? claim.claimedAt : 0;
-        if (Date.now() - claimedAt > LAUNCH_CLAIM_GRACE_MS)
-          return {
-            status: 'unknown',
-            binding,
-            reason:
-              'Owned process launch is unresolved; a worker may still be alive.',
-          };
-      }
-      if (recordValue && binding && !record(claim))
+      if (
+        recordValue &&
+        binding &&
+        !(await pathExists(join(operationDirectory, 'launching.json')))
+      )
         return {
           status: 'never-started',
           binding,
