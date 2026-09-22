@@ -718,10 +718,12 @@ export async function launchOwnedProcess(
       stdio: ['ignore', 'ignore', 'ignore'],
     });
   } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    await recordLaunchFailure(directory, binding, reason);
     return {
       status: 'unknown',
       binding,
-      reason: `Owned process did not launch: ${error instanceof Error ? error.message : String(error)}`,
+      reason: `Owned process did not launch: ${reason}`,
     };
   }
   child.once('error', (error: Error) => {
@@ -755,6 +757,11 @@ export async function launchOwnedProcess(
     startIdentity: await startIdentity(pid),
   };
   await publish(join(directory, 'launch.json'), launch);
+  try {
+    await unlink(join(directory, 'launching.json'));
+  } catch {
+    // A missing claim needs no release.
+  }
   child.unref();
   if (request.lifetime.kind === 'bounded') {
     const timer = setTimeout(() => {
@@ -809,6 +816,11 @@ export async function cancelOwnedProcess(
         stored === undefined ? undefined : requestStubFromRecord(stored);
       const recordValue = request ? readRecord(stored) : undefined;
       const binding = bindingOf(stored);
+      if (
+        (await pathExists(join(operationDirectory, 'launch.json'))) ||
+        (await pathExists(join(operationDirectory, 'retired.json')))
+      )
+        return observeOwnedProcess(operationDirectory);
       const claim = await json(join(operationDirectory, 'launching.json'));
       if (record(claim) && recordValue && binding) {
         const claimedAt =
