@@ -176,7 +176,7 @@ test('background recovery keeps ticking through UI failure and a pending project
   await events.get('session_shutdown')?.({}, context);
   releaseProjection();
   await startup;
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  await new Promise<void>((resolve) => setImmediate(resolve));
+  for (let turn = 0; turn < 100 && projectedUpdates.length < 2; turn += 1)
+    await new Promise<void>((resolve) => setImmediate(resolve));
   assert.deepEqual(projectedUpdates, [1, 4]);
 });
