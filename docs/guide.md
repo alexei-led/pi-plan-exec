@@ -33,8 +33,10 @@ does not require cc-thingz agents.
 
 Strict autonomous execution
 requires the public `pi-subagents/kernel-owned-process` Darwin dependency plus
-matching Bridge, Fusion, and Revmux ownership contracts. The exact source pins
-pass installed-runtime smoke checks; unsupported APIs and unknown ownership
+matching Bridge and Fusion ownership contracts. Bridge and Fusion are released
+npm packages; the native runtime is pinned to a revision until its change lands
+upstream. The pinned revisions pass installed-runtime smoke checks; unsupported
+APIs and unknown ownership
 remain fenced. Local bootstrap
 and required checks use the same unbounded kernel-owned executor and remain
 unavailable when that dependency is missing. See [runtime contracts](runtime-contracts.md)
@@ -723,9 +725,9 @@ Safety limits:
 
 The strict path uses a
 kernel-owned Darwin boundary for native workers, local commands, Bridge, Fusion,
-and Revmux through exact public source pins. Package publication is not required
-for this source installation;
-unknown kernel/API ownership remains fenced. Use [runtime contracts](runtime-contracts.md)
+and Revmux. Bridge and Fusion are released npm packages pinned by version;
+the native runtime is pinned to an upstream revision until its change lands
+upstream. Unknown kernel/API ownership remains fenced. Use [runtime contracts](runtime-contracts.md)
 for the exact prerequisites and dependency PR links; do not treat the latest
 npm package as a fully working autonomous runtime.
 

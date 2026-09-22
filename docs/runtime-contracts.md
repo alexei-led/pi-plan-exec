@@ -150,11 +150,11 @@ four sources, no degradation and no findings on main `091d499`, native
 - Native runtime: [pi-subagents #2376](https://github.com/nicobailon/pi-subagents/pull/2376).
 - Bridge dependency: [pi-subagents-bridge #2](https://github.com/alexei-led/pi-subagents-bridge/pull/2).
 
-The source pins currently under review are:
+The dependency pins are:
 
-- native `pi-subagents`: `e78595340ff36ad481e205c0872fadba9412227d`;
-- Bridge: `3e99ec2752a25c88cc75475db524c44f3157f69d`;
-- Fusion: `b113212469bb5d2d0ad7bb5ff98e7cec12e25c7e`;
+- native `pi-subagents`: `e78595340ff36ad481e205c0872fadba9412227d` (upstream PR pending);
+- Bridge: released `@alexeiled/pi-subagents-bridge@0.3.2`;
+- Fusion: released `@alexeiled/pi-fusion@0.9.1`;
 - Revmux: `988904f30da351e76c29d5779c6833a6bf890b51`;
 - Pi SDK: `0.86.1`.
 

@@ -73,12 +73,14 @@ default backend is one required subagent reviewer. `@tintinweb/pi-tasks` is an
 optional projection cache.
 
 The providers remain independent Pi packages. This feature
-is tested against the exact dependency commits and linked dependency PRs
-listed in [runtime contracts](docs/runtime-contracts.md). The default
+is tested against the released `@alexeiled/pi-subagents-bridge@0.3.2` and
+`@alexeiled/pi-fusion@0.9.1` packages plus the pinned native revision and the
+linked dependency PRs listed in [runtime contracts](docs/runtime-contracts.md). The default
 review backend is `subagent` with an empty fallback list (`none`). An ambiguous
 Fusion or Revmux launch keeps its operation ID and remains recoverable instead
 of starting another reviewer over an unknown child. The development checkout
-and CI use npm 12.0.2. The repository `.npmrc` uses `allow-git=root`; a packed
+and CI use npm 12.0.2. The repository `.npmrc` uses `allow-git=root` for the
+pinned native revision; a packed
 consumer must use a project-local `allow-git=all` for transitive Git refs. Do
 not change global npm configuration.
 
