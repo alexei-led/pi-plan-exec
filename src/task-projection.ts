@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type { TaskStore } from "@tintinweb/pi-tasks/dist/task-store.js";
 import type { Task, TaskStatus } from "@tintinweb/pi-tasks/dist/types.js";
-import { PIPELINE_STAGES, isTerminalStatus, stageIndex } from "./lifecycle.js";
+import { PIPELINE_STAGES, isGoalRun, isTerminalStatus, requirePlanPath, stageIndex } from "./lifecycle.js";
 import { readPlan } from "./plan.js";
 import { RunRegistry } from "./registry.js";
 import {
@@ -118,6 +118,7 @@ export class TaskProjector {
     run: PlanExecRun,
     options: TaskProjectionOptions,
   ): Promise<PlanExecRun> {
+    if (isGoalRun(run)) return run;
     const current = await this.registry.get(run.id);
     if (current && current.updatedAt > run.updatedAt) run = current;
     try {
@@ -368,16 +369,17 @@ function isOwnedTask(task: Task, run: PlanExecRun): boolean {
 }
 
 async function readProjectionPlan(run: PlanExecRun) {
+  const planPath = requirePlanPath(run);
   try {
-    return await readPlan(run.planPath);
+    return await readPlan(planPath);
   } catch (error: unknown) {
     if (!isTerminalStatus(run.status) || !isNodeError(error, "ENOENT"))
       throw error;
     return readPlan(
       join(
-        dirname(run.planPath),
+        dirname(planPath),
         COMPLETED_PLANS_DIRECTORY,
-        basename(run.planPath),
+        basename(planPath),
       ),
     );
   }

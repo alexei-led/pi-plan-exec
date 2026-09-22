@@ -48,18 +48,18 @@ controller's authoritative state.
 
 ## Data flow
 
-`/goal` is deliberately outside the execution controller. It temporarily narrows
-the main Pi session to read-only repository tools (with at most 12 `read` calls)
-and one extension-owned finalization tool. The tool alone validates and atomically publishes the ready
-plan; it never creates a run record or talks to Bridge, Fusion, the projector,
-or pi-subagents.
+`/goal` runs on the same controller and registry as `/exec`. A goal run is a run
+record with a `goal` payload instead of a plan: no plan file, task DAG, or
+checkbox contract. The controller loops one owned worker turn per iteration in
+place on the current branch; the turn's committed work is accepted only after
+the required checks pass, followed by the same review and final-verification
+pipeline `/exec` uses. Goal progress, the turn budget, and blockers live in the
+same durable record, so restart, stop fences, and recovery behave exactly as for
+a plan run.
 
 ```mermaid
 flowchart LR
-    goal["/goal short goal"] --> explore["main Pi read-only exploration"]
-    explore --> finalizer["extension-owned finalizer"]
-    finalizer --> prepared["validated docs/plans/goal-*.md"]
-    prepared --> command
+    goal["/goal goal text"] --> command[Pi command]
     user["/exec plan.md"] --> command[Pi command]
     command --> controller[plan-exec controller]
     controller --> registry["global run registry"]
@@ -77,7 +77,8 @@ flowchart LR
 ```
 
 The controller re-reads the plan after implementation. A child saying “done” is
-not completion evidence; committed checked plan items are. Omitted task
+not completion evidence; committed checked plan items are — and for a goal run,
+passing required checks on committed work are. Omitted task
 dependencies preserve legacy sequential ordering, while `dependsOn: []` marks
 an independent task. For an incomplete task, a leading
 `<<<RALPHEX:TASK_FAILED>>>` records the blocker and schedules automatic
@@ -111,8 +112,8 @@ or preserved user files.
 
 | Module | Responsibility |
 | --- | --- |
-| `src/index.ts` | `/exec` and preparation-only `/goal` command surfaces, interactive selection, background controller loop |
-| `src/goal.ts` | Goal-plan finalization, semantic metadata validation, atomic no-replace publication, safe retry/reuse |
+| `src/index.ts` | `/exec` and `/goal` command surfaces, interactive selection, background controller loop |
+| `src/goal-loop.ts` | Goal prompt and outcome protocol, goal hash, stall and sample limits |
 | `src/controller.ts` | State transitions, operation launch/observation, automatic recovery, cancellation, acceptance |
 | `src/config.ts` | Run configuration parsing and frozen lifetime/review policy |
 | `src/types.ts` | Run, stage, operation, finding, and frozen configuration contracts |

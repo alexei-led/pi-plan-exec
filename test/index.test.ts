@@ -136,7 +136,7 @@ function executionHarness(cwd: string, sessionId: string) {
 test("task blocker status and pause notification explain recovery without a crash", () => {
   const blocked = run({
     status: "paused", stage: "implementation",
-    blockedTask: { taskId: 4, reason: "Constructor merge and readiness evidence missing." },
+    blocked: { taskId: 4, reason: "Constructor merge and readiness evidence missing." },
   });
   delete blocked.activeOperation;
   const status = formatRunStatus(blocked);

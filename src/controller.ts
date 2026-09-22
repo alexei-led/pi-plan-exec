@@ -54,12 +54,26 @@ import {
   type RunCommand,
 } from "./git.js";
 import {
+  assertPlanRun,
+  isGoalRun,
   isRecoverableRun,
   isReviewStage,
   isSkippableStage,
   isTerminalStatus,
   nextStage,
+  requirePlanPath,
 } from "./lifecycle.js";
+import {
+  GOAL_DISABLED_SAMPLE_LIMIT,
+  GOAL_FINGERPRINT_LENGTH,
+  GOAL_NO_PROGRESS_LIMIT,
+  GOAL_OUTCOME,
+  TASK_FAILED_MARKER,
+  goalHash,
+  goalPrompt,
+  normalizeGoalText,
+  parseGoalOutcome,
+} from "./goal-loop.js";
 import { readPlan, parsePlan, materializeApprovedPlan } from "./plan.js";
 import {
   appendProgress,
@@ -70,7 +84,7 @@ import { RunRegistry } from "./registry.js";
 import { diagnoseOperation } from "./diagnostics.js";
 import { resolveRunConfig } from "./config.js";
 import { RevmuxReviewClient, validateReviewResult } from "./review-backend.js";
-import { cancelActiveLocalOperations, durableJson, LocalOperationFailedError, LocalOperationUnknownError, type LocalOperationOptions } from "./local-operation.js";
+import { cancelActiveLocalOperations, durableJson, LocalOperationCancelledError, LocalOperationFailedError, LocalOperationUnknownError, type LocalOperationOptions } from "./local-operation.js";
 import { reconcileTasks, selectReadyTask, nextTaskWake } from "./scheduler.js";
 import { bootstrapCommands, gitValue, requiredChecks, runCommands } from "./lanes.js";
 import {
@@ -277,6 +291,54 @@ export class PlanExecController {
     return this.advance(await this.registry.claim(run, options.sessionId));
   }
 
+  /**
+   * A goal run works in place on the current branch: no plan file, no worktree,
+   * and a clean tree is required because every turn commits its own work.
+   */
+  async startGoal(options: {
+    goal: string;
+    sessionId: string;
+    cwd: string;
+    checks?: string[][];
+    onRunAllocated?: (run: PlanExecRun) => void;
+  }): Promise<PlanExecRun> {
+    const text = normalizeGoalText(options.goal);
+    const repositoryRoot = await requireGitRepository(this.runCommand, options.cwd);
+    const branch = await currentBranch(this.runCommand, options.cwd);
+    const dirty = await worktreeChanges(this.runCommand, options.cwd);
+    if (dirty.length)
+      throw new Error("A goal run works in place and refuses a dirty worktree; commit or stash changes first.");
+    const configured = await resolveRunConfig(repositoryRoot);
+    const config: FrozenRunConfig = { ...configured,
+      requiredChecks: await requiredChecks(options.cwd, options.checks ?? configured.requiredChecks),
+    };
+    if (!config.requiredChecks.length)
+      throw new Error("A goal needs at least one required check to prove completion; add a test or build script, or pass --check <command>.");
+    const initialHead = await gitValue(this.runCommand, options.cwd, ["rev-parse", "HEAD"]);
+    const baseBranch = await defaultBranch(this.runCommand, repositoryRoot);
+    const hash = goalHash(text);
+    const run = await this.registry.create({
+      schemaVersion: 1,
+      repositoryRoot,
+      goal: { text, hash, iteration: 0, noProgress: 0 },
+      worktreeCwd: options.cwd,
+      branch,
+      defaultBranch: baseBranch,
+      outputTarget: { cwd: options.cwd, branch, initialHead, planRelativePath: "" },
+      status: RUN_STATUS.STARTING,
+      stage: RUN_STAGE.IMPLEMENTATION,
+      progressPath: join(options.cwd, ".ralphex", "progress", `progress-goal-${hash}.txt`),
+      taskAttempts: {},
+      stageAttempts: {},
+      reviewFindings: [],
+      config,
+      unresolvedFindings: [],
+      skippedStages: [],
+      branchRebindings: [],
+    }, { exclusive: true, ...(options.onRunAllocated ? { onRunAllocated: options.onRunAllocated } : {}) });
+    return this.advance(await this.registry.claim(run, options.sessionId));
+  }
+
   async markFailed(
     runId: string,
     error: unknown,
@@ -367,13 +429,15 @@ export class PlanExecController {
     }
     if (reviewedPlanHash !== undefined) {
       if (!explicit) throw new Error("Adopting a changed plan requires explicit resume.");
-      const content = await readFile(prepared.planPath, "utf8");
-      const approved = parsePlan(prepared.planPath, content);
+      if (isGoalRun(prepared)) throw new Error("Plan adoption does not apply to goal runs.");
+      const planPath = requirePlanPath(prepared);
+      const content = await readFile(planPath, "utf8");
+      const approved = parsePlan(planPath, content);
       if (approved.hash !== reviewedPlanHash) return this.pauseForReview(prepared, PLAN_STRUCTURE_CHANGED_ERROR);
       const acceptedHead = prepared.acceptedHead ?? prepared.outputTarget?.initialHead ??
         await gitValue(this.runCommand, prepared.worktreeCwd, ["rev-parse", "HEAD"]);
-      const { facts } = await this.planBaseline(prepared, prepared.worktreeCwd, acceptedHead, prepared.planPath);
-      const materialized = parsePlan(prepared.planPath, materializeApprovedPlan(prepared.planPath, content, facts));
+      const { facts } = await this.planBaseline(prepared, prepared.worktreeCwd, acceptedHead, planPath);
+      const materialized = parsePlan(planPath, materializeApprovedPlan(planPath, content, facts));
       const tasks = reconcileTaskFacts(materialized, prepared.tasks);
       const adopted = await this.registry.updateIfCurrent(
         {
@@ -636,7 +700,7 @@ export class PlanExecController {
         );
       }
       case RUN_STAGE.IMPLEMENTATION:
-        return this.advanceImplementation(run);
+        return isGoalRun(run) ? this.advanceGoal(run) : this.advanceImplementation(run);
       case RUN_STAGE.COMPREHENSIVE_REVIEW:
       case RUN_STAGE.SMELLS_REVIEW:
       case RUN_STAGE.CRITICAL_REVIEW:
@@ -648,7 +712,7 @@ export class PlanExecController {
       case RUN_STAGE.STATS:
         return this.launchStats(run);
       case RUN_STAGE.ARCHIVE:
-        return this.archive(run);
+        return isGoalRun(run) ? this.complete(run) : this.archive(run);
       case RUN_STAGE.ISOLATION:
         return this.transition(
           run,
@@ -661,6 +725,7 @@ export class PlanExecController {
   }
 
   private async advanceImplementation(run: PlanExecRun): Promise<PlanExecRun> {
+    assertPlanRun(run);
     const content = await readFile(run.planPath, "utf8");
     const plan = parsePlan(run.planPath, content);
     if (plan.hash !== run.planHash) {
@@ -676,6 +741,7 @@ export class PlanExecController {
       }, run.updatedAt);
       if (!captured.applied) return captured.run;
       run = captured.run;
+      assertPlanRun(run);
     }
     const checkoutRoot = await gitCheckoutRoot(this.runCommand, run.worktreeCwd);
     const tasks = reconcileTasks(plan.tasks, run.tasks);
@@ -703,12 +769,14 @@ export class PlanExecController {
     const task = plan.tasks.find((candidate) => candidate.id === selected.taskId)!;
     const acceptedHead = run.acceptedHead ?? await gitValue(this.runCommand, run.worktreeCwd, ["rev-parse", "HEAD"]);
     if (!run.outputTarget) {
+      const planPath = requirePlanPath(run);
       run = { ...run, tasks, acceptedHead,
         outputTarget: { cwd: run.worktreeCwd, branch: run.branch, initialHead: acceptedHead,
-          planRelativePath: relative(run.worktreeCwd, run.planPath),
+          planRelativePath: relative(run.worktreeCwd, planPath),
           ...(run.progressPath ? { progressRelativePath: relative(run.worktreeCwd, run.progressPath) } : {}) },
       };
     }
+    assertPlanRun(run);
     const selectedPlanPath = selected.laneCwd
       ? join(await gitCheckoutRoot(this.runCommand, selected.laneCwd), relative(checkoutRoot, run.planPath)) : undefined;
     const staleLane = selectedPlanPath && (await readPlan(selectedPlanPath)).hash !== run.planHash;
@@ -767,6 +835,133 @@ export class PlanExecController {
       maxTurns: run.config.workerMaxTurns,
       task: workerPrompt(prepared.run, task.id, task.title, task.unchecked),
     });
+  }
+
+  private async advanceGoal(run: PlanExecRun): Promise<PlanExecRun> {
+    if (!isGoalRun(run)) throw new Error("advanceGoal requires a goal run.");
+    const goal = run.goal;
+    if (goal.iteration >= run.config.maxTaskIterations)
+      return this.pauseGoal(run,
+        `Goal turn budget reached after ${goal.iteration} turns; run /goal resume ${run.id} to authorize more turns.`);
+    return this.launchBridge(run, {
+      kind: OPERATION_KIND.IMPLEMENTATION,
+      agent: run.config.workerAgent,
+      maxTurns: run.config.workerMaxTurns,
+      task: goalPrompt(run, {
+        lastOutcome: goal.lastOutcome,
+        ...(goal.lastCheck?.failures ? { checkFailure: goal.lastCheck.failures } : {}),
+        recentCommits: await this.recentGoalCommits(run),
+      }),
+    });
+  }
+
+  private async recentGoalCommits(run: PlanExecRun): Promise<string | undefined> {
+    const base = run.outputTarget?.initialHead;
+    if (!base) return undefined;
+    const log = await gitValue(this.runCommand, run.worktreeCwd, ["log", "--oneline", "--no-decorate", `${base}..HEAD`]);
+    return log.trim() || undefined;
+  }
+
+  private async finishGoal(
+    run: PlanExecRun,
+    operation: ActiveOperation,
+    state: string,
+    terminalError?: string,
+    output?: string,
+  ): Promise<PlanExecRun> {
+    if (!isGoalRun(run)) throw new Error("finishGoal requires a goal run.");
+    const goal = run.goal;
+    const outcome = parseGoalOutcome(output);
+    if (outcome.kind === GOAL_OUTCOME.BLOCKED || (outcome.kind === GOAL_OUTCOME.CONTINUE && !isSuccessfulOperationState(state)))
+      return this.pauseGoal(run, outcome.reason ?? terminalError ?? `Goal turn ended as ${state}.`);
+    const head = await gitValue(this.runCommand, run.worktreeCwd, ["rev-parse", "HEAD"]);
+    const failure = await this.goalCheckFailure(run, operation);
+    const fingerprint = failure ? `fail:${createHash("sha256").update(failure).digest("hex").slice(0, GOAL_FINGERPRINT_LENGTH)}` : "pass";
+    const progressed = goal.lastCheck === undefined || head !== goal.lastCheck.head || fingerprint !== goal.lastCheck.fingerprint;
+    const noProgress = progressed ? 0 : goal.noProgress + 1;
+    const nextGoal = {
+      ...goal,
+      noProgress,
+      lastOutcome: outcome.kind === GOAL_OUTCOME.DONE && failure
+        ? `Worker reported the goal achieved, but required checks failed: ${failure}\n${outcome.summary}`
+        : outcome.summary,
+      lastCheck: { fingerprint, failures: failure ?? "", head, at: Date.now() },
+    };
+    if (noProgress >= GOAL_NO_PROGRESS_LIMIT)
+      return this.pauseGoal({ ...run, goal: nextGoal },
+        `No progress after ${noProgress} goal turns: HEAD is unchanged and the required checks produced the same result.`);
+    if (outcome.kind === GOAL_OUTCOME.DONE && !failure) {
+      const violation = await this.goalCompletionGuard(run);
+      if (violation) return this.pauseGoal({ ...run, goal: nextGoal }, violation);
+      const advanced = await this.registry.updateIfCurrent(clearError(withoutOperation({
+        ...run, goal: nextGoal, nextAttemptAt: 0,
+        wakeReason: `Goal achieved after ${goal.iteration} turns.`,
+      })), run.updatedAt);
+      if (!advanced.applied) return advanced.run;
+      return run.config.reviewEnabled || run.config.reviewRequired
+        ? this.transition(advanced.run, RUN_STAGE.COMPREHENSIVE_REVIEW, "Goal achieved; starting required review.")
+        : this.transition(advanced.run, RUN_STAGE.FINALIZE, "Goal achieved; final verification required.");
+    }
+    const scheduled = await this.registry.updateIfCurrent(withoutOperation({
+      ...run,
+      goal: nextGoal,
+      nextAttemptAt: Date.now() + run.config.retryDelayMs,
+      wakeReason: failure ? `Goal checks failing: ${failure}` : "Goal turn completed; continuing.",
+    }), run.updatedAt);
+    if (scheduled.applied)
+      await appendProgressBestEffort(scheduled.run,
+        `Goal turn ${goal.iteration} ${outcome.kind}: ${nextGoal.lastOutcome ?? ""}`.trim());
+    return scheduled.run;
+  }
+
+  /** Run the required checks for one goal turn; a cancelled check aborts the run. */
+  private async goalCheckFailure(run: PlanExecRun, operation: ActiveOperation): Promise<string | undefined> {
+    const head = await gitValue(this.runCommand, run.worktreeCwd, ["rev-parse", "HEAD"]);
+    const operationId = `goal:check:${run.goal?.iteration ?? 0}:${operation.operationId}`;
+    try {
+      await this.executeLocalCommands(run.worktreeCwd, run.config.requiredChecks,
+        await this.localOptions(run, operationId, head));
+      return undefined;
+    } catch (error: unknown) {
+      if (error instanceof LocalOperationUnknownError || error instanceof LocalOperationCancelledError) throw error;
+      return error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  /** A goal is not complete when its diff deletes tests or disables them. */
+  private async goalCompletionGuard(run: PlanExecRun): Promise<string | undefined> {
+    const base = run.outputTarget?.initialHead;
+    if (!base) return undefined;
+    const diff = await this.runCommand("git", ["diff", "--name-status", "-z", "--no-relative", base, "HEAD"], run.worktreeCwd);
+    if (diff.code !== 0) return "Cannot verify the goal diff before completion.";
+    const fields = diff.stdout.split("\0").filter(Boolean);
+    const deletedTests: string[] = [];
+    for (let index = 0; index + 1 < fields.length; index += 2)
+      if (fields[index]!.startsWith("D") && isTestPath(fields[index + 1]!)) deletedTests.push(fields[index + 1]!);
+    if (deletedTests.length)
+      return `Goal completion deleted test files: ${deletedTests.join(", ")}. Restore or justify them, then resume.`;
+    const added = await this.runCommand("git", ["diff", "-U0", "--no-relative", base, "HEAD"], run.worktreeCwd);
+    if (added.code !== 0) return "Cannot verify the goal diff before completion.";
+    const disabled = added.stdout.split("\n")
+      .filter((line) => line.startsWith("+") && !line.startsWith("+++"))
+      .filter((line) => /(?:\.(?:skip|only)\s*\(|\b(?:xit|fit)\s*\()/u.test(line));
+    if (disabled.length)
+      return `Goal completion disables tests: ${disabled.slice(0, GOAL_DISABLED_SAMPLE_LIMIT).map((line) => line.slice(1).trim()).join(" | ")}. Restore them, then resume.`;
+    return undefined;
+  }
+
+  private async pauseGoal(run: PlanExecRun, reason: string): Promise<PlanExecRun> {
+    const paused = await this.registry.updateIfCurrent(withoutOperation({
+      ...run,
+      status: RUN_STATUS.PAUSED,
+      blocked: { reason },
+      nextAttemptAt: 0,
+      wakeReason: reason,
+      error: reason,
+      needsAttention: true,
+    }), run.updatedAt);
+    if (paused.applied) await appendProgressBestEffort(paused.run, `Goal paused: ${reason}`);
+    return paused.run;
   }
 
   private async launchReview(run: PlanExecRun): Promise<PlanExecRun> {
@@ -832,6 +1027,7 @@ export class PlanExecController {
   }
 
   private async prepareLane(run: PlanExecRun): Promise<PlanExecRun> {
+    assertPlanRun(run);
     if (run.status === RUN_STATUS.STARTING) return this.registry.update({ ...run, status: RUN_STATUS.RUNNING });
     const preparation = run.lanePreparation!;
     try {
@@ -901,6 +1097,7 @@ export class PlanExecController {
   }
 
   private async publishLanePlan(run: PlanExecRun, cwd: string, baselineCommit: string, planPath: string): Promise<PlanExecRun | undefined> {
+    assertPlanRun(run);
     const options = await this.localOptions(run, `plan:publish:${cwd}`, baselineCommit);
     const directory = join(options.journalRoot, "plan-payloads", run.id);
     const publication = run.lanePreparation!.publication;
@@ -1173,6 +1370,9 @@ export class PlanExecController {
         ...(input.taskId && run.tasks?.[String(input.taskId)] ? { tasks: { ...run.tasks,
           [String(input.taskId)]: { ...run.tasks[String(input.taskId)]!, state: "running", operationId,
             attempts: run.tasks[String(input.taskId)]!.attempts + 1 } } } : {}),
+        ...(isGoalRun(run)
+          ? { goal: { ...run.goal, iteration: run.goal.iteration + 1 } }
+          : {}),
         ...(input.kind === OPERATION_KIND.FIX && run.reviewRecovery ? {
           reviewRecovery: { ...run.reviewRecovery, pendingFix: false },
         } : {}),
@@ -1759,7 +1959,9 @@ export class PlanExecController {
       }
       const current = (await this.registry.get(run.id)) ?? run;
       if (!sameOperationState(run, current, operation)) return current;
-      return this.finishImplementation(current, operation, state, terminalError, output);
+      return isGoalRun(current)
+        ? this.finishGoal(current, operation, state, terminalError, output)
+        : this.finishImplementation(current, operation, state, terminalError, output);
     }
     if (operation.kind === OPERATION_KIND.REVIEW) {
       if (!isSuccessfulOperationState(state))
@@ -2013,10 +2215,9 @@ export class PlanExecController {
     retryTask = false,
     recoveryModel?: string,
   ): Promise<PlanExecRun> {
-    const plan =
-      run.stage === RUN_STAGE.ARCHIVE
-        ? undefined
-        : await readPlan(run.planPath);
+    const plan = isGoalRun(run) || run.stage === RUN_STAGE.ARCHIVE
+      ? undefined
+      : await readPlan(requirePlanPath(run));
     if (plan && plan.hash !== run.planHash)
       return this.pauseForReview(run, PLAN_STRUCTURE_CHANGED_ERROR);
     const settled = await this.settledFailedWorkflow(run);
@@ -2195,6 +2396,7 @@ export class PlanExecController {
     terminalError?: string,
     output?: string,
   ): Promise<PlanExecRun> {
+    assertPlanRun(run);
     const taskId = operation.taskId;
     if (!taskId)
       return this.fail(run, "Implementation operation has no task ID.");
@@ -2332,8 +2534,10 @@ export class PlanExecController {
       const downgraded = findings.some((finding) => priorBlockers.some((previous) => normalizedSummary(previous.summary) === normalizedSummary(finding.summary)));
       if (downgraded) {
         const checkoutRoot = await gitCheckoutRoot(this.runCommand, run.worktreeCwd);
-        const metadata = new Set([gitPath(relative(checkoutRoot, run.planPath)),
-          ...(run.progressPath ? [gitPath(relative(checkoutRoot, run.progressPath))] : [])]);
+        const metadata = new Set([
+          ...(run.planPath ? [gitPath(relative(checkoutRoot, run.planPath))] : []),
+          ...(run.progressPath ? [gitPath(relative(checkoutRoot, run.progressPath))] : []),
+        ]);
         const changes = await this.runCommand("git", ["diff", "--name-only", "--no-relative", "-z", run.reviewRecovery.lastReviewedCommit, "HEAD"], run.worktreeCwd);
         if (changes.code !== 0) return this.reviewFailure(run, "Unable to verify the change supporting review adjudication.");
         if (!changes.stdout.split("\0").some((path) => path && !metadata.has(path)))
@@ -2453,6 +2657,7 @@ export class PlanExecController {
   }
 
   private async archive(run: PlanExecRun): Promise<PlanExecRun> {
+    assertPlanRun(run);
     if (run.archiveOperation) return this.advanceArchiveOperation(run);
     const unmet = await this.completionPrerequisite(run);
     if (unmet) return this.fail(run, unmet);
@@ -2631,12 +2836,21 @@ export class PlanExecController {
   }
 
   private async completionPrerequisite(run: PlanExecRun): Promise<string | undefined> {
-    if (!run.tasks || !Object.values(run.tasks).length || Object.values(run.tasks).some((task) => task.state !== "accepted"))
-      return "Completion requires every implementation task to be accepted; skipped or unchecked tasks remain unmet.";
     const head = await gitValue(this.runCommand, run.worktreeCwd, ["rev-parse", "HEAD"]);
-    const checkoutRoot = await gitCheckoutRoot(this.runCommand, run.worktreeCwd);
     if (!run.verifiedCommit) return "Required checks do not cover the current final commit.";
     if (run.config.reviewRequired && run.reviewedCommit !== run.verifiedCommit) return "Required review does not cover the final verified commit.";
+    if (isGoalRun(run)) {
+      if (run.verifiedCommit !== head) return "Current code differs from the final verified and reviewed commit.";
+      const goalCheckoutRoot = await gitCheckoutRoot(this.runCommand, run.worktreeCwd);
+      const goalDirty = await worktreeChanges(this.runCommand, run.worktreeCwd);
+      const goalProgress = run.progressPath ? gitPath(relative(goalCheckoutRoot, run.progressPath)) : undefined;
+      if (goalDirty.some((path) => path !== goalProgress)) return "Uncommitted source changes prevent completion.";
+      return undefined;
+    }
+    assertPlanRun(run);
+    if (!run.tasks || !Object.values(run.tasks).length || Object.values(run.tasks).some((task) => task.state !== "accepted"))
+      return "Completion requires every implementation task to be accepted; skipped or unchecked tasks remain unmet.";
+    const checkoutRoot = await gitCheckoutRoot(this.runCommand, run.worktreeCwd);
     const archivePaths = new Set([gitPath(relative(checkoutRoot, run.planPath)),
       gitPath(relative(checkoutRoot, join(dirname(run.planPath), COMPLETED_PLANS_DIRECTORY, basename(run.planPath)))),
       ...(run.progressPath ? [gitPath(relative(checkoutRoot, run.progressPath))] : [])]);
@@ -3154,6 +3368,11 @@ function isSuccessfulOperationState(state: string): boolean {
   );
 }
 
+function isTestPath(path: string): boolean {
+  return /(?:^|\/)(?:__tests__|tests?|specs?)\//iu.test(path) ||
+    /\.(?:test|spec)\.[a-z0-9]+$/iu.test(path);
+}
+
 function isActiveBridgeOperationState(state: string): boolean {
   return (
     state === EXTERNAL_OPERATION_STATE.RUNNING ||
@@ -3374,9 +3593,12 @@ function reviewerPrompt(run: PlanExecRun): string {
   return [
     "You are a read-only code reviewer. Do not edit files or run destructive commands.",
     `Review focus: ${focus}.`,
-    `Plan: ${run.planPath}`,
+    run.goal ? `Goal: ${run.goal.text}` : `Plan: ${run.planPath}`,
     `Worktree: ${run.worktreeCwd}`,
-    "Inspect the implementation and diff against the default branch. Return exactly one of:",
+    run.goal
+      ? `Inspect the implementation and the diff from ${run.outputTarget?.initialHead ?? "the goal start"} to HEAD.`
+      : "Inspect the implementation and diff against the default branch.",
+    "Return exactly one of:",
     "NO_FINDINGS",
     "or one or more blocks:",
     "FINDING: CRITICAL|MAJOR|MINOR | concise summary",
@@ -3474,7 +3696,7 @@ function clearError(run: PlanExecRun): PlanExecRun {
   const next = { ...run };
   delete next.error;
   delete next.failedOperation;
-  delete next.blockedTask;
+  delete next.blocked;
   return next;
 }
 
@@ -3490,7 +3712,6 @@ function sameOperationState(
 }
 
 export const TASK_RETRY_OPTION = "--retry-task";
-const TASK_FAILED_MARKER = "<<<RALPHEX:TASK_FAILED>>>";
 
 function taskFailureReason(output: string | undefined): string | undefined {
   const lines = output?.trim().split(/\r?\n/);
@@ -3545,16 +3766,17 @@ export function isRecoverableImplementationFailure(run: PlanExecRun): boolean {
 export function isExternalManualBlocker(run: PlanExecRun): boolean {
   if (run.stage !== RUN_STAGE.IMPLEMENTATION || run.activeOperation)
     return false;
-  return Boolean(run.blockedTask) || recoveryEvidence(run).includes(TASK_FAILED_MARKER) ||
+  return Boolean(run.blocked) || recoveryEvidence(run).includes(TASK_FAILED_MARKER) ||
     /\b(billing|payment|quota|rate[- ]limit|provider|credential|authentication|authorization|permission|unavailable|outage|network|manual|external|checkpoint)\b/i.test(
       recoveryEvidence(run),
     );
 }
 
 export function isTaskRetryConfirmationRequired(run: PlanExecRun): boolean {
+  if (isGoalRun(run)) return false;
   return (
     (run.status === RUN_STATUS.FAILED ||
-      (run.status === RUN_STATUS.PAUSED && run.blockedTask !== undefined)) &&
+      (run.status === RUN_STATUS.PAUSED && run.blocked !== undefined)) &&
     run.stage === RUN_STAGE.IMPLEMENTATION &&
     run.activeOperation === undefined &&
     !isModelProviderFailure(run) &&
@@ -3563,7 +3785,7 @@ export function isTaskRetryConfirmationRequired(run: PlanExecRun): boolean {
 }
 
 export function isModelProviderFailure(run: PlanExecRun): boolean {
-  return !run.blockedTask && isModelProviderFailureText(recoveryEvidence(run));
+  return !run.blocked && isModelProviderFailureText(recoveryEvidence(run));
 }
 
 function isModelProviderFailureText(value: string | undefined): boolean {
@@ -3581,14 +3803,14 @@ function isModelProviderFailureText(value: string | undefined): boolean {
 
 export function taskRetryRequiredMessage(run: PlanExecRun): string {
   const taskId =
-    run.blockedTask?.taskId ??
+    run.blocked?.taskId ??
     run.failedOperation?.taskId ??
     run.error?.match(/Task (\d+)/)?.[1] ??
     run.error?.match(/task (\d+)/i)?.[1] ??
     "the incomplete task";
   return [
     `Task ${taskId} is blocked; no automatic retry will be started.`,
-    run.blockedTask?.reason ?? run.failedOperation?.terminalError ?? run.error ?? "Inspect the worker output for the blocker.",
+    run.blocked?.reason ?? run.failedOperation?.terminalError ?? run.error ?? "Inspect the worker output for the blocker.",
     "Resolve the reported prerequisite or record the required operator decision first. Retrying does not waive plan requirements.",
     `Implementation checkboxes are sequential; the controller cannot bypass an incomplete implementation task. Re-run the same task only with /exec resume ${run.id} ${TASK_RETRY_OPTION}.`,
   ].join(" ");

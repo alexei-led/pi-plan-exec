@@ -89,34 +89,54 @@ remains unchanged. Heartbeats, silence, unknown results, wrapper exits,
 cancellation acknowledgements, and process-group snapshots do not count as
 progress or expiry.
 
-## Prepare a goal
+## Pursue a goal
 
-Use `/goal <short goal>` in a Git repository to prepare, but not start, a
-single executable plan. For example:
+`/goal <goal text>` pursues a goal autonomously in place; no plan file or
+checkbox list is required. For example:
 
 ```text
-/goal Add a greeting endpoint
+/goal Fix the failing tests
+/goal Add a greeting endpoint --check "npm test"
 ```
 
-`/goal` starts a bounded planning turn in the **current Pi session**. During that
-turn it enables only `read`, `grep`, `find`, and `ls` plus the extension-owned
-`finalize_goal_plan` tool; Pi rejects the thirteenth `read` call. The model must
-inspect repository files and cite them
-under `## Repository evidence`; it cannot write files, call execution tools, or
-launch a child. The finalizer is the only writer: it validates the same
-executable-plan parser contract used by `/exec`, the exact `Goal:` text, cited
-repository evidence, and `goal_id`, `goal_hash`, `plan_hash`, and
-`document_hash` metadata before atomically creating `docs/plans/goal-<hash>.md`
-without replacement. It creates no run, worktree, task projection, or child.
+`/goal` refuses to start on a dirty worktree or without at least one required
+check. Checks are resolved the same way as for `/exec` (project test/build
+commands) or supplied with `--check "<command>"`; they are the completion
+evidence.
 
-A retry with equivalent whitespace reuses a ready validated file. A file with an
-invalid metadata/content binding is treated as a user edit or incomplete file
-and is never overwritten. A finalizer validation error retains the restricted
-tool set so the same planning turn may correct its Markdown; Pi restores the
-previous tools only when that turn settles or its session shuts down. If planning
-settles without calling the finalizer, Pi reports an interrupted preparation and
-no plan exists. A ready result prints
-exactly one next action: `/exec <path>`.
+The controller runs one worker turn per iteration through the same owned
+Bridge/native runtime, registry, leases, stop fences, and recovery as `/exec`.
+Each turn receives the goal, the previous outcome, the current check failure,
+and the commits made so far; it inspects the state, chooses and executes the
+next useful action, verifies it, and commits. A turn that ends with an ordinary
+summary — no marker — is an intermediate answer: the controller schedules the
+next turn automatically.
+
+A worker claims completion with `<<<RALPHEX:GOAL_DONE>>>`. The claim only starts
+verification: the controller runs the required checks on the committed work,
+then the configured review and final-verification pipeline. A claim made while
+checks fail is recorded and the goal continues. Before completion, a diff guard
+pauses the goal if the work deleted test files or added `skip`/`only` markers,
+and completion requires a clean tree at the verified commit.
+
+A worker that needs external help ends with `<<<RALPHEX:TASK_FAILED>>>`,
+`Blocker: <reason>`, and `Next step: <what is needed>`. The goal pauses with
+that reason and schedules nothing; `/goal resume <run-id>` continues it. Three
+consecutive turns that neither move HEAD nor change the check result pause the
+goal as stalled. The turn budget is `maxTaskIterations` from the project
+config; when it is reached the goal pauses and can be resumed.
+
+```text
+/goal status [run-id]   Progress, current turn, check result, blocker
+/goal resume [run-id]   Continue after a stop, blocker, or failed turn
+/goal pause [run-id]    Stop scheduling turns; the current turn is preserved
+/goal cancel [run-id]   Cancel the goal and stop the current turn
+/goal help              Command list
+```
+
+Goal runs live in the same registry and `/exec status` lists them; the project
+`pi-tasks` projection is skipped for goals, because a working list is optional
+and an empty list is not an error.
 
 ## Executable plan format
 
@@ -312,7 +332,7 @@ runs match, Pi opens a picker; headless mode asks for the full ID. Bare
 full ID is always in front of you.
 
 ```text
-/goal <short goal>      Prepare a repository-grounded validated plan; does not start it
+/goal <goal> [--check "cmd"]  Pursue a goal autonomously in place; requires a clean worktree and at least one check
 /exec [plan]            Start a run; bare /exec opens the plan picker
 /exec --worktree <path> <plan>  Use an existing worktree and its current branch
 /exec status [run-id]   No run ID: every run grouped by what it needs, any missing package, and one next command per run. With a run ID: that run in detail

@@ -4,7 +4,6 @@ import { hostname } from "node:os";
 import { basename, relative, resolve } from "node:path";
 import {
   SessionManager,
-  withFileMutationQueue,
   type ExtensionAPI,
   type ExtensionCommandContext,
   type ExtensionContext,
@@ -28,18 +27,12 @@ import {
   taskRetryRequiredMessage,
 } from "./controller.js";
 import { FusionClient } from "./fusion.js";
-import {
-  beginGoalPreparation,
-  finalizeGoalPlan,
-  goalPreparationMessage,
-  type PendingGoalPlan,
-} from "./goal.js";
-import { Type } from "typebox";
-import { isPathWithin, requireGitRepository } from "./git.js";
+import { isPathWithin } from "./git.js";
 import { workspaceCommand } from "./workspace-environment.js";
 import {
   ABANDONMENT,
   classifyAbandonment,
+  isGoalRun,
   isInFlightStatus,
   isRecoverableRun,
   isReviewStage,
@@ -47,6 +40,7 @@ import {
   isTerminalStatus,
   longRunningOperation,
   activeExecutionLifetime,
+  requirePlanPath,
   type Abandonment,
   type AbandonmentEvidence,
   type ProcessTerminalProof,
@@ -103,16 +97,9 @@ const CLEANUP_INCLUDE_FAILED_OPTION = "--include-failed";
 const CLEANUP_RETENTION_DAYS = 7;
 const MILLISECONDS_PER_DAY = 86_400_000;
 const CLEANUP_RETENTION_MS = CLEANUP_RETENTION_DAYS * MILLISECONDS_PER_DAY;
+const GOAL_WIDGET_TAIL_LIMIT = 200;
+const GOAL_STATUS_TAIL_LIMIT = 400;
 const RUNS_ALL_OPTION = "--all";
-const GOAL_FINALIZATION_TOOL = "finalize_goal_plan";
-const GOAL_MAX_READ_CALLS = 12;
-const GOAL_EXPLORATION_TOOLS = [
-  "read",
-  "grep",
-  "find",
-  "ls",
-  GOAL_FINALIZATION_TOOL,
-];
 /** Keyed by `ExecAliasAction`, so retiring another name forces a note with it. */
 const ALIAS_NOTES: Record<ExecAliasAction, string> = {
   [EXEC_ACTION.RUNS]:
@@ -324,31 +311,6 @@ async function restoreRetiredRun(
       await waitForControllerPoll();
     }
   }
-}
-
-function goalPreparationPrompt(prepared: PendingGoalPlan): string {
-  return [
-    "Prepare a meaningful executable Markdown plan for this repository. This is preparation only: do not execute work, create a run, launch a child, or change any repository file.",
-    `Requested goal: ${prepared.goal}`,
-    `Use only the enabled read-only tools. Pi enforces at most ${GOAL_MAX_READ_CALLS} read-tool calls for this turn; use them on the most relevant files, then produce 2 to 6 ordered tasks that name the concrete modules, tests, interfaces, and verification commands discovered in this repository.`,
-    "Declare dependencies explicitly in each task heading with JSON metadata such as `dependsOn: [1]`; use `dependsOn: []` for work that is independent. IDs are normalized from 1 in plan order and may reference only earlier tasks. Omit the field only when preserving the legacy sequential default is intentional.",
-    "Before finalizing, make every claim traceable to the repository. Do not invent paths or generic Implement/Verify steps.",
-    "Call finalize_goal_plan exactly once with the plan body and no frontmatter. Its required shape is:",
-    "# <specific plan title>",
-    "",
-    `Goal: ${prepared.goal}`,
-    "",
-    "## Repository evidence",
-    "- `actual/path.ts`: what this file establishes for the plan.",
-    "",
-    "### Task 1: <concrete repository change>",
-    "dependsOn: []",
-    "- [ ] <specific implementation and test work>",
-    "",
-    "### Task 2: <next concrete change>",
-    "dependsOn: [1]",
-    "- [ ] <specific verification work>",
-  ].join("\n");
 }
 
 export default function planExecExtension(pi: ExtensionAPI): void {
@@ -651,138 +613,61 @@ export default function planExecExtension(pi: ExtensionAPI): void {
     },
   });
 
-  let activeGoalPreparation:
-    | (PendingGoalPlan & {
-        previousTools: string[];
-        repositoryRoot: string;
-        sessionId: string;
-        readCalls: number;
-      })
-    | undefined;
-  const restoreGoalTools = (sessionId: string): boolean => {
-    const active = activeGoalPreparation;
-    if (!active || active.sessionId !== sessionId) return false;
-    pi.setActiveTools(active.previousTools);
-    activeGoalPreparation = undefined;
-    return true;
-  };
-
-  pi.registerTool({
-    name: GOAL_FINALIZATION_TOOL,
-    label: "Finalize Goal Plan",
-    description:
-      "Validate and atomically publish the repository-grounded goal plan prepared for the active /goal request.",
-    promptSnippet: "Publish the active researched goal plan after read-only exploration",
-    promptGuidelines: [
-      "Use finalize_goal_plan exactly once after inspecting the repository and drafting a repository-grounded Markdown plan. Do not use edit, write, bash, subagents, or execution tools during /goal preparation.",
-    ],
-    parameters: Type.Object({
-      markdown: Type.String({
-        description:
-          "Plan body only: exact Goal line, repository evidence, and numbered checkbox tasks; no frontmatter.",
-      }),
-    }),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const active = activeGoalPreparation;
-      if (!active || active.sessionId !== ctx.sessionManager.getSessionId())
-        throw new Error(
-          "No active /goal preparation owns this finalization request.",
-        );
-      const prepared = await withFileMutationQueue(active.path, () =>
-        finalizeGoalPlan({
-          repositoryRoot: active.repositoryRoot,
-          goal: active.goal,
-          markdown: params.markdown,
-        }),
-      );
-      const path = relative(ctx.cwd, prepared.path) || prepared.path;
-      restoreGoalTools(active.sessionId);
-      return {
-        content: [{ type: "text", text: goalPreparationMessage(prepared, path) }],
-        details: {
-          goalId: prepared.goalId,
-          goalHash: prepared.goalHash,
-          planHash: prepared.planHash,
-          path: prepared.path,
-        },
-        terminate: true,
-      };
-    },
-  });
-
-  pi.on("tool_call", async (event, ctx) => {
-    const active = activeGoalPreparation;
-    if (!active || active.sessionId !== ctx.sessionManager.getSessionId())
-      return undefined;
-    if (!GOAL_EXPLORATION_TOOLS.includes(event.toolName))
-      return {
-        block: true,
-        reason:
-          "/goal preparation permits only bounded read-only exploration and its extension-owned finalizer.",
-      };
-    if (event.toolName === "read") {
-      if (active.readCalls >= GOAL_MAX_READ_CALLS)
-        return {
-          block: true,
-          reason: `/goal preparation permits at most ${GOAL_MAX_READ_CALLS} read-tool calls.`,
-        };
-      active.readCalls += 1;
-    }
-    return undefined;
-  });
-
-  pi.on("agent_settled", async (_event, ctx) => {
-    if (!restoreGoalTools(ctx.sessionManager.getSessionId())) return;
-    ctx.ui.notify(
-      "Goal preparation ended without a validated ready plan; no file was published. Retry /goal <short goal>.",
-      "warning",
-    );
-  });
-  pi.on("session_shutdown", async (_event, ctx) => {
-    restoreGoalTools(ctx.sessionManager.getSessionId());
-  });
-
   pi.registerCommand("goal", {
-    description:
-      "Research and prepare a validated plan from a short goal without starting execution",
+    description: "Pursue a goal autonomously in place; use /goal help for commands",
+    getArgumentCompletions: (prefix: string) => {
+      const request = prefix.trim().toLowerCase();
+      if (request.includes(" ")) return [];
+      return ["help", "status", "resume", "pause", "stop", "cancel"]
+        .filter((value) => value.startsWith(request))
+        .map((value) => ({ value, label: value }));
+    },
     handler: async (args, ctx) => {
-      let acquiredGoalSessionId: string | undefined;
+      const sessionId = ctx.sessionManager.getSessionId();
+      const parsed = parseGoalCommand(args);
       try {
-        if (!ctx.isIdle())
-          throw new Error("Goal preparation requires an idle Pi session.");
-        if (activeGoalPreparation)
-          throw new Error("Another goal preparation is already active.");
-        const repositoryRoot = await requireGitRepository(runCommand, ctx.cwd);
-        const prepared = await beginGoalPreparation({
-          repositoryRoot,
-          goal: args,
-        });
-        if (prepared.state === "ready") {
-          const path = relative(ctx.cwd, prepared.path) || prepared.path;
-          ctx.ui.notify(goalPreparationMessage(prepared, path), "info");
+        if (parsed.action === EXEC_ACTION.HELP) {
+          notify(ctx, goalHelp(), "info");
           return;
         }
-        activeGoalPreparation = {
-          ...prepared,
-          repositoryRoot,
-          previousTools: pi.getActiveTools(),
-          sessionId: ctx.sessionManager.getSessionId(),
-          readCalls: 0,
-        };
-        acquiredGoalSessionId = activeGoalPreparation.sessionId;
-        pi.setActiveTools(GOAL_EXPLORATION_TOOLS);
-        pi.sendUserMessage(goalPreparationPrompt(prepared));
-        ctx.ui.notify(
-          "Preparing a repository-grounded plan in this Pi session with read-only tools. No run or child was started.",
-          "info",
-        );
+        if (parsed.action === EXEC_ACTION.STATUS) {
+          const run = await resolveGoalRun(parsed.id);
+          if (!run) throw new Error("No goal run found.");
+          notify(ctx, goalStatusText(run), "info");
+          return;
+        }
+        if (parsed.action === EXEC_ACTION.RESUME) {
+          const run = await resolveGoalRun(parsed.id);
+          if (!run) throw new Error("No goal run found.");
+          const resumed = await controller.resume(run.id, sessionId, true);
+          startBackgroundController(resumed, sessionId, ctx.cwd, ctx);
+          notify(ctx, `Goal ${shortRunId(resumed.id)} resumed (${resumed.status}/${resumed.stage}).`, "info");
+          return;
+        }
+        if (parsed.action === EXEC_ACTION.PAUSE || parsed.action === EXEC_ACTION.CANCEL) {
+          const run = await resolveGoalRun(parsed.id);
+          if (!run) throw new Error("No goal run found.");
+          const requested = await requestStatus(run, parsed.action === EXEC_ACTION.PAUSE ? EXEC_ACTION.PAUSE : EXEC_ACTION.CANCEL);
+          startBackgroundController(requested, sessionId, ctx.cwd, ctx);
+          notify(ctx, parsed.action === EXEC_ACTION.PAUSE
+            ? `Goal ${shortRunId(requested.id)} paused; run /goal resume ${requested.id} to continue.`
+            : `Goal ${shortRunId(requested.id)} cancellation requested.`, "info");
+          return;
+        }
+        const run = await controller.startGoal({
+          goal: parsed.goal,
+          sessionId,
+          cwd: ctx.cwd,
+          checks: parsed.checks,
+        });
+        startBackgroundController(run, sessionId, ctx.cwd, ctx);
+        notify(ctx, [
+          `Goal ${shortRunId(run.id)} started: ${run.goal?.text ?? ""}`,
+          `checks: ${run.config.requiredChecks.map((command) => command.join(" ")).join(" · ")}`,
+          `Use /goal status ${run.id} for progress.`,
+        ].join("\n"), "info");
       } catch (error: unknown) {
-        if (acquiredGoalSessionId)
-          restoreGoalTools(acquiredGoalSessionId);
-        ctx.ui.notify(
-          error instanceof Error ? error.message : String(error),
-          "error",
-        );
+        notify(ctx, error instanceof Error ? error.message : String(error), "error");
       }
     },
   });
@@ -1129,11 +1014,13 @@ export function recoveryGuidance(
         };
   }
   if (run.status === RUN_STATUS.PAUSED) {
-    if (run.blockedTask)
+    if (run.blocked)
       return {
-        classification: "paused for a task blocker",
-        action: `Task ${run.blockedTask.taskId}: ${run.blockedTask.reason} Resolve the blocker, then run interactive ${resume}; it asks before retrying the same task. No task was skipped and no automatic retry is scheduled.`,
-        command: resume,
+        classification: run.blocked.taskId === undefined ? "paused for a goal blocker" : "paused for a task blocker",
+        action: run.blocked.taskId === undefined
+          ? `Goal: ${run.blocked.reason} Resolve the blocker, then run interactive /goal resume ${run.id}; no automatic retry is scheduled.`
+          : `Task ${run.blocked.taskId}: ${run.blocked.reason} Resolve the blocker, then run interactive ${resume}; it asks before retrying the same task. No task was skipped and no automatic retry is scheduled.`,
+        command: run.blocked.taskId === undefined ? `/goal resume ${run.id}` : resume,
       };
     if (run.activeOperation)
       return {
@@ -1300,7 +1187,7 @@ export function formatRunStatus(
     : "idle";
   const lines = [
     `Run ${run.id}`,
-    `plan: ${run.planPath}`,
+    run.goal !== undefined ? `goal: ${run.goal.text}` : `plan: ${run.planPath}`,
     `status: ${run.status}`,
     `stage: ${run.stage}`,
     `operation: ${operationText}`,
@@ -1308,6 +1195,11 @@ export function formatRunStatus(
     `worktree: ${run.worktreeCwd}`,
     `updated: ${new Date(run.updatedAt).toISOString()}`,
   ];
+  if (run.goal !== undefined) {
+    lines.push(`turn: ${run.goal.iteration}/${run.config.maxTaskIterations}`);
+    if (run.goal.lastCheck) lines.push(`checks: ${run.goal.lastCheck.failures ? `failing — ${run.goal.lastCheck.failures}` : "passing"}`);
+  }
+  if (run.blocked) lines.push(`blocked: ${run.blocked.reason}`);
   if (operation) lines.push(`operation ID: ${operation.operationId}`);
   if (operation?.externalRunId)
     lines.push(`external run ID: ${operation.externalRunId}`);
@@ -1681,7 +1573,13 @@ export async function execCleanup(
 }
 
 function cleanupRow(run: PlanExecRun): string {
-  return `${run.id} ${basename(run.planPath)} ${run.status}/${run.stage} updated ${relativeTime(run.updatedAt)}`;
+  return `${run.id} ${runLabel(run)} ${run.status}/${run.stage} updated ${relativeTime(run.updatedAt)}`;
+}
+
+function runLabel(run: PlanExecRun): string {
+  return run.planPath !== undefined
+    ? basename(run.planPath)
+    : `goal ${run.goal?.hash ?? run.id}`;
 }
 
 /**
@@ -2263,7 +2161,7 @@ export async function reconcileForResume(
 }
 
 function runClaim(run: PlanExecRun): string {
-  return `${run.id} ${basename(run.planPath)} ${run.status}/${run.stage}`;
+  return `${run.id} ${runLabel(run)} ${run.status}/${run.stage}`;
 }
 
 /** A run and what was observed about it; a diagnosis adds the verdict. */
@@ -3090,6 +2988,7 @@ export function isRecoverableFailure(run: PlanExecRun): boolean {
 }
 
 export function needsPlanStructureReview(run: PlanExecRun): boolean {
+  if (isGoalRun(run)) return false;
   return (
     (run.status === RUN_STATUS.PAUSED || run.status === RUN_STATUS.FAILED) &&
     run.error === PLAN_STRUCTURE_CHANGED_ERROR
@@ -3236,11 +3135,12 @@ export async function reviewedPlanHashForResume(
   },
 ): Promise<string | undefined> {
   if (!needsPlanStructureReview(run)) return undefined;
-  const current = await readPlan(run.planPath);
+  const planPath = requirePlanPath(run);
+  const current = await readPlan(planPath);
   if (current.hash !== run.planHash) {
     if (!ctx.hasUI) {
       throw new Error(
-        `Run ${shortRunId(run.id)} changed the plan structure. Review ${run.planPath}, then resume from interactive Pi to confirm adopting the current structure.`,
+        `Run ${shortRunId(run.id)} changed the plan structure. Review ${planPath}, then resume from interactive Pi to confirm adopting the current structure.`,
       );
     }
     const accepted = await ctx.ui.confirm(
@@ -3305,7 +3205,7 @@ function actionPastTense(action: RunAction): string {
 }
 
 function runSelectorLabel(run: PlanExecRun): string {
-  return `${basename(run.planPath)} — ${run.status}/${run.stage} — ${activeOperationLabel(run)} — ${shortRunId(run.id)}`;
+  return `${runLabel(run)} — ${run.status}/${run.stage} — ${activeOperationLabel(run)} — ${shortRunId(run.id)}`;
 }
 
 function activeOperationLabel(run: PlanExecRun): string {
@@ -3369,6 +3269,17 @@ export function formatRunWidget(
   run: PlanExecRun,
   now = Date.now(),
 ): string[] {
+  if (isGoalRun(run)) {
+    const goal = run.goal;
+    const lines = [`Goal ${runLabel(run)}  turn ${goal.iteration}  ${run.status}`];
+    if (run.activeOperation) lines.push(`Turn ${goal.iteration}: ${activeOperationLabel(run)} · deadline ${executionDeadlineLabel(run)}`);
+    else if (run.wakeReason) lines.push(`Run ${run.status}: ${run.wakeReason}`);
+    if (goal.lastCheck) lines.push(`Checks: ${goal.lastCheck.failures ? `failing · ${goal.lastCheck.failures.slice(0, GOAL_WIDGET_TAIL_LIMIT)}` : "passing"}`);
+    if (run.blocked) lines.push(`Blocked: ${run.blocked.reason}`);
+    if (run.nextAttemptAt && run.nextAttemptAt > now)
+      lines.push(`Next automatic action: ${relativeTimeAt(run.nextAttemptAt, now)}${run.wakeReason ? ` · ${run.wakeReason}` : ""}`);
+    return lines;
+  }
   const summary = taskProjectionSummary(run);
   const taskCounts = [
     `${summary.accepted}/${summary.total} accepted`,
@@ -3377,7 +3288,7 @@ export function formatRunWidget(
     `dependency ${summary.dependency}`,
     `external ${summary.external}`,
   ].join("  ");
-  const lines = [`Plan ${basename(run.planPath)}  ${taskCounts}`];
+  const lines = [`${run.goal !== undefined ? "Goal" : "Plan"} ${runLabel(run)}  ${taskCounts}`];
   const tasks = Object.values(run.tasks ?? {});
   const active = tasks.find(
     (task) =>
@@ -3543,8 +3454,10 @@ function boundedPromise<T>(
 }
 
 export function pausedMessage(run: PlanExecRun): string {
-  return run.blockedTask
-    ? `Plan execution ${shortRunId(run.id)} paused at Task ${run.blockedTask.taskId}: ${run.blockedTask.reason}\nNo automatic retries. Worktree and checkboxes preserved. Resolve the blocker, then use /exec resume ${run.id}; it asks before retrying the same task.`
+  return run.blocked
+    ? run.blocked.taskId === undefined
+      ? `Goal run ${shortRunId(run.id)} paused: ${run.blocked.reason}\nNo automatic retries. Worktree preserved. Resolve the blocker, then use /goal resume ${run.id}.`
+      : `Plan execution ${shortRunId(run.id)} paused at Task ${run.blocked.taskId}: ${run.blocked.reason}\nNo automatic retries. Worktree and checkboxes preserved. Resolve the blocker, then use /exec resume ${run.id}; it asks before retrying the same task.`
     : `Plan execution ${shortRunId(run.id)} is paused; the current attempt is stopping and its checkpoint is preserved. Use /exec resume ${run.id} to continue after confirmed exit.`;
 }
 
@@ -3556,6 +3469,96 @@ function terminalMessage(run: PlanExecRun): string {
   if (run.status === RUN_STATUS.CANCELLED)
     return `Plan execution ${shortRunId(run.id)} cancelled. Its worktree was preserved.`;
   return `Plan execution ${shortRunId(run.id)} completed.`;
+}
+
+export type GoalCommand =
+  | { action: "start"; goal: string; checks: string[][] }
+  | { action: "help" }
+  | { action: "status"; id?: string }
+  | { action: "resume"; id?: string }
+  | { action: "pause"; id?: string }
+  | { action: "cancel"; id?: string };
+
+const GOAL_ACTIONS = new Set<string>([
+  EXEC_ACTION.HELP,
+  EXEC_ACTION.STATUS,
+  EXEC_ACTION.RESUME,
+  EXEC_ACTION.PAUSE,
+  EXEC_ACTION.STOP,
+  EXEC_ACTION.CANCEL,
+]);
+
+/** `/goal <text>` starts; a leading verb addresses an existing goal run. */
+export function parseGoalCommand(input: string): GoalCommand {
+  const trimmed = input.trim();
+  if (!trimmed) return { action: "help" };
+  const [head, ...rest] = trimmed.split(/\s+/u);
+  if (head && GOAL_ACTIONS.has(head)) {
+    if (head === EXEC_ACTION.HELP) return { action: "help" };
+    const action = head === EXEC_ACTION.STOP ? EXEC_ACTION.PAUSE : head;
+    return { action: action as "status" | "resume" | "pause" | "cancel", ...(rest[0] ? { id: rest[0] } : {}) };
+  }
+  const { goal, checks } = parseGoalChecks(trimmed);
+  return { action: "start", goal, checks };
+}
+
+/** `--check "npm test"` is repeatable and removed from the goal text. */
+export function parseGoalChecks(input: string): { goal: string; checks: string[][] } {
+  const checks: string[][] = [];
+  const goal = input.replace(
+    /--check(?:=|\s+)(?:"([^"]*)"|'([^']*)'|(\S+))\s*/gu,
+    (_match, doubleQuoted, singleQuoted, bare) => {
+      const command = (doubleQuoted ?? singleQuoted ?? bare ?? "").trim();
+      if (command) checks.push(command.split(/\s+/u));
+      return " ";
+    },
+  ).replace(/\s+/gu, " ").trim();
+  return { goal, checks };
+}
+
+async function resolveGoalRun(id?: string): Promise<PlanExecRun | undefined> {
+  if (id) {
+    const run = await defaultRegistry.get(id);
+    return run && isGoalRun(run) ? run : undefined;
+  }
+  const { runs } = await defaultRegistry.listWithErrors();
+  return runs.filter(isGoalRun).sort((a, b) => b.updatedAt - a.updatedAt)[0];
+}
+
+export function goalStatusText(run: PlanExecRun): string {
+  if (!isGoalRun(run)) return `Run ${run.id} is not a goal run.`;
+  const goal = run.goal;
+  const lines = [
+    `Goal ${run.id}`,
+    `goal: ${goal.text}`,
+    `status: ${run.status}`,
+    `stage: ${run.stage}`,
+    `turn: ${goal.iteration}/${run.config.maxTaskIterations}`,
+    `branch: ${run.branch}`,
+    `worktree: ${run.worktreeCwd}`,
+    `checks: ${run.config.requiredChecks.map((command) => command.join(" ")).join(" · ") || "none"}`,
+    `updated: ${new Date(run.updatedAt).toISOString()}`,
+  ];
+  if (run.blocked) lines.push(`blocked: ${run.blocked.reason}`);
+  if (goal.lastCheck) lines.push(`checks: ${goal.lastCheck.failures ? `failing — ${goal.lastCheck.failures}` : "passing"}`);
+  if (goal.lastOutcome) lines.push(`last outcome: ${goal.lastOutcome.slice(0, GOAL_STATUS_TAIL_LIMIT)}`);
+  if (goal.noProgress) lines.push(`turns without progress: ${goal.noProgress}`);
+  if (run.activeOperation) lines.push(`operation: ${run.activeOperation.service}/${run.activeOperation.kind} · ${run.activeOperation.operationId}`);
+  return lines.join("\n");
+}
+
+export function goalHelp(): string {
+  return [
+    "/goal <goal text> [--check \"command\"]",
+    "                        Pursue the goal autonomously in place. The worktree must be clean and at least one check must exist.",
+    "/goal status [run-id]  Show goal progress, checks, blocker, and current turn.",
+    "/goal resume [run-id]  Continue after a stop, blocker, or failed turn.",
+    "/goal pause [run-id]   Stop scheduling turns; the current turn is stopped and preserved.",
+    "/goal cancel [run-id]  Cancel the goal and stop the current turn.",
+    "/goal help              Show this list.",
+    "",
+    "The goal is complete only when the required checks pass on the committed work. Deleting tests or adding skip/only markers pauses completion for confirmation.",
+  ].join("\n");
 }
 
 export function execSetup(): string {
