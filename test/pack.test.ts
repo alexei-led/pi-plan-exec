@@ -6,22 +6,22 @@ import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 
-test("package manifest ships only plan-exec resources and requires recovery-capable bridge peers", async () => {
+test("package manifest ships only plan-exec resources, needs no runtime dependency, and requires v2 bridge peers", async () => {
   const manifest = JSON.parse(
     await readFile(join(root, "package.json"), "utf8"),
   ) as {
     pi: { extensions: string[]; skills: string[] };
     dependencies?: Record<string, string>;
+    devDependencies?: Record<string, string>;
     bundledDependencies?: string[];
     peerDependencies: Record<string, string>;
     peerDependenciesMeta: Record<string, { optional?: boolean }>;
   };
   assert.deepEqual(manifest.pi.extensions, ["./src/index.ts"]);
   assert.deepEqual(manifest.pi.skills, ["./skills"]);
-  assert.match(
-    manifest.dependencies?.["pi-subagents"] ?? "",
-    /^git\+https:\/\/github\.com\/alexei-led\/pi-subagents-codex-fix\.git#[a-f0-9]{40}$/,
-  );
+  assert.equal(manifest.dependencies?.["pi-subagents"], undefined);
+  assert.equal(manifest.dependencies?.["@alexeiled/pi-subagents-bridge"], undefined);
+  assert.match(manifest.devDependencies?.["pi-subagents"] ?? "", /^\^0\.70\.1$/);
   assert.equal(manifest.peerDependencies["pi-subagents"], undefined);
   assert.equal(manifest.bundledDependencies, undefined);
   for (const packageName of [
@@ -31,14 +31,14 @@ test("package manifest ships only plan-exec resources and requires recovery-capa
     assert.equal(
       manifest.peerDependencies[packageName],
       packageName === "@alexeiled/pi-fusion"
-        ? ">=0.9.1 <1.0.0"
+        ? ">=0.9.2 <1.0.0"
         : ">=0.9.0",
     );
     assert.equal(manifest.peerDependenciesMeta[packageName]?.optional, true);
   }
   assert.equal(
     manifest.peerDependencies["@alexeiled/pi-subagents-bridge"],
-    ">=0.3.2 <0.4.0",
+    ">=0.4.2 <0.5.0",
   );
   assert.equal(
     manifest.peerDependenciesMeta["@alexeiled/pi-subagents-bridge"]?.optional,

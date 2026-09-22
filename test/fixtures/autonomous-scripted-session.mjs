@@ -39,7 +39,7 @@ export default function scriptedSessions() {
             assert.equal(readFileSync(join(launch.cwd, "result.txt"), "utf8"), "autonomous runtime smoke\n");
             execFileSync(process.execPath, ["check.mjs"], { cwd: launch.cwd, stdio: "pipe" });
           }
-          appendFileSync(process.env.PI_AUTONOMOUS_SMOKE_CALLS, `${JSON.stringify({ agent, cwd: launch.cwd, pid: process.pid, executionLifetime: launch.runtime.executionLifetime, output })}\n`);
+          appendFileSync(process.env.PI_AUTONOMOUS_SMOKE_CALLS, `${JSON.stringify({ agent, cwd: launch.cwd, pid: process.pid, executionLifetime: launch.runtime?.executionLifetime ?? null, output })}\n`);
           emit({ type: "agent_start" });
           emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: output }],
             model: "scripted/smoke", stopReason: "stop", usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } } });

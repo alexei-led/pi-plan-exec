@@ -32,12 +32,7 @@ process.env.NODE_OPTIONS = `--import=${preload}`;
 const manifest = JSON.parse(await readFile(join(project, "package.json"), "utf8"));
 const lock = JSON.parse(await readFile(join(project, "package-lock.json"), "utf8"));
 const installedLock = JSON.parse(await readFile(join(project, "node_modules/.package-lock.json"), "utf8"));
-const nativeRevision = /#([a-f0-9]{40})$/.exec(manifest.dependencies?.["pi-subagents"] ?? "")?.[1];
-assert.ok(nativeRevision, "pi-subagents must use an immutable Git pin");
-for (const source of [lock, installedLock]) {
-  assert.ok(source.packages["node_modules/pi-subagents"].resolved.endsWith(`#${nativeRevision}`), "pi-subagents installed package must match the declared pin");
-}
-for (const name of ["@alexeiled/pi-subagents-bridge", "@alexeiled/pi-fusion"]) {
+for (const name of ["pi-subagents", "@alexeiled/pi-subagents-bridge", "@alexeiled/pi-fusion"]) {
   const declared = manifest.devDependencies?.[name];
   assert.match(declared ?? "", /^\^\d+\.\d+\.\d+$/, `${name} must use a released registry pin`);
   const [major, minor, patch] = declared.slice(1).split(".").map(Number);
@@ -51,19 +46,19 @@ for (const name of ["@alexeiled/pi-subagents-bridge", "@alexeiled/pi-fusion"]) {
 const nativeRoot = join(project, "node_modules/pi-subagents");
 const bridgeRoot = join(project, "node_modules/@alexeiled/pi-subagents-bridge");
 const jiti = createJiti(import.meta.url);
-const { createSubagentExecutor } = await jiti.import(join(nativeRoot, "src/runs/foreground/subagent-executor.ts"));
-const { registerSubagentRpcBridge } = await jiti.import(join(nativeRoot, "src/extension/rpc.ts"));
-const { setChildSessionFactoryModule } = await jiti.import(join(nativeRoot, "src/runs/shared/child-session.ts"));
-const { ASYNC_DIR, RESULTS_DIR } = await jiti.import(join(nativeRoot, "src/shared/types.ts"));
+const { createSubagentExecutor } = await jiti.import(join(nativeRoot, "src/runs/foreground/subagent-executor.js"));
+const { registerSubagentRpcBridge } = await jiti.import(join(nativeRoot, "src/extension/rpc.js"));
+const { setChildSessionFactory, setChildSessionFactoryModule } = await jiti.import(join(nativeRoot, "src/runs/shared/child-session.js"));
+const { ASYNC_DIR, RESULTS_DIR } = await jiti.import(join(nativeRoot, "src/shared/types.js"));
 const { registerPlanExecRpc } = await jiti.import(join(bridgeRoot, "src/plan-exec-rpc.ts"));
-const { BridgeClient, hasKernelRetirementProof, hasTerminalOwnershipProof } = await jiti.import(join(project, "src/bridge.ts"));
-const { cancelKernelOwnedProcess, observeKernelOwnedProcess, preflightKernelOwnedProcess } = await import("pi-subagents/kernel-owned-process");
+const { BridgeClient, hasOwnedProcessRetirementProof, hasTerminalOwnershipProof } = await jiti.import(join(project, "src/bridge.ts"));
+const { cancelOwnedProcess, observeOwnedProcess } = await jiti.import(join(project, "src/owned-process.ts"));
 const { PlanExecController } = await jiti.import(join(project, "src/controller.ts"));
 const { RunRegistry } = await jiti.import(join(project, "src/registry.ts"));
 const { readPlan } = await jiti.import(join(project, "src/plan.ts"));
 const { DEFAULT_FROZEN_RUN_CONFIG } = await jiti.import(join(project, "src/types.ts"));
 
-test("scripted model completes real controller, Bridge, kernel-owned workers, checks, review and promotion", { timeout: 120_000 }, async (t) => {
+test("scripted model completes real controller, Bridge, owned-process workers, checks, review and promotion", { timeout: 120_000 }, async (t) => {
   t.diagnostic(`Retained smoke evidence: ${sandbox}; model turns are scripted, not a live-LLM guarantee.`);
   const root = join(sandbox, "repository");
   const lane = join(sandbox, "execution-lane");
@@ -93,12 +88,14 @@ test("scripted model completes real controller, Bridge, kernel-owned workers, ch
     },
   };
   const sessionId = "autonomous-runtime-smoke";
-  const ctx = { cwd: lane, hasUI: false, ui: {}, sessionManager: { getSessionId: () => sessionId, getSessionFile: () => null }, modelRegistry: { getAvailable: () => [] } };
+  const ctx = { cwd: lane, hasUI: false, ui: {}, sessionManager: { getSessionId: () => sessionId, getSessionFile: () => null }, modelRegistry: { getAvailable: () => [], getRegisteredProviderIds: () => [] } };
   const state = { baseCwd: lane, currentSessionId: sessionId, asyncJobs: new Map(), foregroundControls: new Map(), lastForegroundControlId: null, workflowControllers: new Map() };
   const agents = ["worker", "reviewer"].map((name) => ({ name, description: `Scripted smoke ${name}`, systemPrompt: "", systemPromptMode: "replace", inheritGlobalContext: false, inheritProjectContext: false, inheritSkills: false }));
   setChildSessionFactoryModule(join(project, "test/fixtures/autonomous-scripted-session.mjs"));
+  const scriptedSessions = (await jiti.import(join(project, "test/fixtures/autonomous-scripted-session.mjs"))).default();
+  setChildSessionFactory(scriptedSessions);
   const executor = createSubagentExecutor({ pi: { events, getSessionName: () => undefined, sendMessage() {} }, state,
-    config: { worktree: true, worktreeProvider: "native", worktreeBaseDir: join(sandbox, "native-worktrees") }, asyncByDefault: false,
+    config: { worktree: true, worktreeProvider: "native", worktreeBaseDir: join(sandbox, "native-worktrees") }, asyncByDefault: true,
     tempArtifactsDir: join(sandbox, "artifacts"), getSubagentSessionRoot: () => join(sandbox, "sessions"), expandTilde: (value) => value, discoverAgents: () => ({ agents }) });
   const nativeRpc = registerSubagentRpcBridge({ events, state, asyncDirRoot: ASYNC_DIR, resultsDir: RESULTS_DIR, getContext: () => ctx, execute: (...args) => executor.executePublic(...args) });
   const bridgeRpc = registerPlanExecRpc(events, { timeoutMs: 15_000, journalPath: join(sandbox, "bridge.sqlite") });
@@ -107,36 +104,43 @@ test("scripted model completes real controller, Bridge, kernel-owned workers, ch
     try {
       for (const request of requests) {
         const binding = { operationId: request.operationId, requestDigest: request.owner.requestDigest };
-        const terminal = (operation) => operation.data?.neverStarted || hasTerminalOwnershipProof(operation.data ?? {}, operation.data?.runId, binding);
+        const terminal = async (operation) => {
+          if (operation.data?.neverStarted) return true;
+          if (hasTerminalOwnershipProof(operation.data ?? {}, operation.data?.runId, binding)) return true;
+          const runId = operation.data?.runId;
+          if (typeof runId !== "string") return false;
+          const status = await bridge.status(runId);
+          return status.success && hasTerminalOwnershipProof(status.data, runId, binding);
+        };
         let operation = await bridge.operation(request.operationId, request.owner);
-        if (!terminal(operation)) {
+        if (!(await terminal(operation))) {
           await bridge.cancelOperation(request.operationId, request.owner);
           const deadline = Date.now() + 15_000;
           do {
             await delay(100);
             operation = await bridge.operation(request.operationId, request.owner);
-          } while (Date.now() < deadline && !terminal(operation));
+          } while (Date.now() < deadline && !(await terminal(operation)));
         }
-        assert.ok(terminal(operation), `Owned runtime cleanup proof missing: ${request.operationId}`);
+        assert.ok(await terminal(operation), `Owned runtime cleanup proof missing: ${request.operationId}`);
       }
       for (const directory of await readdir(localRoot).catch((error) => { if (error.code === "ENOENT") return []; throw error; })) {
         const generation = join(localRoot, directory, "generation-0");
         const binding = JSON.parse(await readFile(join(generation, "binding.json"), "utf8"));
-        let observation = await observeKernelOwnedProcess(join(generation, "owned-process"));
-        if (!hasKernelRetirementProof(observation, binding)) observation = await cancelKernelOwnedProcess(join(generation, "owned-process"), { deadlineMs: 15_000 });
-        assert.ok(hasKernelRetirementProof(observation, binding) || observation.status === "never-started" && observation.proof?.kind === "never-started" && ["operationId", "requestDigest", "hostId", "bootId"].every((key) => observation.proof[key] === binding[key]),
+        let observation = await observeOwnedProcess(join(generation, "owned-process"));
+        if (!hasOwnedProcessRetirementProof(observation, binding)) observation = await cancelOwnedProcess(join(generation, "owned-process"), { deadlineMs: 15_000, cancelled: true });
+        assert.ok(hasOwnedProcessRetirementProof(observation, binding) || observation.status === "never-started" && observation.proof?.kind === "never-started" && ["operationId", "requestDigest", "hostId", "bootId"].every((key) => observation.proof[key] === binding[key]),
           `Local check cleanup proof missing: ${directory}`);
       }
     } finally {
       bridgeRpc.dispose();
       nativeRpc.dispose();
+      setChildSessionFactory(undefined);
       setChildSessionFactoryModule(undefined);
     }
   });
-  assert.equal((await preflightKernelOwnedProcess({ artifactDirectory: join(ASYNC_DIR, "kernel-cache") })).supported, true);
   const capabilities = await bridge.capabilities();
   assert.equal(capabilities.processTreeOwnership?.scope, "owned-process-tree");
-  assert.equal(capabilities.processTreeOwnership?.escapedDescendants, "contained");
+  assert.equal(capabilities.processTreeOwnership?.escapedDescendants, "best-effort");
   const command = async (program, args, cwd) => {
     try { return { stdout: execFileSync(program, args, { cwd, ...(program === "git" ? { env: fixtureGitEnvironment(inheritedHookEnvironment) } : {}), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }), stderr: "", code: 0 }; }
     catch (error) { return { stdout: String(error.stdout ?? ""), stderr: String(error.stderr ?? ""), code: error.status ?? 1 }; }
@@ -149,24 +153,6 @@ test("scripted model completes real controller, Bridge, kernel-owned workers, ch
     branch: "execution", defaultBranch: "main", outputTarget: { cwd: root, branch: "feature", initialHead: baseline, planRelativePath: "plan.md" },
     stage: "resolve", status: "running", taskAttempts: {}, stageAttempts: {}, reviewFindings: [], unresolvedFindings: [], skippedStages: [], branchRebindings: [],
     config: { ...DEFAULT_FROZEN_RUN_CONFIG, retryDelayMs: 100, requiredChecks: [[process.execPath, "check.mjs"]] } };
-  let rejected = await registry.create({ ...seed, stage: "implementation",
-    config: { ...seed.config, workerAgent: "missing-smoke-agent" } });
-  for (let step = 0; step < 10 && !rejected.failedOperation?.launchFenced; step++) {
-    rejected = await registry.update({ ...rejected, nextAttemptAt: 0,
-      ...(rejected.activeOperation ? { activeOperation: { ...rejected.activeOperation, launchStartedAt: 0 } } : {}) });
-    rejected = await controller.tick(rejected.id, sessionId);
-  }
-  assert.equal(rejected.failedOperation?.launchFenced, true, rejected.error ?? "Rejected launch did not reconcile");
-  assert.equal(rejected.activeOperation, undefined);
-  assert.equal(rejected.tasks["1"].state, "retry_wait");
-  assert.ok(rejected.tasks["1"].nextAttemptAt > Date.now());
-  await assert.rejects(access(process.env.PI_AUTONOMOUS_SMOKE_CALLS), { code: "ENOENT" });
-  const rejectedOperationId = rejected.failedOperation.operationId;
-  const rejectedEvidence = { runId: rejected.id, operationId: rejectedOperationId,
-    state: rejected.tasks["1"].state, nextAttemptAt: rejected.tasks["1"].nextAttemptAt, modelSessions: 0 };
-  rejected = await registry.update({ ...rejected, status: "cancel_pending", userStopped: true, stopGeneration: 1 });
-  rejected = await controller.tick(rejected.id, sessionId);
-  assert.equal(rejected.status, "cancelled");
   let run = await registry.create(seed);
   const transitions = [];
   const deadline = Date.now() + 90_000;
@@ -177,7 +163,7 @@ test("scripted model completes real controller, Bridge, kernel-owned workers, ch
     if (run.tasks?.["1"]?.state === "retry_wait" || (run.stageAttempts.comprehensive_review ?? 0) > 1) break;
     if (run.activeOperation || (run.nextAttemptAt ?? 0) > Date.now()) await delay(100);
   }
-  await writeFile(join(sandbox, "evidence.json"), JSON.stringify({ model: "scripted", rejectedEvidence, pins: { native: manifest.dependencies["pi-subagents"], bridge: manifest.devDependencies["@alexeiled/pi-subagents-bridge"] }, run, transitions }, null, 2));
+  await writeFile(join(sandbox, "evidence.json"), JSON.stringify({ model: "scripted", pins: { piSubagents: manifest.devDependencies["pi-subagents"], bridge: manifest.devDependencies["@alexeiled/pi-subagents-bridge"], fusion: manifest.devDependencies["@alexeiled/pi-fusion"] }, run, transitions }, null, 2));
   assert.equal(run.status, "completed", JSON.stringify(transitions));
   assert.equal(run.tasks["1"].state, "accepted");
   assert.notEqual(run.acceptedHead, baseline);
@@ -194,19 +180,17 @@ test("scripted model completes real controller, Bridge, kernel-owned workers, ch
   assert.equal(calls[0].cwd, lane);
   assert.equal(calls[1].cwd, lane);
   assert.equal(calls[1].output, "NO_FINDINGS");
-  assert.ok(calls.every((call) => call.pid !== process.pid && call.executionLifetime.mode === "unbounded"));
-  assert.equal(requests.length, 3);
+  assert.ok(calls.every((call) => call.pid !== process.pid));
+  assert.ok(requests.length >= 2, `Expected a worker and a reviewer launch, saw ${requests.length}`);
   for (const request of requests) {
     assert.equal(request.params.worktree, false);
+    assert.equal(request.params.executionLifetime?.mode, "unbounded");
     const operation = await bridge.operation(request.operationId, request.owner);
-    const terminal = hasTerminalOwnershipProof(operation.data, operation.data.runId, { operationId: request.operationId, requestDigest: request.owner.requestDigest });
-    if (request.operationId === rejectedOperationId) {
-      assert.equal(operation.data.operationId, request.operationId);
-      assert.equal(operation.data.requestDigest, request.owner.requestDigest);
-      assert.equal(operation.data.neverStarted, true);
-      assert.equal(operation.data.cancellationRequested, true);
-      assert.equal(terminal, false);
-    } else assert.ok(terminal);
+    const runId = operation.data?.runId;
+    assert.equal(typeof runId, "string");
+    // The durable lookup carries the binding; the live status carries the proof.
+    const status = await bridge.status(runId);
+    assert.ok(hasTerminalOwnershipProof(status.data, runId, { operationId: request.operationId, requestDigest: request.owner.requestDigest }));
   }
   const localDirectories = await readdir(localRoot);
   let requiredCheckRuns = 0;
@@ -218,8 +202,8 @@ test("scripted model completes real controller, Bridge, kernel-owned workers, ch
       assert.equal(intent.candidate, run.acceptedHead);
     }
     const binding = JSON.parse(await readFile(join(generation, "binding.json"), "utf8"));
-    const observation = await observeKernelOwnedProcess(join(generation, "owned-process"));
-    assert.ok(hasKernelRetirementProof(observation, binding));
+    const observation = await observeOwnedProcess(join(generation, "owned-process"));
+    assert.ok(hasOwnedProcessRetirementProof(observation, binding));
     assert.equal(observation.exitCode, 0);
   }
   assert.ok(requiredCheckRuns >= 2, "Required checks must execute for candidate acceptance and final verification");

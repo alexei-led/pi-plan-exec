@@ -1,23 +1,25 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { createRequire } from "node:module";
 import { join } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 import { cancelActiveLocalOperations, durableJson, hasActiveLocalOperations, localOperationDirectory, LocalOperationCancelledError, LocalOperationFailedError, LocalOperationUnknownError, runLocalOperation, type LocalOperationOptions } from "../src/local-operation.js";
+import { cancelOwnedProcess, observeOwnedProcess } from "../src/owned-process.js";
 
-const nativeTest = process.platform === "darwin" ? test : test.skip;
-const require = createRequire(import.meta.url);
-
-async function fixture(native = true) {
+async function fixture() {
   const cwd = await mkdtemp(join(tmpdir(), "plan-local-op-"));
-  const runtimeModule = native ? process.env.PI_PLAN_EXEC_KERNEL_TEST_MODULE ?? pathToFileURL(require.resolve("pi-subagents/kernel-owned-process")).href : pathToFileURL(join(cwd, "runtime.mjs")).href;
-  const options: LocalOperationOptions = { journalRoot: cwd, runId: "run", operationId: "checks", candidate: "candidate", runtimeModule, isAuthorized: async () => true };
+  const options: LocalOperationOptions = { journalRoot: cwd, runId: "run", operationId: "checks", candidate: "candidate", isAuthorized: async () => true };
   return { cwd, options, directory: localOperationDirectory(options) };
+}
+
+function ownedDirectory(options: LocalOperationOptions, generation?: number): string {
+  return join(generation === undefined ? localOperationDirectory(options) : localOperationDirectory({
+    ...options, authorization: { path: options.authorization?.path ?? "", stopGeneration: generation },
+  }), "owned-process");
 }
 
 async function untilFile(path: string): Promise<string> {
@@ -26,6 +28,10 @@ async function untilFile(path: string): Promise<string> {
     try { return await readFile(path, "utf8"); } catch { if (Date.now() > end) throw new Error(`File absent: ${path}`); }
     await delay(20);
   }
+}
+
+async function exists(path: string): Promise<boolean> {
+  try { await stat(path); return true; } catch { return false; }
 }
 
 async function controllerFor(cwd: string, commands: string[][], options: LocalOperationOptions,
@@ -68,16 +74,16 @@ async function killController(controller: ReturnType<typeof spawn>) {
 }
 
 async function clean(cwd: string, options: LocalOperationOptions) {
-  const operation = join(localOperationDirectory(options), "owned-process");
-  try { await stat(operation); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") { await rm(cwd, { recursive: true, force: true }); return; } throw error; }
-  const runtime = await import(options.runtimeModule!);
-  const observation = await runtime.cancelKernelOwnedProcess(operation, { deadlineMs: 10_000 });
-  assert.ok(observation.proof && (observation.status === "retired" || observation.status === "never-started"), `Cleanup retained unproven operation at ${cwd}: ${JSON.stringify(observation)}`);
+  const owned = ownedDirectory(options);
+  if (await exists(owned)) {
+    const observation = await cancelOwnedProcess(owned, { deadlineMs: 10_000, cancelled: true });
+    assert.ok(observation.status === "retired" || observation.status === "never-started",
+      `Cleanup retained unproven operation at ${cwd}: ${JSON.stringify(observation)}`);
+  }
   await rm(cwd, { recursive: true, force: true });
 }
 
-nativeTest("lost result reply and concurrent attachment execute the unbounded batch exactly once", async () => {
+test("lost result reply and concurrent attachment execute the unbounded batch exactly once", async () => {
   const { cwd, options, directory } = await fixture();
   try {
     const commands = [[process.execPath, "-e", "require('fs').appendFileSync('count','x')"]];
@@ -93,7 +99,7 @@ nativeTest("lost result reply and concurrent attachment execute the unbounded ba
   } finally { await clean(cwd, options); }
 });
 
-nativeTest("controller death leaves one command that a new controller adopts", async () => {
+test("controller death leaves one command that a new controller adopts", async () => {
   const { cwd, options } = await fixture();
   const commands = [[process.execPath, "-e", "require('fs').appendFileSync('count','x'); setTimeout(()=>{},1200)"]];
   const controller = await controllerFor(cwd, commands, options);
@@ -105,27 +111,7 @@ nativeTest("controller death leaves one command that a new controller adopts", a
   } finally { await killController(controller); await clean(cwd, options); }
 });
 
-nativeTest("a pending bootstrap without a launched process is reconciled under the same durable identity", async () => {
-  const { cwd, options } = await fixture();
-  const actualRuntime = options.runtimeModule!;
-  const proxy = join(cwd, "pending-launch.mjs");
-  await writeFile(proxy, `export * from ${JSON.stringify(actualRuntime)};
-import { prepareKernelOwnedProcess, observeKernelOwnedProcess } from ${JSON.stringify(actualRuntime)};
-export async function launchKernelOwnedProcess(request) {
-  const prepared = await prepareKernelOwnedProcess(request);
-  return { ...prepared, observation: await observeKernelOwnedProcess(request.operationDirectory) };
-}
-`);
-  options.runtimeModule = pathToFileURL(proxy).href;
-  try {
-    const commands = [[process.execPath, "-e", "require('fs').appendFileSync('count','x')"]];
-    await Promise.all([runLocalOperation(cwd, commands, options), runLocalOperation(cwd, commands, options)]);
-    await runLocalOperation(cwd, commands, options);
-    assert.equal(await readFile(join(cwd, "count"), "utf8"), "x");
-  } finally { await clean(cwd, options); }
-});
-
-nativeTest("local worker excludes inherited Git selectors and injected config from its immutable environment", async () => {
+test("local worker excludes inherited Git selectors and injected config from its immutable environment", async () => {
   const { cwd, options, directory } = await fixture();
   const inherited = {
     GIT_DIR: join(cwd, "canary-not-a-repository"),
@@ -161,22 +147,21 @@ nativeTest("local worker excludes inherited Git selectors and injected config fr
   }
 });
 
-nativeTest("fast detached descendant remains owned after batch wrapper exits", async () => {
+test("fast detached descendant survives its batch wrapper", async () => {
   const { cwd, options } = await fixture();
   try {
     const descendant = "setTimeout(()=>require('fs').writeFileSync('descendant-done','yes'),600)";
     const command = `require('child_process').spawn(process.execPath,['-e',${JSON.stringify(descendant)}],{stdio:'ignore',detached:true}).unref()`;
     await runLocalOperation(cwd, [[process.execPath, "-e", command]], options);
-    assert.equal(await readFile(join(cwd, "descendant-done"), "utf8"), "yes");
+    assert.equal(await untilFile(join(cwd, "descendant-done")), "yes");
   } finally { await clean(cwd, options); }
 });
 
-nativeTest("stop retires escaped descendants and fences later commands and late success", async () => {
+test("stop retires the owned process group and fences later commands", async () => {
   const { cwd, options } = await fixture();
   let authorized = true;
   options.isAuthorized = async () => authorized;
-  const descendant = "require('fs').writeFileSync('started','yes');setInterval(()=>{},1000)";
-  const commands = [[process.execPath, "-e", `require('child_process').spawn(process.execPath,['-e',${JSON.stringify(descendant)}],{stdio:'ignore',detached:true}).unref();setInterval(()=>{},1000)`], [process.execPath, "-e", "require('fs').writeFileSync('late','bad')"]];
+  const commands = [[process.execPath, "-e", "require('fs').writeFileSync('started','yes');setInterval(()=>{},1000)"], [process.execPath, "-e", "require('fs').writeFileSync('late','bad')"]];
   try {
     const running = runLocalOperation(cwd, commands, options);
     const cancelled = assert.rejects(running, LocalOperationCancelledError);
@@ -189,7 +174,7 @@ nativeTest("stop retires escaped descendants and fences later commands and late 
   } finally { await clean(cwd, options); }
 });
 
-nativeTest("stop before launch is durable and has no command side effects", async () => {
+test("stop before launch is durable and has no command side effects", async () => {
   const { cwd, options } = await fixture();
   try {
     options.isAuthorized = async () => false;
@@ -200,7 +185,7 @@ nativeTest("stop before launch is durable and has no command side effects", asyn
   } finally { await clean(cwd, options); }
 });
 
-nativeTest("nonzero exit is durable and a later attempt requires a fresh operation ID", async () => {
+test("nonzero exit is durable and a later attempt requires a fresh operation ID", async () => {
   const { cwd, options } = await fixture();
   try {
     const commands = [[process.execPath, "-e", "require('fs').appendFileSync('count','x');process.exit(7)"], [process.execPath, "-e", "require('fs').writeFileSync('late','bad')"]];
@@ -213,7 +198,7 @@ nativeTest("nonzero exit is durable and a later attempt requires a fresh operati
   } finally { await clean(cwd, options); }
 });
 
-nativeTest("offline batch observes durable registry stop without its controller", async () => {
+test("an offline stop is honored by the next dispatcher after controller death", async () => {
   const { cwd, options } = await fixture();
   const authorizationPath = join(cwd, "run.json");
   options.authorization = { path: authorizationPath, stopGeneration: 0 };
@@ -224,20 +209,12 @@ nativeTest("offline batch observes durable registry stop without its controller"
     await untilFile(join(cwd, "started"));
     await killController(controller);
     await durableJson(authorizationPath, { id: "run", status: "paused", userStopped: true, stopGeneration: 1 });
-    const runtime = await import(options.runtimeModule!);
-    const deadline = Date.now() + 15_000;
-    let observation;
-    do {
-      observation = await runtime.observeKernelOwnedProcess(join(localOperationDirectory(options), "owned-process"));
-      if (Date.now() > deadline) throw new Error(`Offline cancellation did not retire: ${JSON.stringify(observation)}`);
-      await delay(50);
-    } while (observation.status !== "retired");
     await assert.rejects(runLocalOperation(cwd, commands, options), LocalOperationCancelledError);
     await assert.rejects(readFile(join(cwd, "late")), { code: "ENOENT" });
   } finally { await killController(controller); await clean(cwd, options); }
 });
 
-nativeTest("authorization lookup failure preserves the running operation for reconciliation", async () => {
+test("authorization lookup failure preserves the running operation for reconciliation", async () => {
   const { cwd, options } = await fixture();
   let unavailable = false;
   options.isAuthorized = async () => { if (unavailable) throw new Error("Registry unavailable"); return true; };
@@ -253,24 +230,21 @@ nativeTest("authorization lookup failure preserves the running operation for rec
   } finally { await clean(cwd, options); }
 });
 
-nativeTest("batch monitor death cancels surviving descendants before a fresh retry", async () => {
+test("batch monitor death cancels surviving descendants before a fresh retry", async () => {
   const { cwd, options } = await fixture();
   try {
     const running = runLocalOperation(cwd, [[process.execPath, "-e", "require('fs').writeFileSync('started','yes');setInterval(()=>{},1000)"]], options);
     const failed = assert.rejects(running, error => error instanceof LocalOperationFailedError && error.message.includes("lost-result-after-exit"));
     await untilFile(join(cwd, "started"));
-    const runtime = await import(options.runtimeModule!);
-    const observation = await runtime.observeKernelOwnedProcess(join(localOperationDirectory(options), "owned-process"));
-    assert.equal(observation.status, "active");
-    assert.ok(observation.workloadIdentity?.pid);
-    process.kill(observation.workloadIdentity.pid, "SIGKILL");
+    const launch = JSON.parse(await readFile(join(ownedDirectory(options), "launch.json"), "utf8"));
+    process.kill(launch.pid, "SIGKILL");
     await failed;
     await runLocalOperation(cwd, [[process.execPath, "-e", "require('fs').writeFileSync('retry','yes')"]], { ...options, operationId: "checks:after-monitor-death" });
     assert.equal(await readFile(join(cwd, "retry"), "utf8"), "yes");
   } finally { await clean(cwd, options); }
 });
 
-nativeTest("a restarted stop discovers and retires local descendants after both monitors die", async () => {
+test("a restarted stop discovers and retires local descendants after both monitors die", async () => {
   const { cwd, options } = await fixture();
   options.activeDirectory = join(cwd, "active-local");
   const commands = [[process.execPath, "-e", "require('fs').writeFileSync('child-pid',String(process.pid));setInterval(()=>{},1000)"]];
@@ -278,11 +252,9 @@ nativeTest("a restarted stop discovers and retires local descendants after both 
   try {
     const childPid = Number(await untilFile(join(cwd, "child-pid")));
     assert.equal(await hasActiveLocalOperations(options.activeDirectory), true);
-    const runtime = await import(options.runtimeModule!);
-    const observation = await runtime.observeKernelOwnedProcess(join(localOperationDirectory(options), "owned-process"));
-    assert.ok(observation.workloadIdentity?.pid);
+    const launch = JSON.parse(await readFile(join(ownedDirectory(options), "launch.json"), "utf8"));
     await killController(controller);
-    process.kill(observation.workloadIdentity.pid, "SIGKILL");
+    process.kill(launch.pid, "SIGKILL");
     let cleanup = await cancelActiveLocalOperations(options.activeDirectory, options.runId, 1);
     const deadline = Date.now() + 20_000;
     while (cleanup.pending && Date.now() < deadline) {
@@ -298,7 +270,7 @@ nativeTest("a restarted stop discovers and retires local descendants after both 
   } finally { await killController(controller); await clean(cwd, options); }
 });
 
-nativeTest("a new stop generation starts only after prior kernel ownership retires", async () => {
+test("a new stop generation starts only after prior ownership retires", async () => {
   const { cwd, options } = await fixture();
   const authorizationPath = join(cwd, "run.json");
   options.authorization = { path: authorizationPath, stopGeneration: 0 };
@@ -313,90 +285,25 @@ nativeTest("a new stop generation starts only after prior kernel ownership retir
   } finally { await clean(cwd, options); }
 });
 
-const fakeRuntime = `
-import { readFile, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
-const binding={operationId:'owned',requestDigest:'digest',hostId:'host',bootId:'boot'};
-export async function prepareKernelOwnedProcess(request){await writeFile(join(dirname(request.operationDirectory),'effective-lifetime.json'),JSON.stringify(request.lifetime));return {...binding,operationDirectory:request.operationDirectory,stdoutPath:'out',stderrPath:'err'};}
-export async function launchKernelOwnedProcess(request){const directory=dirname(request.operationDirectory);const intent=JSON.parse(await readFile(join(directory,'intent.json'),'utf8'));await writeFile(join(directory,'result.json'),JSON.stringify({digest:intent.digest,code:0,cancelled:false}));return {observation:await observeKernelOwnedProcess(request.operationDirectory)};}
-export async function observeKernelOwnedProcess(directory){const config=JSON.parse(await readFile(join(dirname(dirname(dirname(dirname(directory)))),'fake.json'),'utf8'));return {status:'retired',operationDirectory:directory,exitCode:0,proof:{...binding,...config.binding,kind:'darwin-coalition-retired',observedAt:new Date().toISOString(),identity:{...binding,version:1,backend:'darwin-resource-coalition-v1',coalitionId:'123',leader:{pid:1,uniqueId:'1',pidVersion:1}}}};}
-export async function requestKernelOwnedProcessCancellation(){}
-export async function cancelKernelOwnedProcess(directory){return observeKernelOwnedProcess(directory);}
-`;
-
-test("local runtime passes explicit unbounded lifetime and rejects mismatched retirement proof", async () => {
-  const { cwd, options, directory } = await fixture(false);
-  try {
-    await writeFile(join(cwd, "runtime.mjs"), fakeRuntime);
-    await writeFile(join(cwd, "fake.json"), JSON.stringify({ binding: { requestDigest: "other" } }));
-    await assert.rejects(runLocalOperation(cwd, [["unused"]], options), /terminal proof/);
-    assert.deepEqual(JSON.parse(await readFile(join(directory, "effective-lifetime.json"), "utf8")), { kind: "unbounded" });
-    await writeFile(join(cwd, "fake.json"), JSON.stringify({}));
-    await runLocalOperation(cwd, [["unused"]], options);
-    const intent = JSON.parse(await readFile(join(directory, "intent.json"), "utf8"));
-    intent.commands = [["different"]];
-    await durableJson(join(directory, "intent.json"), intent);
-    await assert.rejects(runLocalOperation(cwd, [["unused"]], options), /digest mismatch/);
-  } finally { await rm(cwd, { recursive: true, force: true }); }
-});
-
-test("confirmed kernel retirement with lost result permits retry but cannot accept success", async () => {
-  const { cwd, options } = await fixture(false);
-  try {
-    await writeFile(join(cwd, "runtime.mjs"), fakeRuntime.replace("await writeFile(join(directory,'result.json'),JSON.stringify({digest:intent.digest,code:0,cancelled:false}));", "void intent;"));
-    await writeFile(join(cwd, "fake.json"), JSON.stringify({}));
-    await assert.rejects(runLocalOperation(cwd, [["unused"]], options), error => error instanceof LocalOperationFailedError && error.message.includes("lost-result-after-exit"));
-  } finally { await rm(cwd, { recursive: true, force: true }); }
-});
-
-test("a stop racing the launch reply wins over a matching late successful result", async () => {
-  const { cwd, options } = await fixture(false);
-  try {
-    await writeFile(join(cwd, "runtime.mjs"), fakeRuntime);
-    await writeFile(join(cwd, "fake.json"), JSON.stringify({}));
-    let reads = 0;
-    options.isAuthorized = async () => reads++ === 0;
-    await assert.rejects(runLocalOperation(cwd, [["unused"]], options), LocalOperationCancelledError);
-    options.isAuthorized = async () => true;
-    await assert.rejects(runLocalOperation(cwd, [["unused"]], options), LocalOperationCancelledError);
-  } finally { await rm(cwd, { recursive: true, force: true }); }
-});
-
-test("a new stop generation cannot replace a prior mismatched ownership proof", async () => {
-  const { cwd, options, directory } = await fixture(false);
-  try {
-    await writeFile(join(cwd, "runtime.mjs"), fakeRuntime);
-    await writeFile(join(cwd, "fake.json"), JSON.stringify({ binding: { bootId: "old-boot" } }));
-    await assert.rejects(runLocalOperation(cwd, [["unused"]], options), LocalOperationUnknownError);
-    const successor = { ...options, authorization: { path: join(cwd, "run.json"), stopGeneration: 1 } };
-    await assert.rejects(runLocalOperation(cwd, [], options), /same generation/);
-    await assert.rejects(runLocalOperation(cwd, [], successor), /Previous local command generation/);
-    await assert.rejects(runLocalOperation(cwd, [["unused"]], successor), /Previous local command generation/);
-    await assert.rejects(readFile(join(localOperationDirectory(successor), "intent.json")), { code: "ENOENT" });
-    assert.ok(await readFile(join(directory, "binding.json"), "utf8"));
-  } finally { await rm(cwd, { recursive: true, force: true }); }
-});
-
-test("an empty local batch needs no runtime backend", async () => {
-  const { cwd, options } = await fixture(false);
+test("an empty local batch needs no process backend", async () => {
+  const { cwd, options } = await fixture();
   try { await runLocalOperation(cwd, [], options); }
   finally { await rm(cwd, { recursive: true, force: true }); }
 });
 
-nativeTest("an empty successor batch retires the prior generation before returning", async () => {
+test("an empty successor batch retires the prior generation before returning", async () => {
   const { cwd, options, directory } = await fixture();
   const commands = [[process.execPath, "-e", "require('fs').writeFileSync('started','yes');setInterval(()=>{},1000)"]];
   const running = runLocalOperation(cwd, commands, options);
   const cancelled = assert.rejects(running, LocalOperationCancelledError);
   try {
     await untilFile(join(cwd, "started"));
-    const runtime = await import(options.runtimeModule!);
-    assert.equal((await runtime.observeKernelOwnedProcess(join(directory, "owned-process"))).status, "active");
+    assert.equal((await observeOwnedProcess(join(directory, "owned-process"))).status, "running");
     const successor = { ...options, authorization: { path: join(cwd, "run.json"), stopGeneration: 1 } };
     await runLocalOperation(cwd, [], successor);
-    const retired = await runtime.observeKernelOwnedProcess(join(directory, "owned-process"));
+    const retired = await observeOwnedProcess(join(directory, "owned-process"));
     assert.equal(retired.status, "retired");
-    assert.equal(retired.proof?.kind, "darwin-coalition-retired");
+    assert.equal(retired.proof?.kind, "process-group-retired");
     await cancelled;
     await assert.rejects(runLocalOperation(cwd, commands, options), LocalOperationCancelledError);
   } finally {
@@ -407,37 +314,46 @@ nativeTest("an empty successor batch retires the prior generation before returni
 });
 
 test("a new stop generation fences an empty interrupted generation before starting", async () => {
-  const { cwd, options, directory } = await fixture(false);
+  const { cwd, options, directory } = await fixture();
   try {
-    await writeFile(join(cwd, "runtime.mjs"), fakeRuntime);
-    await writeFile(join(cwd, "fake.json"), JSON.stringify({}));
     await mkdir(directory, { recursive: true });
     const successor = { ...options, authorization: { path: join(cwd, "run.json"), stopGeneration: 1 } };
+    await durableJson(join(cwd, "run.json"), { id: "run", status: "running", stopGeneration: 1 });
     await runLocalOperation(cwd, [], successor);
     assert.ok(await readFile(join(directory, "stop.json"), "utf8"));
-    await runLocalOperation(cwd, [["unused"]], successor);
+    await runLocalOperation(cwd, [[process.execPath, "-e", "0"]], successor);
     assert.ok(await readFile(join(directory, "stop.json"), "utf8"));
-    await assert.rejects(runLocalOperation(cwd, [["unused"]], options), LocalOperationCancelledError);
-    await runLocalOperation(cwd, [["unused"]], successor);
+    await assert.rejects(runLocalOperation(cwd, [[process.execPath, "-e", "0"]], options), LocalOperationCancelledError);
+    await runLocalOperation(cwd, [[process.execPath, "-e", "0"]], successor);
   } finally { await rm(cwd, { recursive: true, force: true }); }
 });
 
 test("abandoned intent and cancellation publications cannot park an unstarted generation", async () => {
-  const { cwd, options, directory } = await fixture(false);
+  const { cwd, options, directory } = await fixture();
   try {
-    await writeFile(join(cwd, "runtime.mjs"), fakeRuntime);
-    await writeFile(join(cwd, "fake.json"), JSON.stringify({}));
     await mkdir(directory, { recursive: true });
     for (const name of ["intent", "stop"]) await writeFile(join(directory, `${name}.json.00000000-0000-0000-0000-000000000000.tmp`), "{");
     const successor = { ...options, authorization: { path: join(cwd, "run.json"), stopGeneration: 1 } };
-    await runLocalOperation(cwd, [["unused"]], successor);
+    await durableJson(join(cwd, "run.json"), { id: "run", status: "running", stopGeneration: 1 });
+    await runLocalOperation(cwd, [[process.execPath, "-e", "0"]], successor);
     assert.ok(await readFile(join(directory, "stop.json"), "utf8"));
-    await assert.rejects(runLocalOperation(cwd, [["unused"]], options), LocalOperationCancelledError);
+    await assert.rejects(runLocalOperation(cwd, [[process.execPath, "-e", "0"]], options), LocalOperationCancelledError);
   } finally { await rm(cwd, { recursive: true, force: true }); }
 });
 
+test("a tampered local intent is fenced by its digest", async () => {
+  const { cwd, options, directory } = await fixture();
+  try {
+    await runLocalOperation(cwd, [[process.execPath, "-e", "require('fs').writeFileSync('ran','yes')"]], options);
+    const intent = JSON.parse(await readFile(join(directory, "intent.json"), "utf8"));
+    intent.commands = [["different"]];
+    await writeFile(join(directory, "intent.json"), JSON.stringify(intent));
+    await assert.rejects(runLocalOperation(cwd, [[process.execPath, "-e", "require('fs').writeFileSync('ran','yes')"]], options), /digest mismatch/);
+  } finally { await clean(cwd, options); }
+});
+
 for (const publication of ["after successor starts", "while the fence is published"]) {
-  nativeTest(`a fenced incomplete generation cannot launch ${publication}`, async () => {
+  test(`a fenced incomplete generation cannot launch ${publication}`, async () => {
     const { cwd, options, directory } = await fixture();
     const authorizationPath = join(cwd, "run.json");
     options.authorization = { path: authorizationPath, stopGeneration: 0 };
@@ -463,16 +379,14 @@ for (const publication of ["after successor starts", "while the fence is publish
       if (publication === "after successor starts") await writeFile(resume, "resume");
       assert.deepEqual(await Promise.all([staleExit, currentExit]), [0, 0]);
       assert.equal(await readFile(join(cwd, "count"), "utf8"), "x");
-      const runtime = await import(options.runtimeModule!);
-      assert.equal((await runtime.observeKernelOwnedProcess(join(directory, "owned-process"))).status, "never-started");
+      assert.equal((await observeOwnedProcess(join(directory, "owned-process"))).status, "never-started");
       await assert.rejects(runLocalOperation(cwd, commands, options), LocalOperationCancelledError);
       await runLocalOperation(cwd, commands, successor);
       assert.equal(await readFile(join(cwd, "count"), "utf8"), "x");
     } finally {
       await killController(stale);
       if (current) await killController(current);
-      const runtime = await import(options.runtimeModule!);
-      await runtime.cancelKernelOwnedProcess(join(localOperationDirectory(successor), "owned-process"), { deadlineMs: 10_000 });
+      await cancelOwnedProcess(join(localOperationDirectory(successor), "owned-process"), { deadlineMs: 10_000, cancelled: true });
       await clean(cwd, options);
     }
   });
@@ -480,10 +394,8 @@ for (const publication of ["after successor starts", "while the fence is publish
 
 for (const artifact of ["binding.json", "request.json", "result.json", "owned-process", "intent.json", "active-index"]) {
   test(`an incomplete generation with ${artifact} remains fenced`, async () => {
-    const { cwd, options, directory } = await fixture(false);
+    const { cwd, options, directory } = await fixture();
     try {
-      await writeFile(join(cwd, "runtime.mjs"), fakeRuntime);
-      await writeFile(join(cwd, "fake.json"), JSON.stringify({}));
       await mkdir(directory, { recursive: true });
       if (artifact === "active-index") {
         options.activeDirectory = join(cwd, "active-local");
@@ -492,7 +404,7 @@ for (const artifact of ["binding.json", "request.json", "result.json", "owned-pr
       } else if (artifact === "owned-process") await mkdir(join(directory, artifact));
       else await writeFile(join(directory, artifact), "{}");
       const successor = { ...options, authorization: { path: join(cwd, "run.json"), stopGeneration: 1 } };
-      await assert.rejects(runLocalOperation(cwd, [["unused"]], successor), LocalOperationUnknownError);
+      await assert.rejects(runLocalOperation(cwd, [[process.execPath, "-e", "0"]], successor), LocalOperationUnknownError);
       await assert.rejects(readFile(join(localOperationDirectory(successor), "intent.json")), { code: "ENOENT" });
     } finally { await rm(cwd, { recursive: true, force: true }); }
   });

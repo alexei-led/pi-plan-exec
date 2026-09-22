@@ -515,17 +515,18 @@ test("help and setup explain the installed command surface", () => {
     assert.doesNotMatch(execHelp(), new RegExp(`/exec ${alias}`), alias);
   assert.match(
     execSetup(),
-    /pi install -l npm:@alexeiled\/pi-subagents-bridge@\^0\.3\.2$/m,
+    /pi install -l npm:@alexeiled\/pi-subagents-bridge@\^0\.4\.2$/m,
   );
-  assert.match(execSetup(), /pi install -l npm:@alexeiled\/pi-fusion@\^0\.9\.1$/m);
+  assert.match(execSetup(), /pi install -l npm:@alexeiled\/pi-fusion@\^0\.9\.2$/m);
   assert.match(execSetup(), /Keep this plan-exec source build installed/);
 });
 
-test("setup installs the released bridge and fusion pins with the pinned native revision", () => {
-  assert.match(execSetup(), /^pi install -l git:github\.com\/alexei-led\/pi-subagents-codex-fix@[a-f0-9]{40}$/m);
-  assert.match(execSetup(), /^pi install -l npm:@alexeiled\/pi-subagents-bridge@\^0\.3\.2$/m);
-  assert.match(execSetup(), /^pi install -l npm:@alexeiled\/pi-fusion@\^0\.9\.1$/m);
+test("setup installs the released bridge and fusion pins", () => {
+  assert.match(execSetup(), /^pi install -l npm:pi-subagents@\^0\.70\.1$/m);
+  assert.match(execSetup(), /^pi install -l npm:@alexeiled\/pi-subagents-bridge@\^0\.4\.2$/m);
+  assert.match(execSetup(), /^pi install -l npm:@alexeiled\/pi-fusion@\^0\.9\.2$/m);
   assert.doesNotMatch(execSetup(), /^pi install npm:(?:pi-subagents|@alexeiled\/pi-plan-exec)$/m);
+  assert.doesNotMatch(execSetup(), /pi-subagents-codex-fix/);
   assert.match(execSetup(), /Optional task visibility \(not required for execution\)/);
 });
 
@@ -2107,7 +2108,7 @@ test("status reports a missing package with its install commands", async () => {
   });
 
   assert.match(report, /Plan-exec prerequisites — missing: pi-subagents\./);
-  assert.match(report, /^pi install -l git:github\.com\/alexei-led\/pi-subagents-codex-fix@[a-f0-9]{40}$/m);
+  assert.match(report, /^pi install -l npm:pi-subagents@\^0\.70\.1$/m);
   assert.doesNotMatch(report, /pi-fusion/);
   assert.match(report, /No plan execution runs\. Start one with \/exec\./);
   assert.equal(
@@ -2162,7 +2163,7 @@ test("the retired read verbs still work and name their replacement", async () =>
   assert.match(doctor ?? "", /\/exec doctor is now \/exec status/);
 
   const setup = await execRead(registry, "setup", []);
-  assert.match(setup ?? "", /^pi install -l git:github\.com\/alexei-led\/pi-subagents-codex-fix@[a-f0-9]{40}$/m);
+  assert.match(setup ?? "", /^pi install -l npm:pi-subagents@\^0\.70\.1$/m);
   assert.match(setup ?? "", /\/exec setup is now part of \/exec status/);
 
   assert.equal(await execRead(registry, "resume", []), undefined);
@@ -3728,16 +3729,9 @@ test("explicit pause from an unrelated session polls a dead owner's worker until
   t.mock.method(RunRegistry.prototype, "get", registry.get.bind(registry));
   t.mock.method(RunRegistry.prototype, "claim", registry.claim.bind(registry));
   t.mock.method(RunRegistry.prototype, "updateIfCurrent", registry.updateIfCurrent.bind(registry));
-  const binding = { operationId: "kernel-operation", requestDigest: "kernel-digest",
-    hostId: "00000000-0000-0000-0000-000000000001", bootId: "00000000-0000-0000-0000-000000000002" };
-  const identity = { ...binding, version: 1, backend: "darwin-resource-coalition-v1", coalitionId: "2001",
-    leader: { pid: 4242, uniqueId: "1001", pidVersion: 1 } };
   const proof = { version: 1, state: "observed", runId: "owned-worker", runnerProcessInstanceId: "fixture", observedAt: Date.now(),
     processTreeOwnership: OWNED_PROCESS_TREE,
-    callerBinding: { operationId: "owned-operation", requestDigest: "owned-digest" },
-    nativeOperation: { operationId: "native-operation", digest: "native-digest" }, kernelBinding: binding,
-    kernelProof: { status: "retired", operationDirectory: join(root, "operation"), binding, identity,
-      proof: { ...binding, kind: "darwin-coalition-retired", identity, observedAt: new Date().toISOString() }, exitCode: 0, signal: null } };
+    callerBinding: { operationId: "owned-operation", requestDigest: "owned-digest" }, instances: [] };
   let stopCalls = 0;
   const unavailable = async (): Promise<never> => { throw new Error("Pause must not dispatch implementation or consume a result."); };
   const bridge = {

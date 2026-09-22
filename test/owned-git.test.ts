@@ -17,7 +17,7 @@ import { DEFAULT_FROZEN_RUN_CONFIG } from "../src/types.js";
 const execute = promisify(execFile);
 const projectRoot = fileURLToPath(new URL("..", import.meta.url));
 const controllerFixture = fileURLToPath(new URL("./fixtures/owned-git-controller.mjs", import.meta.url));
-const nativeOptions = { skip: process.platform === "darwin" ? false : "requires Darwin kernel-owned process ownership" };
+const nativeOptions = { skip: process.platform === "win32" ? "requires a POSIX process group" : false };
 const SESSION_ID = "owned-git-controller-death";
 
 type GitResult = { stdout: string; stderr: string; code: number };

@@ -3372,9 +3372,7 @@ function usefulProgressAtRetirement(operation: ActiveOperation, status: Record<s
   const proof = status.processTerminalProof ?? status.workflowTerminalProof;
   if (!proof || typeof proof !== "object") return false;
   const outer = proof as Record<string, unknown>;
-  const kernel = outer.kernelProof && typeof outer.kernelProof === "object" ? outer.kernelProof as Record<string, unknown> : undefined;
-  const retired = kernel?.proof && typeof kernel.proof === "object" ? kernel.proof as Record<string, unknown> : undefined;
-  const retiredAt = typeof retired?.observedAt === "string" ? Date.parse(retired.observedAt) : outer.observedAt;
+  const retiredAt = outer.observedAt;
   if (typeof retiredAt !== "number" || !Number.isFinite(retiredAt) || retiredAt > Date.now()) return false;
   const activity = operation.diagnostics;
   const toolAt = activity?.lastToolActivityAt;

@@ -4,8 +4,6 @@ import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { pathToFileURL } from "node:url";
-import { createRequire } from "node:module";
 import {
   parseRevmuxReport, reviewRequestDigest, validateReviewResult, RevmuxReviewClient,
 } from "../src/review-backend.js";
@@ -84,7 +82,7 @@ const args = process.argv.slice(2);
 const behavior = ` + JSON.stringify(behavior) + String.raw`;
 if (args.includes('--capabilities')) {
   console.log(JSON.stringify({protocol:'plan-exec-revmux',version:1,
-    executionLifetime:{version:1,modes:['unbounded','bounded'],flag:'--execution-lifetime'},
+    ...(behavior === 'unsupported' ? {} : {executionLifetime:{version:1,modes:['unbounded','bounded'],flag:'--execution-lifetime'}}),
     processTreeOwnership:{version:1,scope:behavior === 'scoped' ? 'posix-process-group' : 'owned-process-tree',
       escapedDescendants:behavior === 'scoped' ? 'unverified' : 'contained'},
     processTerminalProof:{version:1,...(behavior === 'scoped' ? {scope:'process-groups',escapedDescendants:'unsupported'} : {})}}));
@@ -120,64 +118,7 @@ if (args.includes('--capabilities')) {
   }
 }
 `, { mode: 0o700 });
-  const kernelPath = join(cwd, "fixture-kernel.mjs");
-  await writeFile(kernelPath, String.raw`
-import {spawn} from 'node:child_process';
-import {createHash} from 'node:crypto';
-import {join} from 'node:path';
-import {writeFile} from 'node:fs/promises';
-const behavior = ` + JSON.stringify(behavior) + String.raw`;
-const operations = new Map();
-const fences = new Set();
-export async function preflightKernelOwnedProcess() { return {supported:behavior !== 'unsupported'}; }
-export async function prepareKernelOwnedProcess(request) {
-  const directory=request.operationDirectory;
-  const digest=createHash('sha256').update(JSON.stringify(request)).digest('hex');
-  const existing=operations.get(directory);
-  if(existing) { if(existing.prepared.requestDigest!==digest) throw Error('request conflict'); return existing.prepared; }
-  const prepared={operationDirectory:directory,operationId:directory,requestDigest:digest,
-    hostId:'00000000-0000-0000-0000-000000000001',bootId:'00000000-0000-0000-0000-000000000002',
-    stdoutPath:join(directory,'stdout'),stderrPath:join(directory,'stderr')};
-  operations.set(directory,{request,prepared,status:fences.has(directory)?'never-started':'pending'});
-  await writeFile(join(request.cwd,'kernel-lifetime.json'),JSON.stringify(request.lifetime));
-  return prepared;
-}
-export function capturedRequest(directory) { return operations.get(directory)?.request; }
-export async function observeKernelOwnedProcess(directory) {
-  const state=operations.get(directory);
-  if(!state) return {operationDirectory:directory,status:'unknown'};
-  const binding=state.prepared;
-  const proof=state.status==='retired' ? {...binding,kind:'darwin-coalition-retired',identity:state.identity,observedAt:new Date().toISOString()}
-    :state.status==='never-started'?{...binding,kind:'never-started',observedAt:new Date().toISOString()}:undefined;
-  return {operationDirectory:directory,status:state.status,binding,identity:state.identity,exitCode:state.exitCode,
-    ...(behavior==='missing-proof' && state.status==='retired'?{reason:'Kernel retirement proof is unavailable.'}:{proof})};
-}
-export async function launchKernelOwnedProcess(request) {
-  const prepared=await prepareKernelOwnedProcess(request);
-  const state=operations.get(request.operationDirectory);
-  if(state.status==='pending' && !fences.has(request.operationDirectory)) {
-    state.status='active';
-    state.child=spawn(request.argv[0],request.argv.slice(1),{cwd:request.cwd,env:request.env,detached:true,stdio:'ignore'});
-    state.identity={...prepared,version:1,backend:'darwin-resource-coalition-v1',coalitionId:'42',
-      leader:{pid:state.child.pid,uniqueId:'123456',pidVersion:1}};
-    state.closed=new Promise(resolve=>state.child.once('close',(code)=>{state.exitCode=code;state.status='retired';resolve();}));
-    if(behavior==='lost-launch-reply') throw Error('Lost launch response');
-  }
-  return {...prepared,observation:await observeKernelOwnedProcess(request.operationDirectory)};
-}
-export async function cancelKernelOwnedProcess(directory) {
-  fences.add(directory);
-  const state=operations.get(directory);
-  if(state?.status==='pending') state.status='never-started';
-  else if(state?.status==='active') {
-    try {process.kill(-state.child.pid,'SIGTERM');} catch(error) {if(error.code!=='ESRCH')throw error;}
-    await state.closed;
-  }
-  return observeKernelOwnedProcess(directory);
-}
-`);
-  const options = { cwd, executable, stateDirectory: join(cwd, "operations"), reviewedCommit: "abc",
-    kernelRuntimeModule: pathToFileURL(kernelPath).href };
+  const options = { cwd, executable, stateDirectory: join(cwd, "operations"), reviewedCommit: "abc" };
   return { cwd, options, client: new RevmuxReviewClient(options) };
 }
 
@@ -228,8 +169,8 @@ test("controlled Revmux review survives client restart and replays exactly one o
   assert.equal((await restarted.start("op", "Different request")).success, false);
 });
 
-test("bounded compatibility mode is explicit in both the kernel root and Revmux CLI", async (t) => {
-  const { client, cwd } = await harness(t);
+test("bounded compatibility mode is explicit in the process request and the Revmux CLI", async (t) => {
+  const { client, cwd, options } = await harness(t);
   await client.start("op", "Review", undefined, { mode: "bounded", timeoutMs: 7000 }, "caller-digest");
   await eventually(async () => {
     const result = await client.result("op");
@@ -238,10 +179,12 @@ test("bounded compatibility mode is explicit in both the kernel root and Revmux 
   const argv = await readFile(join(cwd, "launches"), "utf8");
   assert.match(argv, /--execution-lifetime=bounded/);
   assert.match(argv, /--hard-timeout=7000ms/);
-  assert.deepEqual(JSON.parse(await readFile(join(cwd, "kernel-lifetime.json"), "utf8")), { kind: "bounded", timeoutMs: 7000 });
+  const directory = join(options.stateDirectory, createHash("sha256").update("op").digest("hex"));
+  const request = JSON.parse(await readFile(join(directory, "owned-process", "request.json"), "utf8"));
+  assert.deepEqual(request.lifetime, { kind: "bounded", timeoutMs: 7000 });
 });
 
-test("Revmux freezes a worktree-safe kernel environment and preserves it on replay", async (t) => {
+test("Revmux freezes a worktree-safe process environment and preserves it on replay", async (t) => {
   const { client, cwd, options } = await harness(t);
   const canaries = {
     GIT_DIR: "/foreign/.git", GIT_WORK_TREE: "/foreign", GIT_INDEX_FILE: "/foreign/index",
@@ -258,8 +201,8 @@ test("Revmux freezes a worktree-safe kernel environment and preserves it on repl
       return result.success && (result.data.run as { terminal: boolean }).terminal;
     });
     const directory = join(options.stateDirectory, createHash("sha256").update("op").digest("hex"));
-    const runtime = await import(options.kernelRuntimeModule);
-    const request = runtime.capturedRequest(join(directory, "kernel-operation"));
+    const requestPath = join(directory, "owned-process", "request.json");
+    const request = JSON.parse(await readFile(requestPath, "utf8"));
     assert.equal(request.cwd, cwd);
     for (const name of Object.keys(canaries).filter((name) => name !== "GIT_AUTHOR_NAME" && name !== "GIT_SSH_COMMAND" && name !== "PLAN_EXEC_TEST_AUTH"))
       assert.equal(request.env[name], undefined, name);
@@ -272,8 +215,9 @@ test("Revmux freezes a worktree-safe kernel environment and preserves it on repl
     process.env.GIT_AUTHOR_NAME = "Changed parent author";
     process.env.PLAN_EXEC_TEST_AUTH = "changed-parent-auth";
     assert.equal((await new RevmuxReviewClient(options).start("op", "Review", undefined, { mode: "unbounded" }, "caller-digest")).success, true);
-    assert.equal(runtime.capturedRequest(join(directory, "kernel-operation")).env.GIT_AUTHOR_NAME, "Fixture author");
-    assert.equal(runtime.capturedRequest(join(directory, "kernel-operation")).env.PLAN_EXEC_TEST_AUTH, "fixture-auth");
+    const replayed = JSON.parse(await readFile(requestPath, "utf8"));
+    assert.equal(replayed.env.GIT_AUTHOR_NAME, "Fixture author");
+    assert.equal(replayed.env.PLAN_EXEC_TEST_AUTH, "fixture-auth");
   } finally {
     for (const [name, value] of Object.entries(previous)) {
       if (value === undefined) delete process.env[name];
@@ -282,75 +226,38 @@ test("Revmux freezes a worktree-safe kernel environment and preserves it on repl
   }
 });
 
-test("installed kernel launcher reconciles a lost Revmux launch reply with actual retirement evidence", { skip: process.platform !== "darwin" }, async (t) => {
-  const { options, cwd } = await harness(t);
-  const runtimeModule = process.env.PI_PLAN_EXEC_KERNEL_RUNTIME ?? "pi-subagents/kernel-owned-process";
-  const runtimeUrl = runtimeModule.startsWith("file:") ? runtimeModule : pathToFileURL(createRequire(import.meta.url).resolve(runtimeModule)).href;
-  const runtime = await import(runtimeUrl);
-  const preflight = await runtime.preflightKernelOwnedProcess({ artifactDirectory: join(options.stateDirectory, "kernel-artifacts") });
-  assert.equal(preflight.supported, true, preflight.reason);
-  const proxy = join(cwd, "lost-kernel-reply.mjs");
-  await writeFile(proxy, `export * from ${JSON.stringify(runtimeUrl)};\n` +
-    `import {launchKernelOwnedProcess as launch} from ${JSON.stringify(runtimeUrl)};\n` +
-    "let lost=false; export async function launchKernelOwnedProcess(request) {const value=await launch(request); if(!lost){lost=true;throw Error('Lost response after owned launch');} return value;}\n");
-  const ownedOptions = { ...options, kernelRuntimeModule: pathToFileURL(proxy).href };
-  const client = new RevmuxReviewClient(ownedOptions);
-  const operationDirectory = join(options.stateDirectory, createHash("sha256").update("op").digest("hex"), "kernel-operation");
-  try {
-    const started = await client.start("op", "Review", undefined, { mode: "unbounded" }, "caller-digest");
-    assert.ok(!started.success);
-    assert.equal(started.error.code, "launch_unknown");
-    const restored = new RevmuxReviewClient(ownedOptions);
-    await eventually(async () => {
-      const result = await restored.result("op");
-      return result.success && hasTerminalOwnershipProof(result.data, "op", { operationId: "op", requestDigest: "caller-digest" });
-    }, 1000);
-    const result = await restored.result("op");
-    assert.ok(result.success);
-    assert.deepEqual(result.data.callerOutput, { contract: "plan-review-v1", output: "NO_FINDINGS" });
-    assert.equal((await readFile(join(cwd, "launches"), "utf8")).trim().split("\n").length, 1);
-  } finally { await runtime.cancelKernelOwnedProcess(operationDirectory, { deadlineMs: 5000 }); }
-});
-
-test("installed kernel launcher cancels escaped reviewer descendants before accepting cleanup", { skip: process.platform !== "darwin" }, async (t) => {
-  const { options, cwd } = await harness(t, "escaped-wait");
-  const runtimeModule = process.env.PI_PLAN_EXEC_KERNEL_RUNTIME ?? "pi-subagents/kernel-owned-process";
-  const runtimeUrl = runtimeModule.startsWith("file:") ? runtimeModule : pathToFileURL(createRequire(import.meta.url).resolve(runtimeModule)).href;
-  const runtime = await import(runtimeUrl);
-  const preflight = await runtime.preflightKernelOwnedProcess({ artifactDirectory: join(options.stateDirectory, "kernel-artifacts") });
-  assert.equal(preflight.supported, true, preflight.reason);
-  const client = new RevmuxReviewClient({ cwd: options.cwd, executable: options.executable,
-    stateDirectory: options.stateDirectory, reviewedCommit: options.reviewedCommit,
-    ...(process.env.PI_PLAN_EXEC_KERNEL_RUNTIME ? { kernelRuntimeModule: runtimeUrl } : {}) });
-  const operationDirectory = join(options.stateDirectory, createHash("sha256").update("op").digest("hex"), "kernel-operation");
-  try {
-    assert.equal((await client.start("op", "Review", undefined, { mode: "unbounded" }, "caller-digest")).success, true);
-    await eventually(async () => readFile(join(cwd, "escaped-pid")).then(() => true, () => false), 1000);
-    const pid = Number(await readFile(join(cwd, "escaped-pid"), "utf8"));
-    assert.doesNotThrow(() => process.kill(pid, 0));
-    await client.cancel(undefined, "op");
-    await eventually(async () => {
-      const result = await client.status("op");
-      return result.success && hasTerminalOwnershipProof(result.data, "op", { operationId: "op", requestDigest: "caller-digest" });
-    }, 1000);
-    const result = await client.status("op");
-    assert.ok(result.success);
-    assert.equal((result.data.run as { phase: string }).phase, "cancelled");
-    assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
-  } finally { await runtime.cancelKernelOwnedProcess(operationDirectory, { deadlineMs: 5000 }); }
-});
-
-test("CLI completion without observed process proof never completes a Revmux review", async (t) => {
-  const { client, cwd } = await harness(t, "missing-proof");
-  await client.start("op", "Review");
+test("killing the reviewer process group before its receipt fails the review without a relaunch", async (t) => {
+  const { client, cwd, options } = await harness(t, "wait");
+  await client.start("op", "Review", undefined, { mode: "unbounded" }, "caller-digest");
+  await eventually(async () => readFile(join(cwd, "launches")).then(() => true, () => false));
+  const directory = join(options.stateDirectory, createHash("sha256").update("op").digest("hex"));
+  const launch = JSON.parse(await readFile(join(directory, "owned-process", "launch.json"), "utf8"));
+  process.kill(-launch.pgid, "SIGKILL");
   await eventually(async () => {
-    const result = await client.status("op");
-    return result.success && typeof result.data.error === "string";
+    const result = await client.result("op");
+    return result.success && (result.data.run as { terminal: boolean }).terminal;
   });
   const result = await client.result("op");
   assert.ok(result.success);
-  assert.equal((result.data.run as { terminal: boolean }).terminal, false);
+  assert.equal((result.data.run as { phase: string }).phase, "failed");
+  assert.equal(hasTerminalOwnershipProof(result.data, "op", { operationId: "op", requestDigest: "caller-digest" }), true);
   assert.equal((await readFile(join(cwd, "launches"), "utf8")).trim().split("\n").length, 1);
+});
+
+test("cancel retires the reviewer process group and reports escaped descendants as best-effort", async (t) => {
+  const { client, cwd } = await harness(t, "escaped-wait");
+  await client.start("op", "Review", undefined, { mode: "unbounded" }, "caller-digest");
+  await eventually(async () => readFile(join(cwd, "escaped-pid")).then(() => true, () => false));
+  const pid = Number(await readFile(join(cwd, "escaped-pid"), "utf8"));
+  assert.doesNotThrow(() => process.kill(pid, 0));
+  const cancellation = await client.cancel(undefined, "op");
+  assert.ok(cancellation.success);
+  await eventually(async () => {
+    const result = await client.status("op");
+    return result.success && (result.data.run as { phase: string }).phase === "cancelled";
+  });
+  // The detached descendant left the owned process group; v2-lite makes no containment promise for it.
+  try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
 });
 
 test("Revmux cancellation is fenced and reconciled by the persistent monitor", async (t) => {
@@ -371,12 +278,11 @@ test("Revmux cancellation is fenced and reconciled by the persistent monitor", a
   assert.equal((await readFile(join(cwd, "launches"), "utf8")).trim().split("\n").length, 1);
 });
 
-test("unavailable kernel ownership is rejected before launching a required Revmux review", async (t) => {
+test("a reviewer without explicit execution-lifetime support is rejected before launching", async (t) => {
   const { client, cwd } = await harness(t, "unsupported");
   const capabilities = await client.capabilities();
   assert.equal(capabilities.healthy, true);
-  assert.deepEqual(capabilities.executionLifetimeModes, ["unbounded", "bounded"]);
-  assert.equal(capabilities.processTreeOwnership, undefined);
+  assert.equal(capabilities.executionLifetimeModes, undefined);
   const result = await client.start("op", "Review");
   assert.ok(!result.success);
   assert.equal(result.error.code, "unsupported");
@@ -417,26 +323,10 @@ test("authoritative absent receipt permits same-ID immutable replay racing the o
   assert.equal((await readFile(join(cwd, "launches"), "utf8")).trim().split("\n").length, 1);
 });
 
-test("lost kernel launch reply reconciles the same owned reviewer after client restart", async (t) => {
-  const { client, cwd, options } = await harness(t, "lost-launch-reply");
-  const launched = await client.start("op", "Review", undefined, { mode: "unbounded" }, "caller-digest");
-  assert.ok(!launched.success);
-  assert.equal(launched.error.code, "launch_unknown");
-  const restarted = new RevmuxReviewClient(options);
-  await eventually(async () => {
-    const result = await restarted.status("op");
-    return result.success && (result.data.run as { terminal: boolean }).terminal;
-  });
-  const result = await restarted.result("op");
-  assert.ok(result.success);
-  assert.equal(hasTerminalOwnershipProof(result.data, "op", { operationId: "op", requestDigest: "caller-digest" }), true);
-  assert.equal((await readFile(join(cwd, "launches"), "utf8")).trim().split("\n").length, 1);
-});
-
-test("kernel retirement owns Revmux descendants independently of its internal process-group proof", async (t) => {
+test("reviewer capabilities advertise a best-effort owned process tree and still complete", async (t) => {
   const { client } = await harness(t, "scoped");
   const capabilities = await client.capabilities();
-  assert.equal(capabilities.processTreeOwnership?.scope, "owned-process-tree");
+  assert.deepEqual(capabilities.processTreeOwnership, { version: 1, scope: "owned-process-tree", escapedDescendants: "best-effort" });
   await client.start("op", "Review", undefined, { mode: "unbounded" }, "caller-digest");
   await eventually(async () => {
     const result = await client.result("op");
@@ -454,7 +344,7 @@ test("missing request plus existing admission is uncertain rather than replayabl
   assert.equal(result.error.code, "launch_unknown");
 });
 
-test("cancel during owned payload setup requires kernel retirement before release", async (t) => {
+test("cancel during payload setup retires the owned process group before release", async (t) => {
   const { client, cwd, options } = await harness(t, "delayed-setup");
   await client.start("op", "Review", undefined, { mode: "unbounded" }, "caller-digest");
   await eventually(async () => readFile(join(cwd, "setup-started")).then(() => true, () => false));

@@ -31,7 +31,7 @@ async function authorized(intent, directory) {
 
 async function main(directory, expectedDigest) {
   const intent = await json(join(directory, "intent.json"));
-  if (intent?.version !== 2 || typeof intent.digest !== "string" || typeof intent.runtimeModule !== "string" ||
+  if (intent?.version !== 3 || typeof intent.digest !== "string" ||
       typeof intent.cwd !== "string" || !Array.isArray(intent.commands) ||
       intent.commands.some(command => !Array.isArray(command) || !command.length || command.some(arg => typeof arg !== "string"))) {
     throw new Error("Invalid local command intent.");
@@ -40,11 +40,8 @@ async function main(directory, expectedDigest) {
   if (digest !== expectedDigest || createHash("sha256").update(JSON.stringify(request)).digest("hex") !== digest) {
     throw new Error("Local command intent identity changed.");
   }
-  const runtime = await import(intent.runtimeModule);
-  const operationDirectory = join(directory, "owned-process");
   const stop = async () => {
     await publish(directory, "stop.json", { digest: intent.digest });
-    await runtime.requestKernelOwnedProcessCancellation(operationDirectory);
   };
   let cancelled = false;
   let code = 0;
