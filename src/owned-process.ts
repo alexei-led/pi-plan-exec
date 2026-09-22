@@ -29,6 +29,7 @@ const DIRECTORY_MODE = 0o700;
 const CANCEL_POLL_MS = 25;
 const DEFAULT_CANCEL_DEADLINE_MS = 2_000;
 const HOST_ID_LENGTH = 32;
+const LAUNCH_CLAIM_GRACE_MS = 30_000;
 const MILLISECONDS_PER_SECOND = 1_000;
 const execFileAsync = promisify(execFile);
 
@@ -478,6 +479,92 @@ function readLaunch(
   return value as unknown as LaunchRecord;
 }
 
+async function recordLaunchFailure(
+  operationDirectory: string,
+  binding: OwnedProcessBinding,
+  reason: string,
+): Promise<void> {
+  try {
+    await publish(join(operationDirectory, 'launch-failed.json'), {
+      version: 1,
+      operationId: binding.operationId,
+      requestDigest: binding.requestDigest,
+      hostId: binding.hostId,
+      bootId: binding.bootId,
+      failedAt: new Date().toISOString(),
+      reason,
+    });
+  } catch {
+    // Evidence is best effort; the claim removal below is what unblocks retry.
+  }
+  try {
+    await unlink(join(operationDirectory, 'launching.json'));
+  } catch {
+    // A missing claim is already unblocked.
+  }
+}
+
+async function storedRetirement(
+  operationDirectory: string,
+  binding: OwnedProcessBinding,
+): Promise<OwnedProcessObservation | undefined> {
+  const proof = await json(join(operationDirectory, 'retired.json'));
+  if (
+    !record(proof) ||
+    proof.kind !== 'process-group-retired' ||
+    !ownedProcessBindingMatches(bindingOf(proof), binding)
+  )
+    return undefined;
+  const identity = record(proof.identity)
+    ? (proof.identity as unknown as OwnedProcessIdentity)
+    : undefined;
+  // The writer record is final once the group is gone; re-read it so a marker
+  // persisted during the publication race never hides the exit code.
+  const exitCode = await writerExitCode(dirname(operationDirectory));
+  return {
+    status: 'retired',
+    binding,
+    ...(identity ? { identity } : {}),
+    ...(exitCode !== undefined ? { exitCode } : {}),
+    proof: proof as unknown as OwnedProcessProof,
+  };
+}
+
+async function persistRetirement(
+  operationDirectory: string,
+  proof: OwnedProcessProof,
+): Promise<void> {
+  try {
+    await publishImmutable(join(operationDirectory, 'retired.json'), proof);
+  } catch {
+    // The observation still carries the proof; the marker is an optimization.
+  }
+}
+
+/** Identity check before any signal: host/boot, retirement marker, leader. */
+async function signalableLaunch(
+  operationDirectory: string,
+): Promise<LaunchRecord | undefined> {
+  const binding = bindingOf(
+    await json(join(operationDirectory, 'request.json')),
+  );
+  if (!binding) return undefined;
+  const current = await currentHostIdentity();
+  if (current.hostId !== binding.hostId || current.bootId !== binding.bootId)
+    return undefined;
+  if ((await json(join(operationDirectory, 'retired.json'))) !== undefined)
+    return undefined;
+  const launch = await launchOf(operationDirectory);
+  if (!launch) return undefined;
+  if (
+    pidAlive(launch.pid) &&
+    launch.startIdentity !== null &&
+    (await startIdentity(launch.pid)) !== launch.startIdentity
+  )
+    return undefined;
+  return launch;
+}
+
 export async function observeOwnedProcess(
   operationDirectory: string,
 ): Promise<OwnedProcessObservation> {
@@ -492,12 +579,42 @@ export async function observeOwnedProcess(
       status: 'unknown',
       reason: 'Owned process request identity is malformed.',
     };
+  const retired = await storedRetirement(operationDirectory, binding);
+  if (retired) return retired;
+  const current = await currentHostIdentity();
+  if (current.hostId !== binding.hostId || current.bootId !== binding.bootId)
+    return {
+      status: 'unknown',
+      reason: 'Owned process host or boot identity changed.',
+    };
   const launchRaw = await json(join(operationDirectory, 'launch.json'));
   // Writers publish their terminal record next to the launch intent, one level
   // above the owned-process directory.
   const writerDirectory = dirname(operationDirectory);
   const exitCode = await writerExitCode(writerDirectory);
   if (launchRaw === undefined) {
+    const failed = await json(join(operationDirectory, 'launch-failed.json'));
+    if (record(failed))
+      return {
+        status: 'unknown',
+        binding,
+        reason: `Owned process failed to launch: ${String(failed.reason ?? 'unknown reason')}`,
+      };
+    const claim = await json(join(operationDirectory, 'launching.json'));
+    if (record(claim)) {
+      const claimedAt =
+        typeof claim.claimedAt === 'number' ? claim.claimedAt : 0;
+      // A fresh claim is a peer launcher mid-spawn: wait. A stale claim is a
+      // crashed launcher whose worker may still be alive: fence.
+      if (Date.now() - claimedAt <= LAUNCH_CLAIM_GRACE_MS)
+        return { status: 'pending', binding };
+      return {
+        status: 'unknown',
+        binding,
+        reason:
+          'Owned process launch is unresolved; a worker may still be alive.',
+      };
+    }
     if (
       (await pathExists(join(writerDirectory, 'stop.json'))) ||
       (await pathExists(join(operationDirectory, 'stop.json')))
@@ -522,12 +639,14 @@ export async function observeOwnedProcess(
       // The writer may have published between the first read and the leader
       // check; the exit record is final once the group is gone.
       const finalExit = exitCode ?? (await writerExitCode(writerDirectory));
+      const proof = proofFor(recordValue, 'process-group-retired', identity);
+      await persistRetirement(operationDirectory, proof);
       return {
         status: 'retired',
         binding,
         identity,
         ...(finalExit !== undefined ? { exitCode: finalExit } : {}),
-        proof: proofFor(recordValue, 'process-group-retired', identity),
+        proof,
       };
     }
     // The writer exited without a result; report an unknown exit code so the
@@ -605,9 +724,18 @@ export async function launchOwnedProcess(
       reason: `Owned process did not launch: ${error instanceof Error ? error.message : String(error)}`,
     };
   }
+  child.once('error', (error: Error) => {
+    void recordLaunchFailure(directory, binding, error.message);
+  });
   const pid = child.pid;
   if (pid === undefined) {
-    child.kill('SIGKILL');
+    // Never call child.kill() here: with no pid Node signals the caller's own
+    // process group, which kills the Pi host.
+    await recordLaunchFailure(
+      directory,
+      binding,
+      'Owned process did not report a pid.',
+    );
     return {
       status: 'unknown',
       binding,
@@ -630,7 +758,10 @@ export async function launchOwnedProcess(
   child.unref();
   if (request.lifetime.kind === 'bounded') {
     const timer = setTimeout(() => {
-      void requestOwnedProcessCancellation(directory);
+      void (async () => {
+        if ((await json(join(directory, 'retired.json'))) !== undefined) return;
+        await requestOwnedProcessCancellation(directory);
+      })();
     }, request.lifetime.timeoutMs);
     timer.unref();
   }
@@ -658,7 +789,7 @@ async function launchOf(directory: string): Promise<LaunchRecord | undefined> {
 export async function requestOwnedProcessCancellation(
   operationDirectory: string,
 ): Promise<void> {
-  const launch = await launchOf(operationDirectory);
+  const launch = await signalableLaunch(operationDirectory);
   if (launch) signalGroup(launch.pgid, 'SIGTERM');
 }
 
@@ -667,18 +798,30 @@ export async function cancelOwnedProcess(
   options: { deadlineMs?: number; cancelled?: boolean } = {},
 ): Promise<OwnedProcessObservation> {
   const deadlineMs = options.deadlineMs ?? DEFAULT_CANCEL_DEADLINE_MS;
-  const launch = await launchOf(operationDirectory);
+  const launch = await signalableLaunch(operationDirectory);
   if (!launch) {
     // A caller that already published its own cancellation fence can retire an
-    // operation that never reached a launch record. The window between spawn
-    // and the launch record is the documented best-effort ceiling.
+    // operation that never claimed a launch. An unresolved claim is fenced:
+    // the worker may be alive even though no launch record was published.
     if (options.cancelled) {
       const stored = await json(join(operationDirectory, 'request.json'));
       const request =
         stored === undefined ? undefined : requestStubFromRecord(stored);
       const recordValue = request ? readRecord(stored) : undefined;
       const binding = bindingOf(stored);
-      if (recordValue && binding)
+      const claim = await json(join(operationDirectory, 'launching.json'));
+      if (record(claim) && recordValue && binding) {
+        const claimedAt =
+          typeof claim.claimedAt === 'number' ? claim.claimedAt : 0;
+        if (Date.now() - claimedAt > LAUNCH_CLAIM_GRACE_MS)
+          return {
+            status: 'unknown',
+            binding,
+            reason:
+              'Owned process launch is unresolved; a worker may still be alive.',
+          };
+      }
+      if (recordValue && binding && !record(claim))
         return {
           status: 'never-started',
           binding,

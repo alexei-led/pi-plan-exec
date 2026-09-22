@@ -566,6 +566,30 @@ test('an empty local batch needs no process backend', async () => {
   }
 });
 
+test('an unresolved launch claim fences the batch instead of reporting never-started', async () => {
+  const { cwd, options, directory } = await fixture();
+  const operationDirectory = join(directory, 'owned-process');
+  try {
+    await mkdir(operationDirectory, { recursive: true });
+    await writeFile(
+      join(operationDirectory, 'launching.json'),
+      JSON.stringify({ version: 1, claimedAt: Date.now() - 10 * 60_000 }),
+    );
+    const commands = [
+      [process.execPath, '-e', "require('fs').writeFileSync('ran','yes')"],
+    ];
+    await assert.rejects(
+      runLocalOperation(cwd, commands, options),
+      LocalOperationUnknownError,
+    );
+    await assert.rejects(readFile(join(cwd, 'ran'), 'utf8'), {
+      code: 'ENOENT',
+    });
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test('an empty successor batch retires the prior generation before returning', async () => {
   const { cwd, options, directory } = await fixture();
   const commands = [

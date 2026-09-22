@@ -554,6 +554,7 @@ export class RevmuxReviewClient {
         observation = await controlDeadline(
           cancelOwnedProcess(execution.request.operationDirectory, {
             deadlineMs: REVMUX_PREFLIGHT_TIMEOUT_MS,
+            cancelled: true,
           }),
         );
       } else {
