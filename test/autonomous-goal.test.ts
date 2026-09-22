@@ -26,15 +26,8 @@ const command: RunCommand = async (program, args, cwd) => {
 const ok = (data: Record<string, unknown>): BridgeResult => ({ success: true, data });
 
 function observedWorkerProof(id: string, digest: string) {
-  const binding = { operationId: `kernel-${id}`, requestDigest: `kernel-digest-${id}`,
-    hostId: "00000000-0000-0000-0000-000000000001", bootId: "00000000-0000-0000-0000-000000000002" };
-  const identity = { ...binding, version: 1, backend: "darwin-resource-coalition-v1", coalitionId: "2001",
-    leader: { pid: 4242, uniqueId: "1001", pidVersion: 1 } };
-  const proof = { ...binding, kind: "darwin-coalition-retired", identity, observedAt: new Date().toISOString() };
   return { version: 1, state: "observed", runId: id, runnerProcessInstanceId: "fixture", observedAt: Date.now(),
-    processTreeOwnership: { version: 1, scope: "owned-process-tree", escapedDescendants: "contained" },
-    callerBinding: { operationId: id, requestDigest: digest }, nativeOperation: { operationId: `native-${id}`, digest: `native-digest-${id}` },
-    kernelBinding: binding, kernelProof: { status: "retired", operationDirectory: "/fixture/op", binding, identity, proof, exitCode: 0, signal: null } };
+    callerBinding: { operationId: id, requestDigest: digest }, instances: [] };
 }
 
 class GoalWorker {

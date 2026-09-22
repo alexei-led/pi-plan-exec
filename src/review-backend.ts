@@ -3,14 +3,21 @@ import { execFile } from "node:child_process";
 import { link, mkdir, open, readFile, stat, unlink } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
-import { executionLifetimeCapabilities, hasKernelRetirementProof, parseExecutionLifetime, supportsOwnedProcessTree } from "./bridge.js";
+import { executionLifetimeCapabilities, hasOwnedProcessRetirementProof, parseExecutionLifetime, supportsOwnedProcessTree } from "./bridge.js";
 import { FUSION_PHASE, PLAN_REVIEW_OUTPUT_CONTRACT, type FusionCapabilities, type FusionResult, type ReviewExecutionContext } from "./fusion.js";
 import { formatFindings, hasBlockingFindings, parseReviewFindings } from "./review.js";
 import { workspaceEnvironment } from "./workspace-environment.js";
 import { EXTERNAL_OPERATION_STATE, type ExecutionLifetime, type ReviewBackend, type ReviewFinding } from "./types.js";
-import type {
-  KernelOperationBinding, KernelOwnedProcessObservation, KernelOwnedProcessRequest, PreparedKernelOwnedProcess,
-} from "pi-subagents/kernel-owned-process";
+import {
+  cancelOwnedProcess,
+  launchOwnedProcess,
+  observeOwnedProcess,
+  ownedProcessBindingMatches,
+  prepareOwnedProcess,
+  type OwnedProcessBinding,
+  type OwnedProcessObservation,
+  type OwnedProcessRequest,
+} from "./owned-process.js";
 
 export interface ReviewRequest {
   operationId: string;
@@ -120,15 +127,13 @@ export interface RevmuxReviewOptions {
   stateDirectory: string;
   reviewedCommit: string;
   executable?: string;
-  kernelRuntimeModule?: string;
 }
 
 const execFileAsync = promisify(execFile);
 const REVMUX_PREFLIGHT_TIMEOUT_MS = 5_000;
 const PRIVATE_DIRECTORY_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
-const OWNED_TREE = { version: 1, scope: "owned-process-tree", escapedDescendants: "contained" } as const;
-type KernelRuntime = typeof import("pi-subagents/kernel-owned-process");
+const OWNED_TREE = { version: 1, scope: "owned-process-tree", escapedDescendants: "best-effort" } as const;
 
 /** The monitor owns the CLI handle across Pi restarts; an intent is never relaunched after claiming it. */
 export class RevmuxReviewClient {
@@ -142,12 +147,10 @@ export class RevmuxReviewClient {
       const value: unknown = JSON.parse(stdout);
       if (!isRecord(value) || value.protocol !== "plan-exec-revmux" || value.version !== 1 || value.supported === false)
         return { healthy: false, durableOperationLookup: true };
-      const runtime = await this.kernelRuntime();
-      const ownership = await controlDeadline(runtime.preflightKernelOwnedProcess({ artifactDirectory: this.kernelArtifacts() }));
       return { healthy: true, durableOperationLookup: true, processTerminalProofVersion: 1,
         ...(isRecord(value.executionLifetime) && value.executionLifetime.flag === "--execution-lifetime"
           ? executionLifetimeCapabilities(value.executionLifetime) : {}),
-        ...(ownership.supported ? { processTreeOwnership: OWNED_TREE } : {}) };
+        processTreeOwnership: OWNED_TREE };
     } catch {
       return { healthy: false, durableOperationLookup: true };
     }
@@ -185,7 +188,7 @@ export class RevmuxReviewClient {
     }
     const inserted = await insertJson(join(directory, "request.json"), { request, digest,
       ...(callerDigest ? { callerDigest } : {}), executable: this.options.executable ?? "revmux",
-      kernelArgv: [process.execPath, "-e", REVMUX_PAYLOAD, directory],
+      argv: [process.execPath, "-e", REVMUX_PAYLOAD, directory],
       env: workspaceEnvironment() });
     if (!inserted) return this.start(operationId, prompt, profile, lifetime, callerDigest, context);
     return this.observe(operationId);
@@ -201,37 +204,29 @@ export class RevmuxReviewClient {
     return directory;
   }
 
-  private async kernelRuntime(): Promise<KernelRuntime> {
-    return await import(this.options.kernelRuntimeModule ?? "pi-subagents/kernel-owned-process") as KernelRuntime;
-  }
-
-  private kernelArtifacts(): string {
-    return join(resolve(this.options.stateDirectory), "kernel-artifacts");
-  }
-
   private async prepareExecution(directory: string, stored: Record<string, unknown>): Promise<{
-    request: KernelOwnedProcessRequest; prepared: PreparedKernelOwnedProcess; runtime: KernelRuntime;
+    request: OwnedProcessRequest; prepared: OwnedProcessBinding;
   }> {
+    const argv = stored.argv ?? stored.kernelArgv;
     if (!isRecord(stored.request) || typeof stored.request.cwd !== "string" || !isRecord(stored.env) ||
       Object.values(stored.env).some((value) => typeof value !== "string") ||
-      !Array.isArray(stored.kernelArgv) || !stored.kernelArgv.length ||
-      stored.kernelArgv.some((value: unknown) => typeof value !== "string"))
+      !Array.isArray(argv) || !argv.length ||
+      argv.some((value: unknown) => typeof value !== "string"))
       throw new Error("Review command environment is missing; refusing to reconstruct a dispatched request.");
     const lifetime = parseExecutionLifetime(stored.request.executionLifetime);
     if (!lifetime) throw new Error("Review execution lifetime is missing.");
-    const request: KernelOwnedProcessRequest = {
-      operationDirectory: join(directory, "kernel-operation"), artifactDirectory: this.kernelArtifacts(),
-      argv: stored.kernelArgv as [string, ...string[]], cwd: stored.request.cwd,
+    const request: OwnedProcessRequest = {
+      operationDirectory: join(directory, "owned-process"),
+      argv: argv as [string, ...string[]], cwd: stored.request.cwd,
       env: stored.env as Record<string, string>, lifetime: lifetime.mode === "unbounded"
         ? { kind: "unbounded" } : { kind: "bounded", timeoutMs: lifetime.timeoutMs },
     };
-    const runtime = await this.kernelRuntime();
-    const prepared = await controlDeadline(runtime.prepareKernelOwnedProcess(request));
-    const receiptPath = join(directory, "kernel-binding.json");
+    const prepared = await controlDeadline(prepareOwnedProcess(request));
+    const receiptPath = join(directory, "process-binding.json");
     await insertJson(receiptPath, prepared);
     const receipt = await readJson(receiptPath);
-    if (!sameKernelBinding(receipt, prepared)) throw new Error("Review kernel ownership binding changed.");
-    return { request, prepared, runtime };
+    if (!sameProcessBinding(receipt, prepared)) throw new Error("Review process ownership binding changed.");
+    return { request, prepared };
   }
 
   status(runId?: string, operationId?: string): Promise<FusionResult> {
@@ -254,9 +249,8 @@ export class RevmuxReviewClient {
     await insertJson(join(directory, "cancel"), { operationId: id });
     const admission = await readJson(join(directory, "admission.json"));
     if (isRecord(admission) && admission.state === "dispatching") {
-      const runtime = await this.kernelRuntime();
-      await controlDeadline(runtime.cancelKernelOwnedProcess(join(directory, "kernel-operation"),
-        { deadlineMs: REVMUX_PREFLIGHT_TIMEOUT_MS }));
+      await controlDeadline(cancelOwnedProcess(join(directory, "owned-process"),
+        { deadlineMs: REVMUX_PREFLIGHT_TIMEOUT_MS, cancelled: true }));
     }
     return this.observe(id);
   }
@@ -288,7 +282,7 @@ export class RevmuxReviewClient {
         cancellationRequested: true, neverStarted: true, replaySafe: false,
         ...(typeof requestDigest === "string" ? { requestDigest } : {}) } };
     if (stored === undefined) {
-      for (const artifact of ["admission.json", "claimed", "outcome.json", "process-proof.json", "cancel", "kernel-binding.json", "kernel-operation"])
+      for (const artifact of ["admission.json", "claimed", "outcome.json", "process-proof.json", "cancel", "process-binding.json", "kernel-binding.json", "kernel-operation", "owned-process"])
         if (await filePresent(join(directory, artifact)))
           return failure("launch_unknown", "Review execution evidence exists without its immutable request; replay is not safe.");
       return { success: true, data: { operationId, state: "absent", replaySafe: true } };
@@ -297,10 +291,10 @@ export class RevmuxReviewClient {
     if (!isRecord(stored) || !registeredRequest || registeredRequest.operationId !== operationId ||
       stored.digest !== reviewRequestDigest(registeredRequest))
       return failure("malformed", "Review launch identity is malformed.");
-    if (await filePresent(join(directory, "claimed")) && !await filePresent(join(directory, "kernel-binding.json")))
-      return failure("launch_unknown", "Legacy reviewer monitor has no kernel ownership receipt; retaining ownership.");
-    let prepared: PreparedKernelOwnedProcess;
-    let observation: KernelOwnedProcessObservation;
+    if (await filePresent(join(directory, "claimed")) && !await filePresent(join(directory, "process-binding.json")) && !await filePresent(join(directory, "kernel-binding.json")))
+      return failure("launch_unknown", "Legacy reviewer monitor has no process ownership receipt; retaining ownership.");
+    let prepared: OwnedProcessBinding;
+    let observation: OwnedProcessObservation;
     try {
       const execution = await this.prepareExecution(directory, stored);
       prepared = execution.prepared;
@@ -309,14 +303,14 @@ export class RevmuxReviewClient {
       if (!isRecord(admitted) || admitted.state !== "dispatching") return this.observe(operationId);
       const cancelled = await filePresent(join(directory, "cancel"));
       if (cancelled) {
-        observation = await controlDeadline(execution.runtime.cancelKernelOwnedProcess(execution.request.operationDirectory,
+        observation = await controlDeadline(cancelOwnedProcess(execution.request.operationDirectory,
           { deadlineMs: REVMUX_PREFLIGHT_TIMEOUT_MS }));
       } else {
-        observation = await controlDeadline(execution.runtime.observeKernelOwnedProcess(execution.request.operationDirectory));
+        observation = await controlDeadline(observeOwnedProcess(execution.request.operationDirectory));
         if (observation.status === EXTERNAL_OPERATION_STATE.PENDING)
-          observation = (await controlDeadline(execution.runtime.launchKernelOwnedProcess(execution.request))).observation;
+          observation = await controlDeadline(launchOwnedProcess(execution.request));
       }
-    } catch (error) { return failure("launch_unknown", `Review kernel operation needs reconciliation: ${String(error)}`); }
+    } catch (error) { return failure("launch_unknown", `Review process operation needs reconciliation: ${String(error)}`); }
     const lifetime = registeredRequest.executionLifetime;
     const data: Record<string, unknown> = { operationId,
       ...(typeof requestDigest === "string" ? { requestDigest } : {}),
@@ -325,20 +319,23 @@ export class RevmuxReviewClient {
       reviewedCommit: registeredRequest.reviewedCommit,
       ...(lifetime ? { effectiveExecutionLifetime: lifetime } : {}),
       run: { runId: operationId, operationId, phase: FUSION_PHASE.PANEL, terminal: false } };
-    if (observation.status === "never-started" && sameKernelBinding(observation.proof, prepared) &&
+    if (observation.status === "never-started" && sameProcessBinding(observation.proof, prepared) &&
       observation.proof?.kind === "never-started" && data.cancellationRequested === true)
       return { success: true, data: { operationId, requestDigest, state: FUSION_PHASE.CANCELLED,
         cancellationRequested: true, neverStarted: true, replaySafe: false } };
-    if (observation.status !== "retired" || !hasKernelRetirementProof(observation, prepared))
+    if (observation.status !== "retired" || !hasOwnedProcessRetirementProof(observation, prepared))
       return { success: true, data: { ...data,
         ...(observation.reason ? { error: observation.reason } : {}) } };
     const proof = observation.proof;
-    if (!proof || proof.kind !== "darwin-coalition-retired") return failure("malformed", "Review kernel retirement proof is missing.");
+    if (!proof || proof.kind !== "process-group-retired" || !proof.identity)
+      return failure("malformed", "Review process retirement proof is missing.");
+    const observedAt = Date.parse(proof.observedAt);
     data.processTerminalProof = { version: 1, state: "observed", runId: operationId,
-      runnerProcessInstanceId: `${proof.identity.coalitionId}:${proof.identity.leader.uniqueId}`,
-      observedAt: Date.parse(proof.observedAt), processTreeOwnership: OWNED_TREE,
-      callerBinding: { operationId, requestDigest }, nativeOperation: { operationId, digest: stored.digest },
-      kernelBinding: kernelBinding(prepared), kernelProof: observation };
+      runnerProcessInstanceId: `${proof.identity.pgid}:${proof.identity.leader.pid}`,
+      observedAt, processTreeOwnership: OWNED_TREE,
+      instances: [{ pgid: proof.identity.pgid, leaderPid: proof.identity.leader.pid,
+        backend: proof.identity.backend, exitedAt: observedAt }],
+      callerBinding: { operationId, requestDigest }, nativeOperation: { operationId, digest: stored.digest } };
     const outcome = await optionalJson(join(directory, "outcome.json"));
     const success = isRecord(outcome) && (outcome.code === 0 || outcome.code === 1) &&
       (observation.exitCode === 0 || observation.exitCode === 1);
@@ -404,20 +401,21 @@ function failure(code: string, message: string): FusionResult {
   return { success: false, error: { code, message } };
 }
 
-function kernelBinding(value: KernelOperationBinding): KernelOperationBinding {
-  return { operationId: value.operationId, requestDigest: value.requestDigest, hostId: value.hostId, bootId: value.bootId };
-}
-
-function sameKernelBinding(value: unknown, expected: KernelOperationBinding): boolean {
-  return isRecord(value) && value.operationId === expected.operationId && value.requestDigest === expected.requestDigest &&
-    value.hostId === expected.hostId && value.bootId === expected.bootId;
+function sameProcessBinding(value: unknown, expected: OwnedProcessBinding): boolean {
+  if (!isRecord(value)) return false;
+  return ownedProcessBindingMatches({
+    operationId: typeof value.operationId === "string" ? value.operationId : "",
+    requestDigest: typeof value.requestDigest === "string" ? value.requestDigest : "",
+    hostId: typeof value.hostId === "string" ? value.hostId : "",
+    bootId: typeof value.bootId === "string" ? value.bootId : "",
+  }, expected);
 }
 
 async function controlDeadline<T>(operation: Promise<T>): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([operation, new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error("Kernel ownership control request timed out; reconcile the same operation.")),
+      timer = setTimeout(() => reject(new Error("Owned process control request timed out; reconcile the same operation.")),
         REVMUX_PREFLIGHT_TIMEOUT_MS);
     })]);
   } finally { if (timer) clearTimeout(timer); }

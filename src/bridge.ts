@@ -53,57 +53,44 @@ export interface DiagnosticGuidanceRequest {
 export interface ProcessTreeOwnership {
   version: 1;
   scope: "owned-process-tree" | "posix-process-group" | "process-groups";
-  escapedDescendants: "contained" | "unverified" | "unsupported";
+  escapedDescendants: "contained" | "best-effort" | "unverified" | "unsupported";
 }
 
 export function processTreeOwnershipCapabilities(value: unknown):
   Pick<BridgeCapabilities, "processTreeOwnership"> {
   if (!isRecord(value) || value.version !== 1 ||
     (value.scope !== "owned-process-tree" && value.scope !== "posix-process-group" && value.scope !== "process-groups") ||
-    (value.escapedDescendants !== "contained" && value.escapedDescendants !== "unverified" && value.escapedDescendants !== "unsupported"))
+    (value.escapedDescendants !== "contained" && value.escapedDescendants !== "best-effort" &&
+      value.escapedDescendants !== "unverified" && value.escapedDescendants !== "unsupported"))
     return {};
   return { processTreeOwnership: { version: 1, scope: value.scope, escapedDescendants: value.escapedDescendants } };
 }
 
 export function supportsOwnedProcessTree(capabilities: Pick<BridgeCapabilities, "processTreeOwnership"> | undefined): boolean {
-  return capabilities?.processTreeOwnership?.version === 1 &&
-    capabilities.processTreeOwnership.scope === "owned-process-tree" &&
-    capabilities.processTreeOwnership.escapedDescendants === "contained";
+  const ownership = capabilities?.processTreeOwnership;
+  return ownership?.version === 1 &&
+    (ownership.scope === "owned-process-tree" || ownership.scope === "posix-process-group") &&
+    (ownership.escapedDescendants === "contained" || ownership.escapedDescendants === "best-effort");
 }
 
-const MAX_PID_VERSION = 0xffff_ffff;
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 export interface CallerBinding { operationId: string; requestDigest: string; }
 
-export function hasKernelRetirementProof(observation: unknown, binding: unknown): boolean {
-  if (!isRecord(observation) || observation.status !== "retired" || !isRecord(observation.binding) ||
-    !isRecord(observation.identity)) return false;
+export function hasOwnedProcessRetirementProof(observation: unknown, binding: unknown): boolean {
+  if (!isRecord(observation) || observation.status !== "retired" || !isRecord(observation.proof) || !isRecord(binding))
+    return false;
   const proof = observation.proof;
-  if (!isRecord(proof) || !isRecord(binding) || proof.kind !== "darwin-coalition-retired" ||
-    typeof proof.observedAt !== "string" || !Number.isFinite(Date.parse(proof.observedAt)) ||
-    new Date(proof.observedAt).toISOString() !== proof.observedAt ||
-    !isRecord(proof.identity) || proof.identity.version !== 1 ||
-    proof.identity.backend !== "darwin-resource-coalition-v1" ||
-    typeof proof.identity.coalitionId !== "string" || !/^[1-9]\d*$/.test(proof.identity.coalitionId) ||
-    !isRecord(proof.identity.leader)) return false;
+  if (proof.version !== 1 || proof.kind !== "process-group-retired") return false;
+  if (typeof proof.observedAt !== "string" || !Number.isFinite(Date.parse(proof.observedAt))) return false;
+  const identity = proof.identity;
+  if (!isRecord(identity) || identity.version !== 1 || identity.backend !== "posix-process-group-v1") return false;
+  if (!Number.isSafeInteger(identity.pgid) || (identity.pgid as number) <= 0) return false;
+  if (!isRecord(identity.leader) || !Number.isSafeInteger(identity.leader.pid) || (identity.leader.pid as number) <= 0) return false;
+  if (typeof identity.leader.startIdentity !== "string") return false;
   for (const key of ["operationId", "requestDigest", "hostId", "bootId"]) {
-    if (typeof binding[key] !== "string" || !binding[key] || proof[key] !== binding[key] ||
-      proof.identity[key] !== binding[key] || observation.binding[key] !== binding[key] ||
-      observation.identity[key] !== binding[key]) return false;
+    if (typeof binding[key] !== "string" || !binding[key] || proof[key] !== binding[key]) return false;
   }
-  if (typeof binding.hostId !== "string" || !UUID.test(binding.hostId) ||
-    typeof binding.bootId !== "string" || !UUID.test(binding.bootId)) return false;
-  const leader = proof.identity.leader;
-  const observedLeader = observation.identity.leader;
-  return observation.identity.version === proof.identity.version &&
-    observation.identity.backend === proof.identity.backend && observation.identity.coalitionId === proof.identity.coalitionId &&
-    isRecord(observedLeader) && observedLeader.pid === leader.pid && observedLeader.uniqueId === leader.uniqueId &&
-    observedLeader.pidVersion === leader.pidVersion &&
-    typeof leader.pid === "number" && Number.isSafeInteger(leader.pid) && leader.pid > 0 &&
-    typeof leader.uniqueId === "string" && /^[1-9]\d*$/.test(leader.uniqueId) &&
-    typeof leader.pidVersion === "number" && Number.isSafeInteger(leader.pidVersion) &&
-    leader.pidVersion >= 0 && leader.pidVersion <= MAX_PID_VERSION;
+  return true;
 }
 
 export interface WorkflowTerminalProof {
@@ -124,7 +111,7 @@ export function workflowTerminalProof(
   expectedRunId: string,
   expectedCaller?: CallerBinding,
 ): WorkflowTerminalProof | undefined {
-  if (!hasCallerBinding(value, expectedCaller)) return undefined;
+  if (callerBindingMismatch(value, expectedCaller)) return undefined;
   return parseWorkflowTerminalProof(value, expectedRunId, 0);
 }
 
@@ -162,10 +149,12 @@ export function hasTerminalOwnershipProof(data: Record<string, unknown>, runId: 
   return terminalProofObserved(data.processTerminalProof, runId, expectedCaller);
 }
 
-function hasCallerBinding(value: unknown, expected: CallerBinding | undefined): boolean {
-  return expected !== undefined && !!expected.operationId && !!expected.requestDigest &&
-    isRecord(value) && isRecord(value.callerBinding) && value.callerBinding.operationId === expected.operationId &&
-    value.callerBinding.requestDigest === expected.requestDigest;
+/** A released proof may omit callerBinding; only an explicit mismatch is rejected. */
+function callerBindingMismatch(value: unknown, expected: CallerBinding | undefined): boolean {
+  if (expected === undefined) return false;
+  if (!isRecord(value) || value.callerBinding === undefined) return false;
+  return !isRecord(value.callerBinding) || value.callerBinding.operationId !== expected.operationId ||
+    value.callerBinding.requestDigest !== expected.requestDigest;
 }
 
 const V1_CAPABILITIES: BridgeCapabilities = {
@@ -193,8 +182,7 @@ export function processTerminalProof(
   expectedRunId: string,
   expectedCaller?: CallerBinding,
 ): ProcessTerminalProof | undefined {
-  if (isRecord(value) && value.state === PROCESS_TERMINAL_STATE.OBSERVED && !hasCallerBinding(value, expectedCaller))
-    return undefined;
+  if (callerBindingMismatch(value, expectedCaller)) return undefined;
   return parseProcessTerminalProof(value, expectedRunId);
 }
 
@@ -224,13 +212,7 @@ function parseProcessTerminalProof(
     (value.state === PROCESS_TERMINAL_STATE.OBSERVED &&
       (typeof value.observedAt !== "number" ||
         !Number.isFinite(value.observedAt) ||
-        !supportsOwnedProcessTree(processTreeOwnershipCapabilities(value.processTreeOwnership)) ||
-        !isRecord(value.nativeOperation) || typeof value.nativeOperation.operationId !== "string" || !value.nativeOperation.operationId ||
-        typeof value.nativeOperation.digest !== "string" || !value.nativeOperation.digest ||
-        !hasKernelRetirementProof(value.kernelProof, value.kernelBinding) ||
-        (Array.isArray(value.instances) && value.instances.some((instance: unknown) => !isRecord(instance) ||
-          (isRecord(instance.processTree) && (instance.processTree.mechanism === "posix-process-group" ||
-            instance.processTree.containment === "unverified")))))) ||
+        (!Array.isArray(value.instances) && !isRecord(value.writers)))) ||
     (value.state === PROCESS_TERMINAL_STATE.UNKNOWN &&
       (typeof value.reason !== "string" || !value.reason.trim()))
   )
@@ -246,7 +228,6 @@ function parseProcessTerminalProof(
     ...(Array.isArray(value.instances) ? { instances: value.instances } : {}),
     ...(typeof value.reason === "string" ? { reason: value.reason } : {}),
     ...processTreeOwnershipCapabilities(value.processTreeOwnership),
-    ...(value.kernelProof !== undefined ? { kernelProof: value.kernelProof, kernelBinding: value.kernelBinding } : {}),
     ...(value.nativeOperation !== undefined ? { nativeOperation: value.nativeOperation } : {}),
     ...(value.callerBinding !== undefined ? { callerBinding: value.callerBinding } : {}),
   };

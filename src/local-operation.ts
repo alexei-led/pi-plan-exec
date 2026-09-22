@@ -1,10 +1,20 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, open, readFile, readdir, rename, link, unlink } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import { createRequire } from "node:module";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
-import type { KernelOperationBinding, KernelOwnedProcessObservation, KernelOwnedProcessRequest, PreparedKernelOwnedProcess } from "pi-subagents/kernel-owned-process";
+import {
+  cancelOwnedProcess,
+  launchOwnedProcess,
+  observeOwnedProcess,
+  ownedProcessBindingMatches,
+  ownedProcessTerminal,
+  prepareOwnedProcess,
+  reconcileOwnedProcess,
+  requestOwnedProcessCancellation,
+  type OwnedProcessBinding,
+  type OwnedProcessRequest,
+} from "./owned-process.js";
 import { EXTERNAL_OPERATION_STATE } from "./types.js";
 import { workspaceEnvironment } from "./workspace-environment.js";
 
@@ -15,8 +25,7 @@ const CANCEL_PROBE_MS = 2_000;
 const JOURNAL_FILE_MODE = 0o600;
 const JOURNAL_DIRECTORY_MODE = 0o700;
 const CANCELLATION_BATCH_SIZE = 4;
-const require = createRequire(import.meta.url);
-type KernelRuntime = typeof import("pi-subagents/kernel-owned-process");
+const LOCAL_OPERATION_INTENT_VERSION = 3;
 
 export interface LocalOperationOptions {
   journalRoot: string;
@@ -25,12 +34,11 @@ export interface LocalOperationOptions {
   candidate?: string;
   authorization?: { path: string; stopGeneration: number };
   isAuthorized: () => Promise<boolean>;
-  runtimeModule?: string;
   activeDirectory?: string;
 }
 
 interface LocalOperationIntent {
-  version: 2;
+  version: typeof LOCAL_OPERATION_INTENT_VERSION;
   digest: string;
   runId: string;
   operationId: string;
@@ -38,7 +46,6 @@ interface LocalOperationIntent {
   cwd: string;
   commands: string[][];
   authorization: { path: string; stopGeneration: number } | null;
-  runtimeModule: string;
   environment: Record<string, string>;
   executable: string;
   worker: string;
@@ -56,14 +63,13 @@ export class LocalOperationFailedError extends Error {
 }
 
 interface LocalOperationIndex {
-  version: 1;
+  version: 2;
   runId: string;
   operationId: string;
   generation: number;
   directory: string;
   digest: string;
-  runtimeModule: string;
-  binding: KernelOperationBinding;
+  binding: OwnedProcessBinding;
 }
 
 async function activeEntries(directory: string): Promise<string[]> {
@@ -101,24 +107,23 @@ export async function cancelActiveLocalOperations(directory: string, runId: stri
         const entryPath = join(directory, name);
         const raw = await json(entryPath);
         if (raw === undefined) continue;
-        if (!record(raw) || raw.version !== 1 || raw.runId !== runId || typeof raw.operationId !== "string" ||
-          typeof raw.directory !== "string" || typeof raw.digest !== "string" || typeof raw.runtimeModule !== "string" ||
+        if (!record(raw) || raw.version !== 2 || raw.runId !== runId || typeof raw.operationId !== "string" ||
+          typeof raw.directory !== "string" || typeof raw.digest !== "string" ||
           !Number.isSafeInteger(raw.generation) || typeof raw.generation !== "number" || raw.generation > generation)
           throw new LocalOperationUnknownError("Local operation cancellation index is unresolved.");
         const entry = raw as unknown as LocalOperationIndex;
         const intent = readIntent(await json(join(entry.directory, "intent.json")));
         const binding = readBinding(entry.binding);
         if (intent.runId !== runId || intent.operationId !== entry.operationId || intent.digest !== entry.digest ||
-          intent.runtimeModule !== entry.runtimeModule || (intent.authorization?.stopGeneration ?? 0) !== entry.generation)
+          (intent.authorization?.stopGeneration ?? 0) !== entry.generation)
           throw new LocalOperationUnknownError("Local operation cancellation identity changed.");
-        const runtime = await import(entry.runtimeModule) as KernelRuntime;
         const operationDirectory = join(entry.directory, "owned-process");
-        let observation = await bounded(runtime.observeKernelOwnedProcess(operationDirectory));
-        if (!terminal(observation, binding)) {
+        let observation = await observeOwnedProcess(operationDirectory);
+        if (!ownedProcessTerminal(observation, binding)) {
           await durableJson(join(entry.directory, "stop.json"), { digest: intent.digest });
-          observation = await bounded(runtime.cancelKernelOwnedProcess(operationDirectory, { deadlineMs: CANCEL_PROBE_MS }));
+          observation = await cancelOwnedProcess(operationDirectory, { deadlineMs: CANCEL_PROBE_MS, cancelled: true });
         }
-        if (terminal(observation, binding)) await removeActiveEntry(entryPath);
+        if (ownedProcessTerminal(observation, binding)) await removeActiveEntry(entryPath);
         else reason = observation.reason ?? "Local command process-tree exit remains unconfirmed.";
       } catch (error) { reason = error instanceof Error ? error.message : String(error); }
       await durableJson(cursorPath, { generation, name });
@@ -165,16 +170,6 @@ export function localOperationDirectory(options: Pick<LocalOperationOptions, "jo
   return join(options.journalRoot, "local-operations", key, `generation-${options.authorization?.stopGeneration ?? 0}`);
 }
 
-function bindingMatches(a: KernelOperationBinding, b: KernelOperationBinding): boolean {
-  return a.operationId === b.operationId && a.requestDigest === b.requestDigest && a.hostId === b.hostId && a.bootId === b.bootId;
-}
-
-function terminal(observation: KernelOwnedProcessObservation, binding: KernelOperationBinding): boolean {
-  if (!observation.proof || !bindingMatches(observation.proof, binding)) return false;
-  return observation.status === "never-started" && observation.proof.kind === "never-started" ||
-    observation.status === "retired" && observation.proof.kind === "darwin-coalition-retired" && bindingMatches(observation.proof.identity, binding);
-}
-
 async function immutableJson(path: string, value: unknown): Promise<unknown> {
   const pending = `${path}.${randomUUID()}.tmp`;
   const file = await open(pending, "wx", JOURNAL_FILE_MODE);
@@ -186,9 +181,9 @@ async function immutableJson(path: string, value: unknown): Promise<unknown> {
 }
 
 function readIntent(value: unknown): LocalOperationIntent {
-  if (!record(value) || value.version !== 2 || typeof value.digest !== "string" || typeof value.runId !== "string" ||
+  if (!record(value) || value.version !== LOCAL_OPERATION_INTENT_VERSION || typeof value.digest !== "string" || typeof value.runId !== "string" ||
       typeof value.operationId !== "string" || (value.candidate !== null && typeof value.candidate !== "string") ||
-      typeof value.cwd !== "string" || typeof value.runtimeModule !== "string" || typeof value.executable !== "string" || typeof value.worker !== "string" || !Array.isArray(value.commands) ||
+      typeof value.cwd !== "string" || typeof value.executable !== "string" || typeof value.worker !== "string" || !Array.isArray(value.commands) ||
       value.commands.some((command: unknown) => !Array.isArray(command) || !command.length || command.some((arg: unknown) => typeof arg !== "string")) ||
       !record(value.environment) || Object.values(value.environment).some(entry => typeof entry !== "string") ||
       (value.authorization !== null && (!record(value.authorization) || typeof value.authorization.path !== "string" || !Number.isSafeInteger(value.authorization.stopGeneration)))) {
@@ -200,11 +195,11 @@ function readIntent(value: unknown): LocalOperationIntent {
   return intent;
 }
 
-function readBinding(value: unknown): KernelOperationBinding {
+function readBinding(value: unknown): OwnedProcessBinding {
   if (!record(value) || [value.operationId, value.requestDigest, value.hostId, value.bootId].some(entry => typeof entry !== "string" || !entry)) {
     throw new LocalOperationUnknownError("Missing local command ownership binding.");
   }
-  return value as unknown as KernelOperationBinding;
+  return value as unknown as OwnedProcessBinding;
 }
 
 function generationStopMatches(value: unknown, runId: string, operationId: string, generation: number): boolean {
@@ -217,9 +212,9 @@ function stopMatches(value: unknown, intent: LocalOperationIntent): boolean {
     generationStopMatches(value, intent.runId, intent.operationId, intent.authorization?.stopGeneration ?? 0);
 }
 
-function kernelRequestFor(directory: string, intent: LocalOperationIntent, artifactDirectory: string): KernelOwnedProcessRequest {
+function ownedRequestFor(directory: string, intent: LocalOperationIntent): OwnedProcessRequest {
   return {
-    operationDirectory: join(directory, "owned-process"), artifactDirectory,
+    operationDirectory: join(directory, "owned-process"),
     argv: [intent.executable, intent.worker, directory, intent.digest], cwd: intent.cwd,
     env: intent.environment, lifetime: { kind: "unbounded" },
   };
@@ -231,8 +226,6 @@ async function runOwnedOperation(cwd: string, commands: string[][], options: Loc
   await mkdir(dirname(directory), { recursive: true, mode: JOURNAL_DIRECTORY_MODE });
   const generations = await readdir(dirname(directory), { withFileTypes: true });
   if (!commands.length && !generations.length) return;
-  const runtimeModule = options.runtimeModule ?? pathToFileURL(require.resolve("pi-subagents/kernel-owned-process")).href;
-  const runtime: KernelRuntime = await bounded(import(runtimeModule));
   const generation = options.authorization?.stopGeneration ?? 0;
   for (const previous of generations) {
     const prior = join(dirname(directory), previous.name);
@@ -267,68 +260,67 @@ async function runOwnedOperation(cwd: string, commands: string[][], options: Loc
         (priorIntent.authorization?.stopGeneration ?? 0) !== priorGeneration || !stopMatches(priorStop, priorIntent)) {
       throw new LocalOperationUnknownError("Previous local command generation identity changed.");
     }
-    const priorPrepared = await bounded(runtime.prepareKernelOwnedProcess(kernelRequestFor(prior, priorIntent, join(options.journalRoot, "kernel-runtime"))));
+    const priorPrepared = await bounded(prepareOwnedProcess(ownedRequestFor(prior, priorIntent)));
     const priorBinding = readBinding(await immutableJson(join(prior, "binding.json"), priorPrepared));
-    if (!bindingMatches(priorBinding, priorPrepared)) throw new LocalOperationUnknownError("Previous local command ownership binding changed.");
-    const observation = await bounded(runtime.cancelKernelOwnedProcess(join(prior, "owned-process"), { deadlineMs: CANCEL_PROBE_MS }));
-    if (!terminal(observation, priorBinding)) {
+    if (!ownedProcessBindingMatches(priorBinding, priorPrepared)) throw new LocalOperationUnknownError("Previous local command ownership binding changed.");
+    const observation = await cancelOwnedProcess(join(prior, "owned-process"), { deadlineMs: CANCEL_PROBE_MS, cancelled: true });
+    if (!ownedProcessTerminal(observation, priorBinding)) {
       throw new LocalOperationUnknownError("Previous local command generation has not proven exit; replacement remains fenced.");
     }
     if (options.activeDirectory) await removeActiveEntry(join(options.activeDirectory, `${createHash("sha256").update(prior).digest("hex")}.json`));
   }
   if (!commands.length) return;
   await mkdir(directory, { recursive: true, mode: JOURNAL_DIRECTORY_MODE });
-  const logical = { version: 2 as const, runId: options.runId, operationId: options.operationId, candidate: options.candidate ?? null, cwd: resolve(cwd), commands, authorization: options.authorization ?? null };
+  const logical = { version: LOCAL_OPERATION_INTENT_VERSION, runId: options.runId, operationId: options.operationId, candidate: options.candidate ?? null, cwd: resolve(cwd), commands, authorization: options.authorization ?? null };
   let raw = await json(join(directory, "intent.json"));
   if (raw === undefined) {
     const environment = workspaceEnvironment();
-    const request = { ...logical, runtimeModule, environment, executable: process.execPath, worker: fileURLToPath(new URL("./local-operation-worker.mjs", import.meta.url)) };
+    const request = { ...logical, environment, executable: process.execPath, worker: fileURLToPath(new URL("./local-operation-worker.mjs", import.meta.url)) };
     raw = await immutableJson(join(directory, "intent.json"), { ...request, digest: createHash("sha256").update(JSON.stringify(request)).digest("hex") });
   }
   const intent = readIntent(raw);
   if (Object.entries(logical).some(([key, value]) => JSON.stringify(Reflect.get(intent, key)) !== JSON.stringify(value))) {
     throw new LocalOperationUnknownError("Local operation request changed; the original operation remains fenced.");
   }
-  const kernelRequest = kernelRequestFor(directory, intent, join(options.journalRoot, "kernel-runtime"));
-  const prepared: PreparedKernelOwnedProcess = await bounded(runtime.prepareKernelOwnedProcess(kernelRequest));
+  const ownedRequest = ownedRequestFor(directory, intent);
+  const prepared = await bounded(prepareOwnedProcess(ownedRequest));
   const binding = readBinding(await immutableJson(join(directory, "binding.json"), prepared));
-  if (!bindingMatches(binding, prepared)) throw new LocalOperationUnknownError("Local command ownership binding changed.");
+  if (!ownedProcessBindingMatches(binding, prepared)) throw new LocalOperationUnknownError("Local command ownership binding changed.");
   let activePath: string | undefined;
   if (options.activeDirectory) {
     await mkdir(options.activeDirectory, { recursive: true, mode: JOURNAL_DIRECTORY_MODE });
     activePath = join(options.activeDirectory, `${createHash("sha256").update(directory).digest("hex")}.json`);
-    const entry: LocalOperationIndex = { version: 1, runId: options.runId, operationId: options.operationId,
-      generation: options.authorization?.stopGeneration ?? 0, directory, digest: intent.digest,
-      runtimeModule: intent.runtimeModule, binding };
+    const entry: LocalOperationIndex = { version: 2, runId: options.runId, operationId: options.operationId,
+      generation: options.authorization?.stopGeneration ?? 0, directory, digest: intent.digest, binding };
     const existing = await immutableJson(activePath, entry);
     if (JSON.stringify(existing) !== JSON.stringify(entry)) throw new LocalOperationUnknownError("Local operation cancellation index changed.");
   }
   const stop = async (): Promise<void> => {
     await durableJson(join(directory, "stop.json"), { digest: intent.digest });
-    await bounded(runtime.requestKernelOwnedProcessCancellation(kernelRequest.operationDirectory));
+    await requestOwnedProcessCancellation(ownedRequest.operationDirectory);
   };
   if (!(await bounded(options.isAuthorized()))) await stop();
-  if (await json(join(directory, "stop.json")) === undefined) await bounded(runtime.launchKernelOwnedProcess(kernelRequest));
+  if (await json(join(directory, "stop.json")) === undefined) await bounded(launchOwnedProcess(ownedRequest));
   for (;;) {
     if (!(await bounded(options.isAuthorized()))) await stop();
     let stopped = await json(join(directory, "stop.json"));
     if (stopped !== undefined && !stopMatches(stopped, intent)) throw new LocalOperationUnknownError("Local command cancellation identity mismatch.");
     let observation = stopped === undefined
-      ? await bounded(runtime.observeKernelOwnedProcess(kernelRequest.operationDirectory))
-      : await bounded(runtime.cancelKernelOwnedProcess(kernelRequest.operationDirectory, { deadlineMs: CANCEL_PROBE_MS }));
+      ? await observeOwnedProcess(ownedRequest.operationDirectory)
+      : await cancelOwnedProcess(ownedRequest.operationDirectory, { deadlineMs: CANCEL_PROBE_MS, cancelled: true });
     if (stopped === undefined && observation.status === EXTERNAL_OPERATION_STATE.PENDING) {
       const lateStop = await json(join(directory, "stop.json"));
       if (lateStop !== undefined && !stopMatches(lateStop, intent)) throw new LocalOperationUnknownError("Local command cancellation identity mismatch.");
       if (!(await bounded(options.isAuthorized())) || lateStop !== undefined) {
         await stop();
         stopped = { digest: intent.digest };
-        observation = await bounded(runtime.cancelKernelOwnedProcess(kernelRequest.operationDirectory, { deadlineMs: CANCEL_PROBE_MS }));
+        observation = await cancelOwnedProcess(ownedRequest.operationDirectory, { deadlineMs: CANCEL_PROBE_MS, cancelled: true });
       } else {
-        observation = await bounded(runtime.reconcileKernelOwnedProcess(kernelRequest.operationDirectory));
+        observation = await reconcileOwnedProcess(ownedRequest.operationDirectory);
       }
     }
     if (observation.status === EXTERNAL_OPERATION_STATE.UNKNOWN) throw new LocalOperationUnknownError(observation.reason ?? "Local command ownership is unknown.");
-    if (terminal(observation, binding)) {
+    if (ownedProcessTerminal(observation, binding)) {
       if (activePath) await removeActiveEntry(activePath);
       if (stopped !== undefined || !(await bounded(options.isAuthorized()))) throw new LocalOperationCancelledError("Local operation was cancelled after confirmed process-tree exit.");
       const result = await json(join(directory, "result.json"));
@@ -350,7 +342,7 @@ async function runOwnedOperation(cwd: string, commands: string[][], options: Loc
     if (observation.exitCode !== undefined) {
       const result = await json(join(directory, "result.json"));
       if (result === undefined || record(result) && result.digest === intent.digest && result.code !== 0) {
-        await bounded(runtime.requestKernelOwnedProcessCancellation(kernelRequest.operationDirectory));
+        await requestOwnedProcessCancellation(ownedRequest.operationDirectory);
       }
     }
     const request = await json(join(directory, "request.json"));

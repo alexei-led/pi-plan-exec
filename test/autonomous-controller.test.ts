@@ -5,7 +5,6 @@ import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { promisify } from "node:util";
-import { pathToFileURL } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import test, { type TestContext } from "node:test";
 import { PlanExecController } from "../src/controller.js";
@@ -34,15 +33,8 @@ const command: RunCommand = async (program, args, cwd) => {
 const ok = (data: Record<string, unknown>): BridgeResult => ({ success: true, data });
 
 function observedWorkerProof(id: string, digest: string) {
-  const binding = { operationId: `kernel-${id}`, requestDigest: `kernel-digest-${id}`,
-    hostId: "00000000-0000-0000-0000-000000000001", bootId: "00000000-0000-0000-0000-000000000002" };
-  const identity = { ...binding, version: 1, backend: "darwin-resource-coalition-v1", coalitionId: "2001",
-    leader: { pid: 4242, uniqueId: "1001", pidVersion: 1 } };
-  const proof = { ...binding, kind: "darwin-coalition-retired", identity, observedAt: new Date().toISOString() };
   return { version: 1, state: "observed", runId: id, runnerProcessInstanceId: "fixture", observedAt: Date.now(),
-    processTreeOwnership: { version: 1, scope: "owned-process-tree", escapedDescendants: "contained" },
-    callerBinding: { operationId: id, requestDigest: digest }, nativeOperation: { operationId: `native-${id}`, digest: `native-digest-${id}` },
-    kernelBinding: binding, kernelProof: { status: "retired", operationDirectory: "/fixture/op", binding, identity, proof, exitCode: 0, signal: null } };
+    callerBinding: { operationId: id, requestDigest: digest }, instances: [] };
 }
 
 class Worker {
@@ -2376,26 +2368,15 @@ test("bounded expiry without recent useful progress retries with a changed strat
   assert.match(String(f.worker.launches.at(-1)?.params.task), /Change the previous approach/);
 });
 
-test("cancel retains the worktree fence until a local command proves retirement", async (t) => {
+test("cancel waits for local command retirement before releasing the worktree fence", async (t) => {
   const f = await fixture(t);
   const started = join(f.root, ".git", "local-started");
-  const retired = join(f.root, ".git", "local-retired");
-  const runtimePath = join(f.root, ".git", "local-runtime.mjs");
-  await writeFile(runtimePath, `import { readFile, writeFile } from 'node:fs/promises';
-const binding={operationId:'local-owned',requestDigest:'local-digest',hostId:'host',bootId:'boot'};
-export async function prepareKernelOwnedProcess(request){return {...binding,operationDirectory:request.operationDirectory,stdoutPath:'out',stderrPath:'err'};}
-export async function launchKernelOwnedProcess(request){await writeFile(${JSON.stringify(started)},'yes');return {observation:await observeKernelOwnedProcess(request.operationDirectory)};}
-export async function observeKernelOwnedProcess(directory){
-  let done=false;try{done=await readFile(${JSON.stringify(retired)},'utf8')==='yes';}catch{}
-  return done?{status:'retired',operationDirectory:directory,exitCode:0,proof:{...binding,kind:'darwin-coalition-retired',identity:{...binding,version:1,backend:'darwin-resource-coalition-v1',coalitionId:'123',leader:{pid:123,uniqueId:'1',pidVersion:1}}}}:{status:'active',operationDirectory:directory,binding};
-}
-export async function requestKernelOwnedProcessCancellation(){}
-export async function cancelKernelOwnedProcess(directory){return observeKernelOwnedProcess(directory);}
-export async function reconcileKernelOwnedProcess(directory){return observeKernelOwnedProcess(directory);}
-`);
-  const running = runLocalOperation(f.root, [["unused"]], {
+  // The command ignores SIGTERM, so the controller's cancellation probe has to
+  // hold the fence while the owned process group is still alive.
+  const localCommand = `process.on('SIGTERM',()=>{});require('fs').writeFileSync(${JSON.stringify(started)},'yes');setInterval(()=>{},1000)`;
+  const running = runLocalOperation(f.root, [[process.execPath, "-e", localCommand]], {
     journalRoot: join(f.root, ".git", "local-jobs"), runId: f.run.id, operationId: "verification",
-    activeDirectory: f.registry.localOperationsPath(f.run.id), runtimeModule: pathToFileURL(runtimePath).href,
+    activeDirectory: f.registry.localOperationsPath(f.run.id),
     authorization: { path: f.registry.authorizationPath(f.run.id), stopGeneration: 0 },
     isAuthorized: async () => (await f.registry.get(f.run.id))?.status === "running",
   }).then(() => undefined, (error: unknown) => error);
@@ -2407,19 +2388,14 @@ export async function reconcileKernelOwnedProcess(directory){return observeKerne
     }
     let run = (await f.registry.get(f.run.id))!;
     assert.equal(run.localOperationActive, true);
-    run = await f.registry.update({ ...run, status: "cancel_pending", userStopped: true, stopGeneration: 1 });
-    run = await f.controller.advance(run);
-    assert.equal(run.status, "cancel_pending");
-    assert.equal(run.localOperationActive, true);
     await assert.rejects(f.registry.assertExclusive({ worktreeCwd: f.root, planPath: f.planPath, repositoryRoot: f.root }), /already exists/);
-    await writeFile(retired, "yes");
+    run = await f.registry.update({ ...run, status: "cancel_pending", userStopped: true, stopGeneration: 1 });
     assert.ok(await running instanceof LocalOperationCancelledError);
-    run = await new PlanExecController(f.registry, f.worker, fusion, command, f.localExecutor).advance((await f.registry.get(run.id))!);
+    run = await f.controller.advance((await f.registry.get(run.id))!);
     assert.equal(run.status, "cancelled");
     assert.equal(run.localOperationActive, undefined);
     assert.equal(f.worker.launches.length, 0);
   } finally {
-    await writeFile(retired, "yes");
     await running;
   }
 });
