@@ -37,14 +37,16 @@ POSIX host (Darwin or Linux).
 
 Signal paths (`cancel`, cooperative cancellation, and the bounded-lifetime
 timer) first prove the binding still belongs to this host and boot, that no
-retirement was already persisted, and that the recorded leader identity is not
-a reused pid. Retirement is persisted once observed and short-circuits every
-later signal. A successful launch keeps `launching.json` as the durable launch
-lock, so a concurrent launcher observes instead of spawning a second group. An
-unresolved claim with no launch record is `pending` while fresh and fenced as
-`unknown` once stale; it is never reported as `never-started`. A failed spawn
-records `launch-failed.json`, releases the claim, and lets a later attempt
-launch again.
+retirement was already persisted, and, when a start identity was recorded, that
+the leader pid was not reused. Retirement is persisted once observed and
+short-circuits every later signal. A successful launch keeps `launching.json`
+as the durable launch lock, so a concurrent launcher observes instead of
+spawning a second group. With no launch record and no `launch-failed.json`, an
+unresolved claim is `pending` while fresh and fenced as `unknown` once stale;
+it is never reported as `never-started`. A failed spawn records
+`launch-failed.json` and releases the claim: local operations relaunch on the
+next attempt, while the Revmux adapter reports `unknown` until the review is
+cancelled.
 
 ## Released runtime and Bridge dependency
 
