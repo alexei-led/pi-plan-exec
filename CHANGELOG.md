@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.5.0 - 2026-09-22
+
+- Add planless autonomous `/goal`: a bounded loop runs the frozen pipeline against repository checks, detects progress from normalized check output, pauses after three stalled turns, and accepts completion only when every check passes.
+- Run only released runtimes: `pi-subagents`, `@alexeiled/pi-subagents-bridge@0.4.2`, and `@alexeiled/pi-fusion@0.9.2`. No Git pins.
+- Replace the kernel-owned process dependency with plan-exec's own POSIX process-group runner: detached launch, ps-based leader identity, writer-exit retirement, persisted retirement markers, guarded cancellation, and best-effort containment for descendants that leave the group.
+- Accept the released Bridge contracts: best-effort owned-process capability, upstream-shaped process proofs, and the bridge-synthesized workflow terminal proof for persistent workflow hosts.
+- Keep every durable identity and cancellation fence: local-operation intents to v3, active index to v2, and stop fences honored even when retirement lands first.
+- Modernize tooling: TypeScript 7, Biome (replacing ESLint), Vitest (replacing node:test for all but the documented session-lifecycle file), and npm 12.
+
 ## 1.4.1 - 2026-09-20
 
 - Consume implementation worker output before retrying unchecked tasks. An explicit `TASK_FAILED` pauses the plan with its reason instead of relaunching workers and ending in a generic failure.
