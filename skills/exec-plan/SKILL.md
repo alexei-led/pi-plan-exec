@@ -64,7 +64,7 @@ external prerequisite.
   after its last update. `failed` runs are excluded, because their registry
   entry is what `/exec resume` needs. Removal deletes the registry entry only;
   the worktree, branch, and progress file stay in place.
-- Waive an optional review/finalize/stats stage: `/exec skip <full-run-id> --reason <text>`. Required review and final verification cannot be skipped. It is a waiver of last resort and needs a human; see below.
+- Waive an optional review or statistics stage: `/exec skip <full-run-id> --reason <text>`. Required review and final verification cannot be skipped. It is a waiver of last resort and needs a human; see below.
 - Inspect live command support: `/exec help`.
 
 Use the full run ID whenever more than one run exists, after a reload, or when
@@ -254,9 +254,9 @@ second writer.
   launches in this run.
 - `/exec skip` is a last-resort waiver, not a review pass. It requires an
   interactive confirmation and reason, stops any tracked child before advancing,
-  and ends as `completed_with_findings`. It applies only to optional review,
-  finalization, or statistics stages. Required review/final verification,
-  implementation, and archive cannot be skipped.
+  and ends as `completed_with_findings`. It applies only to optional review or
+  statistics stages. Required review/final verification, implementation, and
+  archive cannot be skipped.
 - Reconciling never launches a worker. It only converts a provably abandoned
   run into a recoverable `failed` run, leaves `taskAttempts` unchanged, and
   skips any run a live session reclaimed while it was being diagnosed. Recovery

@@ -117,6 +117,7 @@ or preserved user files.
 | `src/config.ts` | Run configuration parsing and frozen lifetime/review policy |
 | `src/types.ts` | Run, stage, operation, finding, and frozen configuration contracts |
 | `src/registry.ts` | Locked atomic run persistence, migration, leases, liveness, removal |
+| `src/registry-lock.ts` | Kernel `flock` binding for stable, never-unlinked registry lock files |
 | `src/lifecycle.ts` | Stage order and status classification predicates shared by command and controller |
 | `src/plan.ts` | Strict Markdown plan parser and structure hash |
 | `src/scheduler.ts` | Dependency reconciliation, ready-task selection, and wake scheduling |
@@ -139,8 +140,11 @@ Run records live at:
 ~/.pi/plan-exec/runs/<run-id>/run.json
 ```
 
-Writes use compare-and-set updates under tokenized lock files plus temporary-file
-rename. Controller transitions use a per-run lock; stale reload instances cannot
+Writes use compare-and-set updates under kernel `flock` locks plus temporary-file
+rename. Lock files live at stable paths under `<runs>/.locks/` and are never
+unlinked, so a lock's lifetime is the open file description's lifetime: a dead
+owner releases it when the kernel closes the descriptor. Controller transitions
+use a per-run lock; stale reload instances cannot
 blindly overwrite newer pause, cancellation, or operation state. Each record
 includes:
 
@@ -379,7 +383,7 @@ outcomes below are also the non-interactive entry points.
   is recorded explicitly before resuming. Interactive `resume` asks for it when
   the run's error is an execution-branch mismatch and nothing is tracked;
   `--adopt-current-branch` answers the same question for a caller with no human.
-- `skip` is an interactive, auditable waiver for optional review, finalization,
+- `skip` is an interactive, auditable waiver for optional review
   and statistics only. Required review and final verification cannot be
   skipped. It first persists `skip_pending`, then stops and terminally
   reconciles any tracked operation before clearing it and advancing exactly one

@@ -134,8 +134,10 @@ ownership decisions.
 model turns are scripted; a passing smoke run is not a live-LLM guarantee. A
 Darwin host with the native GUI/compiler prerequisites is required for the
 supported path. The full pipeline passed on the final dependency pins. The
-main full gate passed all 519 tests, lint, TypeScript and package validation,
-including optional skip races and frozen candidate checkouts. The cumulative Revmux
+main full gate passed all 537 tests, lint, TypeScript and package validation,
+including optional skip races and frozen candidate checkouts, and
+`npm run test:runtime-smoke` passed the installed controller, Bridge/native RPC,
+owned workers, required review, promotion and archive. The cumulative Revmux
 confirmation remains pending.
 
 ## Source and review tracking
@@ -148,16 +150,18 @@ confirmation remains pending.
 
 The source pins currently under review are:
 
-- native `pi-subagents`: `689d9378c4526826813da4ccd2402a9cd1acd036`;
+- native `pi-subagents`: `e78595340ff36ad481e205c0872fadba9412227d`;
 - Bridge: `3e99ec2752a25c88cc75475db524c44f3157f69d`;
-- Fusion: `fc4c0ac4e29ec75a70a39489d08c1b3585dfc2f3`;
+- Fusion: `108c52cc3062076e3f721fcfb31061531000b73a`;
 - Revmux: `988904f30da351e76c29d5779c6833a6bf890b51`;
 - Pi SDK: `0.86.1`.
 
-Reported dependency checks are native 3341 unit tests and seven actual
-owned-worktree cases (the full integration rerun is pending), Bridge 72 tests
-plus delayed-admission/restart/cancel and exact-checkout smoke, Fusion 255 unit,
-129 integration, and one E2E, and the Revmux full Go gates. These are dependency
+Reported dependency checks are native 3337/3361 unit and 1101/1109 integration
+tests with the 10 unit and 1 integration failure reproduced unchanged on the
+prior revision as Darwin environment failures (`/var` canonicalization and
+unix-socket `EINVAL`), seven actual owned-worktree cases, Bridge 72 tests
+plus delayed-admission/restart/cancel and exact-checkout smoke, Fusion 256 unit,
+132 integration, and one E2E, and the Revmux full Go gates. These are dependency
 evidence, not a claim that the main product gate or full production pipeline is
 complete.
 
