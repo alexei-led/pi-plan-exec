@@ -208,10 +208,11 @@ plan-exec can tell, and `/exec status` says so in those words. Absence of a
 signal is not evidence that the worker died. Do not treat
 `running, but nothing proves the worker is alive` or
 an observation failure as permission to start a second run. The default
-unbounded lifetime has no wall-clock deadline and never emits an over-budget
-classification. Bounded compatibility is an explicit frozen choice with its
-`timeoutMs`; any timeout classification is diagnostic only and never authorizes
-a replacement child.
+unbounded policy has no plan-exec wall-clock deadline or over-budget
+classification; the native child may still reach its own default timeout.
+Bounded compatibility is an explicit frozen choice with its `timeoutMs`; any
+timeout classification is diagnostic only and never authorizes a replacement
+child.
 
 `/exec status` names `/exec stop <id>` because it writes for a human at a
 keyboard, and `/exec stop` asks whether to pause or to cancel. An agent has
