@@ -48,7 +48,6 @@ export interface FusionCapabilities {
   healthy: boolean;
   durableOperationLookup: boolean;
   processTerminalProofVersion?: number;
-  workflowTerminalProofVersion?: 1;
   executionLifetimeVersion?: 1;
   executionLifetimeModes?: readonly ExecutionLifetime['mode'][];
   processTreeOwnership?: ProcessTreeOwnership;
@@ -89,10 +88,6 @@ export class FusionClient {
       ...(isRecord(capabilities.processTerminalProof) &&
       capabilities.processTerminalProof.version === 1
         ? { processTerminalProofVersion: 1 }
-        : {}),
-      ...(isRecord(capabilities.workflowTerminalProof) &&
-      capabilities.workflowTerminalProof.version === 1
-        ? { workflowTerminalProofVersion: 1 as const }
         : {}),
       ...executionLifetimeCapabilities(capabilities.executionLifetime),
       ...processTreeOwnershipCapabilities(capabilities.processTreeOwnership),

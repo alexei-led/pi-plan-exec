@@ -26,20 +26,20 @@ test('package manifest ships only plan-exec resources, needs no runtime dependen
   );
   assert.match(
     manifest.devDependencies?.['pi-subagents'] ?? '',
-    /^\^0\.70\.1$/,
+    /^\^0\.71\.0$/,
   );
   assert.equal(manifest.peerDependencies['pi-subagents'], undefined);
   assert.equal(manifest.bundledDependencies, undefined);
   for (const packageName of ['@alexeiled/pi-fusion', '@tintinweb/pi-tasks']) {
     assert.equal(
       manifest.peerDependencies[packageName],
-      packageName === '@alexeiled/pi-fusion' ? '>=0.9.2 <1.0.0' : '>=0.9.0',
+      packageName === '@alexeiled/pi-fusion' ? '>=0.9.3 <1.0.0' : '>=0.9.0',
     );
     assert.equal(manifest.peerDependenciesMeta[packageName]?.optional, true);
   }
   assert.equal(
     manifest.peerDependencies['@alexeiled/pi-subagents-bridge'],
-    '>=0.4.2 <0.5.0',
+    '>=0.5.0 <0.6.0',
   );
   assert.equal(
     manifest.peerDependenciesMeta['@alexeiled/pi-subagents-bridge']?.optional,

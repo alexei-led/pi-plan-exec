@@ -111,6 +111,9 @@ const { setChildSessionFactory, setChildSessionFactoryModule } =
 const { ASYNC_DIR, RESULTS_DIR } = await jiti.import(
   join(nativeRoot, 'src/shared/types.js'),
 );
+const { readWorkflowTerminalProof } = await jiti.import(
+  join(nativeRoot, 'src/runs/background/workflow-terminal-proof.js'),
+);
 const { registerPlanExecRpc } = await jiti.import(
   join(bridgeRoot, 'src/plan-exec-rpc.ts'),
 );
@@ -130,6 +133,63 @@ const { readPlan } = await jiti.import(join(project, 'src/plan.ts'));
 const { DEFAULT_FROZEN_RUN_CONFIG } = await jiti.import(
   join(project, 'src/types.ts'),
 );
+
+test('released native workflow proof accepts a recorded child startup failure', async () => {
+  const runs = join(sandbox, 'failed-native-workflow');
+  const parent = join(runs, 'workflow-parent');
+  const child = join(runs, 'failed-child');
+  await mkdir(parent, { recursive: true });
+  await mkdir(child);
+  const notStarted = {
+    version: 1,
+    state: 'not-started',
+    runId: 'failed-child',
+    runnerProcessInstanceId: 'failed-runner-instance',
+  };
+  await writeFile(
+    join(child, 'status.json'),
+    JSON.stringify({
+      runId: 'failed-child',
+      state: 'failed',
+      error: 'runner failed before launch',
+      processTerminal: notStarted,
+    }),
+  );
+  const proof = readWorkflowTerminalProof(
+    parent,
+    [{ agent: 'worker', async: true, runId: 'failed-child' }],
+    {
+      workflowRunId: 'workflow-parent',
+      workflowState: 'failed',
+      inventoryComplete: true,
+    },
+    0,
+    1234,
+  );
+  assert.deepEqual(proof, {
+    version: 1,
+    kind: 'workflow',
+    runId: 'workflow-parent',
+    state: 'observed',
+    dispatchClosed: true,
+    observedAt: 1234,
+    children: [notStarted],
+  });
+  assert.equal(
+    hasTerminalOwnershipProof(
+      { workflowTerminalProof: proof },
+      'workflow-parent',
+    ),
+    true,
+  );
+  assert.equal(
+    hasTerminalOwnershipProof(
+      { processTerminalProof: notStarted },
+      'failed-child',
+    ),
+    false,
+  );
+});
 
 test('scripted model completes real controller, Bridge, owned-process workers, checks, review and promotion', {
   timeout: 120_000,

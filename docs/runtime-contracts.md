@@ -2,8 +2,8 @@
 
 A run is admitted only when the selected runtime advertises explicit lifetime
 support and ownership of every operation-owned descendant. Plan-exec 1.5 uses
-only released packages: `pi-subagents@0.70.1` as the installed runtime,
-`@alexeiled/pi-subagents-bridge@0.4.2`, and `@alexeiled/pi-fusion@0.9.2`. No Git
+only released packages: `pi-subagents@0.71.0` as the installed runtime,
+`@alexeiled/pi-subagents-bridge@0.5.0`, and `@alexeiled/pi-fusion@0.9.3`. No Git
 pins are required.
 
 ## Owned-process runner
@@ -56,23 +56,30 @@ operation lookup, terminal-proof support, and
 "best-effort" }`.
 
 The released `pi-subagents` runtime executes an async agent task as a
-**persistent workflow host**: the parent run publishes no writer-exit proof, and
-only child runs write `process-terminal.json`. Bridge 0.4.2 therefore
-synthesizes a workflow terminal proof when the status reply carries a
-`workflowChildren` summary with a matching `workflowRunId`,
-`inventoryComplete: true`, a terminal `workflowState` (`completed`, `failed`, or
-`stopped`), and every child has an attested process-terminal proof. Child proofs
-come from the cached `subagent:process-terminal` event or, on a cache miss, from
-the child's `process-terminal.json` next to the parent's async directory. A
-partial or open inventory yields no proof and plan-exec keeps polling.
+**persistent workflow host**: the parent run publishes no writer-exit proof.
+Since 0.71.0, its targeted status includes `details.workflowTerminalProof`
+only after dispatch closes and each async child has observed exit evidence or
+a recorded `not-started` failure. Bridge 0.5.0 validates and forwards that
+native proof; it no longer reconstructs one from child events or sidecar files.
+Absent, pending, unknown, or malformed proofs cannot release ownership. A
+closed terminal workflow without a native proof field yields an upgrade/status
+artifact diagnostic rather than a claim that its process tree exited.
+
+Fusion 0.9.3 supports ordinary panels and judges with this native runtime, but
+plan-exec's strict Fusion review path requires durable native operations and
+contained process-tree ownership that 0.71.0 does not provide. Selecting
+`reviewBackend: "fusion"` fails preflight on this released stack; the default
+subagent review backend remains available.
 
 ## Lifetime and recovery
 
 The frozen run policy is either `{ "mode": "unbounded" }` or
-`{ "mode": "bounded", "timeoutMs": <positive integer> }`. Unbounded means no
-wall-clock deadline. Local verification and bootstrap commands always use an
-unbounded owned-process operation and remain user-stoppable, even when the run's
-model/review policy selects bounded compatibility mode.
+`{ "mode": "bounded", "timeoutMs": <positive integer> }`. Local verification
+and bootstrap commands use an unbounded owned-process operation and remain
+user-stoppable, even when the run's model/review policy selects bounded mode.
+For native model work, bridge unbounded mode omits the outer workflow deadline,
+but `pi-subagents@0.71.0` may still apply a default timeout to its child. It
+does not guarantee end-to-end unbounded execution.
 
 For Bridge, native review, Fusion, and Revmux operations, bounded mode is an
 explicit compatibility timeout. The controller only treats
@@ -159,8 +166,8 @@ ownership decisions.
 `npm run test:runtime-smoke` is the declared host-boundary smoke check. Its
 model turns are scripted; a passing smoke run is not a live-LLM guarantee. It
 runs on any POSIX host, and its scripted worker is executed by a detached
-released-runtime runner so the bridge must synthesize the workflow terminal
-proof for the run to complete. The main full gate covers the controller, Bridge
+released-runtime runner so the bridge must obtain a workflow terminal proof
+(native in 0.71.0, or its compatibility fallback) for the run to complete. The main full gate covers the controller, Bridge
 RPC, owned-process runner, required review, promotion, and archive.
 
 ## Source and review tracking
@@ -174,9 +181,9 @@ RPC, owned-process runner, required review, promotion, and archive.
 
 The dependency pins are:
 
-- native `pi-subagents`: released `^0.70.1`;
-- Bridge: released `@alexeiled/pi-subagents-bridge@^0.4.2`;
-- Fusion: released `@alexeiled/pi-fusion@^0.9.2`;
+- native `pi-subagents`: released `^0.71.0`;
+- Bridge: released `@alexeiled/pi-subagents-bridge@^0.5.0`;
+- Fusion: released `@alexeiled/pi-fusion@^0.9.3`;
 - Revmux: `988904f30da351e76c29d5779c6833a6bf890b51`;
 - Pi SDK: `0.86.1`.
 
