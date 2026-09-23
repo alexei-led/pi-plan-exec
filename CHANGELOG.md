@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.6.0 - 2026-09-23
+
+- Require released `pi-subagents@^0.71.0`, Bridge `^0.5.0`, and Fusion `^0.9.3`; update peer ranges without Git or fork pins.
+- Accept a native `not-started` child only inside an observed, dispatch-closed workflow proof. Reject standalone not-started proof as terminal ownership evidence.
+- Remove unused workflow-proof capability projections. Use the upstream targeted status proof forwarded by Bridge, not synthesized child proof.
+- Add an installed-runtime smoke check for the native startup-failure proof. Clarify that bridge unbounded mode omits the outer deadline but does not remove the native child's default timeout; strict Fusion review remains unsupported on this released stack.
+
 ## 1.5.0 - 2026-09-22
 
 - Add planless autonomous `/goal`: a bounded loop runs the frozen pipeline against repository checks, detects progress from normalized check output, pauses after three stalled turns, and accepts completion only when every check passes.
