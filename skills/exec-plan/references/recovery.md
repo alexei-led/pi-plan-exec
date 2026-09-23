@@ -80,10 +80,11 @@ the user accepts losing the in-flight work, end it and keep the worktree:
 
 Only an explicitly bounded `executionLifetime` can produce this classification.
 It means the configured `timeoutMs` has passed; there is no synthetic per-turn
-allowance. Unbounded runs never receive this classification and have no
-wall-clock deadline. The bounded classification is an attention hint only: it
-does not stop the child, consume a retry, or authorize a replacement. Missing
-activity or provider observations are never proof that a child stopped.
+allowance. Unbounded runs never receive this plan-exec classification, but a
+native child may still reach its own default timeout. The bounded
+classification is an attention hint only: it does not stop the child, consume a
+retry, or authorize a replacement. Missing activity or provider observations
+are never proof that a child stopped.
 
 Re-check while a live controller or lease is polling:
 

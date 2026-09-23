@@ -68,8 +68,9 @@ artifact diagnostic rather than a claim that its process tree exited.
 Fusion 0.9.3 supports ordinary panels and judges with this native runtime, but
 plan-exec's strict Fusion review path requires durable native operations and
 contained process-tree ownership that 0.71.0 does not provide. Selecting
-`reviewBackend: "fusion"` fails preflight on this released stack; the default
-subagent review backend remains available.
+`reviewBackend: "fusion"` fails when the review stage launches, after
+implementation has run; the default subagent review backend remains available.
+Fusion's standalone panel and judge still work on the released stack.
 
 ## Lifetime and recovery
 
@@ -166,17 +167,18 @@ ownership decisions.
 `npm run test:runtime-smoke` is the declared host-boundary smoke check. Its
 model turns are scripted; a passing smoke run is not a live-LLM guarantee. It
 runs on any POSIX host, and its scripted worker is executed by a detached
-released-runtime runner so the bridge must obtain a workflow terminal proof
-(native in 0.71.0, or its compatibility fallback) for the run to complete. The main full gate covers the controller, Bridge
-RPC, owned-process runner, required review, promotion, and archive.
+released-runtime runner. The run completes only when Bridge 0.5.0 forwards
+native `details.workflowTerminalProof` from pi-subagents 0.71.0. The main full
+gate covers the controller, Bridge RPC, owned-process runner, required review,
+promotion, and archive.
 
 ## Source and review tracking
 
-- Main draft: [pi-plan-exec #8](https://github.com/alexei-led/pi-plan-exec/pull/8).
+- Current integration: [pi-plan-exec #9](https://github.com/alexei-led/pi-plan-exec/pull/9).
 - Revmux adapter evidence: [revmux #35](https://github.com/umputun/revmux/pull/35).
-- Fusion dependency: [pi-fusion #12](https://github.com/alexei-led/pi-fusion/pull/12).
-- Bridge dependency: [pi-subagents-bridge #2](https://github.com/alexei-led/pi-subagents-bridge/pull/2)
-  and the workflow-proof synthesis in
+- Fusion compatibility: [pi-fusion #14](https://github.com/alexei-led/pi-fusion/pull/14).
+- Native proof forwarding: [pi-subagents-bridge #5](https://github.com/alexei-led/pi-subagents-bridge/pull/5),
+  replacing the synthesis introduced by
   [pi-subagents-bridge #4](https://github.com/alexei-led/pi-subagents-bridge/pull/4).
 
 The dependency pins are:

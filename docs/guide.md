@@ -415,9 +415,10 @@ absence of a signal as health. Every in-flight situation reads differently:
 - `running longer than its budget allows` — only an explicitly bounded
   `executionLifetime` can produce this classification. It means the configured
   `timeoutMs` has passed; there is no synthetic per-turn allowance. Unbounded
-  runs never receive this classification and have no wall-clock deadline. The
-  bounded classification is diagnostic only and does not authorize a
-  replacement; use `/exec stop` when the user wants to end the run.
+  runs never receive this plan-exec classification, but the native child may
+  still reach its own default timeout. The bounded classification is diagnostic
+  only and does not authorize a replacement; use `/exec stop` when the user
+  wants to end the run.
 - `the worker is gone, so nothing is running` — checked at the moment status
   ran: a matching owned-process-tree terminal proof covers the bound external
   run, or an authoritative never-started fence or durable `absent` lookup covers
