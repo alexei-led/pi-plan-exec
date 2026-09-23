@@ -30,7 +30,6 @@ export interface BridgeCapabilities {
   singleAgentSpawn?: boolean;
   durableOperationLookup: boolean;
   processTerminalProofVersion?: number;
-  workflowTerminalProofVersion?: 1;
   executionLifetimeVersion?: 1;
   executionLifetimeModes?: readonly ExecutionLifetime['mode'][];
   processTreeOwnership?: ProcessTreeOwnership;
@@ -201,7 +200,11 @@ function parseWorkflowTerminalProof(
       child.kind === 'workflow'
         ? parseWorkflowTerminalProof(child, child.runId, depth + 1)
         : parseProcessTerminalProof(child, child.runId);
-    if (!parsed || parsed.state !== PROCESS_TERMINAL_STATE.OBSERVED)
+    if (
+      !parsed ||
+      (parsed.state !== PROCESS_TERMINAL_STATE.OBSERVED &&
+        parsed.state !== PROCESS_TERMINAL_STATE.NOT_STARTED)
+    )
       return undefined;
     children.push(parsed);
   }
@@ -628,10 +631,6 @@ function parseV2Capabilities(
     singleAgentSpawn: capabilities.singleAgentSpawn === true,
     durableOperationLookup: true,
     processTerminalProofVersion: 1,
-    ...(isRecord(capabilities.workflowTerminalProof) &&
-    capabilities.workflowTerminalProof.version === 1
-      ? { workflowTerminalProofVersion: 1 as const }
-      : {}),
     ...executionLifetimeCapabilities(capabilities.executionLifetime),
     ...processTreeOwnershipCapabilities(capabilities.processTreeOwnership),
     ...(isRecord(capabilities.diagnosticGuidance) &&

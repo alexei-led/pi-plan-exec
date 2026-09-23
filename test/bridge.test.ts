@@ -57,7 +57,7 @@ test('observed process proofs bind the exact run and caller', () => {
     );
 });
 
-test('workflow proof requires closed dispatch and recursively observed child exit', () => {
+test('workflow proof requires closed dispatch and terminal child evidence', () => {
   const child = observedProof('child');
   const workflow = {
     version: 1,
@@ -81,6 +81,28 @@ test('workflow proof requires closed dispatch and recursively observed child exi
     hasTerminalOwnershipProof({ workflowTerminalProof: workflow }, 'flow'),
     true,
   );
+  const failedToStart = {
+    version: 1,
+    state: 'not-started',
+    runId: 'child',
+    runnerProcessInstanceId: 'released-instance',
+  };
+  assert.equal(
+    hasTerminalOwnershipProof(
+      { workflowTerminalProof: { ...workflow, children: [failedToStart] } },
+      'flow',
+      CALLER_BINDING,
+    ),
+    true,
+  );
+  assert.equal(
+    hasTerminalOwnershipProof(
+      { processTerminalProof: failedToStart },
+      'child',
+      CALLER_BINDING,
+    ),
+    false,
+  );
   assert.equal(
     hasTerminalOwnershipProof(
       {
@@ -97,7 +119,15 @@ test('workflow proof requires closed dispatch and recursively observed child exi
   for (const invalid of [
     { ...workflow, dispatchClosed: false },
     { ...workflow, children: [{ ...child, state: 'pending' }] },
+    {
+      ...workflow,
+      children: [{ ...failedToStart, state: 'unknown', reason: 'unknown' }],
+    },
     { ...workflow, children: [{ ...child, instances: undefined }] },
+    {
+      ...workflow,
+      children: [{ ...failedToStart, runnerProcessInstanceId: '' }],
+    },
     { ...workflow, children: [{}] },
     { ...workflow, runId: 'different' },
   ])

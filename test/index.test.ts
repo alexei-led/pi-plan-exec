@@ -632,24 +632,24 @@ test('help and setup explain the installed command surface', () => {
     assert.doesNotMatch(execHelp(), new RegExp(`/exec ${alias}`), alias);
   assert.match(
     execSetup(),
-    /pi install -l npm:@alexeiled\/pi-subagents-bridge@\^0\.4\.2$/m,
+    /pi install -l npm:@alexeiled\/pi-subagents-bridge@\^0\.5\.0$/m,
   );
   assert.match(
     execSetup(),
-    /pi install -l npm:@alexeiled\/pi-fusion@\^0\.9\.2$/m,
+    /pi install -l npm:@alexeiled\/pi-fusion@\^0\.9\.3$/m,
   );
   assert.match(execSetup(), /Keep this plan-exec source build installed/);
 });
 
 test('setup installs the released bridge and fusion pins', () => {
-  assert.match(execSetup(), /^pi install -l npm:pi-subagents@\^0\.70\.1$/m);
+  assert.match(execSetup(), /^pi install -l npm:pi-subagents@\^0\.71\.0$/m);
   assert.match(
     execSetup(),
-    /^pi install -l npm:@alexeiled\/pi-subagents-bridge@\^0\.4\.2$/m,
+    /^pi install -l npm:@alexeiled\/pi-subagents-bridge@\^0\.5\.0$/m,
   );
   assert.match(
     execSetup(),
-    /^pi install -l npm:@alexeiled\/pi-fusion@\^0\.9\.2$/m,
+    /^pi install -l npm:@alexeiled\/pi-fusion@\^0\.9\.3$/m,
   );
   assert.doesNotMatch(
     execSetup(),
@@ -2254,7 +2254,7 @@ test('status reports a missing package with its install commands', async () => {
   });
 
   assert.match(report, /Plan-exec prerequisites — missing: pi-subagents\./);
-  assert.match(report, /^pi install -l npm:pi-subagents@\^0\.70\.1$/m);
+  assert.match(report, /^pi install -l npm:pi-subagents@\^0\.71\.0$/m);
   assert.doesNotMatch(report, /pi-fusion/);
   assert.match(report, /No plan execution runs\. Start one with \/exec\./);
   assert.equal(
@@ -2309,7 +2309,7 @@ test('the retired read verbs still work and name their replacement', async () =>
   assert.match(doctor ?? '', /\/exec doctor is now \/exec status/);
 
   const setup = await execRead(registry, 'setup', []);
-  assert.match(setup ?? '', /^pi install -l npm:pi-subagents@\^0\.70\.1$/m);
+  assert.match(setup ?? '', /^pi install -l npm:pi-subagents@\^0\.71\.0$/m);
   assert.match(setup ?? '', /\/exec setup is now part of \/exec status/);
 
   assert.equal(await execRead(registry, 'resume', []), undefined);
