@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.6.1 - 2026-09-30
+
+### Changes
+
+- Validate the development stack against Pi `0.99.1` and pi-subagents `0.73.1`, including package loading, detached workers and native terminal proofs. The newer subagent runtime fixes async recovery, prompt-cache retention and a shutdown race.
+- Reject private Pi SDK, TUI and TypeBox dependencies during packaging; add regression checks for host-module warnings. Existing plan-exec host dependencies remain wildcard peers. Warnings from other installed extensions require fixes in those packages.
+- Correct setup commands and installation docs to use released runtimes without Git pins. Limit optional pi-tasks compatibility to the adapter's supported `0.9.x` range.
+- Publish GitHub release notes from this changelog with the version tag as the title.
+
+### Known limits
+
+- Strict Fusion review and released Revmux still lack required ownership/lifetime contracts. Native child execution is not guaranteed to be unbounded.
+- Dependency audit findings remain unresolved; the suggested force fix downgrades below the required terminal-proof baseline. See [upstream audit](https://github.com/alexei-led/pi-plan-exec/blob/v1.6.1/docs/upstream-audit.md).
+
+[Full comparison](https://github.com/alexei-led/pi-plan-exec/compare/v1.6.0...v1.6.1)
+
 ## 1.6.0 - 2026-09-23
 
 - Require released `pi-subagents@^0.71.0`, Bridge `^0.5.0`, and Fusion `^0.9.3`; update peer ranges without Git or fork pins.

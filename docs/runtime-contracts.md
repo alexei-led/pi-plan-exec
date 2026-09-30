@@ -1,10 +1,12 @@
 # Autonomous runtime contracts
 
 A run is admitted only when the selected runtime advertises explicit lifetime
-support and ownership of every operation-owned descendant. Plan-exec 1.5 uses
-only released packages: `pi-subagents@0.71.0` as the installed runtime,
-`@alexeiled/pi-subagents-bridge@0.5.0`, and `@alexeiled/pi-fusion@0.9.3`. No Git
-pins are required.
+support and ownership of every operation-owned descendant. The development
+baseline uses released Pi `0.99.1`, `pi-subagents@0.73.1`,
+`@alexeiled/pi-subagents-bridge@0.5.0`, and `@alexeiled/pi-fusion@0.9.3`.
+The default subagent backend needs no Git pins. The optional Revmux contract
+still depends on an unmerged upstream change; it is not a released backend.
+See the [upstream audit](upstream-audit.md) for release evidence and limits.
 
 ## Owned-process runner
 
@@ -67,7 +69,7 @@ artifact diagnostic rather than a claim that its process tree exited.
 
 Fusion 0.9.3 supports ordinary panels and judges with this native runtime, but
 plan-exec's strict Fusion review path requires durable native operations and
-contained process-tree ownership that 0.71.0 does not provide. Selecting
+contained process-tree ownership not established by this runtime upgrade. Selecting
 `reviewBackend: "fusion"` fails when the review stage launches, after
 implementation has run; the default subagent review backend remains available.
 Fusion's standalone panel and judge still work on the released stack.
@@ -79,8 +81,8 @@ The frozen run policy is either `{ "mode": "unbounded" }` or
 and bootstrap commands use an unbounded owned-process operation and remain
 user-stoppable, even when the run's model/review policy selects bounded mode.
 For native model work, bridge unbounded mode omits the outer workflow deadline,
-but `pi-subagents@0.71.0` may still apply a default timeout to its child. It
-does not guarantee end-to-end unbounded execution.
+but the native runtime may still apply a default timeout to its child. This
+integration does not guarantee end-to-end unbounded execution.
 
 For Bridge, native review, Fusion, and Revmux operations, bounded mode is an
 explicit compatibility timeout. The controller only treats
@@ -112,7 +114,7 @@ These identity namespaces are separate and must never be equated:
   ID, and its retirement proof must match that binding.
 
 The owner DTO is `{ kind: "pi-plan-exec", runId, key, requestDigest }`; the
-request digest is the canonical digest of `{ cwd, params }`. A synthesized
+request digest is the canonical digest of `{ cwd, params }`. A native
 workflow proof binds the parent run to the attested writer-exit proofs of its
 children; the direct native process-terminal proof, when the runtime publishes
 one, takes precedence.
@@ -133,8 +135,10 @@ Writers must use the updated protocol; conflicting unknown legacy snapshots
 remain visible and fenced rather than being discarded or replaced by age.
 
 Revmux must support the explicit `--execution-lifetime=unbounded|bounded`
-selection from [Revmux commit 988904f](https://github.com/umputun/revmux/pull/35/commits/988904f30da351e76c29d5779c6833a6bf890b51),
-and the plan-exec adapter wraps it in the outer owned-process group. Revmux's
+selection from [Revmux commit 988904f](https://github.com/umputun/revmux/pull/35/commits/988904f30da351e76c29d5779c6833a6bf890b51).
+That commit belongs to open PR #35, not released v0.2.6. The adapter must reject
+a binary without the required capabilities. It wraps a compatible binary in
+the outer owned-process group. Revmux's
 internal process-group proof is narrower and cannot satisfy the full ownership
 contract by itself. Its report remains invalid unless source coverage, agent
 health, findings, and unresolved questions all validate.
@@ -168,7 +172,7 @@ ownership decisions.
 model turns are scripted; a passing smoke run is not a live-LLM guarantee. It
 runs on any POSIX host, and its scripted worker is executed by a detached
 released-runtime runner. The run completes only when Bridge 0.5.0 forwards
-native `details.workflowTerminalProof` from pi-subagents 0.71.0. The main full
+native `details.workflowTerminalProof` from pi-subagents 0.73.1. The main full
 gate covers the controller, Bridge RPC, owned-process runner, required review,
 promotion, and archive.
 
@@ -183,11 +187,12 @@ promotion, and archive.
 
 The dependency pins are:
 
-- native `pi-subagents`: released `^0.71.0`;
+- native `pi-subagents`: released `^0.73.1`;
 - Bridge: released `@alexeiled/pi-subagents-bridge@^0.5.0`;
 - Fusion: released `@alexeiled/pi-fusion@^0.9.3`;
-- Revmux: `988904f30da351e76c29d5779c6833a6bf890b51`;
-- Pi SDK: `0.86.1`.
+- Revmux: unreleased `988904f30da351e76c29d5779c6833a6bf890b51` (PR #35);
+- Pi SDK: `0.99.1`;
+- optional pi-tasks projection: `>=0.9.0 <0.10.0`, session scope only.
 
 These are dependency evidence, not a claim that the full production pipeline is
 complete. The implementation remains a release candidate; no production support

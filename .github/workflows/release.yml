@@ -41,10 +41,24 @@ jobs:
               return;
             }
 
+            const changelog = fs.readFileSync("CHANGELOG.md", "utf8");
+            const heading = `## ${pkg.version} - `;
+            const start = changelog.split("\n").findIndex(line => line.startsWith(heading));
+            if (start < 0) throw new Error(`Missing changelog section for ${tag}`);
+            const lines = changelog.split("\n").slice(start + 1);
+            const end = lines.findIndex(line => line.startsWith("## "));
+            const body = lines.slice(0, end < 0 ? lines.length : end).join("\n").trim();
+            if (!body || !/^\s*-\s+\S/m.test(body)) {
+              throw new Error(`Missing release content for ${tag}`);
+            }
+            const notesPath = `${process.env.RUNNER_TEMP}/plan-exec-release-notes.md`;
+            fs.writeFileSync(notesPath, body);
+            core.setOutput("notes_path", notesPath);
+
             core.setOutput("name", pkg.name);
             core.setOutput("version", pkg.version);
             core.setOutput("tag", tag);
-            core.setOutput("release_name", `${pkg.name} ${pkg.version}`);
+            core.setOutput("release_name", tag);
             core.setOutput("prerelease", String(pkg.version.includes("-")));
       - name: Ensure tag is on main
         run: |
@@ -101,19 +115,14 @@ jobs:
           PACKAGE_VERSION: ${{ steps.metadata.outputs.version }}
           RELEASE_NAME: ${{ steps.metadata.outputs.release_name }}
           RELEASE_TAG: ${{ steps.metadata.outputs.tag }}
+          NOTES_PATH: ${{ steps.metadata.outputs.notes_path }}
           PRERELEASE: ${{ steps.metadata.outputs.prerelease }}
         with:
           script: |
             const [owner, repo] = process.env.GITHUB_REPOSITORY.split("/");
             const tag = process.env.RELEASE_TAG;
-            const body = [
-              "## Package",
-              `- Name: \`${process.env.PACKAGE_NAME}\``,
-              `- Version: \`${process.env.PACKAGE_VERSION}\``,
-              `- Tag: \`${tag}\``,
-              `- Commit: \`${process.env.GITHUB_SHA}\``,
-              "- npm provenance: enabled",
-            ].join("\n");
+            const fs = require("node:fs");
+            const body = fs.readFileSync(process.env.NOTES_PATH, "utf8");
 
             try {
               const { data: existing } = await github.rest.repos.getReleaseByTag({
@@ -136,7 +145,7 @@ jobs:
               target_commitish: process.env.GITHUB_SHA,
               name: process.env.RELEASE_NAME,
               body,
-              generate_release_notes: true,
+              generate_release_notes: false,
               prerelease: process.env.PRERELEASE === "true",
               make_latest: process.env.PRERELEASE === "true" ? "false" : "true",
             });

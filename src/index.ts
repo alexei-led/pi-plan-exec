@@ -4069,13 +4069,13 @@ export function goalHelp(): string {
 
 export function execSetup(): string {
   return [
-    'Install the exact source runtimes pinned by this plan-exec build (project-local settings):',
+    'Install the released runtimes tested by this plan-exec build (project-local settings):',
     ...requiredSetupCommands(),
-    'Optional Fusion review backend:',
+    'Optional standalone Fusion panels (strict plan-exec review remains unsupported):',
     sourceInstallCommand('@alexeiled/pi-fusion'),
     'Optional task visibility (not required for execution):',
-    'pi install -l npm:@tintinweb/pi-tasks',
-    'Keep this plan-exec source build installed; published packages may not expose the required runtime contract yet.',
+    sourceInstallCommand('@tintinweb/pi-tasks'),
+    'No Git dependency pins are required for the default subagent review backend.',
     '',
     'Then run /reload. Use /exec help for commands.',
   ].join('\n');

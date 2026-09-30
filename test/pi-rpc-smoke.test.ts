@@ -32,7 +32,7 @@ syncBuiltinESMExports();
       '--no-extensions',
       '--no-skills',
       '-e',
-      resolve('src/index.ts'),
+      resolve('.'),
     ],
     {
       cwd: process.cwd(),
@@ -102,6 +102,10 @@ syncBuiltinESMExports();
   assert.equal(commandsRegistered, true, errors.slice(-2_000));
   assert.equal(statusRendered, true, errors.slice(-2_000));
   assert.equal(modelStarted, false);
+  assert.doesNotMatch(
+    errors,
+    /Host-provided extension packages|duplicate runtime modules/,
+  );
 });
 
 function isRecord(value: unknown): value is Record<string, unknown> {

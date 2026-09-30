@@ -14,7 +14,7 @@ Reload Pi after changing the extension:
 /reload
 ```
 
-Use npm 12.0.2. Strict execution installs released packages only; see
+Use npm 12.0.2. The default subagent backend uses released packages; see
 [runtime contracts](docs/runtime-contracts.md) before attempting an execution.
 
 Tooling: TypeScript 7, Biome (lint and format, replacing ESLint), and Vitest.
@@ -36,8 +36,14 @@ npm run pack:dry
 `npm run check` runs Biome and `tsc`; `npm run lint` and `npm run format` are
 available for focused runs. `npm run test:all` is the local gate used by CI and
 the release workflow.
-`npm run pack:dry` checks the final npm tarball against a runtime-only allowlist;
-the release workflow checks npm before it performs an actual publish.
+`npm run pack:dry` rejects private host SDK/TUI/TypeBox dependencies and checks
+the final npm tarball against a runtime-only allowlist. Host packages must be
+`"*"` peers; development pins are allowed. The release workflow checks npm before
+it performs an actual publish. The real Pi RPC smoke test loads the package
+root and checks command registration without host-module warnings.
+
+The tested baseline and deferred integration work are recorded in the
+[upstream audit](docs/upstream-audit.md).
 
 ## Release
 

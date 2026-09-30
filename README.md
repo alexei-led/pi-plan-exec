@@ -16,8 +16,8 @@ second writer after a restart. This extension moves task order, automatic
 recovery, worktree checks, commit acceptance, and provider reconciliation out of
 prompt prose into durable controller state.
 The controller keeps polling and reconciles durable operations after a restart.
-The released providers implement the strict runtime contract on POSIX hosts
-with the prerequisites documented below.
+The default subagent backend uses the strict runtime contract on POSIX hosts
+with the prerequisites and limits documented below.
 
 It executes ready checked-list tasks in a Git checkout you choose, then runs
 the required review and fix stages with fresh Pi subagents or an explicitly
@@ -26,7 +26,7 @@ checked items, accepted commit, required checks, and a clean worktree with no
 uncommitted or untracked non-ignored files are the implementation record.
 
 > Pre-release feature. The strict controller requires the released
-> `pi-subagents` runtime plus the matching Bridge and Fusion releases. A worker
+> `pi-subagents` runtime plus the matching Bridge release. A worker
 > or host that cannot prove process retirement remains fenced; see
 > [runtime contracts](docs/runtime-contracts.md).
 
@@ -63,26 +63,31 @@ are best-effort, matching the released runtime.
 
 ## Install and run
 
-Use a project-local source checkout with the exact dependency Git refs listed
-in [runtime contracts](docs/runtime-contracts.md). This pre-release path is not
-provided by the published npm runtime; do not install the latest provider
-versions and assume that they expose the required native contract. The exact
-native pin is recorded in the runtime contract and provides the public API
-without requiring a package release. Fusion and Revmux are optional explicit review backends; the
-default backend is one required subagent reviewer. `@tintinweb/pi-tasks` is an
-optional projection cache.
+The development baseline is Pi `0.99.1`, `pi-subagents@0.73.1`, and
+`@alexeiled/pi-subagents-bridge@0.5.0`. Install the providers as independent Pi
+packages; no Git dependency or `allow-git=all` setting is required:
 
-The providers remain independent Pi packages. This feature
-is tested against the released `@alexeiled/pi-subagents-bridge@0.3.2` and
-`@alexeiled/pi-fusion@0.9.1` packages plus the pinned native revision and the
-linked dependency PRs listed in [runtime contracts](docs/runtime-contracts.md). The default
-review backend is `subagent` with an empty fallback list (`none`). An ambiguous
-Fusion or Revmux launch keeps its operation ID and remains recoverable instead
-of starting another reviewer over an unknown child. The development checkout
-and CI use npm 12.0.2. The repository `.npmrc` uses `allow-git=root` for the
-pinned native revision; a packed
-consumer must use a project-local `allow-git=all` for transitive Git refs. Do
-not change global npm configuration.
+```bash
+pi install -l npm:pi-subagents@0.73.1
+pi install -l npm:@alexeiled/pi-subagents-bridge@0.5.0
+pi install -l /absolute/path/to/pi-plan-exec
+```
+
+The default review backend is one required subagent reviewer with an empty
+fallback list (`none`). Fusion `0.9.3` is current, but cannot satisfy this
+extension's strict review ownership contract. Revmux's required lifecycle
+support is still in an unmerged PR, not its latest release. Do not select these
+backends for an unattended run; see [runtime contracts](docs/runtime-contracts.md).
+`@tintinweb/pi-tasks@0.9.x` is an optional, session-scoped projection cache.
+The development checkout and CI use npm 12.0.2.
+
+Pi supplies its SDK, TUI and TypeBox modules. This extension declares them as
+`"*"` peers, never runtime dependencies. If startup reports **“Host-provided
+extension packages must be declared in peerDependencies”**, check the
+`package.json` path in the warning: another installed extension can cause it.
+Update or fix that package's declarations; do not suppress the warning or add
+private SDK copies here. See the [upstream audit](docs/upstream-audit.md) for
+known dependency limitations and upgrade priorities.
 
 Reload Pi. From an interactive session in a Git repository, start a goal or run
 an existing executable plan:

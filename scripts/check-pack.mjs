@@ -1,4 +1,42 @@
 import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+
+// Match Pi's host module aliases, including the legacy package names.
+const HOST_PACKAGES = new Set([
+  '@earendil-works/pi-agent-core',
+  '@earendil-works/pi-ai',
+  '@earendil-works/pi-coding-agent',
+  '@earendil-works/pi-tui',
+  '@mariozechner/pi-agent-core',
+  '@mariozechner/pi-ai',
+  '@mariozechner/pi-coding-agent',
+  '@mariozechner/pi-tui',
+  '@sinclair/typebox',
+  'typebox',
+]);
+const packageJson = JSON.parse(readFileSync('package.json', 'utf8'));
+const invalid = [];
+for (const name of HOST_PACKAGES) {
+  for (const field of ['dependencies', 'optionalDependencies']) {
+    if (Object.hasOwn(packageJson[field] ?? {}, name))
+      invalid.push(`${field}: ${name}`);
+  }
+  if (
+    Object.hasOwn(packageJson.peerDependencies ?? {}, name) &&
+    packageJson.peerDependencies[name] !== '*'
+  )
+    invalid.push(`peerDependencies: ${name}`);
+  for (const field of ['bundledDependencies', 'bundleDependencies']) {
+    if (Array.isArray(packageJson[field]) && packageJson[field].includes(name))
+      invalid.push(`${field}: ${name}`);
+  }
+}
+if (invalid.length > 0) {
+  console.error(
+    `Host-provided extension packages must be declared in peerDependencies with a "*" range, not installed or bundled as runtime dependencies:\n${invalid.map((entry) => `- ${entry}`).join('\n')}`,
+  );
+  process.exit(1);
+}
 
 const ALWAYS_ALLOWED = new Set(['LICENSE', 'README.md', 'package.json']);
 const REQUIRED = new Set([
