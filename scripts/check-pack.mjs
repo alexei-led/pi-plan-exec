@@ -21,11 +21,13 @@ for (const name of HOST_PACKAGES) {
     if (Object.hasOwn(packageJson[field] ?? {}, name))
       invalid.push(`${field}: ${name}`);
   }
+  const expectedPeerRange =
+    name === '@earendil-works/pi-coding-agent' ? '^1.0.2' : '*';
   if (
     Object.hasOwn(packageJson.peerDependencies ?? {}, name) &&
-    packageJson.peerDependencies[name] !== '*'
+    packageJson.peerDependencies[name] !== expectedPeerRange
   )
-    invalid.push(`peerDependencies: ${name}`);
+    invalid.push(`peerDependencies: ${name} (expected ${expectedPeerRange})`);
   for (const field of ['bundledDependencies', 'bundleDependencies']) {
     if (Array.isArray(packageJson[field]) && packageJson[field].includes(name))
       invalid.push(`${field}: ${name}`);
@@ -33,7 +35,7 @@ for (const name of HOST_PACKAGES) {
 }
 if (invalid.length > 0) {
   console.error(
-    `Host-provided extension packages must be declared in peerDependencies with a "*" range, not installed or bundled as runtime dependencies:\n${invalid.map((entry) => `- ${entry}`).join('\n')}`,
+    `Host-provided extension packages must be declared in peerDependencies with the tested host range, not installed or bundled as runtime dependencies:\n${invalid.map((entry) => `- ${entry}`).join('\n')}`,
   );
   process.exit(1);
 }

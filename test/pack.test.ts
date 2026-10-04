@@ -55,14 +55,14 @@ for (const packageName of hostPackages) {
         result.stderr,
       );
       assert.ok(
-        result.stderr.includes('peerDependencies with a "*" range'),
+        result.stderr.includes('peerDependencies with the tested host range'),
         result.stderr,
       );
     });
   }
 }
 
-test('imported host packages are wildcard peers, never private runtime copies', async () => {
+test('imported host packages use tested peers, never private runtime copies', async () => {
   const manifest = JSON.parse(
     await readFile(join(root, 'package.json'), 'utf8'),
   );
@@ -71,14 +71,39 @@ test('imported host packages are wildcard peers, never private runtime copies', 
     '@earendil-works/pi-tui',
     'typebox',
   ]) {
-    assert.equal(manifest.peerDependencies[name], '*');
+    assert.equal(
+      manifest.peerDependencies[name],
+      name === '@earendil-works/pi-coding-agent' ? '^1.0.2' : '*',
+    );
   }
   for (const name of hostPackages) {
     assert.equal(manifest.dependencies?.[name], undefined);
     assert.equal(manifest.optionalDependencies?.[name], undefined);
     if (manifest.peerDependencies[name] !== undefined)
-      assert.equal(manifest.peerDependencies[name], '*');
+      assert.equal(
+        manifest.peerDependencies[name],
+        name === '@earendil-works/pi-coding-agent' ? '^1.0.2' : '*',
+      );
   }
+});
+
+test('pack accepts the tested host peer without private runtime copies', {
+  timeout: 20_000,
+}, async () => {
+  const home = await mkdtemp(join(tmpdir(), 'plan-exec-pack-home-'));
+  onTestFinished(() => rm(home, { recursive: true, force: true }));
+  const result = spawnSync(
+    process.execPath,
+    [join(root, 'scripts/check-pack.mjs')],
+    {
+      cwd: root,
+      env: { PATH: process.env.PATH ?? '', HOME: home },
+      encoding: 'utf8',
+      timeout: 15_000,
+    },
+  );
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /@alexeiled\/pi-plan-exec@/);
 });
 
 test('package manifest ships only plan-exec resources, needs no runtime dependency, and requires v2 bridge peers', async () => {

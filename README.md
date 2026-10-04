@@ -63,7 +63,8 @@ are best-effort, matching the released runtime.
 
 ## Install and run
 
-The development baseline is Pi `0.99.1`, `pi-subagents@0.73.1`, and
+Requires Pi `^1.0.2` (1.0.2 or later in the 1.x series).
+The development baseline is Pi `1.0.2`, `pi-subagents@0.73.1`, and
 `@alexeiled/pi-subagents-bridge@0.5.0`. Install the providers as independent Pi
 packages; no Git dependency or `allow-git=all` setting is required:
 

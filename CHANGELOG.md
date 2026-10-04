@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.6.2 - 2026-10-04
+
+### Changed
+
+- Validate the host API against Pi 1.0.2 and bound the Pi SDK development and peer range to `^1.0.2`. Keep host SDK/TUI/TypeBox packages out of runtime and bundled dependencies; packaging checks now accept the tested Pi peer range and verify the runtime-only tarball.
+- Controller, child RPC, lifecycle, cancellation, and recovery behavior are unchanged.
+
+### Upgrade
+
+- Upgrade Pi to 1.0.2 or later in the 1.x series before installing this release, then reload Pi. Older hosts are no longer supported.
+
 ## 1.6.1 - 2026-09-30
 
 ### Changes

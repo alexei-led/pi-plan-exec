@@ -37,8 +37,9 @@ npm run pack:dry
 available for focused runs. `npm run test:all` is the local gate used by CI and
 the release workflow.
 `npm run pack:dry` rejects private host SDK/TUI/TypeBox dependencies and checks
-the final npm tarball against a runtime-only allowlist. Host packages must be
-`"*"` peers; development pins are allowed. The release workflow checks npm before
+the final npm tarball against a runtime-only allowlist. Host packages stay peers,
+never runtime copies: Pi core uses `^1.0.2`; the other host aliases use `"*"`.
+Development dependencies use the tested host range. The release workflow checks npm before
 it performs an actual publish. The real Pi RPC smoke test loads the package
 root and checks command registration without host-module warnings.
 

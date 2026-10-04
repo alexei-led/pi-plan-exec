@@ -191,7 +191,7 @@ The dependency pins are:
 - Bridge: released `@alexeiled/pi-subagents-bridge@^0.5.0`;
 - Fusion: released `@alexeiled/pi-fusion@^0.9.3`;
 - Revmux: unreleased `988904f30da351e76c29d5779c6833a6bf890b51` (PR #35);
-- Pi SDK: `0.99.1`;
+- Pi SDK: `^1.0.2`, validated at `1.0.2`;
 - optional pi-tasks projection: `>=0.9.0 <0.10.0`, session scope only.
 
 These are dependency evidence, not a claim that the full production pipeline is
