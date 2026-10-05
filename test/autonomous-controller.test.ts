@@ -1667,6 +1667,149 @@ for (const lostReply of [false, true]) {
   });
 }
 
+for (const outcome of [
+  'valid',
+  'owner-mismatch',
+  'digest-mismatch',
+  'bound',
+  'cancel-race',
+] as const) {
+  test(`typed prelaunch rejection recovery: ${outcome}`, async (t) => {
+    const f = await fixture(t);
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(Date.now());
+    let rejectedId = '';
+    let cancellations = 0;
+    let spawnCount = 0;
+    const spawn = f.worker.spawn.bind(f.worker);
+    f.worker.spawn = async (id, params) => {
+      spawnCount++;
+      if (rejectedId) return spawn(id, params);
+      rejectedId = id;
+      f.worker.launches.push({ id, params });
+      return {
+        success: false,
+        error: {
+          code: 'upstream_error',
+          upstreamCode: 'invalid_params',
+          message: 'Invalid RPC field',
+        },
+      };
+    };
+    const receipt = () => {
+      const digest = bridgeRequestDigest(required(f.worker.launches[0]).params);
+      return {
+        state: 'not_started',
+        operationId: rejectedId,
+        requestDigest: digest,
+        neverStarted: true,
+        replaySafe: false,
+        ...(outcome === 'bound' ? { runId: 'live-child' } : {}),
+        launchRejection: {
+          version: 1,
+          source: 'subagents-rpc',
+          requestId: 'exact-rpc',
+          method: 'spawn',
+          code: 'invalid_params',
+          message: 'Invalid RPC field',
+          operationId: rejectedId,
+          requestDigest: outcome === 'digest-mismatch' ? 'foreign' : digest,
+          ownerRunId: outcome === 'owner-mismatch' ? 'foreign' : f.run.id,
+        },
+      };
+    };
+    const worker = {
+      capabilities: () => f.worker.capabilities(),
+      spawn: f.worker.spawn,
+      operation: async (id: string) =>
+        id === rejectedId ? ok(receipt()) : f.worker.operation(id),
+      status: (id: string) => f.worker.status(id),
+      result: () => f.worker.result(),
+      adopt: () => f.worker.adopt(),
+      stop: () => f.worker.stop(),
+      cancelOperation: async () => {
+        cancellations++;
+        if (outcome === 'cancel-race') {
+          const current = required(await f.registry.get(f.run.id));
+          await f.registry.update({
+            ...current,
+            status: 'cancel_pending',
+            userStopped: true,
+            stopGeneration: (current.stopGeneration ?? 0) + 1,
+          });
+        }
+        return ok({
+          ...receipt(),
+          state: 'cancelled',
+          cancellationRequested: true,
+        });
+      },
+    };
+    let controller = new PlanExecController(
+      f.registry,
+      worker,
+      fusion,
+      command,
+      f.localExecutor,
+    );
+    let run = await controller.tick(f.run.id, 'session');
+    const digest = run.activeOperation?.requestDigest;
+    controller = new PlanExecController(
+      f.registry,
+      worker,
+      fusion,
+      command,
+      f.localExecutor,
+    );
+    run = await due(f.registry, run);
+    if (outcome === 'valid') {
+      run = await f.registry.update({
+        ...run,
+        lease: { sessionId: 'dead', pid: 2147483647, heartbeatAt: 0 },
+      });
+      const before = run.activeOperation;
+      const reconciled = await reconcileForResume(
+        f.registry,
+        run,
+        async () => ({
+          durableOperationLookup: true,
+          bridgeState: 'not_started',
+          launchRejected: true,
+        }),
+      );
+      assert.deepEqual(reconciled.run.activeOperation, before);
+      assert.equal(cancellations, 0);
+      assert.equal(spawnCount, 1);
+      run = reconciled.run;
+    }
+    run = await controller.tick(run.id, 'session');
+    if (outcome === 'valid') {
+      assert.equal(run.activeOperation, undefined);
+      assert.equal(run.failedOperation?.operationId, rejectedId);
+      assert.equal(run.failedOperation?.requestDigest, digest);
+      assert.equal(run.failedOperation?.launchFenced, true);
+      vi.advanceTimersByTime(
+        required(run.tasks?.['1']?.nextAttemptAt) - Date.now(),
+      );
+      run = await due(f.registry, run);
+      await Promise.all([
+        controller.resume(run.id, 'session'),
+        controller.resume(run.id, 'session'),
+      ]);
+      run = required(await f.registry.get(run.id));
+      assert.equal(spawnCount, 2);
+      assert.notEqual(run.activeOperation?.operationId, rejectedId);
+      assert.equal(cancellations, 1);
+    } else {
+      assert.equal(run.activeOperation?.operationId, rejectedId);
+      assert.equal(run.activeOperation?.requestDigest, digest);
+      assert.equal(spawnCount, 1);
+      assert.equal(cancellations, outcome === 'cancel-race' ? 1 : 0);
+      if (outcome === 'cancel-race') assert.equal(run.status, 'cancel_pending');
+    }
+  });
+}
+
 test('a foreign never-started receipt cannot cancel or replace the tracked worker', async (t) => {
   const f = await fixture(t);
   let run = await f.controller.tick(f.run.id, 'session');

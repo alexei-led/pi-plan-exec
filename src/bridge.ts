@@ -34,6 +34,40 @@ export interface BridgeCapabilities {
   executionLifetimeModes?: readonly ExecutionLifetime['mode'][];
   processTreeOwnership?: ProcessTreeOwnership;
   diagnosticGuidance?: DiagnosticGuidanceCapability;
+  prelaunchRejectionVersion?: 1;
+}
+
+/** Validate new rejection receipts; legacy never-started fences retain their contract. */
+export function hasBoundNeverStarted(
+  data: Record<string, unknown>,
+  binding: { operationId: string; requestDigest?: string },
+  ownerRunId: string,
+): boolean {
+  if (
+    data.neverStarted !== true ||
+    data.operationId !== binding.operationId ||
+    !binding.requestDigest ||
+    data.requestDigest !== binding.requestDigest
+  )
+    return false;
+  const proof = data.launchRejection;
+  if (proof === undefined && data.state !== 'not_started') return true;
+  return (
+    isRecord(proof) &&
+    proof.version === 1 &&
+    proof.source === 'subagents-rpc' &&
+    typeof proof.requestId === 'string' &&
+    Boolean(proof.requestId.trim()) &&
+    proof.method === 'spawn' &&
+    proof.code === 'invalid_params' &&
+    typeof proof.message === 'string' &&
+    Boolean(proof.message.trim()) &&
+    proof.operationId === binding.operationId &&
+    proof.requestDigest === binding.requestDigest &&
+    proof.ownerRunId === ownerRunId &&
+    data.runId === undefined &&
+    data.replaySafe === false
+  );
 }
 
 export interface DiagnosticGuidanceCapability {
@@ -631,6 +665,10 @@ function parseV2Capabilities(
     singleAgentSpawn: capabilities.singleAgentSpawn === true,
     durableOperationLookup: true,
     processTerminalProofVersion: 1,
+    ...(isRecord(capabilities.prelaunchRejection) &&
+    capabilities.prelaunchRejection.version === 1
+      ? { prelaunchRejectionVersion: 1 as const }
+      : {}),
     ...executionLifetimeCapabilities(capabilities.executionLifetime),
     ...processTreeOwnershipCapabilities(capabilities.processTreeOwnership),
     ...(isRecord(capabilities.diagnosticGuidance) &&
@@ -676,6 +714,9 @@ function parseReply(value: unknown): BridgeResult {
     success: false,
     error: {
       ...(typeof error.code === 'string' ? { code: error.code } : {}),
+      ...(typeof error.upstreamCode === 'string'
+        ? { upstreamCode: error.upstreamCode }
+        : {}),
       message:
         typeof error.message === 'string'
           ? error.message

@@ -182,6 +182,31 @@ keeps the durable operation attached, records the last observation, and keeps
 automatic recovery scheduled. Do not convert silence into a deadline or a
 replacement launch.
 
+## Unknown launch after a Bridge RPC rejection
+
+Plan-exec 1.6.3 preserves the original launch message and structured codes
+separately from later lookup diagnostics. Status shows the operation ID and
+request digest. Bridge 0.5.3 adds correlated pre-launch rejection evidence.
+
+- A newly observed rejection is recoverable only when Bridge persisted the exact
+  RPC request ID, spawn method, pre-execution `invalid_params` code, plan owner,
+  operation ID, and request digest. The controller validates the receipt and
+  requests a durable cancellation fence before allocating a fresh operation.
+- A lost reply, legacy `dispatching` row, missing run ID, old error string, clean
+  worktree, dead PID, or elapsed time is not proof that no child started.
+- Legacy rows without correlated evidence remain unresolved after upgrade.
+  pi-subagents 0.76.0 has no authoritative durable operation lookup API that can
+  fill this gap. No supported force-resume or evidence importer exists.
+- Inspect `/exec status <full-run-id>` and retain the reported identity and
+  diagnostics. Upgrade incompatible local packages and reload. If no new
+  authoritative evidence exists, report the run blocked; repeated resume cannot
+  supply it. Do not recreate the run, edit its journal, or manually launch a
+  replacement. Stop requests also remain pending until ownership is proven.
+
+After a valid rejection is durably fenced, `/exec resume <full-run-id>` continues
+the same plan and worktree. A later pause or cancel still wins. Fresh recovery
+success does not resolve an older row that lacks proof.
+
 ## Abandoned after a Pi restart
 
 A run is **abandoned** only when all three hold at once: it claims `running`,

@@ -64,13 +64,13 @@ are best-effort, matching the released runtime.
 ## Install and run
 
 Requires Pi `^1.0.2` (1.0.2 or later in the 1.x series).
-The development baseline is Pi `1.0.2`, `pi-subagents@0.73.1`, and
-`@alexeiled/pi-subagents-bridge@0.5.0`. Install the providers as independent Pi
+The development baseline is Pi `1.0.2`, `pi-subagents@0.76.0`, and
+`@alexeiled/pi-subagents-bridge@0.5.3`. Install the providers as independent Pi
 packages; no Git dependency or `allow-git=all` setting is required:
 
 ```bash
-pi install -l npm:pi-subagents@0.73.1
-pi install -l npm:@alexeiled/pi-subagents-bridge@0.5.0
+pi install -l npm:pi-subagents@0.76.0
+pi install -l npm:@alexeiled/pi-subagents-bridge@0.5.3
 pi install -l /absolute/path/to/pi-plan-exec
 ```
 

@@ -13,6 +13,7 @@ import type { AutocompleteItem } from '@earendil-works/pi-tui';
 import {
   type BridgeCapabilities,
   BridgeClient,
+  hasBoundNeverStarted,
   parseExecutionLifetime,
   processTerminalProof,
   supportsOwnedProcessTree,
@@ -493,9 +494,13 @@ export default function planExecExtension(pi: ExtensionAPI): void {
           ? { replaySafe: true }
           : {}),
         ...(proofData?.state === RUN_STATUS.CANCELLED &&
-        proofData.neverStarted === true &&
+        hasBoundNeverStarted(proofData, operation, run.id) &&
         proofData.cancellationRequested === true
           ? { neverStarted: true }
+          : {}),
+        ...(proofData?.state === 'not_started' &&
+        hasBoundNeverStarted(proofData, operation, run.id)
+          ? { launchRejected: true }
           : {}),
         ...(proof ? { processTerminalProof: proof } : {}),
       };
@@ -584,7 +589,7 @@ export default function planExecExtension(pi: ExtensionAPI): void {
       const capabilities = await bridge.capabilities();
       if (!bridgeRuntimeCompatible(bridgeReply.data, capabilities))
         incompatible.push(
-          '@alexeiled/pi-subagents-bridge (durable lookup, direct owned-agent spawn, and explicit lifetime support required)',
+          '@alexeiled/pi-subagents-bridge >=0.5.3 (prelaunch rejection evidence, durable lookup, direct owned-agent spawn, and explicit lifetime support required)',
         );
     }
     return [
@@ -983,6 +988,7 @@ export function bridgeRuntimeCompatible(
     return false;
   if (capabilities.protocolVersion === 2)
     return (
+      capabilities.prelaunchRejectionVersion === 1 &&
       capabilities.durableOperationLookup &&
       capabilities.processTerminalProofVersion === 1 &&
       capabilities.executionLifetimeVersion === 1 &&
@@ -1115,7 +1121,9 @@ export function recoveryGuidance(
   )
     return {
       classification: 'the pending launch can be checked without replacing it',
-      action: `Run ${resume}; it preserves the same operation ID and immutable request. An empty lookup does not prove that an earlier request cannot still arrive.`,
+      action: evidence.launchRejected
+        ? `Run ${resume}; it preserves the rejected operation until durable cancellation fencing succeeds, then retries the task.`
+        : `Run ${resume}; it preserves the same operation ID and immutable request. An empty lookup does not prove that an earlier request cannot still arrive.`,
       command: resume,
     };
   if (
@@ -1168,6 +1176,13 @@ export function recoveryGuidance(
       command: stageWaiverCommand(run),
     };
   }
+  if (evidence?.launchRejected === true)
+    return {
+      classification:
+        'launch rejected before dispatch; cancellation fence required',
+      action: `Run ${resume}; it validates the same rejected operation, durably fences it, then retries the preserved task.`,
+      command: resume,
+    };
   if (
     run.activeOperation?.recovery === OPERATION_RECOVERY.REQUIRED ||
     run.activeOperation?.lastObservedState ===
@@ -1175,8 +1190,8 @@ export function recoveryGuidance(
   )
     return {
       classification: 'recovery required: worker launch outcome is unknown',
-      action: `Run ${resume} only to re-check the same durable operation identity. Plan-exec will not launch replacement work without v2 durable absence proof. Use ${stop} if you must stop recovery.`,
-      command: resume,
+      action: `Inspect the launch error and lookup diagnostic, and repair Bridge/runtime compatibility if needed. Recovery requires identity-bound pre-launch rejection, durable absence, or terminal ownership proof; missing IDs, elapsed time, and old error text are not proof. Run ${status} after evidence or runtime support changes. Repeated resume cannot supply missing evidence; do not start replacement work.`,
+      command: status,
     };
   // In-flight only. A settled run's own record says the controller stopped, and
   // its resume looks the operation up by ID rather than launching a second one.
@@ -1452,6 +1467,19 @@ export function formatRunStatus(
   }
   if (run.blocked) lines.push(`blocked: ${run.blocked.reason}`);
   if (operation) lines.push(`operation ID: ${operation.operationId}`);
+  if (operation?.requestDigest)
+    lines.push(`request digest: ${operation.requestDigest}`);
+  if (operation?.lastLaunchError)
+    lines.push(
+      `launch error${operation.lastLaunchErrorCode ? ` (${operation.lastLaunchErrorCode})` : ''}: ${operation.lastLaunchError}`,
+    );
+  if (operation?.lastLaunchUpstreamCode)
+    lines.push(`upstream launch code: ${operation.lastLaunchUpstreamCode}`);
+  if (
+    operation?.lastObservedState === EXTERNAL_OPERATION_STATE.UNKNOWN_LAUNCH &&
+    operation.lastStatusError
+  )
+    lines.push(`launch lookup: ${operation.lastStatusError}`);
   if (operation?.externalRunId)
     lines.push(`external run ID: ${operation.externalRunId}`);
   if (run.archiveOperation)
@@ -1984,6 +2012,7 @@ export function abandonmentProbe(
     processTerminalProof?: ProcessTerminalProof;
     replaySafe?: boolean;
     neverStarted?: boolean;
+    launchRejected?: boolean;
   }>,
 ): EvidenceProbe {
   return async (run) => {

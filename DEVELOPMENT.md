@@ -46,6 +46,32 @@ root and checks command registration without host-module warnings.
 The tested baseline and deferred integration work are recorded in the
 [upstream audit](docs/upstream-audit.md).
 
+## Visible recovery integration
+
+Run `node test/recovery-agterm.mjs <new-sandbox> <bridge-checkout> --server-only`
+in a dedicated agterm session. The sandbox must not exist, its parent must
+exist, and its canonical path must be outside both checkouts. It creates two
+isolated repositories and a local
+deterministic HTTP model. Launch the actual Pi CLI in a second agterm session
+with `session new --command`, using the sandbox's `home`, `agent`, and temporary
+directory. Load only the released pi-subagents extension, local Bridge,
+local plan-exec, and `test/fixtures/recovery-host.ts`; disable discovered
+extensions/context files. Set `PLAN_EXEC_RECOVERY_SANDBOX` and
+`PLAN_EXEC_RECOVERY_BRIDGE` to those exact paths.
+
+Run `/fixture-seed` once. It sends a genuine removed-field request through
+Bridge to the native validator, tests replay, and creates a synthetic legacy
+dispatching row. Close that Pi host, then start a new one against the same
+sandbox. Use `/exec status` and the IDs in `ids.json` for status/resume.
+The rejected run must complete one task with one successful worker dispatch;
+the legacy row must stay unknown with no child. `/fixture-proof` asserts both
+and writes `proof.json`. The expected two native spawn requests are one
+pre-launch rejection and one successful child workflow, not two workers.
+
+The model's tool call modifies only the fixture repository. No credentials are
+copied, no global package is changed, and no real run/journal is used. Retain
+the sandbox and agterm IDs as local evidence; do not publish private paths.
+
 ## Release
 
 Target package:

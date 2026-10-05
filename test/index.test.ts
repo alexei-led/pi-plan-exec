@@ -465,6 +465,7 @@ test('bridge runtime compatibility requires direct owned-agent recovery rather t
         healthy: true,
         workflowScriptSpawn: false,
         singleAgentSpawn: true,
+        prelaunchRejectionVersion: 1,
         durableOperationLookup: true,
         processTerminalProofVersion: 1,
         executionLifetimeVersion: 1,
@@ -632,7 +633,7 @@ test('help and setup explain the installed command surface', () => {
     assert.doesNotMatch(execHelp(), new RegExp(`/exec ${alias}`), alias);
   assert.match(
     execSetup(),
-    /pi install -l npm:@alexeiled\/pi-subagents-bridge@\^0\.5\.0$/m,
+    /pi install -l npm:@alexeiled\/pi-subagents-bridge@\^0\.5\.3$/m,
   );
   assert.match(
     execSetup(),
@@ -647,10 +648,10 @@ test('help and setup explain the installed command surface', () => {
 });
 
 test('setup installs the released bridge and fusion pins', () => {
-  assert.match(execSetup(), /^pi install -l npm:pi-subagents@\^0\.73\.1$/m);
+  assert.match(execSetup(), /^pi install -l npm:pi-subagents@\^0\.76\.0$/m);
   assert.match(
     execSetup(),
-    /^pi install -l npm:@alexeiled\/pi-subagents-bridge@\^0\.5\.0$/m,
+    /^pi install -l npm:@alexeiled\/pi-subagents-bridge@\^0\.5\.3$/m,
   );
   assert.match(
     execSetup(),
@@ -959,6 +960,38 @@ test('run status classifies recovery and gives one safe next action', () => {
   // The same operation on a settled run: its record already says the
   // controller stopped, and resume looks the operation up rather than
   // launching a second worker.
+  const fencedUnknown = unnamedWorker('running');
+  fencedUnknown.activeOperation = {
+    ...required(fencedUnknown.activeOperation),
+    recovery: 'recovery_required',
+    lastObservedState: 'unknown_launch',
+    requestDigest: 'sha256:original',
+    lastLaunchError: 'RPC spawn workflowScript was removed',
+    lastLaunchErrorCode: 'upstream_error',
+    lastLaunchUpstreamCode: 'invalid_params',
+    lastStatusError: 'No correlated pre-launch rejection is available.',
+  };
+  const fencedStatus = formatRunStatus(fencedUnknown, { leaseLive: true });
+  assert.match(fencedStatus, /launch error \(upstream_error\): RPC spawn/);
+  assert.match(fencedStatus, /upstream launch code: invalid_params/);
+  assert.match(fencedStatus, /request digest: sha256:original/);
+  assert.match(
+    fencedStatus,
+    /launch lookup: No correlated pre-launch rejection/,
+  );
+  assert.match(fencedStatus, /Repeated resume cannot supply missing evidence/);
+  assert.doesNotMatch(fencedStatus, /next safe action:.*Run \/exec resume/);
+
+  const rejectedStatus = formatRunStatus(fencedUnknown, {
+    leaseLive: false,
+    launchRejected: true,
+  });
+  assert.match(
+    rejectedStatus,
+    /launch rejected before dispatch; cancellation fence required/,
+  );
+  assert.match(rejectedStatus, /next safe action: Run \/exec resume/);
+
   const unknownSettled = formatRunStatus(unnamedWorker('failed'));
   assert.match(unknownSettled, /recovery: stopped, and you can continue it/);
   assert.match(unknownSettled, /\/exec resume /);
@@ -2259,7 +2292,7 @@ test('status reports a missing package with its install commands', async () => {
   });
 
   assert.match(report, /Plan-exec prerequisites — missing: pi-subagents\./);
-  assert.match(report, /^pi install -l npm:pi-subagents@\^0\.73\.1$/m);
+  assert.match(report, /^pi install -l npm:pi-subagents@\^0\.76\.0$/m);
   assert.doesNotMatch(report, /pi-fusion/);
   assert.match(report, /No plan execution runs\. Start one with \/exec\./);
   assert.equal(
@@ -2314,7 +2347,7 @@ test('the retired read verbs still work and name their replacement', async () =>
   assert.match(doctor ?? '', /\/exec doctor is now \/exec status/);
 
   const setup = await execRead(registry, 'setup', []);
-  assert.match(setup ?? '', /^pi install -l npm:pi-subagents@\^0\.73\.1$/m);
+  assert.match(setup ?? '', /^pi install -l npm:pi-subagents@\^0\.76\.0$/m);
   assert.match(setup ?? '', /\/exec setup is now part of \/exec status/);
 
   assert.equal(await execRead(registry, 'resume', []), undefined);

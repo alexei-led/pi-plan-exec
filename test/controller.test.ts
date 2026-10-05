@@ -1619,6 +1619,92 @@ test('controller refuses an untracked persisted bridge operation rather than dup
   assert.equal(bridge.spawnCount, 0);
 });
 
+test('launch rejection survives restart and unknown lookup without another spawn', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  const planPath = join(root, 'plan.md');
+  const plan = '### Task 1: Implement\n- [ ] Do the work\n';
+  await writeFile(planPath, plan);
+  const registry = new RunRegistry(join(root, 'runs'));
+  const bridge = new DurableAbsentBridge(join(root, 'none.json'));
+  let spawnCount = 0;
+  bridge.spawn = async () => {
+    spawnCount += 1;
+    return {
+      success: false,
+      error: {
+        code: 'upstream_error',
+        upstreamCode: 'invalid_params',
+        message:
+          'RPC spawn workflowScript was removed; pass inline script text as script.',
+      },
+    };
+  };
+  bridge.operation = async (_id, owner) =>
+    success({
+      state: 'unknown',
+      requestDigest: owner?.requestDigest,
+      text: 'No correlated pre-launch rejection is available; ownership remains unresolved.',
+    });
+  const controller = new PlanExecController(
+    registry,
+    bridge,
+    new FakeFusion(),
+    fakeGit(root),
+  );
+  const run = await registry.create({
+    ...baseRun(root, planPath),
+    planHash: parsePlan(planPath, plan).hash,
+    stage: 'implementation',
+  });
+  const failed = await controller.advance(run);
+  assert.equal(
+    failed.activeOperation?.lastLaunchError,
+    'RPC spawn workflowScript was removed; pass inline script text as script.',
+  );
+  assert.equal(failed.activeOperation?.lastLaunchErrorCode, 'upstream_error');
+  assert.equal(
+    failed.activeOperation?.lastLaunchUpstreamCode,
+    'invalid_params',
+  );
+  assert.equal(failed.activeOperation?.recovery, 'recovery_required');
+  const stored = await registry.update({
+    ...required(await registry.get(run.id)),
+    nextAttemptAt: 0,
+    activeOperation: {
+      ...required(failed.activeOperation),
+      launchStartedAt: 0,
+    },
+  });
+  const restarted = new PlanExecController(
+    new RunRegistry(join(root, 'runs')),
+    bridge,
+    new FakeFusion(),
+    fakeGit(root),
+  );
+  const recovered = await restarted.advance(stored);
+  assert.equal(
+    recovered.activeOperation?.operationId,
+    failed.activeOperation?.operationId,
+  );
+  assert.equal(
+    recovered.activeOperation?.requestDigest,
+    failed.activeOperation?.requestDigest,
+  );
+  assert.equal(
+    recovered.activeOperation?.lastLaunchError,
+    failed.activeOperation?.lastLaunchError,
+  );
+  assert.equal(
+    recovered.activeOperation?.lastLaunchErrorCode,
+    'upstream_error',
+  );
+  assert.match(
+    recovered.activeOperation?.lastStatusError ?? '',
+    /No correlated pre-launch rejection/,
+  );
+  assert.equal(spawnCount, 1);
+});
+
 test('controller safely replays a v2 operation proven durably absent', async () => {
   const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
   const planPath = join(root, 'plan.md');
@@ -2143,7 +2229,7 @@ test('unknown bridge lookup stays recoverable without a duplicate spawn', async 
   const resumed = await controller.resume(failed.id, 'session-1');
 
   assert.equal(resumed.status, 'running');
-  assert.match(resumed.error ?? '', /lookup is unresolved/);
+  assert.match(resumed.error ?? '', /launch remains unresolved/);
   assert.equal(bridge.spawnCount, 0);
 });
 
@@ -2163,7 +2249,7 @@ test('bridge lookup recovery handles pending and malformed outcomes without spaw
       name: 'unknown',
       lookup: { state: 'unknown' },
       status: 'running',
-      error: /lookup is unresolved/,
+      error: /launch remains unresolved/,
     },
     {
       name: 'invalid state',

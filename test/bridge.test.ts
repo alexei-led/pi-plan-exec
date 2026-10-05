@@ -7,6 +7,7 @@ import {
   bridgeRequestDigest,
   type EventBus,
   executionLifetimeCapabilities,
+  hasBoundNeverStarted,
   hasTerminalOwnershipProof,
   parseExecutionLifetime,
   processTerminalProof,
@@ -35,6 +36,59 @@ function observedProof(runId: string) {
     instances: [],
   };
 }
+
+test('pre-launch rejection receipts bind owner, operation, digest and correlated RPC', () => {
+  const proof = {
+    version: 1,
+    source: 'subagents-rpc',
+    requestId: 'rpc-1',
+    method: 'spawn',
+    code: 'invalid_params',
+    message: 'Rejected before execution',
+    ...CALLER_BINDING,
+    ownerRunId: 'plan-1',
+  };
+  const data = {
+    ...CALLER_BINDING,
+    state: 'not_started',
+    neverStarted: true,
+    replaySafe: false,
+    launchRejection: proof,
+  };
+  assert.equal(hasBoundNeverStarted(data, CALLER_BINDING, 'plan-1'), true);
+  for (const patch of [
+    { version: 2 },
+    { source: 'log' },
+    { requestId: '' },
+    { method: 'status' },
+    { code: 'execution_failed' },
+    { message: '' },
+    { operationId: 'other' },
+    { requestDigest: 'other' },
+    { ownerRunId: 'other' },
+  ])
+    assert.equal(
+      hasBoundNeverStarted(
+        { ...data, launchRejection: { ...proof, ...patch } },
+        CALLER_BINDING,
+        'plan-1',
+      ),
+      false,
+    );
+  for (const patch of [
+    { launchRejection: undefined },
+    { launchRejection: null },
+    { replaySafe: true },
+    { runId: 'running-child' },
+    { neverStarted: false },
+    { operationId: 'other' },
+    { requestDigest: 'other' },
+  ])
+    assert.equal(
+      hasBoundNeverStarted({ ...data, ...patch }, CALLER_BINDING, 'plan-1'),
+      false,
+    );
+});
 
 test('observed process proofs bind the exact run and caller', () => {
   const proof = observedProof('native-run');
@@ -359,6 +413,43 @@ test('cold cancellation remains bounded and retries the same owned operation', a
     })),
   );
   assert.equal(events.listenerCount, 0);
+});
+
+test('rejection capability and upstream error code survive the RPC boundary', async () => {
+  const events = new TestEvents();
+  const bridge = new BridgeClient(events, 50);
+  const probe = bridge.capabilities();
+  events.reply('plan-exec:bridge:v2:reply:', {
+    success: true,
+    data: {
+      protocol: 'plan-exec-bridge',
+      version: 2,
+      capabilities: {
+        singleAgentSpawn: true,
+        durableOperationLookup: { version: 1 },
+        processTerminalProof: { version: 1 },
+        prelaunchRejection: { version: 1 },
+      },
+    },
+  });
+  assert.equal((await probe).prelaunchRejectionVersion, 1);
+  const lookup = bridge.operation('op');
+  events.reply('plan-exec:bridge:v2:reply:', {
+    success: false,
+    error: {
+      code: 'upstream_error',
+      upstreamCode: 'invalid_params',
+      message: 'Rejected',
+    },
+  });
+  assert.deepEqual(await lookup, {
+    success: false,
+    error: {
+      code: 'upstream_error',
+      upstreamCode: 'invalid_params',
+      message: 'Rejected',
+    },
+  });
 });
 
 test('diagnostic guidance stays bound to confirmed failure and durable operation identity', async () => {

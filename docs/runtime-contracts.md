@@ -2,8 +2,8 @@
 
 A run is admitted only when the selected runtime advertises explicit lifetime
 support and ownership of every operation-owned descendant. The development
-baseline uses released Pi `0.99.1`, `pi-subagents@0.73.1`,
-`@alexeiled/pi-subagents-bridge@0.5.0`, and `@alexeiled/pi-fusion@0.9.3`.
+baseline uses Pi `1.0.2`, `pi-subagents@0.76.0`,
+`@alexeiled/pi-subagents-bridge@0.5.3`, and `@alexeiled/pi-fusion@0.9.3`.
 The default subagent backend needs no Git pins. The optional Revmux contract
 still depends on an unmerged upstream change; it is not a released backend.
 See the [upstream audit](upstream-audit.md) for release evidence and limits.
@@ -103,6 +103,21 @@ cannot downgrade an owned run to the legacy launcher. Continuation uses a fresh
 correlated owned operation after predecessor retirement. Owner-bound Bridge
 lookup and cancellation use v2 even before a new client negotiates capabilities.
 
+## Pre-launch rejection recovery
+
+Admission requires Bridge's `prelaunchRejection: { version: 1 }` capability,
+available from 0.5.3. A `not_started` receipt must carry `neverStarted: true`,
+`replaySafe: false`, and a validated `launchRejection` bound to the operation
+ID, request digest and plan owner. Its source is `subagents-rpc`, method
+`spawn`, code `invalid_params`, with an exact correlated request ID and
+message. Plan-exec still requests cancellation before retiring that identity.
+
+The original error code, upstream code and message are retained separately from
+subsequent lookup diagnostics. Legacy journal rows lacking a correlated receipt
+remain unknown. pi-subagents 0.76.0 has no authoritative durable operation lookup
+API for retrospective absence proof. No timeout, old log string, or missing ID
+authorizes replacement work. See [recovery](../skills/exec-plan/references/recovery.md).
+
 ## Caller, native, and process identities
 
 These identity namespaces are separate and must never be equated:
@@ -171,8 +186,8 @@ ownership decisions.
 `npm run test:runtime-smoke` is the declared host-boundary smoke check. Its
 model turns are scripted; a passing smoke run is not a live-LLM guarantee. It
 runs on any POSIX host, and its scripted worker is executed by a detached
-released-runtime runner. The run completes only when Bridge 0.5.0 forwards
-native `details.workflowTerminalProof` from pi-subagents 0.73.1. The main full
+released-runtime runner. The run completes only when Bridge forwards native
+`details.workflowTerminalProof` from pi-subagents. The main full
 gate covers the controller, Bridge RPC, owned-process runner, required review,
 promotion, and archive.
 
@@ -187,8 +202,8 @@ promotion, and archive.
 
 The dependency pins are:
 
-- native `pi-subagents`: released `^0.73.1`;
-- Bridge: released `@alexeiled/pi-subagents-bridge@^0.5.0`;
+- native `pi-subagents`: released `^0.76.0`;
+- Bridge: `@alexeiled/pi-subagents-bridge@^0.5.3`;
 - Fusion: released `@alexeiled/pi-fusion@^0.9.3`;
 - Revmux: unreleased `988904f30da351e76c29d5779c6833a6bf890b51` (PR #35);
 - Pi SDK: `^1.0.2`, validated at `1.0.2`;

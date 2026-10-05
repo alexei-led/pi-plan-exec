@@ -198,6 +198,8 @@ export interface AbandonmentEvidence {
   durableOperationLookup?: boolean;
   replaySafe?: boolean;
   neverStarted?: boolean;
+  /** Correlated rejection observed; cancellation fencing is still required. */
+  launchRejected?: boolean;
   processTerminalProof?: ProcessTerminalProof;
 }
 
@@ -218,10 +220,15 @@ export function classifyAbandonment(
     evidence.durableOperationLookup === true &&
     evidence.replaySafe === true &&
     evidence.bridgeState === EXTERNAL_OPERATION_STATE.ABSENT;
+  const rejectedLaunch =
+    !run.activeOperation.externalRunId &&
+    evidence.durableOperationLookup === true &&
+    evidence.bridgeState === 'not_started' &&
+    evidence.launchRejected === true;
   return terminalObserved ||
     (evidence.durableOperationLookup === true && evidence.neverStarted === true)
     ? ABANDONMENT.ABANDONED
-    : replaySafeAbsence
+    : replaySafeAbsence || rejectedLaunch
       ? ABANDONMENT.RECONCILABLE
       : ABANDONMENT.AMBIGUOUS;
 }

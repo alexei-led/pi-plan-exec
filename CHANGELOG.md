@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.6.3 - 2026-10-05
+
+### Fixed
+
+- Preserve original Bridge launch errors and structured upstream codes across restart and later lookup failures.
+- Validate owner-bound, correlated pre-launch rejection receipts from Bridge before requesting a durable cancellation fence and retrying the preserved task. Lost replies, mismatched identities, and late cancellation remain fenced.
+- Show the request digest and lookup diagnostic in status; explain missing proof instead of recommending repeated resume.
+
+### Upgrade
+
+- Install Bridge 0.5.3 and pi-subagents 0.76.0 or compatible later versions, then reload Pi. Admission now requires Bridge's pre-launch rejection capability.
+
+### Known limits
+
+- Legacy unresolved launches without a persisted correlated rejection remain blocked. This release does not prove that those workers never started; no force-resume or retrospective evidence importer is provided.
+
 ## 1.6.2 - 2026-10-04
 
 ### Changed

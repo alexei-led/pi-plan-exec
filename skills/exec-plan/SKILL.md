@@ -270,6 +270,9 @@ second writer.
 - Do not start a second non-terminal or failed run for the same plan or worktree.
   Failed runs still reserve their execution target for recovery.
 - Do not hand-edit `~/.pi/plan-exec/runs/<id>/run.json`.
+- A legacy unknown launch without correlated rejection evidence stays fenced
+  after upgrading. Preserve its operation ID, digest, launch error and lookup
+  diagnostic. Repeated resume is not a substitute for proof; see recovery.
 - Do not edit the worktree until status evidence rules out a live writer.
 - `/exec resume` on a run another session owns is an active takeover that may
   advance work. Inspect first.

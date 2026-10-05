@@ -26,6 +26,7 @@ import {
   type BridgeOperationOwner,
   bridgeRequestDigest,
   type DiagnosticGuidanceRequest,
+  hasBoundNeverStarted,
   hasTerminalOwnershipProof,
   parseExecutionLifetime,
   supportsOwnedProcessTree,
@@ -160,7 +161,10 @@ export const PLAN_STRUCTURE_CHANGED_ERROR =
 
 type ServiceReply =
   | { success: true; data: Record<string, unknown> }
-  | { success: false; error: { code?: string; message: string } };
+  | {
+      success: false;
+      error: { code?: string; upstreamCode?: string; message: string };
+    };
 
 interface BridgeLike {
   spawn(
@@ -2410,7 +2414,22 @@ export class PlanExecController {
     const intended = persisted.run;
     const owner = bridgeOperationOwner(intended, intended.activeOperation);
     const reply = await this.bridge.spawn(operationId, params, owner);
-    if (!reply.success) return this.fail(intended, reply.error.message, true);
+    if (!reply.success) {
+      const rejected = await this.updateActiveOperation(intended, operationId, {
+        lastLaunchError: reply.error.message,
+        ...(reply.error.code ? { lastLaunchErrorCode: reply.error.code } : {}),
+        ...(reply.error.upstreamCode
+          ? { lastLaunchUpstreamCode: reply.error.upstreamCode }
+          : {}),
+      });
+      if (rejected.activeOperation?.operationId !== operationId)
+        return rejected;
+      return this.failUnknownLaunch(
+        rejected,
+        rejected.activeOperation,
+        reply.error.message,
+      );
+    }
     if (
       !sameLifetime(
         parseExecutionLifetime(reply.data.effectiveExecutionLifetime),
@@ -2480,7 +2499,7 @@ export class PlanExecController {
           operation,
           'Bridge operation lookup did not match the persisted request digest.',
         );
-      if (isFencedCancellation(lookup.data, operation)) {
+      if (isFencedCancellation(lookup.data, operation, run.id)) {
         const fenced = await this.updateActiveOperation(
           run,
           operation.operationId,
@@ -2492,7 +2511,7 @@ export class PlanExecController {
           return fenced;
         return this.recoverFencedOperation(fenced);
       }
-      if (isBoundNeverStarted(lookup.data, operation))
+      if (hasBoundNeverStarted(lookup.data, operation, run.id))
         return this.fenceRejectedLaunch(run, operation, lookup.data);
       if (lookupState === EXTERNAL_OPERATION_STATE.FOUND) {
         const expectedLifetime = operationExpectedLifetime(operation);
@@ -2555,7 +2574,7 @@ export class PlanExecController {
         return this.failUnknownLaunch(
           run,
           operation,
-          'Bridge operation lookup is unresolved; retry /exec resume after the provider recovers.',
+          `Bridge launch remains unresolved: ${text(lookup.data.text) ?? 'no identity-bound pre-launch rejection or terminal ownership proof is available'}. Replacement work is fenced; repeated resume cannot supply missing evidence.`,
         );
       return this.failUnknownLaunch(
         run,
@@ -2875,7 +2894,7 @@ export class PlanExecController {
           operation,
           reply.error.message,
         );
-      if (isFencedCancellation(reply.data, operation))
+      if (isFencedCancellation(reply.data, operation, run.id))
         return this.updateActiveOperation(run, operation.operationId, {
           launchFenced: true,
           stopAcknowledged: true,
@@ -3013,7 +3032,7 @@ export class PlanExecController {
         reply?.error.message ??
           'Cancellation is awaiting the original provider operation identity.',
       );
-    const fenced = isFencedCancellation(reply.data, operation);
+    const fenced = isFencedCancellation(reply.data, operation, run.id);
     const current = (await this.registry.get(run.id)) ?? run;
     if (
       !sameOperationState(run, current, operation) ||
@@ -3121,7 +3140,7 @@ export class PlanExecController {
       status.data,
     );
     if (!sameOperationState(run, observed, operation)) return observed;
-    if (isBoundNeverStarted(status.data, operation))
+    if (hasBoundNeverStarted(status.data, operation, run.id))
       return this.fenceRejectedLaunch(observed, operation, status.data);
     if (
       !state ||
@@ -4798,7 +4817,7 @@ export class PlanExecController {
             operation,
             launched.error.message,
           );
-        if (isFencedCancellation(launched.data, operation)) {
+        if (isFencedCancellation(launched.data, operation, run.id)) {
           const fenced = await this.updateActiveOperation(
             run,
             operation.operationId,
@@ -4843,7 +4862,7 @@ export class PlanExecController {
           operation,
           `Unable to look up bridge operation: ${lookup.error.message}`,
         );
-      if (isFencedCancellation(lookup.data, operation)) {
+      if (isFencedCancellation(lookup.data, operation, run.id)) {
         const fenced = await this.updateActiveOperation(
           run,
           operation.operationId,
@@ -5261,26 +5280,15 @@ function isFencedReviewCancellation(
   );
 }
 
-function isBoundNeverStarted(
-  data: Record<string, unknown>,
-  operation: ActiveOperation,
-): boolean {
-  return (
-    data.neverStarted === true &&
-    data.operationId === operation.operationId &&
-    Boolean(operation.requestDigest) &&
-    data.requestDigest === operation.requestDigest
-  );
-}
-
 function isFencedCancellation(
   data: Record<string, unknown>,
   operation: ActiveOperation,
+  ownerRunId: string,
 ): boolean {
   return operation.service === OPERATION_SERVICE.BRIDGE
     ? data.operationId === operation.operationId &&
         data.state === RUN_STATUS.CANCELLED &&
-        data.neverStarted === true &&
+        hasBoundNeverStarted(data, operation, ownerRunId) &&
         data.cancellationRequested === true &&
         operation.requestDigest !== undefined &&
         data.requestDigest === operation.requestDigest

@@ -275,6 +275,8 @@ export interface ActiveOperation {
   recovery?: OperationRecovery;
   launchFailures?: number;
   lastLaunchError?: string;
+  lastLaunchErrorCode?: string;
+  lastLaunchUpstreamCode?: string;
   statusFailures?: number;
   lastObservedAt?: number;
   lastObservedState?: string;
@@ -503,4 +505,7 @@ export interface PlanExecRun {
 
 export type BridgeResult =
   | { success: true; data: Record<string, unknown> }
-  | { success: false; error: { code?: string; message: string } };
+  | {
+      success: false;
+      error: { code?: string; upstreamCode?: string; message: string };
+    };

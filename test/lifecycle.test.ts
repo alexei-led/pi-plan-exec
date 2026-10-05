@@ -109,6 +109,42 @@ test('durable absence is ambiguous unless it explicitly permits same-identity re
   );
 });
 
+test('correlated rejection permits same-identity reconciliation, not abandonment', () => {
+  const run = inFlight({
+    activeOperation: {
+      operationId: 'op',
+      service: 'bridge',
+      kind: 'implementation',
+    },
+  });
+  assert.equal(
+    classifyAbandonment(run, {
+      leaseLive: false,
+      durableOperationLookup: true,
+      bridgeState: 'not_started',
+      launchRejected: true,
+    }),
+    'reconcilable',
+  );
+  assert.equal(
+    classifyAbandonment(run, {
+      leaseLive: false,
+      durableOperationLookup: true,
+      bridgeState: 'unknown',
+    }),
+    'ambiguous',
+  );
+  assert.equal(
+    classifyAbandonment(inFlight(), {
+      leaseLive: false,
+      durableOperationLookup: true,
+      bridgeState: 'not_started',
+      launchRejected: true,
+    }),
+    'ambiguous',
+  );
+});
+
 test('only explicitly bounded compatibility runs receive an elapsed deadline', () => {
   const unbounded = inFlight({
     activeOperation: {
