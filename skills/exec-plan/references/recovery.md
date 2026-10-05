@@ -207,6 +207,37 @@ After a valid rejection is durably fenced, `/exec resume <full-run-id>` continue
 the same plan and worktree. A later pause or cancel still wins. Fresh recovery
 success does not resolve an older row that lacks proof.
 
+## Explicit independent-checkout recovery
+
+Use this only after the operator approves changing the execution target for a
+local implementation task. It preserves the same run, but does not establish
+that the old worker died. Ordinary resume never relocates a run.
+
+1. Preview: `/exec recover-isolated <full-run-id> <absolute-new-checkout>`.
+2. Review the old/new paths, accepted baseline, interrupted task, frozen checks,
+   and any absolute/shared resources or external side effects. This path refuses
+   known deployment/payment/publishing work and pending owned local operations.
+   It is Git/filesystem isolation, not containment of malicious same-UID code.
+3. Apply: add `--apply` and answer the confirmation. A scripted owner with
+   explicit operator approval can use `--apply --confirm-local-isolation`.
+4. The controller quarantines the old generation, durably fences redispatch,
+   creates independent Git metadata/files with no remotes or object alternates,
+   and restores only the verified accepted commit and checked plan. Old partial
+   files/commits/progress stay where they were and are listed in lineage.
+5. Activation is paused. Start Pi in the reported new checkout with the same
+   registry/providers; use `/exec status <id>`, then `/exec resume <id>`.
+   Do not resume or edit the quarantined tree. Accepted tasks are not reset.
+6. Repeating the same isolation command reuses its durable target/ticket.
+   A pause/cancel during preparation prevents activation; cancellation never
+   authorizes a new attempt. A paused preparation needs explicit renewed apply
+   confirmation. Unverifiable target ownership stays blocked without overwriting it.
+
+Only implementation-stage recovery is supported by this action. Goal, review,
+finalize, archive and local-command ownership need their existing reconciliation
+paths, not an isolation bypass. Cleanup retains records that reserve an unknown
+quarantined writer. Importing old partial work requires separate review and
+normal verification; it is never silently copied into the new target.
+
 ## Abandoned after a Pi restart
 
 A run is **abandoned** only when all three hold at once: it claims `running`,

@@ -8,6 +8,7 @@ import {
   type EventBus,
   executionLifetimeCapabilities,
   hasBoundNeverStarted,
+  hasBoundOperation,
   hasTerminalOwnershipProof,
   parseExecutionLifetime,
   processTerminalProof,
@@ -88,6 +89,85 @@ test('pre-launch rejection receipts bind owner, operation, digest and correlated
       hasBoundNeverStarted({ ...data, ...patch }, CALLER_BINDING, 'plan-1'),
       false,
     );
+});
+
+test('live-child binding permits only exact identity and frozen lifetime reattachment', () => {
+  const operation = {
+    operationId: 'operation',
+    requestDigest: 'digest',
+    expectedLifetime: { mode: 'unbounded' as const },
+  };
+  const data = {
+    state: 'found',
+    operationId: 'operation',
+    requestDigest: 'digest',
+    runId: 'child',
+    effectiveExecutionLifetime: { mode: 'unbounded' },
+  };
+  assert.equal(hasBoundOperation(data, operation), true);
+  assert.equal(
+    hasBoundOperation(data, { ...operation, externalRunId: 'child' }),
+    true,
+  );
+  for (const patch of [
+    { state: 'unknown' },
+    { operationId: 'other' },
+    { operationId: undefined },
+    { requestDigest: 'other' },
+    { requestDigest: undefined },
+    { runId: '' },
+    { runId: undefined },
+    { neverStarted: true },
+    { launchRetirement: { version: 1 } },
+    { effectiveExecutionLifetime: undefined },
+    { effectiveExecutionLifetime: { mode: 'bounded', timeoutMs: 10 } },
+  ])
+    assert.equal(hasBoundOperation({ ...data, ...patch }, operation), false);
+  assert.equal(
+    hasBoundOperation(data, { ...operation, externalRunId: 'other' }),
+    false,
+  );
+  assert.equal(
+    hasBoundOperation(data, {
+      operationId: 'operation',
+      requestDigest: 'digest',
+    }),
+    false,
+  );
+  assert.equal(
+    hasBoundOperation(
+      {
+        ...data,
+        effectiveExecutionLifetime: { mode: 'bounded', timeoutMs: 11 },
+      },
+      { ...operation, expectedLifetime: { mode: 'bounded', timeoutMs: 10 } },
+    ),
+    false,
+  );
+});
+
+test('retirement claims cannot masquerade as never-started evidence', () => {
+  const binding = {
+    operationId: 'legacy-operation',
+    requestDigest: 'legacy-digest',
+  };
+  for (const receipt of [
+    { ...binding, state: 'retired', neverStarted: true },
+    {
+      ...binding,
+      state: 'cancelled',
+      neverStarted: true,
+      launchRetirement: { version: 1, kind: 'host-reboot' },
+    },
+    {
+      ...binding,
+      state: 'found',
+      neverStarted: true,
+      launchRetirement: { bootChanged: true, operatorConfirmed: true },
+    },
+  ]) {
+    assert.equal(hasBoundNeverStarted(receipt, binding, 'legacy-plan'), false);
+  }
 });
 
 test('observed process proofs bind the exact run and caller', () => {

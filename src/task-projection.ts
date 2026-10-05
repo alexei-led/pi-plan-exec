@@ -124,13 +124,21 @@ export class TaskProjector {
     run: PlanExecRun,
     options: TaskProjectionOptions,
   ): Promise<PlanExecRun> {
-    if (isGoalRun(run)) return run;
     const current = await this.registry.get(run.id);
     if (current && current.updatedAt > run.updatedAt) run = current;
+    if (isGoalRun(run) || run.isolationRecovery?.state === 'fenced') return run;
+    if (run.isolationRecovery?.state === 'active')
+      options = { ...options, cwd: run.worktreeCwd };
     try {
       const target = await resolveProjectionTarget(options);
       const store = await openCompatibleStore(target.storeTarget);
       const plan = await readProjectionPlan(run);
+      const latest = await this.registry.get(run.id);
+      if (
+        latest &&
+        (latest.executionGeneration ?? 0) !== (run.executionGeneration ?? 0)
+      )
+        return latest;
       const tasks = store.list();
       const existing = deduplicateOwnedTasks(store, tasks, run);
       const desiredKeys = new Set([

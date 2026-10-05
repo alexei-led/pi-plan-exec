@@ -1810,6 +1810,90 @@ for (const outcome of [
   });
 }
 
+for (const stop of ['none', 'paused', 'cancel_pending'] as const) {
+  test(`unverified retirement after a lost live-worker reply preserves ownership with ${stop}`, async (t) => {
+    const f = await fixture(t);
+    let observed!: () => void;
+    const observing = new Promise<void>((resolve) => {
+      observed = resolve;
+    });
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    class RetirementClaimWorker extends Worker {
+      cancellations = 0;
+      override async operation(id: string) {
+        observed();
+        await released;
+        return ok({
+          operationId: id,
+          requestDigest: bridgeRequestDigest(
+            required(this.launches.find((launch) => launch.id === id)).params,
+          ),
+          state: 'retired',
+          neverStarted: true,
+          replaySafe: false,
+          launchRetirement: {
+            version: 1,
+            kind: 'host-reboot',
+            beforeBootId: 'old',
+            afterBootId: 'new',
+            operatorConfirmed: true,
+          },
+        });
+      }
+      async cancelOperation(id: string, owner: BridgeOperationOwner) {
+        this.cancellations++;
+        return ok({
+          state: 'cancelled',
+          operationId: id,
+          requestDigest: owner.requestDigest,
+          cancellationRequested: true,
+          neverStarted: true,
+        });
+      }
+    }
+    const worker = new RetirementClaimWorker(f.worker.resultPath);
+    worker.loseSpawn = true;
+    const controller = new PlanExecController(
+      f.registry,
+      worker,
+      fusion,
+      command,
+      f.localExecutor,
+    );
+    let run = await controller.tick(f.run.id, 'session');
+    const operation = required(run.activeOperation);
+    run = await due(f.registry, run);
+    const recovery = controller.tick(run.id, 'session');
+    await observing;
+    if (stop !== 'none') {
+      const current = required(await f.registry.get(run.id));
+      await f.registry.update({
+        ...current,
+        status: stop,
+        userStopped: true,
+        stopGeneration: (current.stopGeneration ?? 0) + 1,
+      });
+    }
+    release();
+    run = await recovery;
+    assert.equal(run.activeOperation?.operationId, operation.operationId);
+    assert.equal(run.activeOperation?.requestDigest, operation.requestDigest);
+    assert.equal(run.activeOperation?.processTreeExited, undefined);
+    assert.equal(run.activeOperation?.launchFenced, undefined);
+    assert.equal(worker.launches.length, 1);
+    assert.equal(worker.cancellations, 0);
+    assert.equal(run.tasks?.['1']?.state, 'running');
+    if (stop !== 'none') {
+      assert.equal(run.status, stop);
+      assert.equal(run.userStopped, true);
+      assert.equal(run.stopGeneration, 1);
+    }
+  });
+}
+
 test('a foreign never-started receipt cannot cancel or replace the tracked worker', async (t) => {
   const f = await fixture(t);
   let run = await f.controller.tick(f.run.id, 'session');
@@ -1862,6 +1946,42 @@ test('lost spawn reply is reconciled after controller restart without duplicate 
   );
   run = await restarted.tick(run.id, 'session');
   assert.equal(run.activeOperation?.externalRunId, f.worker.launches[0]?.id);
+  assert.equal(f.worker.launches.length, 1);
+});
+
+test('resume preflight reattaches an exactly bound live child after controller death', async (t) => {
+  const f = await fixture(t);
+  f.worker.loseSpawn = true;
+  let run = await f.controller.tick(f.run.id, 'session');
+  const operation = required(run.activeOperation);
+  run = await due(f.registry, run);
+  run = await f.registry.update({
+    ...run,
+    lease: { sessionId: 'dead-owner', pid: 2147483647, heartbeatAt: 0 },
+  });
+  const reconciled = await reconcileForResume(f.registry, run, async () => ({
+    durableOperationLookup: true,
+    bridgeState: 'found',
+    operationBound: true,
+  }));
+  assert.equal(
+    reconciled.run.activeOperation?.operationId,
+    operation.operationId,
+  );
+  assert.equal(reconciled.run.activeOperation?.externalRunId, undefined);
+  assert.equal(reconciled.run.activeOperation?.processTreeExited, undefined);
+  assert.equal(f.worker.launches.length, 1);
+  const restarted = new PlanExecController(
+    f.registry,
+    f.worker,
+    fusion,
+    command,
+    f.localExecutor,
+  );
+  run = await restarted.resume(run.id, 'replacement-owner');
+  assert.equal(run.activeOperation?.operationId, operation.operationId);
+  assert.equal(run.activeOperation?.externalRunId, f.worker.launches[0]?.id);
+  assert.equal(run.activeOperation?.processTreeExited, undefined);
   assert.equal(f.worker.launches.length, 1);
 });
 

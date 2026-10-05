@@ -44,6 +44,8 @@ export function hasBoundNeverStarted(
   ownerRunId: string,
 ): boolean {
   if (
+    data.state === 'retired' ||
+    data.launchRetirement !== undefined ||
     data.neverStarted !== true ||
     data.operationId !== binding.operationId ||
     !binding.requestDigest ||
@@ -67,6 +69,46 @@ export function hasBoundNeverStarted(
     proof.ownerRunId === ownerRunId &&
     data.runId === undefined &&
     data.replaySafe === false
+  );
+}
+
+/** An exact lookup can reattach a writer; it is not evidence that the writer exited. */
+export function hasBoundOperation(
+  data: unknown,
+  operation: {
+    operationId: string;
+    requestDigest?: string;
+    externalRunId?: string;
+    expectedLifetime?: ExecutionLifetime;
+    effectiveLifetime?: ExecutionLifetime;
+    params?: Record<string, unknown>;
+  },
+): boolean {
+  if (
+    !isRecord(data) ||
+    data.state !== 'found' ||
+    data.operationId !== operation.operationId ||
+    !operation.requestDigest ||
+    data.requestDigest !== operation.requestDigest ||
+    typeof data.runId !== 'string' ||
+    !data.runId.trim() ||
+    (operation.externalRunId !== undefined &&
+      data.runId !== operation.externalRunId) ||
+    data.launchRetirement !== undefined ||
+    data.neverStarted === true
+  )
+    return false;
+  const expected =
+    operation.expectedLifetime ??
+    parseExecutionLifetime(operation.params?.executionLifetime) ??
+    operation.effectiveLifetime;
+  const actual = parseExecutionLifetime(data.effectiveExecutionLifetime);
+  return (
+    expected !== undefined &&
+    actual !== undefined &&
+    expected.mode === actual.mode &&
+    (expected.mode === 'unbounded' ||
+      (actual.mode === 'bounded' && actual.timeoutMs === expected.timeoutMs))
   );
 }
 

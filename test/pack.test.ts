@@ -141,7 +141,7 @@ test('package manifest ships only plan-exec resources, needs no runtime dependen
   }
   assert.equal(
     manifest.peerDependencies['@alexeiled/pi-subagents-bridge'],
-    '>=0.5.3 <0.6.0',
+    '>=0.5.4 <0.6.0',
   );
   assert.equal(
     manifest.peerDependenciesMeta['@alexeiled/pi-subagents-bridge']?.optional,

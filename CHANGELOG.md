@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.6.4 - 2026-10-05
+
+### Fixed
+
+- Reattach an exactly bound live child after controller restart without launching a replacement.
+- Preserve unrelated task prerequisites and accepted progress during explicitly confirmed recovery.
+
+### Added
+
+- `/exec recover-isolated` previews and confirms continuation of the same logical run in an independent checkout. It uses the accepted commit and checked plan, fences old redispatch and acceptance, and preserves the old operation, tree, partial work and progress as quarantined lineage.
+- Show task/check/bootstrap details, old HEAD/commit delta and ignored-file metadata before recovery. Stop/cancel and crash recovery preserve ownership; preparation failures pause for explicit repair/retry.
+
+### Upgrade and limits
+
+- Install Bridge 0.5.4 and reload Pi. It retains exact RPC request identities for lost-reply recovery; existing unbound records without evidence still cannot use ordinary resume.
+- Isolated recovery changes the target, not the old worker's retirement state. It supports local implementation tasks only, leaves the new target paused, and does not copy unaccepted edits, bypass required checks, or provide a security sandbox. Quarantined targets remain reserved.
+
 ## 1.6.3 - 2026-10-05
 
 ### Fixed

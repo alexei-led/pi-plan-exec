@@ -65,6 +65,11 @@ external prerequisite.
   entry is what `/exec resume` needs. Removal deletes the registry entry only;
   the worktree, branch, and progress file stay in place.
 - Waive an optional review or statistics stage: `/exec skip <full-run-id> --reason <text>`. Required review and final verification cannot be skipped. It is a waiver of last resort and needs a human; see below.
+- Explicitly change a stuck local implementation run's target only with operator
+  approval: `/exec recover-isolated <full-run-id> <absolute-new-checkout>` previews;
+  `--apply` confirms. It quarantines the old unknown operation, does not prove
+  retirement, and leaves the new independent checkout paused. Read recovery
+  before applying; ordinary resume never performs this change.
 - Inspect live command support: `/exec help`.
 
 Use the full run ID whenever more than one run exists, after a reload, or when

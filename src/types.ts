@@ -13,6 +13,7 @@ export const EXEC_ACTION = {
   STOP: 'stop',
   PAUSE: 'pause',
   RESUME: 'resume',
+  ISOLATE: 'recover-isolated',
   ADOPT: 'adopt',
   SKIP: 'skip',
   CANCEL: 'cancel',
@@ -36,7 +37,7 @@ export type ExecAliasAction = (typeof EXEC_ALIAS_ACTIONS)[number];
 
 export type RunAction = (typeof EXEC_ACTION)[Exclude<
   keyof typeof EXEC_ACTION,
-  'HELP' | 'SETUP' | 'RUNS' | 'CLEANUP' | 'DOCTOR' | 'ADOPT'
+  'HELP' | 'SETUP' | 'RUNS' | 'CLEANUP' | 'DOCTOR' | 'ADOPT' | 'ISOLATE'
 >];
 
 export const RUN_STAGE = {
@@ -259,6 +260,7 @@ export interface WorkerSignal {
 
 export interface ActiveOperation {
   operationId: string;
+  executionGeneration?: number;
   service: OperationService;
   kind: OperationKind;
   externalRunId?: string;
@@ -380,9 +382,56 @@ export interface GoalState {
   lastCheck?: GoalCheckEvidence;
 }
 
+export interface QuarantinedExecution {
+  id: string;
+  generation: number;
+  operation: ActiveOperation;
+  repositoryRoot: string;
+  cwd: string;
+  branch: string;
+  planPath: string;
+  progressPath?: string;
+  tasks?: Record<string, TaskExecution>;
+  inventory: string;
+  inventoryEntries: number;
+  ignoredEntries: number;
+  observedHead: string;
+  baseline: string;
+  commitDelta: string;
+  quarantinedAt: number;
+  error?: string;
+  dispatchFenced?: boolean;
+}
+
+export interface IsolationRecovery {
+  id: string;
+  state: 'fenced' | 'active';
+  generation: number;
+  stopGeneration: number;
+  target: string;
+  sourceRoot: string;
+  worktreeRelativePath: string;
+  planRelativePath: string;
+  planContent: string;
+  baseline: string;
+  branch: string;
+  authorName: string;
+  authorEmail: string;
+  taskId: number;
+  taskTitle: string;
+  taskItems: string[];
+  bootstrapCommands: string[][];
+  intentDigest: string;
+  requestedBy: string;
+  requestedAt: number;
+}
+
 export interface PlanExecRun {
   schemaVersion: 1;
   id: string;
+  executionGeneration?: number;
+  isolationRecovery?: IsolationRecovery;
+  quarantinedExecutions?: QuarantinedExecution[];
   /** Monotonic durable-state revision. Missing only on legacy v1 records. */
   revision?: number;
   goal?: GoalState;

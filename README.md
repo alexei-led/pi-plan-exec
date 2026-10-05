@@ -65,12 +65,12 @@ are best-effort, matching the released runtime.
 
 Requires Pi `^1.0.2` (1.0.2 or later in the 1.x series).
 The development baseline is Pi `1.0.2`, `pi-subagents@0.76.0`, and
-`@alexeiled/pi-subagents-bridge@0.5.3`. Install the providers as independent Pi
+`@alexeiled/pi-subagents-bridge@0.5.4`. Install the providers as independent Pi
 packages; no Git dependency or `allow-git=all` setting is required:
 
 ```bash
 pi install -l npm:pi-subagents@0.76.0
-pi install -l npm:@alexeiled/pi-subagents-bridge@0.5.3
+pi install -l npm:@alexeiled/pi-subagents-bridge@0.5.4
 pi install -l /absolute/path/to/pi-plan-exec
 ```
 
@@ -141,6 +141,15 @@ Four verbs cover everything after the start:
   are inconclusive; only a matching owned-tree terminal proof, an authoritative
   never-started fence, or v2 durable absence for an unbound launch permits
   recovery to launch again.
+- `/exec recover-isolated <full-run-id> <absolute-new-checkout>` previews an
+  explicitly different recovery contract for local implementation tasks. `--apply`
+  asks for confirmation, preserves the same logical run, quarantines the old
+  operation/tree, and prepares an independent repository from the verified accepted
+  commit. It does not prove the old worker stopped or import unaccepted edits.
+  Activation leaves the run paused; continue from the new checkout with ordinary
+  `/exec resume`. No shared Git metadata, object alternates, or old push remote is
+  retained. This is not a security sandbox; refuse external-side-effect tasks.
+  Quarantined trees remain reserved and prevent record cleanup.
 - `/exec stop` asks whether to pause the run (resumable) or cancel it (final,
   worktree preserved).
 - `/exec cleanup` retires run records. It previews by default and deletes

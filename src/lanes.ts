@@ -26,17 +26,20 @@ async function exists(path: string): Promise<boolean> {
   }
 }
 
+export const BOOTSTRAP_LOCKS = [
+  ['package-lock.json', ['npm', 'ci']],
+  ['pnpm-lock.yaml', ['pnpm', 'install', '--frozen-lockfile']],
+  ['yarn.lock', ['yarn', 'install', '--immutable']],
+  ['uv.lock', ['uv', 'sync', '--frozen']],
+] as const;
+
 export async function bootstrapCommands(
   cwd: string,
   configured: string[][],
 ): Promise<string[][]> {
   if (configured.length) return configured;
-  if (await exists(join(cwd, 'package-lock.json'))) return [['npm', 'ci']];
-  if (await exists(join(cwd, 'pnpm-lock.yaml')))
-    return [['pnpm', 'install', '--frozen-lockfile']];
-  if (await exists(join(cwd, 'yarn.lock')))
-    return [['yarn', 'install', '--immutable']];
-  if (await exists(join(cwd, 'uv.lock'))) return [['uv', 'sync', '--frozen']];
+  for (const [file, command] of BOOTSTRAP_LOCKS)
+    if (await exists(join(cwd, file))) return [[...command]];
   return [];
 }
 

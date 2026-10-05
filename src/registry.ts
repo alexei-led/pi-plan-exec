@@ -42,7 +42,14 @@ type RunReservations = Pick<PlanExecRun, 'worktreeCwd' | 'repositoryRoot'> &
   Partial<
     Pick<
       PlanExecRun,
-      'id' | 'planPath' | 'goal' | 'outputTarget' | 'lanePreparation' | 'tasks'
+      | 'id'
+      | 'planPath'
+      | 'goal'
+      | 'outputTarget'
+      | 'lanePreparation'
+      | 'tasks'
+      | 'isolationRecovery'
+      | 'quarantinedExecutions'
     >
   >;
 
@@ -76,6 +83,8 @@ async function reservedCheckouts(run: RunReservations): Promise<Set<string>> {
     run.worktreeCwd,
     run.outputTarget?.cwd,
     run.lanePreparation?.cwd,
+    run.isolationRecovery?.target,
+    ...(run.quarantinedExecutions ?? []).map((entry) => entry.cwd),
     ...Object.values(run.tasks ?? {}).flatMap((task) => [
       task.laneCwd,
       task.recoverySource?.cwd,
@@ -170,6 +179,8 @@ export function takeoverRefusal(
  * would refuse.
  */
 export function removalRefusal(run: PlanExecRun): string | undefined {
+  if (run.quarantinedExecutions?.length)
+    return `Run ${run.id} retains quarantined operations with unknown writer state; keep its reservation and lineage.`;
   if (run.localOperationActive)
     return `Run ${run.id} still has unconfirmed local command ownership.`;
   if (!isTerminalStatus(run.status))
@@ -236,6 +247,19 @@ export class RunRegistry {
     }
   }
 
+  async updateExclusive(
+    run: PlanExecRun,
+    expectedUpdatedAt: number,
+  ): Promise<{ run: PlanExecRun; applied: boolean }> {
+    const lock = await acquireLock(join(this.directory, 'registry.lock'));
+    try {
+      await this.assertExclusive(run);
+      return await this.updateIfCurrent(run, expectedUpdatedAt);
+    } finally {
+      await lock.release();
+    }
+  }
+
   /** Create holds the registry lock; resume already owns a reserved run. */
   async assertExclusive(run: RunReservations): Promise<void> {
     const { runs, errors } = await this.listWithErrors();
@@ -251,6 +275,7 @@ export class RunRegistry {
         isTerminalStatus(existing.status) &&
         existing.status !== RUN_STATUS.FAILED &&
         !existing.activeOperation &&
+        !existing.quarantinedExecutions?.length &&
         !existing.localOperationActive &&
         !(existing.lease && isLeaseLive(existing.lease))
       )
@@ -373,7 +398,15 @@ export class RunRegistry {
           });
         throw error;
       }
-      if (current.updatedAt !== expectedUpdatedAt)
+      if (
+        current.updatedAt !== expectedUpdatedAt ||
+        (run.executionGeneration ?? 0) < (current.executionGeneration ?? 0) ||
+        (run.activeOperation &&
+          current.quarantinedExecutions?.some(
+            (entry) =>
+              entry.operation.operationId === run.activeOperation?.operationId,
+          ))
+      )
         return { run: current, applied: false };
       const updated: PlanExecRun = {
         ...run,
@@ -393,8 +426,10 @@ export class RunRegistry {
     run: PlanExecRun,
     taskProjection: NonNullable<PlanExecRun['taskProjection']>,
   ): Promise<PlanExecRun> {
-    let current = run;
+    let current = (await this.get(run.id)) ?? run;
     for (let attempt = 0; attempt < CLAIM_CAS_RETRIES; attempt += 1) {
+      if ((current.executionGeneration ?? 0) !== (run.executionGeneration ?? 0))
+        return current;
       const written = await this.updateIfCurrent(
         { ...current, taskProjection },
         current.updatedAt,
@@ -726,6 +761,7 @@ function assertRun(run: PlanExecRun): void {
     (run.revision ?? 0) < 1 ||
     !Number.isFinite(run.createdAt) ||
     !Number.isFinite(run.updatedAt) ||
+    !isIsolationState(run) ||
     !isFrozenConfig(run.config) ||
     !isAutonomousState(run) ||
     !isRunSubject(run) ||
@@ -791,6 +827,80 @@ function isRunSubject(run: PlanExecRun): boolean {
     run.planPath.length > 0 &&
     typeof run.planHash === 'string' &&
     run.planHash.length > 0
+  );
+}
+
+function isIsolationState(run: PlanExecRun): boolean {
+  const generation = run.executionGeneration ?? 0;
+  if (!Number.isSafeInteger(generation) || generation < 0) return false;
+  if (
+    run.quarantinedExecutions !== undefined &&
+    (!Array.isArray(run.quarantinedExecutions) ||
+      !run.quarantinedExecutions.every(
+        (entry) =>
+          isRecord(entry) &&
+          typeof entry.id === 'string' &&
+          RUN_ID.test(entry.id) &&
+          Number.isSafeInteger(entry.generation) &&
+          entry.generation >= 0 &&
+          entry.generation < generation &&
+          [
+            entry.repositoryRoot,
+            entry.cwd,
+            entry.branch,
+            entry.planPath,
+            entry.inventory,
+            entry.observedHead,
+            entry.baseline,
+            entry.commitDelta,
+          ].every((value) => typeof value === 'string') &&
+          Number.isSafeInteger(entry.inventoryEntries) &&
+          entry.inventoryEntries >= 0 &&
+          Number.isSafeInteger(entry.ignoredEntries) &&
+          entry.ignoredEntries >= 0 &&
+          Number.isFinite(entry.quarantinedAt) &&
+          isValidOperationForStage(entry.operation, RUN_STAGE.IMPLEMENTATION) &&
+          entry.operation !== undefined &&
+          (entry.dispatchFenced === undefined || entry.dispatchFenced === true),
+      ))
+  )
+    return false;
+  const recovery = run.isolationRecovery;
+  if (recovery === undefined) return !run.quarantinedExecutions?.length;
+  return (
+    isRecord(recovery) &&
+    typeof recovery.id === 'string' &&
+    RUN_ID.test(recovery.id) &&
+    ['fenced', 'active'].includes(recovery.state) &&
+    recovery.generation === generation &&
+    Number.isSafeInteger(recovery.stopGeneration) &&
+    recovery.stopGeneration >= 0 &&
+    [
+      recovery.target,
+      recovery.sourceRoot,
+      recovery.branch,
+      recovery.authorName,
+      recovery.authorEmail,
+      recovery.requestedBy,
+      recovery.taskTitle,
+      recovery.intentDigest,
+    ].every((value) => typeof value === 'string' && value.length > 0) &&
+    typeof recovery.planRelativePath === 'string' &&
+    Boolean(recovery.planRelativePath) &&
+    typeof recovery.worktreeRelativePath === 'string' &&
+    typeof recovery.planContent === 'string' &&
+    Number.isSafeInteger(recovery.taskId) &&
+    recovery.taskId > 0 &&
+    Array.isArray(recovery.taskItems) &&
+    recovery.taskItems.every((item) => typeof item === 'string') &&
+    isCommands(recovery.bootstrapCommands) &&
+    typeof recovery.baseline === 'string' &&
+    /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/i.test(recovery.baseline) &&
+    Number.isFinite(recovery.requestedAt) &&
+    run.quarantinedExecutions?.some((entry) => entry.id === recovery.id) ===
+      true &&
+    parsePlan(run.planPath ?? recovery.planRelativePath, recovery.planContent)
+      .hash === run.planHash
   );
 }
 

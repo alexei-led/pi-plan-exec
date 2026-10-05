@@ -70,6 +70,15 @@ import {
   TASK_FAILED_MARKER,
 } from './goal-loop.js';
 import {
+  activateIsolation,
+  isolationCloneCommands,
+  isolationPreview,
+  prepareIsolationDirectory,
+  quarantineExecution,
+  verifyIndependentCheckout,
+  verifyResumableIsolation,
+} from './isolation.js';
+import {
   bootstrapCommands,
   gitValue,
   requiredChecks,
@@ -227,6 +236,237 @@ export class PlanExecController {
     private readonly runCommand: RunCommand,
     private readonly executeLocalCommands: typeof runCommands = runCommands,
   ) {}
+
+  async previewIsolated(runId: string, target: string) {
+    const run = await this.registry.get(runId);
+    if (!run) throw new Error('Plan run not found.');
+    return isolationPreview(run, target, this.runCommand);
+  }
+
+  async recoverIsolated(
+    runId: string,
+    sessionId: string,
+    target: string,
+    confirmedLocalScope: boolean,
+    expectedOperationId?: string,
+    expectedIntentDigest?: string,
+  ): Promise<PlanExecRun> {
+    if (!confirmedLocalScope)
+      throw new Error(
+        'Explicit confirmation of local-files-only isolation is required.',
+      );
+    const result = await this.registry.withControllerLock(runId, async () => {
+      let run = await this.registry.get(runId);
+      if (!run) throw new Error('Plan run not found.');
+      if (
+        run.isolationRecovery?.target === target &&
+        run.isolationRecovery.state === 'active'
+      )
+        return run;
+      if (
+        run.status === RUN_STATUS.CANCELLED ||
+        run.status === RUN_STATUS.CANCEL_PENDING
+      )
+        throw new Error(
+          'Cancellation wins; isolated recovery cannot restart this run.',
+        );
+      if (
+        expectedOperationId &&
+        run.activeOperation?.operationId !== expectedOperationId &&
+        run.isolationRecovery?.state !== 'fenced'
+      )
+        throw new Error(
+          'The operation changed after isolation preview; inspect it again.',
+        );
+      run = await this.registry.claim(run, sessionId);
+      const recovery = await isolationPreview(run, target, this.runCommand);
+      if (
+        expectedIntentDigest &&
+        recovery.intentDigest !== expectedIntentDigest
+      )
+        throw new Error(
+          'The plan, checks, baseline or target changed after preview; review isolation again.',
+        );
+      if (!run.isolationRecovery || run.isolationRecovery.id !== recovery.id) {
+        const quarantined = await quarantineExecution(
+          run,
+          recovery,
+          this.runCommand,
+        );
+        const fenced = {
+          ...run,
+          executionGeneration: recovery.generation,
+          stopGeneration: recovery.stopGeneration,
+          isolationRecovery: { ...recovery, requestedBy: sessionId },
+          quarantinedExecutions: [
+            ...(run.quarantinedExecutions ?? []),
+            quarantined,
+          ],
+          status: RUN_STATUS.RUNNING,
+          userStopped: false,
+          nextAttemptAt: 0,
+          wakeReason:
+            'Old execution generation quarantined; preparing an independent checkout. Old worker state remains unknown.',
+        };
+        delete fenced.activeOperation;
+        delete fenced.failedOperation;
+        delete fenced.progressPath;
+        const saved = await this.registry.updateExclusive(
+          fenced,
+          run.updatedAt,
+        );
+        if (!saved.applied) return saved.run;
+        run = saved.run;
+      } else if (
+        run.userStopped ||
+        run.status === RUN_STATUS.PAUSED ||
+        recovery.stopGeneration !== (run.stopGeneration ?? 0)
+      ) {
+        const resumed = await this.registry.updateIfCurrent(
+          {
+            ...run,
+            status: RUN_STATUS.RUNNING,
+            userStopped: false,
+            isolationRecovery: {
+              ...recovery,
+              stopGeneration: run.stopGeneration ?? 0,
+            },
+          },
+          run.updatedAt,
+        );
+        if (!resumed.applied) return resumed.run;
+        run = resumed.run;
+      }
+      return this.continueIsolation(run);
+    });
+    return result ?? required(await this.registry.get(runId));
+  }
+
+  private async continueIsolation(run: PlanExecRun): Promise<PlanExecRun> {
+    const recovery = required(run.isolationRecovery);
+    if (recovery.state === 'active') return run;
+    const authorized = (current: PlanExecRun) =>
+      current.isolationRecovery?.id === recovery.id &&
+      current.executionGeneration === recovery.generation &&
+      current.stopGeneration === recovery.stopGeneration &&
+      current.status === RUN_STATUS.RUNNING &&
+      !current.userStopped;
+    if (!authorized(run)) return run;
+    const quarantined = required(
+      run.quarantinedExecutions?.find((entry) => entry.id === recovery.id),
+    );
+    if (!quarantined.dispatchFenced) {
+      const operation = quarantined.operation;
+      const owner: BridgeOperationOwner = {
+        kind: 'pi-plan-exec',
+        runId: run.id,
+        key: operation.operationId,
+        requestDigest: required(operation.requestDigest),
+      };
+      if (!this.bridge.cancelOperation)
+        throw new Error('Bridge cannot durably fence old redispatch.');
+      const reply = await this.bridge.cancelOperation(
+        operation.operationId,
+        owner,
+      );
+      const latest = required(await this.registry.get(run.id));
+      if (!authorized(latest)) return latest;
+      if (
+        !reply.success ||
+        reply.data.operationId !== operation.operationId ||
+        reply.data.requestDigest !== owner.requestDigest ||
+        reply.data.cancellationRequested !== true ||
+        reply.data.replaySafe !== false
+      )
+        return this.fail(
+          latest,
+          'Old operation redispatch fence is not confirmed; isolated target remains inactive.',
+          true,
+        );
+      const fenced = await this.registry.updateIfCurrent(
+        {
+          ...latest,
+          quarantinedExecutions: required(latest.quarantinedExecutions).map(
+            (entry) =>
+              entry.id === recovery.id
+                ? { ...entry, dispatchFenced: true }
+                : entry,
+          ),
+        },
+        latest.updatedAt,
+      );
+      if (!fenced.applied) return fenced.run;
+      run = fenced.run;
+    }
+    try {
+      await prepareIsolationDirectory(recovery);
+      const options: LocalOperationOptions = {
+        journalRoot: join(
+          dirname(this.registry.authorizationPath(run.id)),
+          'isolation-commands',
+        ),
+        runId: run.id,
+        operationId: `isolation:${recovery.id}:${recovery.stopGeneration}`,
+        activeDirectory: this.registry.localOperationsPath(run.id),
+        authorization: {
+          path: this.registry.authorizationPath(run.id),
+          stopGeneration: recovery.stopGeneration,
+        },
+        isAuthorized: async () =>
+          authorized(required(await this.registry.get(run.id))),
+      };
+      await verifyResumableIsolation(recovery, this.runCommand);
+      await this.executeLocalCommands(
+        recovery.target,
+        isolationCloneCommands(recovery),
+        options,
+      );
+      run = required(await this.registry.get(run.id));
+      if (!authorized(run)) return run;
+      await verifyIndependentCheckout(recovery, this.runCommand);
+      const workerCwd = join(recovery.target, recovery.worktreeRelativePath);
+      await this.executeLocalCommands(workerCwd, recovery.bootstrapCommands, {
+        ...options,
+        operationId: `isolation-bootstrap:${recovery.id}:${recovery.stopGeneration}`,
+      });
+      run = required(await this.registry.get(run.id));
+      if (!authorized(run)) return run;
+      await verifyIndependentCheckout(recovery, this.runCommand);
+      const next = activateIsolation(run, recovery);
+      next.progressPath = await initializeProgress(next);
+      await appendProgress(
+        next,
+        `Explicit isolated recovery from ${quarantined.cwd}; old operation ${quarantined.operation.operationId} remains quarantined, not retired. Old partial work was not imported.`,
+      );
+      const latest = required(await this.registry.get(run.id));
+      if (!authorized(latest)) return latest;
+      return (
+        await this.registry.updateIfCurrent(
+          { ...next, ...(latest.lease ? { lease: latest.lease } : {}) },
+          latest.updatedAt,
+        )
+      ).run;
+    } catch (error) {
+      const latest = required(await this.registry.get(run.id));
+      if (!authorized(latest)) return latest;
+      return (
+        await this.registry.updateIfCurrent(
+          {
+            ...latest,
+            status: RUN_STATUS.PAUSED,
+            userStopped: true,
+            stopGeneration: (latest.stopGeneration ?? 0) + 1,
+            error: `Isolated recovery paused: ${error instanceof Error ? error.message : String(error)}`,
+            wakeReason:
+              'Repair the reported preparation failure, then explicitly apply the same recover-isolated target again. No plan worker is authorized.',
+            needsAttention: true,
+            nextAttemptAt: 0,
+          },
+          latest.updatedAt,
+        )
+      ).run;
+    }
+  }
 
   async start(options: StartRunOptions): Promise<PlanExecRun> {
     if (options.existingWorktree !== undefined && options.useWorktree)
@@ -529,6 +769,14 @@ export class PlanExecController {
       (existing.stopGeneration ?? 0) !== expectedStopGeneration
     )
       return existing;
+    if (
+      explicit &&
+      existing.isolationRecovery?.state === 'fenced' &&
+      existing.userStopped
+    )
+      throw new Error(
+        `Isolation preparation was stopped. Review /exec recover-isolated ${existing.id} "${existing.isolationRecovery.target}" --apply before continuing.`,
+      );
     if (explicit) await this.registry.assertExclusive(existing);
     const claimed = await this.registry.claim(existing, sessionId);
     if (
@@ -860,6 +1108,8 @@ export class PlanExecController {
     }
     if (run.userStopped) return run;
     if ((run.nextAttemptAt ?? 0) > Date.now()) return run;
+    if (run.isolationRecovery && run.isolationRecovery.state !== 'active')
+      return this.continueIsolation(run);
     if (run.activeOperation) return this.observeActiveOperation(run);
 
     if (run.lanePreparation) return this.prepareLane(run);
@@ -2379,6 +2629,7 @@ export class PlanExecController {
           launchStartedAt,
           recovery: OPERATION_RECOVERY.REPLAY,
           stopGeneration: run.stopGeneration ?? 0,
+          executionGeneration: run.executionGeneration ?? 0,
           expectedLifetime: lifetime,
           ...(input.taskId ? { taskId: input.taskId } : {}),
           ...(input.reviewIteration
@@ -2808,6 +3059,12 @@ export class PlanExecController {
           lastStatusError: message,
         })
       : run;
+    if (
+      operation &&
+      (marked.activeOperation?.operationId !== operation.operationId ||
+        (marked.executionGeneration ?? 0) !== (run.executionGeneration ?? 0))
+    )
+      return marked;
     return this.fail(marked, message, true);
   }
 
@@ -5867,6 +6124,7 @@ function sameOperationState(
 ): boolean {
   return (
     after.status === before.status &&
+    (after.executionGeneration ?? 0) === (before.executionGeneration ?? 0) &&
     after.activeOperation?.operationId === operation.operationId
   );
 }

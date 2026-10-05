@@ -145,6 +145,36 @@ test('correlated rejection permits same-identity reconciliation, not abandonment
   );
 });
 
+test('exact live-child binding permits reattachment but never claims retirement', () => {
+  const run = inFlight();
+  assert.equal(
+    classifyAbandonment(run, {
+      leaseLive: false,
+      durableOperationLookup: true,
+      bridgeState: 'found',
+      operationBound: true,
+    }),
+    'reconcilable',
+  );
+  assert.equal(
+    classifyAbandonment(run, {
+      leaseLive: false,
+      durableOperationLookup: true,
+      bridgeState: 'found',
+    }),
+    'ambiguous',
+  );
+  assert.equal(
+    classifyAbandonment(run, {
+      leaseLive: true,
+      durableOperationLookup: true,
+      bridgeState: 'found',
+      operationBound: true,
+    }),
+    'live',
+  );
+});
+
 test('only explicitly bounded compatibility runs receive an elapsed deadline', () => {
   const unbounded = inFlight({
     activeOperation: {

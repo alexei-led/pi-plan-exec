@@ -8,6 +8,7 @@ import {
   mkdirSync,
   readFileSync,
   realpathSync,
+  watch,
   writeFileSync,
 } from 'node:fs';
 import http from 'node:http';
@@ -60,69 +61,113 @@ for (const kind of ['rejected', 'legacy']) {
   git('add', 'plan.md', '.gitignore');
   git('commit', '-m', 'Fixture baseline');
 }
+const lifecycleLog = join(sandbox, 'server-lifecycle.jsonl');
+const logLifecycle = (event) =>
+  appendFileSync(
+    lifecycleLog,
+    `${JSON.stringify({ at: Date.now(), pid: process.pid, ...event })}\n`,
+  );
+logLifecycle({ event: 'start' });
+process.on('uncaughtExceptionMonitor', (error) =>
+  logLifecycle({ event: 'uncaught-exception', error: error.message }),
+);
+process.on('exit', (code) => logLifecycle({ event: 'exit', code }));
+for (const [signal, code] of [
+  ['SIGHUP', 129],
+  ['SIGINT', 130],
+  ['SIGTERM', 143],
+])
+  process.on(signal, () => {
+    logLifecycle({ event: 'signal', signal });
+    process.exit(code);
+  });
 const server = http.createServer((req, res) => {
   let body = '';
   req.on('data', (data) => (body += data));
   req.on('end', () => {
     const input = JSON.parse(body);
-    const worker = body.includes('PLAN_EXEC_FIXTURE_WORKER');
+    const oldWorker = body.includes('PLAN_EXEC_FIXTURE_OLD_WORKER');
+    const worker = oldWorker || body.includes('PLAN_EXEC_FIXTURE_WORKER');
     const hasTool = input.messages.some((message) => message.role === 'tool');
     appendFileSync(
       join(sandbox, 'model-calls.jsonl'),
-      `${JSON.stringify({ worker, hasTool })}\n`,
+      `${JSON.stringify({ worker, oldWorker, hasTool })}\n`,
     );
-    const command =
-      "node -e \"const fs=require('fs');fs.writeFileSync('result.txt','done\\n');fs.writeFileSync('plan.md',fs.readFileSync('plan.md','utf8').replace('[ ]','[x]'))\" && git add result.txt plan.md && git commit -m 'Deliver fixture'";
-    const delta =
-      worker && !hasTool
-        ? {
-            role: 'assistant',
-            tool_calls: [
+    const deliver = () => {
+      const oldScript = `const fs=require('node:fs'),cp=require('node:child_process');let n=0;const timer=setInterval(()=>{fs.writeFileSync('old-live.txt',String(++n));fs.appendFileSync('.ralphex/progress/old-progress.txt','OLD_WRITER_TICK '+n+'\\n');if(fs.existsSync(${JSON.stringify(join(sandbox, 'release-old'))})){clearInterval(timer);cp.execFileSync('git',['add','old-live.txt']);cp.execFileSync('git',['-c','commit.gpgsign=false','commit','-m','Old fixture completed']);}},100);setTimeout(()=>{clearInterval(timer);process.exit(2)},600000).unref();`;
+      const command = oldWorker
+        ? `node -e '${oldScript.replaceAll("'", "'\\''")}'`
+        : "node -e \"const fs=require('fs');fs.writeFileSync('result.txt','done\\n');fs.writeFileSync('plan.md',fs.readFileSync('plan.md','utf8').replace('[ ]','[x]'))\" && git add result.txt plan.md && git commit -m 'Deliver fixture'";
+      const delta =
+        worker && !hasTool
+          ? {
+              role: 'assistant',
+              tool_calls: [
+                {
+                  index: 0,
+                  id: 'fixture-write',
+                  type: 'function',
+                  function: {
+                    name: 'bash',
+                    arguments: JSON.stringify({ command }),
+                  },
+                },
+              ],
+            }
+          : {
+              role: 'assistant',
+              content: worker ? 'Fixture committed.' : 'Ready.',
+            };
+      const chunk = {
+        id: 'fixture',
+        object: 'chat.completion.chunk',
+        created: 1,
+        model: 'fixture',
+      };
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      res.write(
+        'data: ' +
+          JSON.stringify({
+            ...chunk,
+            choices: [{ index: 0, delta, finish_reason: null }],
+          }) +
+          '\n\n',
+      );
+      res.write(
+        'data: ' +
+          JSON.stringify({
+            ...chunk,
+            choices: [
               {
                 index: 0,
-                id: 'fixture-write',
-                type: 'function',
-                function: {
-                  name: 'bash',
-                  arguments: JSON.stringify({ command }),
-                },
+                delta: {},
+                finish_reason: worker && !hasTool ? 'tool_calls' : 'stop',
               },
             ],
-          }
-        : {
-            role: 'assistant',
-            content: worker ? 'Fixture committed.' : 'Ready.',
-          };
-    const chunk = {
-      id: 'fixture',
-      object: 'chat.completion.chunk',
-      created: 1,
-      model: 'fixture',
+          }) +
+          '\n\n',
+      );
+      res.end('data: [DONE]\n\n');
     };
-    res.writeHead(200, { 'Content-Type': 'text/event-stream' });
-    res.write(
-      'data: ' +
-        JSON.stringify({
-          ...chunk,
-          choices: [{ index: 0, delta, finish_reason: null }],
-        }) +
-        '\n\n',
-    );
-    res.write(
-      'data: ' +
-        JSON.stringify({
-          ...chunk,
-          choices: [
-            {
-              index: 0,
-              delta: {},
-              finish_reason: worker && !hasTool ? 'tool_calls' : 'stop',
-            },
-          ],
-        }) +
-        '\n\n',
-    );
-    res.end('data: [DONE]\n\n');
+    const hold = join(sandbox, 'hold-worker');
+    if (worker && !hasTool && existsSync(hold)) {
+      const watcher = watch(sandbox, () => {
+        if (!existsSync(hold)) {
+          watcher.close();
+          clearTimeout(timer);
+          deliver();
+        }
+      });
+      const timer = setTimeout(() => {
+        watcher.close();
+        res.writeHead(504);
+        res.end('Fixture hold exceeded ten minutes');
+      }, 600_000);
+      res.on('close', () => {
+        watcher.close();
+        clearTimeout(timer);
+      });
+    } else deliver();
   });
 });
 server.listen(0, '127.0.0.1');
@@ -160,6 +205,10 @@ writeFileSync(
 writeFileSync(
   join(agent, 'agents/recovery-worker.md'),
   '---\nname: recovery-worker\ndescription: Isolated deterministic recovery worker\nmodel: recovery/fixture\nthinking: off\ntools: bash\nsystemPromptMode: replace\ninheritProjectContext: false\ninheritSkills: false\n---\nPLAN_EXEC_FIXTURE_WORKER\nComplete the fixture through the bash tool.\n',
+);
+writeFileSync(
+  join(agent, 'agents/recovery-old-worker.md'),
+  '---\nname: recovery-old-worker\ndescription: Genuine isolated old writer\nmodel: recovery/fixture\nthinking: off\ntools: bash\nsystemPromptMode: replace\ninheritProjectContext: false\ninheritSkills: false\n---\nPLAN_EXEC_FIXTURE_OLD_WORKER\nWrite only in your current old fixture checkout.\n',
 );
 const sources = [
   join(bridge, 'node_modules/pi-subagents/index.js'),

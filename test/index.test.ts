@@ -48,6 +48,7 @@ import planExecExtension, {
   needsPlanStructureReview,
   parseCleanupArguments,
   parseDoctorArguments,
+  parseIsolationArguments,
   parseResumeArguments,
   parseResumeOptions,
   parseSkipReason,
@@ -633,7 +634,7 @@ test('help and setup explain the installed command surface', () => {
     assert.doesNotMatch(execHelp(), new RegExp(`/exec ${alias}`), alias);
   assert.match(
     execSetup(),
-    /pi install -l npm:@alexeiled\/pi-subagents-bridge@\^0\.5\.3$/m,
+    /pi install -l npm:@alexeiled\/pi-subagents-bridge@\^0\.5\.4$/m,
   );
   assert.match(
     execSetup(),
@@ -651,7 +652,7 @@ test('setup installs the released bridge and fusion pins', () => {
   assert.match(execSetup(), /^pi install -l npm:pi-subagents@\^0\.76\.0$/m);
   assert.match(
     execSetup(),
-    /^pi install -l npm:@alexeiled\/pi-subagents-bridge@\^0\.5\.3$/m,
+    /^pi install -l npm:@alexeiled\/pi-subagents-bridge@\^0\.5\.4$/m,
   );
   assert.match(
     execSetup(),
@@ -712,6 +713,27 @@ test('resume accepts options without an explicit run ID', () => {
       model: 'current',
     },
   );
+});
+
+test('isolated recovery is explicit and quotes only the new checkout path', () => {
+  const id = '11111111-1111-4111-8111-111111111111';
+  assert.deepEqual(
+    parseIsolationArguments(`recover-isolated ${id} "/new checkout"`),
+    { runId: id, target: '/new checkout', apply: false, confirmed: false },
+  );
+  assert.equal(
+    parseIsolationArguments(
+      `recover-isolated ${id} /new --apply --confirm-local-isolation`,
+    ).confirmed,
+    true,
+  );
+  for (const args of [
+    `recover-isolated ${id} relative`,
+    `recover-isolated ${id} /new --force`,
+    `recover-isolated ${id} /new --confirm-local-isolation`,
+    `recover-isolated ${id} /new --apply --apply`,
+  ])
+    assert.throws(() => parseIsolationArguments(args), /Usage/);
 });
 
 test('resume branch-adoption and recovery-model options are explicit', () => {

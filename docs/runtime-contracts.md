@@ -3,7 +3,7 @@
 A run is admitted only when the selected runtime advertises explicit lifetime
 support and ownership of every operation-owned descendant. The development
 baseline uses Pi `1.0.2`, `pi-subagents@0.76.0`,
-`@alexeiled/pi-subagents-bridge@0.5.3`, and `@alexeiled/pi-fusion@0.9.3`.
+`@alexeiled/pi-subagents-bridge@0.5.4`, and `@alexeiled/pi-fusion@0.9.3`.
 The default subagent backend needs no Git pins. The optional Revmux contract
 still depends on an unmerged upstream change; it is not a released backend.
 See the [upstream audit](upstream-audit.md) for release evidence and limits.
@@ -118,6 +118,19 @@ remain unknown. pi-subagents 0.76.0 has no authoritative durable operation looku
 API for retrospective absence proof. No timeout, old log string, or missing ID
 authorizes replacement work. See [recovery](../skills/exec-plan/references/recovery.md).
 
+Bridge 0.5.4 persists the native RPC request UUID before dispatch and recovers
+only an exact retained native tool-call binding or durable completion binding.
+No UUID is inferred from task text, paths or timestamps. An unbound legacy row
+without retained evidence stays unknown under ordinary resume.
+
+Explicit `recover-isolated` is a different operator-approved contract: it closes
+old-generation acceptance/redispatch, retains quarantined lineage and creates an
+independent checkout from the accepted commit and checked plan. It does not
+claim old-worker death. Local implementation tasks only; no shared Git metadata,
+object alternates, hardlinked working data or remotes. The new target is paused
+until resume. Old partial work is inventoried, not silently imported, and the
+quarantined target keeps its reservation. See the recovery reference above.
+
 ## Caller, native, and process identities
 
 These identity namespaces are separate and must never be equated:
@@ -203,7 +216,7 @@ promotion, and archive.
 The dependency pins are:
 
 - native `pi-subagents`: released `^0.76.0`;
-- Bridge: `@alexeiled/pi-subagents-bridge@^0.5.3`;
+- Bridge: `@alexeiled/pi-subagents-bridge@^0.5.4`;
 - Fusion: released `@alexeiled/pi-fusion@^0.9.3`;
 - Revmux: unreleased `988904f30da351e76c29d5779c6833a6bf890b51` (PR #35);
 - Pi SDK: `^1.0.2`, validated at `1.0.2`;

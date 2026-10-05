@@ -2,7 +2,7 @@ import type { Dirent } from 'node:fs';
 import { readFileSync } from 'node:fs';
 import { access, readdir } from 'node:fs/promises';
 import { hostname } from 'node:os';
-import { basename, relative, resolve } from 'node:path';
+import { basename, isAbsolute, relative, resolve } from 'node:path';
 import {
   type ExtensionAPI,
   type ExtensionCommandContext,
@@ -14,6 +14,7 @@ import {
   type BridgeCapabilities,
   BridgeClient,
   hasBoundNeverStarted,
+  hasBoundOperation,
   parseExecutionLifetime,
   processTerminalProof,
   supportsOwnedProcessTree,
@@ -96,6 +97,7 @@ const MINUTES_PER_HOUR = 60;
 const DISPLAY_RUN_ID_LENGTH = 8;
 const RECOVERY_MODEL_OPTION = '--model';
 const EXISTING_WORKTREE_OPTION = '--worktree';
+const ISOLATION_ACTION = EXEC_ACTION.ISOLATE;
 const SAME_MACHINE_OPTION = '--same-machine';
 const CLEANUP_APPLY_OPTION = '--apply';
 const CLEANUP_INCLUDE_FAILED_OPTION = '--include-failed';
@@ -199,6 +201,12 @@ function requiredSetupCommands(): string[] {
 
 /** Primary verbs only: a retired name still dispatches, but is never taught. */
 const EXEC_COMMANDS: AutocompleteItem[] = [
+  {
+    value: EXEC_ACTION.ISOLATE,
+    label: EXEC_ACTION.ISOLATE,
+    description:
+      'Preview explicit local-files-only recovery in a new independent checkout',
+  },
   {
     value: EXEC_ACTION.HELP,
     label: EXEC_ACTION.HELP,
@@ -489,6 +497,9 @@ export default function planExecExtension(pi: ExtensionAPI): void {
         : undefined;
       return {
         durableOperationLookup: capabilities.durableOperationLookup,
+        ...(hasBoundOperation(proofData, operation)
+          ? { operationBound: true }
+          : {}),
         ...(proofData?.state === EXTERNAL_OPERATION_STATE.ABSENT &&
         proofData.replaySafe === true
           ? { replaySafe: true }
@@ -1120,10 +1131,14 @@ export function recoveryGuidance(
     classifyAbandonment(run, evidence) === ABANDONMENT.RECONCILABLE
   )
     return {
-      classification: 'the pending launch can be checked without replacing it',
-      action: evidence.launchRejected
-        ? `Run ${resume}; it preserves the rejected operation until durable cancellation fencing succeeds, then retries the task.`
-        : `Run ${resume}; it preserves the same operation ID and immutable request. An empty lookup does not prove that an earlier request cannot still arrive.`,
+      classification: evidence.operationBound
+        ? 'the existing worker can be reattached'
+        : 'the pending launch can be checked without replacing it',
+      action: evidence.operationBound
+        ? `Run ${resume}; it reattaches the exact bound child under the preserved operation ID. No worker exit is claimed and no replacement is launched.`
+        : evidence.launchRejected
+          ? `Run ${resume}; it preserves the rejected operation until durable cancellation fencing succeeds, then retries the task.`
+          : `Run ${resume}; it preserves the same operation ID and immutable request. An empty lookup does not prove that an earlier request cannot still arrive.`,
       command: resume,
     };
   if (
@@ -1183,6 +1198,12 @@ export function recoveryGuidance(
       action: `Run ${resume}; it validates the same rejected operation, durably fences it, then retries the preserved task.`,
       command: resume,
     };
+  if (run.isolationRecovery?.state === 'fenced')
+    return {
+      classification: 'independent checkout preparation is pending',
+      action: `Inspect the reported preparation failure or owned-command cleanup. Once resolved, run /exec recover-isolated ${run.id} "${run.isolationRecovery.target}" --apply to confirm continuation; ordinary resume does not override a stopped preparation.`,
+      command: `/exec recover-isolated ${run.id} "${run.isolationRecovery.target}" --apply`,
+    };
   if (
     run.activeOperation?.recovery === OPERATION_RECOVERY.REQUIRED ||
     run.activeOperation?.lastObservedState ===
@@ -1190,7 +1211,7 @@ export function recoveryGuidance(
   )
     return {
       classification: 'recovery required: worker launch outcome is unknown',
-      action: `Inspect the launch error and lookup diagnostic, and repair Bridge/runtime compatibility if needed. Recovery requires identity-bound pre-launch rejection, durable absence, or terminal ownership proof; missing IDs, elapsed time, and old error text are not proof. Run ${status} after evidence or runtime support changes. Repeated resume cannot supply missing evidence; do not start replacement work.`,
+      action: `Inspect the launch error and lookup diagnostic, and repair Bridge/runtime compatibility if needed. Recovery requires identity-bound pre-launch rejection, durable absence, or terminal ownership proof; missing IDs, elapsed time, and old error text are not proof. Run ${status} after evidence or runtime support changes. Repeated resume cannot supply missing evidence; do not start replacement work in the old target.${run.stage === RUN_STAGE.IMPLEMENTATION && run.activeOperation?.service === OPERATION_SERVICE.BRIDGE ? ` If the operator approves a different local-files-only target, preview /exec recover-isolated ${run.id} <absolute-new-checkout>; the old writer remains quarantined, not retired.` : ''}`,
       command: status,
     };
   // In-flight only. A settled run's own record says the controller stopped, and
@@ -1504,6 +1525,17 @@ export function formatRunStatus(
       );
   }
   if (run.progressPath) lines.push(`progress: ${run.progressPath}`);
+  if (run.isolationRecovery)
+    lines.push(
+      `isolated recovery: ${run.isolationRecovery.state}; generation ${run.executionGeneration}; target ${run.isolationRecovery.target}`,
+    );
+  for (const entry of run.quarantinedExecutions ?? [])
+    lines.push(
+      `quarantined generation ${entry.generation}: operation ${entry.operation.operationId}; ${entry.cwd} (${entry.branch}); writer status UNKNOWN; old partial work/progress preserved; redispatch ${entry.dispatchFenced ? 'fenced' : 'pending'}`,
+      `quarantine observed HEAD: ${entry.observedHead}; accepted base: ${entry.baseline}`,
+      `quarantine commit delta (up to 50): ${entry.commitDelta || '(none)'}`,
+      `quarantine inventory: ${entry.inventoryEntries} status entries, ${entry.ignoredEntries} ignored entries (directories may be grouped). Observations may race the old worker; not a stable import snapshot.\n${entry.inventory || '(clean)'}`,
+    );
   lines.push(...taskStatusLines(run));
   const usage = totalUsage(run);
   if (usage) lines.push(`usage: ${usage}`);
@@ -2013,6 +2045,7 @@ export function abandonmentProbe(
     replaySafe?: boolean;
     neverStarted?: boolean;
     launchRejected?: boolean;
+    operationBound?: boolean;
   }>,
 ): EvidenceProbe {
   return async (run) => {
@@ -2543,6 +2576,8 @@ function overdueText(diagnosis: ObservedRun): string {
 function operationEvidence(diagnosis: ObservedRun): string {
   const operation = diagnosis.run.activeOperation;
   if (!operation) return 'no operation is tracked';
+  if (diagnosis.evidence.operationBound)
+    return 'the provider identified the exact bound child; it can be reattached without launching a replacement';
   if (diagnosis.evidence.neverStarted)
     return 'the original launch was durably fenced before dispatch';
   if (
@@ -2727,6 +2762,8 @@ export async function handleCommand(
   } = dependencies;
   const [subcommand, ...rest] = args.split(/\s+/).filter(Boolean);
   if (subcommand === EXEC_ACTION.HELP) return execHelp();
+  if (subcommand === ISOLATION_ACTION)
+    return recoverIsolatedCommand(args, ctx, dependencies);
   if (subcommand === EXEC_ACTION.CLEANUP)
     return execCleanup(defaultRegistry, rest);
   if (
@@ -2838,6 +2875,100 @@ export async function handleCommand(
       : undefined,
   );
   return `Run ${shortRunId(run.id)} started: ${run.status} (${run.stage})\nbranch: ${run.branch}\nworktree: ${run.worktreeCwd}\nUse /exec status ${run.id} for live progress.`;
+}
+
+export function parseIsolationArguments(input: string): {
+  runId: string;
+  target: string;
+  apply: boolean;
+  confirmed: boolean;
+} {
+  const match =
+    /^recover-isolated\s+([a-f0-9-]{36})\s+(?:"([^"]+)"|'([^']+)'|(\S+))(.*)$/i.exec(
+      input.trim(),
+    );
+  const target = match?.[2] ?? match?.[3] ?? match?.[4];
+  const flags = match?.[5]?.trim().split(/\s+/).filter(Boolean) ?? [];
+  if (
+    !match?.[1] ||
+    !target ||
+    !isAbsolute(target) ||
+    new Set(flags).size !== flags.length ||
+    flags.some(
+      (flag) => flag !== '--apply' && flag !== '--confirm-local-isolation',
+    ) ||
+    (flags.includes('--confirm-local-isolation') && !flags.includes('--apply'))
+  )
+    throw new Error(
+      'Usage: /exec recover-isolated <full-run-id> <absolute-new-checkout> [--apply [--confirm-local-isolation]]',
+    );
+  return {
+    runId: match[1],
+    target,
+    apply: flags.includes('--apply'),
+    confirmed: flags.includes('--confirm-local-isolation'),
+  };
+}
+
+async function recoverIsolatedCommand(
+  args: string,
+  ctx: ExtensionCommandContext,
+  dependencies: CommandDependencies,
+): Promise<string> {
+  const options = parseIsolationArguments(args);
+  const run = await defaultRegistry.get(options.runId);
+  if (!run) throw new Error('Plan run not found.');
+  const preview = await dependencies.controller.previewIsolated(
+    run.id,
+    options.target,
+  );
+  const description = [
+    `Same run: ${run.id}; generation ${preview.generation}; Task ${run.activeOperation?.taskId ?? 'preserved'}`,
+    `Old target stays quarantined: ${preview.sourceRoot}`,
+    `New independent checkout: ${preview.target}`,
+    `Accepted baseline: ${preview.baseline}`,
+    `Task ${preview.taskId}: ${preview.taskTitle}`,
+    ...preview.taskItems.map((item) => `- ${item}`),
+    `Required checks (unchanged): ${JSON.stringify(run.config.requiredChecks)}`,
+    `Bootstrap from the accepted baseline: ${JSON.stringify(preview.bootstrapCommands)}`,
+    'Bootstrap may download dependencies or run package install scripts; review their shared/external effects before approval.',
+    'Old operation may still run. This is Git/filesystem target isolation, not worker retirement or a security sandbox.',
+    'Old partial files/commits/progress remain in place; unaccepted work is NOT copied. Frozen checks and accepted tasks are preserved.',
+    'Confirm this task and its commands affect only local files/tests: no deployment, payment, publishing, external side effects or shared resources.',
+    'New checkout has independent Git metadata/files and no remotes. Activation leaves the plan paused until ordinary resume in the new checkout.',
+  ].join('\n');
+  if (!options.apply)
+    return `${description}\nPreview only. Apply: /exec recover-isolated ${run.id} "${preview.target}" --apply`;
+  const confirmed =
+    options.confirmed ||
+    (ctx.hasUI &&
+      (await ctx.ui.confirm(
+        'Isolate this run and preserve the unknown old worker?',
+        description,
+      )));
+  if (!confirmed) {
+    if (!ctx.hasUI)
+      throw new Error(
+        `${description}\nExplicit operator confirmation is required: --apply --confirm-local-isolation.`,
+      );
+    return 'Isolation cancelled; no run state changed.';
+  }
+  if (dependencies.isSessionClosed?.())
+    return 'Session closed; isolation not applied.';
+  dependencies.recordRun?.(run);
+  const isolated = await mutateCommand(dependencies, () =>
+    dependencies.controller.recoverIsolated(
+      run.id,
+      ctx.sessionManager.getSessionId(),
+      preview.target,
+      true,
+      run.activeOperation?.operationId,
+      preview.intentDigest,
+    ),
+  );
+  return isolated.isolationRecovery?.state === 'active'
+    ? `Run ${run.id} isolated and ${isolated.status}. Old writer status remains unknown. New checkout: ${isolated.worktreeCwd}. Continue there with /exec resume ${run.id}; do not resume or edit the quarantined target.`
+    : `Run ${run.id} isolation is pending; no new worker is authorized. ${isolated.error ?? isolated.wakeReason ?? 'Inspect /exec status.'}`;
 }
 
 /**
@@ -4117,6 +4248,7 @@ export function execHelp(): string {
     '/exec --worktree <path> <plan-path>  Execute a plan in an existing registered worktree.',
     '/exec status [run-id]   No run ID: every run grouped by what it needs, with any missing package and one next command per run. With a run ID: that run in detail.',
     `/exec resume [run-id] [${RECOVERY_MODEL_OPTION} current|provider/model]`,
+    '/exec recover-isolated <full-run-id> <absolute-new-checkout> [--apply] — explicit local-files-only target change; old writer stays unknown',
     "                        Continue a stuck run: take over a dead session's lease while retaining the existing operation and saved result. Explicit pauses require resume; automatic task retries preserve their checkpoints.",
     '/exec stop [run-id]     Stop a run: it asks whether to pause it (resumable) or cancel it (final, worktree preserved).',
     `/exec cleanup [full-run-id] [${CLEANUP_APPLY_OPTION}]`,

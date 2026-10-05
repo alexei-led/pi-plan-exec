@@ -200,6 +200,8 @@ export interface AbandonmentEvidence {
   neverStarted?: boolean;
   /** Correlated rejection observed; cancellation fencing is still required. */
   launchRejected?: boolean;
+  /** Exact owner-bound lookup permits observing the same child, never replacement. */
+  operationBound?: boolean;
   processTerminalProof?: ProcessTerminalProof;
 }
 
@@ -225,10 +227,14 @@ export function classifyAbandonment(
     evidence.durableOperationLookup === true &&
     evidence.bridgeState === 'not_started' &&
     evidence.launchRejected === true;
+  const boundOperation =
+    evidence.durableOperationLookup === true &&
+    evidence.bridgeState === EXTERNAL_OPERATION_STATE.FOUND &&
+    evidence.operationBound === true;
   return terminalObserved ||
     (evidence.durableOperationLookup === true && evidence.neverStarted === true)
     ? ABANDONMENT.ABANDONED
-    : replaySafeAbsence || rejectedLaunch
+    : replaySafeAbsence || rejectedLaunch || boundOperation
       ? ABANDONMENT.RECONCILABLE
       : ABANDONMENT.AMBIGUOUS;
 }
