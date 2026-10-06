@@ -302,7 +302,7 @@ test('visibility survives restoration and late updates cannot undo hiding or dis
   next.remember(run({ id: 'run-2', revision: 1 }));
   assert.equal(next.current()?.id, 'run-2');
 });
-test('stale projection does not replace newer cancellation state; removed records disappear', () => {
+test('stale snapshot does not replace newer cancellation state; removed records disappear', () => {
   const view = new RunPresentation();
   view.remember(run({ revision: 3, status: 'cancel_pending' }));
   view.remember(run({ revision: 2, status: 'running' }));

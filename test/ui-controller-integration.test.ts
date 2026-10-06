@@ -1,13 +1,16 @@
 import assert from 'node:assert/strict';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type {
   ExtensionAPI,
   ExtensionContext,
 } from '@earendil-works/pi-coding-agent';
 import { onTestFinished, test, vi } from 'vitest';
-import { PlanExecController } from '../src/controller.js';
 import planExecExtension from '../src/index.js';
 import { RunRegistry } from '../src/registry.js';
-import { TaskProjector } from '../src/task-projection.js';
+import { required } from '../src/required.js';
+import { PlanExecRuntimeIntegration } from '../src/runtime-integration.js';
 import {
   DEFAULT_FROZEN_RUN_CONFIG,
   type PlanExecRun,
@@ -15,12 +18,16 @@ import {
   RUN_STATUS,
 } from '../src/types.js';
 
-test('background recovery keeps ticking through UI failure and a pending projection', async (_t) => {
-  const cwd = '/tmp/pi-plan-exec-ui-controller-integration';
+test('background recovery keeps ticking through UI failure and pending Fleet publication', async (_t) => {
+  const cwd = await mkdtemp(join(tmpdir(), 'exec-ui-controller-'));
+  onTestFinished(() => rm(cwd, { recursive: true, force: true }));
+  await writeFile(join(cwd, 'plan.md'), '### Task 1: Work\n- [ ] Work\n');
+  const registry = new RunRegistry(join(cwd, 'runs'));
+  const progressPath = join(cwd, 'progress.txt');
+  await writeFile(progressPath, '');
   const sessionId = 'session-ui-controller-integration';
-  const run: PlanExecRun = {
+  const run = await registry.create({
     schemaVersion: 1,
-    id: '11111111-1111-4111-8111-111111111111',
     repositoryRoot: cwd,
     planPath: `${cwd}/plan.md`,
     planHash: 'plan-hash',
@@ -28,66 +35,43 @@ test('background recovery keeps ticking through UI failure and a pending project
     branch: 'feature',
     defaultBranch: 'main',
     status: RUN_STATUS.RUNNING,
-    stage: RUN_STAGE.IMPLEMENTATION,
+    stage: RUN_STAGE.RESOLVE,
+    progressPath,
     taskAttempts: {},
     stageAttempts: {},
     reviewFindings: [],
     unresolvedFindings: [],
     skippedStages: [],
     branchRebindings: [],
-    taskProjection: {
-      sessionId,
-      taskIds: {},
-    },
+    ownerSessionId: sessionId,
     config: DEFAULT_FROZEN_RUN_CONFIG,
-    createdAt: 1,
-    updatedAt: 1,
-  };
-  let tickCount = 0;
-  let projectionStarted = false;
-  let firstProjectionReleased = false;
-  const projectedUpdates: number[] = [];
-  let releaseProjection!: () => void;
-  const projectionPending = new Promise<void>((resolve) => {
-    releaseProjection = resolve;
   });
-  const originalListWithErrors = RunRegistry.prototype.listWithErrors;
-  const originalTick = PlanExecController.prototype.tick;
-  const originalSync = TaskProjector.prototype.sync;
-  onTestFinished(() => {
-    RunRegistry.prototype.listWithErrors = originalListWithErrors;
-    PlanExecController.prototype.tick = originalTick;
-    TaskProjector.prototype.sync = originalSync;
-    releaseProjection();
+  // Redirect the extension's default registry to real, isolated files.
+  for (const method of [
+    'get',
+    'listWithErrors',
+    'claim',
+    'updateIfCurrent',
+    'withControllerLock',
+    'release',
+  ] as const) {
+    const implementation = RunRegistry.prototype[method];
+    vi.spyOn(RunRegistry.prototype, method).mockImplementation(
+      implementation.bind(registry) as never,
+    );
+  }
+  let releaseRuntime!: () => void;
+  const pendingRuntime = new Promise<void>((resolve) => {
+    releaseRuntime = resolve;
   });
-
-  RunRegistry.prototype.listWithErrors = async () => ({
-    runs: [run],
-    errors: [],
-  });
-  PlanExecController.prototype.tick = async () => {
-    tickCount += 1;
-    if (tickCount === 1)
-      return { ...run, stage: RUN_STAGE.COMPREHENSIVE_REVIEW, updatedAt: 2 };
-    if (tickCount === 2)
-      return { ...run, stage: RUN_STAGE.COMPREHENSIVE_REVIEW, updatedAt: 3 };
-    return {
-      ...run,
-      status: RUN_STATUS.COMPLETED,
-      stage: RUN_STAGE.COMPLETE,
-      updatedAt: 4,
-    };
-  };
-  TaskProjector.prototype.sync = async (projectedRun) => {
-    projectionStarted = true;
-    projectedUpdates.push(projectedRun.updatedAt);
-    if (projectedUpdates.length === 1) {
-      await projectionPending;
-      firstProjectionReleased = true;
-    }
-    return projectedRun;
-  };
-
+  onTestFinished(() => releaseRuntime());
+  const published: PlanExecRun[] = [];
+  vi.spyOn(PlanExecRuntimeIntegration.prototype, 'sync').mockImplementation(
+    async (current) => {
+      published.push(current);
+      await pendingRuntime;
+    },
+  );
   const events = new Map<
     string,
     (event: unknown, ctx: ExtensionContext) => Promise<void>
@@ -114,8 +98,12 @@ test('background recovery keeps ticking through UI failure and a pending project
       return [];
     },
     setActiveTools() {},
-    async exec() {
-      return { stdout: `${cwd}\n`, stderr: '', code: 0 };
+    async exec(_command: string, args: string[]) {
+      return {
+        stdout: args.includes('--show-current') ? 'feature\n' : `${cwd}\n`,
+        stderr: '',
+        code: 0,
+      };
     },
     sendUserMessage() {},
   } as unknown as ExtensionAPI;
@@ -148,35 +136,44 @@ test('background recovery keeps ticking through UI failure and a pending project
     },
   } as unknown as ExtensionContext;
 
-  vi.useFakeTimers({ toFake: ['setInterval', 'setTimeout'] });
-  const sessionStart = events.get('session_start');
-  assert.ok(sessionStart);
-  const startup = sessionStart({}, context);
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  assert.equal(projectionStarted, true);
-  assert.equal(tickCount, 0);
-  await vi.advanceTimersByTimeAsync(1_000);
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  assert.equal(tickCount, 1);
-  assert.equal(projectionStarted, true);
-  assert.equal(notifyCalls, 1);
-  await vi.advanceTimersByTimeAsync(1_000);
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  assert.equal(tickCount, 2);
-  assert.equal(projectionStarted, true);
-  assert.equal(statusCalls >= 2, true);
-  await vi.advanceTimersByTimeAsync(1_000);
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  assert.equal(tickCount, 3);
+  vi.useFakeTimers({ toFake: ['setInterval'] });
+  onTestFinished(async () => {
+    await events.get('session_shutdown')?.({}, context);
+  });
+  await events.get('session_start')?.({}, context);
+  async function waitFor(predicate: () => Promise<boolean>): Promise<void> {
+    for (let attempt = 0; attempt < 500; attempt++) {
+      if (await predicate()) return;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    assert.fail('Controller did not settle');
+  }
+  for (const stage of [
+    RUN_STAGE.PROJECT_TASKS,
+    RUN_STAGE.BRANCH,
+    RUN_STAGE.PROGRESS,
+  ]) {
+    await vi.advanceTimersByTimeAsync(1_000);
+    await waitFor(async () => (await registry.get(run.id))?.stage === stage);
+    await waitFor(async () =>
+      published.some((current) => current.stage === stage),
+    );
+  }
   assert.equal(statusFailures, 1);
   assert.equal(widgetFailures, 1);
   assert.equal(widgetCalls >= 3, true);
+  assert.equal(statusCalls >= 2, true);
   assert.equal(notifyCalls >= 2, true);
-  assert.equal(firstProjectionReleased, false);
+  assert.match(await readFile(progressPath, 'utf8'), /Execution branch ready/);
+  const current = required(await registry.get(run.id));
+  await registry.update({ ...current, status: RUN_STATUS.CANCEL_PENDING });
+  await vi.advanceTimersByTimeAsync(1_000);
+  await waitFor(
+    async () => (await registry.get(run.id))?.status === RUN_STATUS.CANCELLED,
+  );
+  await waitFor(async () =>
+    published.some((current) => current.status === RUN_STATUS.CANCELLED),
+  );
+  releaseRuntime();
   await events.get('session_shutdown')?.({}, context);
-  releaseProjection();
-  await startup;
-  for (let turn = 0; turn < 100 && projectedUpdates.length < 2; turn += 1)
-    await new Promise<void>((resolve) => setImmediate(resolve));
-  assert.deepEqual(projectedUpdates, [1, 4]);
 });

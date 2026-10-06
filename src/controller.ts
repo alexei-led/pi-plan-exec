@@ -554,6 +554,7 @@ export class PlanExecController {
     const run = await this.registry.create(
       {
         schemaVersion: 1,
+        ownerSessionId: options.sessionId,
         repositoryRoot,
         planPath: executionPlanPath,
         planHash: plan.hash,
@@ -642,6 +643,7 @@ export class PlanExecController {
     const run = await this.registry.create(
       {
         schemaVersion: 1,
+        ownerSessionId: options.sessionId,
         repositoryRoot,
         goal: {
           text,
@@ -1261,14 +1263,10 @@ export class PlanExecController {
         return this.transition(
           run,
           RUN_STAGE.PROJECT_TASKS,
-          'Plan validated; projecting task list.',
+          'Plan validated; preparing execution tasks.',
         );
       case RUN_STAGE.PROJECT_TASKS:
-        return this.transition(
-          run,
-          RUN_STAGE.BRANCH,
-          'Task projection created.',
-        );
+        return this.transition(run, RUN_STAGE.BRANCH, 'Execution tasks ready.');
       case RUN_STAGE.BRANCH:
         return this.transition(
           run,

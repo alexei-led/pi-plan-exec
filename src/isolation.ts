@@ -677,7 +677,6 @@ export function activateIsolation(
   delete next.activeOperation;
   delete next.failedOperation;
   delete next.progressPath;
-  delete next.taskProjection;
   delete next.error;
   delete next.blocked;
   delete next.needsAttention;

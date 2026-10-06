@@ -148,18 +148,19 @@ for (const status of [
     const terminal = await registry.update({ ...run, status });
     assert.equal(terminal.retiredAt, terminal.updatedAt);
     const released = await registry.release(terminal);
-    const projected = await registry.updateTaskProjection(released, {
-      version: 1,
-      state: 'degraded',
-      owner: 'pi-plan-exec',
-      sessionId: 'session',
-      revision: released.revision ?? 1,
-      taskIds: {},
-      error: 'fixture',
-    });
-    assert.equal(projected.retiredAt, terminal.retiredAt);
-    assert.ok(projected.updatedAt > terminal.updatedAt);
-    assert.equal(projected.revision, released.revision);
+    const metadataUpdated = await registry
+      .updateIfCurrent(
+        { ...released, wakeReason: 'Concurrent metadata observation' },
+        released.updatedAt,
+        true,
+      )
+      .then((result) => {
+        assert.equal(result.applied, true);
+        return result.run;
+      });
+    assert.equal(metadataUpdated.retiredAt, terminal.retiredAt);
+    assert.ok(metadataUpdated.updatedAt > terminal.updatedAt);
+    assert.equal(metadataUpdated.revision, released.revision);
   });
 for (const status of ['running', 'paused', 'cancel_pending', 'failed'] as const)
   test(`recoverable or unfinished status ${status} does not acquire a retirement stamp`, async () => {
@@ -1734,4 +1735,91 @@ test('--same-machine asserts the host and touches nothing else', () => {
     { id: run.id },
     'a run with no lease has no host to assert',
   );
+});
+
+test('session attribution follows successful claims but not rejected or abandoned claims', async () => {
+  const { directory, registry } = await seedRegistry();
+  onTestFinished(() => rm(directory, { recursive: true, force: true }));
+  const allocated = await registry.create({
+    ...runSeed(),
+    ownerSessionId: 'creator',
+  });
+  assert.equal(allocated.ownerSessionId, 'creator');
+  const adopted = await registry.claim(allocated, 'adopter');
+  assert.equal(adopted.ownerSessionId, 'adopter');
+  await assert.rejects(registry.claim(adopted, 'foreign'));
+  assert.equal((await registry.get(allocated.id))?.ownerSessionId, 'adopter');
+  const abandoned = await registry.abandon(allocated.id, 'adopter');
+  const before = await readFile(
+    registry.authorizationPath(allocated.id),
+    'utf8',
+  );
+  assert.equal(
+    (await registry.claim(abandoned, 'foreign')).ownerSessionId,
+    'adopter',
+  );
+  assert.equal(
+    await readFile(registry.authorizationPath(allocated.id), 'utf8'),
+    before,
+  );
+});
+
+test('legacy session attribution is validated and read-only, including terminal history', async () => {
+  const { directory, registry } = await seedRegistry();
+  onTestFinished(() => rm(directory, { recursive: true, force: true }));
+  const allocated = await registry.create(runSeed());
+  const terminal = await registry.update({ ...allocated, status: 'completed' });
+  const path = registry.authorizationPath(allocated.id);
+  for (const [projection, expected] of [
+    [{ sessionId: 'legacy' }, 'legacy'],
+    [
+      {
+        version: 1,
+        owner: 'pi-plan-exec',
+        scope: 'session',
+        sessionId: 'legacy',
+      },
+      'legacy',
+    ],
+    [{ sessionId: '' }, undefined],
+    [{ sessionId: ' padded ' }, undefined],
+    [{ sessionId: 1 }, undefined],
+    [{ sessionId: 'foreign', owner: 'another-extension' }, undefined],
+    [{ sessionId: 'foreign', version: 2 }, undefined],
+    [{ sessionId: 'foreign', scope: 'global' }, undefined],
+  ] as const) {
+    const raw = JSON.stringify({ ...terminal, taskProjection: projection });
+    await writeFile(path, raw);
+    const loaded = required(await registry.get(allocated.id));
+    assert.equal(loaded.ownerSessionId, expected);
+    assert.equal('taskProjection' in loaded, false);
+    assert.equal(loaded.status, 'completed');
+    assert.equal(await readFile(path, 'utf8'), raw);
+  }
+  await writeFile(
+    path,
+    JSON.stringify({
+      ...terminal,
+      ownerSessionId: 'explicit',
+      taskProjection: { sessionId: 'legacy' },
+    }),
+  );
+  assert.equal((await registry.get(allocated.id))?.ownerSessionId, 'explicit');
+});
+
+test('invalid explicit attribution is rejected rather than replaced with legacy ownership', async () => {
+  const { directory, registry } = await seedRegistry();
+  onTestFinished(() => rm(directory, { recursive: true, force: true }));
+  const run = await registry.create(runSeed());
+  const path = registry.authorizationPath(run.id);
+  for (const ownerSessionId of [null, '', ' padded ', 1]) {
+    const raw = JSON.stringify({
+      ...run,
+      ownerSessionId,
+      taskProjection: { sessionId: 'legacy' },
+    });
+    await writeFile(path, raw);
+    await assert.rejects(registry.get(run.id), /Invalid plan-exec/);
+    assert.equal(await readFile(path, 'utf8'), raw);
+  }
 });

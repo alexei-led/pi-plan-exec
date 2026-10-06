@@ -31,7 +31,7 @@ export default function recoveryFixture(pi: ExtensionAPI) {
       'isolation',
       'lifecycle',
       'registry',
-      'task-projection',
+      'task-summary',
       'types',
     ].map((name) => join(sourceRoot, 'src', `${name}.ts`));
     paths.push(

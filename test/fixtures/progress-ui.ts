@@ -77,7 +77,7 @@ export default function progressUiFixture(pi: ExtensionAPI): void {
       delete data.activeOperation;
       delete data.failedOperation;
       delete data.error;
-      delete data.taskProjection;
+      delete data.ownerSessionId;
       delete data.archiveOperation;
       delete data.nextAttemptAt;
       const display = displayId

@@ -195,6 +195,10 @@ test('existing linked worktree execution keeps its branch and plan', async () =>
     useWorktree: false,
     existingWorktree: target,
     sessionId: 'session-1',
+    onRunAllocated: (allocated) => {
+      assert.equal(allocated.ownerSessionId, 'session-1');
+      assert.equal(allocated.lease, undefined);
+    },
   });
 
   assert.equal(run.branch, 'feature/existing');
@@ -1224,7 +1228,7 @@ test('same-session concurrent resumes launch one operation', async () => {
   );
 });
 
-test('projection contention cannot log an unapplied stage transition', async () => {
+test('metadata contention cannot log an unapplied stage transition', async () => {
   const root = await mkdtemp(join(tmpdir(), 'exec-transition-cas-'));
   onTestFinished(() => rm(root, { recursive: true, force: true }));
   const planPath = join(root, 'plan.md');
@@ -1238,23 +1242,24 @@ test('projection contention cannot log an unapplied stage transition', async () 
   });
   const bridge = new FakeBridge(join(root, 'none.json'));
   const git = fakeGit(root);
-  let project = true;
+  let concurrentWrite = true;
   const controller = new PlanExecController(
     registry,
     bridge,
     new FakeFusion(),
     async (...args) => {
-      if (project) {
-        project = false;
-        await registry.updateTaskProjection(run, {
-          version: 1,
-          state: 'degraded',
-          owner: 'pi-plan-exec',
-          sessionId: 'session',
-          revision: run.revision ?? 1,
-          taskIds: {},
-          error: 'fixture',
-        });
+      if (concurrentWrite) {
+        concurrentWrite = false;
+        await registry
+          .updateIfCurrent(
+            { ...run, wakeReason: 'Concurrent metadata observation' },
+            run.updatedAt,
+            true,
+          )
+          .then((result) => {
+            assert.equal(result.applied, true);
+            return result.run;
+          });
       }
       return git(args[0], args[1]);
     },
@@ -1271,7 +1276,7 @@ test('projection contention cannot log an unapplied stage transition', async () 
   assert.equal(bridge.spawnCount, 0);
   const log = await readFile(progressPath, 'utf8');
   assert.equal(
-    log.split('Plan validated; projecting task list.').length - 1,
+    log.split('Plan validated; preparing execution tasks.').length - 1,
     1,
   );
 });
@@ -1318,16 +1323,17 @@ test('controller cancels a stopped review without advancing later stages', async
   assert.equal(cancelled.activeOperation, undefined);
   assert.ok(cancelled.retiredAt !== undefined);
   assert.ok(cancelled.retiredAt >= beforeCancellation);
-  const projected = await registry.updateTaskProjection(cancelled, {
-    version: 1,
-    state: 'degraded',
-    owner: 'pi-plan-exec',
-    sessionId: 'session',
-    revision: cancelled.revision ?? 1,
-    taskIds: {},
-    error: 'fixture',
-  });
-  assert.equal(projected.retiredAt, cancelled.retiredAt);
+  const metadataUpdated = await registry
+    .updateIfCurrent(
+      { ...cancelled, wakeReason: 'Concurrent metadata observation' },
+      cancelled.updatedAt,
+      true,
+    )
+    .then((result) => {
+      assert.equal(result.applied, true);
+      return result.run;
+    });
+  assert.equal(metadataUpdated.retiredAt, cancelled.retiredAt);
   assert.equal(bridge.spawnCount, 0);
 });
 

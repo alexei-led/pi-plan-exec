@@ -5,7 +5,7 @@ import {
 } from '@earendil-works/pi-tui';
 import { parseAdvisoryObservation } from './advisory-observation.js';
 import { isGoalRun, isInFlightStatus, isTerminalStatus } from './lifecycle.js';
-import { taskProjectionSummary } from './task-projection.js';
+import { taskSummary } from './task-summary.js';
 import { type PlanExecRun, RUN_STATUS } from './types.js';
 
 export type ProgressTone = 'success' | 'warning' | 'error' | 'muted';
@@ -56,7 +56,7 @@ export function progressView(
 }
 
 function currentProgressView(run: PlanExecRun, now: number): ProgressView {
-  const summary = taskProjectionSummary(run);
+  const summary = taskSummary(run);
   const title = isGoalRun(run)
     ? run.goal.text
     : basename(run.planPath ?? 'Plan')

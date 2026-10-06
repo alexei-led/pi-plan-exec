@@ -267,28 +267,18 @@ test('terminal runs remain visible but leave background work', () => {
   assert.deepEqual(provider?.listActiveWork(), []);
 });
 
-test('degraded task projection is visible on the top-level row', () => {
+test('owner attribution keeps terminal history visible after lease release', () => {
   const api = new FakeRuntimeApi();
   const integration = new PlanExecRuntimeIntegration(api);
-  integration.reconcile(
-    [
-      run({
-        taskProjection: {
-          version: 1,
-          state: 'degraded',
-          owner: 'pi-plan-exec',
-          sessionId: 'session-1',
-          revision: 3,
-          taskIds: {},
-          error: 'pi-tasks memory scope has no durable path',
-        },
-      }),
-    ],
-    'session-1',
+  const terminal = run({ status: 'completed', ownerSessionId: 'session-1' });
+  delete terminal.lease;
+  integration.reconcile([terminal], 'foreign');
+  assert.equal(api.rows.size, 0);
+  integration.reconcile([terminal], 'session-1');
+  assert.equal(
+    [...api.rows.values()][0]?.preview,
+    'completed · implementation',
   );
-
-  assert.match(
-    [...api.rows.values()][0]?.preview ?? '',
-    /projection degraded.*memory scope/i,
-  );
+  assert.deepEqual([...api.providers.values()][0]?.listActiveWork(), []);
+  integration.dispose();
 });

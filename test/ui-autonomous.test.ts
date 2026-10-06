@@ -1,8 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { TaskStore } from '@tintinweb/pi-tasks/dist/task-store.js';
 import { test } from 'vitest';
 import {
   formatRunStatus,
@@ -10,8 +7,6 @@ import {
   shouldAutoRestoreRun,
   shouldStopBackgroundController,
 } from '../src/index.js';
-import { RunRegistry } from '../src/registry.js';
-import { sessionTaskPath, TaskProjector } from '../src/task-projection.js';
 import {
   DEFAULT_FROZEN_RUN_CONFIG,
   type PlanExecRun,
@@ -41,39 +36,6 @@ function runFixture(
     config: DEFAULT_FROZEN_RUN_CONFIG,
   };
 }
-
-test('projection preserves explicit independent dependencies and durable state', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-ui-'));
-  await writeFile(
-    join(root, 'plan.md'),
-    [
-      '### Task 1: First',
-      '- [ ] Pending',
-      '',
-      '### Task 2: Independent',
-      'dependsOn: []',
-      '- [ ] Pending',
-      '',
-      '### Task 3: Needs first',
-      'dependsOn: [1]',
-      '- [ ] Pending',
-      '',
-    ].join('\n'),
-  );
-  const registry = new RunRegistry(join(root, 'runs'));
-  const run = await registry.create(runFixture(root));
-  const projected = await new TaskProjector(registry).sync(run, {
-    cwd: root,
-    sessionId: 'session-1',
-  });
-  const tasks = new TaskStore(sessionTaskPath(root, 'session-1')).list();
-  const implementation = (id: number) =>
-    tasks.find((task) => task.metadata.planExecKey === `implementation:${id}`);
-  assert.deepEqual(implementation(2)?.blockedBy, []);
-  assert.deepEqual(implementation(3)?.blockedBy, [implementation(1)?.id]);
-  assert.deepEqual(implementation(2)?.metadata.planExecDependsOn, []);
-  assert.equal(projected.taskProjection?.state, 'ready');
-});
 
 test('strip prioritizes retry and keeps usage and lifetime evidence in status', () => {
   const now = 1_000_000;

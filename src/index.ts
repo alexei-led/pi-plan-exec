@@ -66,12 +66,11 @@ import {
   renderProgressStrip,
   VIEW_ENTRY,
 } from './run-view.js';
-import { loadPlanExecRuntimeIntegration } from './runtime-integration.js';
 import {
-  TASK_EXECUTION_STATE,
-  TaskProjector,
-  taskProjectionSummary,
-} from './task-projection.js';
+  loadPlanExecRuntimeIntegration,
+  matchesRunSession,
+} from './runtime-integration.js';
+import { TASK_EXECUTION_STATE, taskSummary } from './task-summary.js';
 import {
   type ActiveOperation,
   COMPLETED_PLANS_DIRECTORY,
@@ -93,7 +92,7 @@ import { workspaceCommand } from './workspace-environment.js';
 const defaultRegistry = new RunRegistry();
 const STATUS_KEY = 'plan-exec';
 const PROVIDER_PROBE_TIMEOUT_MS = 1_500;
-const PROJECTION_TIMEOUT_MS = 1_500;
+const RUNTIME_TIMEOUT_MS = 1_500;
 const COMMAND_CAS_RETRIES = 5;
 const SESSION_RETIREMENTS_KEY = Symbol.for(
   'pi-plan-exec.session-retirements.v1',
@@ -250,14 +249,12 @@ type StartBackgroundController = (
 type RuntimeCheck = () => Promise<void>;
 /** Prerequisite problems in report form; empty when every package is present. */
 type RuntimeProbe = () => Promise<string[]>;
-type SyncProjection = (
+type SyncRuntime = (
   run: PlanExecRun,
   options: { cwd: string; sessionId: string; runtimeSessionId?: string },
 ) => Promise<PlanExecRun>;
 
-function projectionContext(
-  ctx: Pick<ExtensionContext, 'cwd' | 'sessionManager'>,
-) {
+function runtimeContext(ctx: Pick<ExtensionContext, 'cwd' | 'sessionManager'>) {
   const sessionId = ctx.sessionManager.getSessionId();
   return {
     cwd: ctx.cwd,
@@ -375,60 +372,16 @@ async function restoreRetiredRun(
 }
 
 export default function planExecExtension(pi: ExtensionAPI): void {
-  const projector = new TaskProjector(defaultRegistry);
-  let persistentSession = true;
   const runtimeIntegration = loadPlanExecRuntimeIntegration().catch(
     () => undefined,
   );
-  type ProjectionRequest = {
-    run: PlanExecRun;
-    options: Parameters<SyncProjection>[1];
-  };
-  const projectionQueues = new Map<
-    string,
-    { work: Promise<PlanExecRun>; latest?: ProjectionRequest }
-  >();
-  const syncProjection: SyncProjection = (run, options) => {
+  const syncRuntime: SyncRuntime = (run, options) => {
     void runtimeIntegration
       .then((integration) =>
         integration?.sync(run, options.runtimeSessionId ?? options.sessionId),
       )
       .catch(() => undefined);
-    const pending = projectionQueues.get(run.id);
-    if (pending) {
-      if (!pending.latest || run.updatedAt >= pending.latest.run.updatedAt)
-        pending.latest = { run, options };
-      return Promise.resolve(run);
-    }
-    const persistent = persistentSession;
-    const next = Promise.resolve().then(() =>
-      projector.sync(run, { ...options, persistent }),
-    );
-    const entry: { work: Promise<PlanExecRun>; latest?: ProjectionRequest } = {
-      work: next,
-    };
-    projectionQueues.set(run.id, entry);
-    void next
-      .then(
-        () => undefined,
-        () => undefined,
-      )
-      .finally(() => {
-        if (projectionQueues.get(run.id) === entry) {
-          projectionQueues.delete(run.id);
-          if (entry.latest)
-            void syncProjection(entry.latest.run, entry.latest.options).catch(
-              () => undefined,
-            );
-        }
-      });
-    // A broken pi-tasks/runtime integration must not hold controller progress.
-    // Keep one cache writer; later ticks use their current snapshot and coalesce
-    // missed updates until this write settles.
-    return boundedPromise(next, PROJECTION_TIMEOUT_MS).then(
-      (projected) => entry.latest?.run ?? projected ?? run,
-      () => entry.latest?.run ?? run,
-    );
+    return Promise.resolve(run);
   };
   const bridge = new BridgeClient(pi.events);
   const fusion = new FusionClient(pi.events);
@@ -706,20 +659,19 @@ export default function planExecExtension(pi: ExtensionAPI): void {
             const transition = progressTransition(previous, run);
             if (transition) notify(ctx, transition, 'info');
           }
-          // Projection is a cache repair. Keep it serialized per run, but do
-          // not hold the controller's next tick on a slow or broken cache.
+          // Fleet is advisory and never holds the controller's next tick.
           void (async () => {
             try {
               setStatus(
-                await syncProjection(run, {
-                  ...projectionContext(ctx),
+                await syncRuntime(run, {
+                  ...runtimeContext(ctx),
                   sessionId,
                   cwd,
                 }),
                 ctx,
               );
             } catch {
-              // A broken projection cache never holds the controller's tick.
+              // Fleet failures never hold the controller's tick.
             }
           })();
           return run;
@@ -825,7 +777,7 @@ export default function planExecExtension(pi: ExtensionAPI): void {
         const message = await handleCommand(args.trim(), ctx, {
           controller,
           startBackgroundController,
-          syncProjection,
+          syncRuntime,
           checkRuntime,
           runtimeProblems,
           doctorProbe,
@@ -862,7 +814,7 @@ export default function planExecExtension(pi: ExtensionAPI): void {
             abandonedRuns.add(run.id);
             stopBackgroundController(run.id);
             setStatus(run, context);
-            void syncProjection(run, projectionContext(context)).catch(
+            void syncRuntime(run, runtimeContext(context)).catch(
               () => undefined,
             );
           },
@@ -992,7 +944,6 @@ export default function planExecExtension(pi: ExtensionAPI): void {
   });
 
   pi.on('session_start', async (_event, ctx) => {
-    persistentSession = ctx.sessionManager.getSessionFile?.() !== undefined;
     presentation = new RunPresentation(
       readViewPreferences(ctx.sessionManager.getBranch?.() ?? []),
     );
@@ -1000,7 +951,7 @@ export default function planExecExtension(pi: ExtensionAPI): void {
     const sessionId = ctx.sessionManager.getSessionId();
     const { runs, errors } = await defaultRegistry.listWithErrors();
     const contextualRuns = runs.filter((run) => matchesContext(run, ctx.cwd));
-    const runtimeSessionId = projectionContext(ctx).runtimeSessionId;
+    const runtimeSessionId = runtimeContext(ctx).runtimeSessionId;
     presentation.reconcile(contextualRuns);
     renderStatus(ctx);
     if (displayTimer) clearInterval(displayTimer);
@@ -1064,13 +1015,7 @@ export default function planExecExtension(pi: ExtensionAPI): void {
         })
         .catch(() => undefined);
     }
-    for (const run of contextualRuns) {
-      if (shouldRepairProjectionForSession(run, sessionId))
-        void syncProjection(run, projectionContext(ctx))
-          .then((projected) => setStatus(projected, ctx))
-          .catch(() => undefined);
-    }
-    void boundedPromise(runtimeIntegration, PROJECTION_TIMEOUT_MS)
+    void boundedPromise(runtimeIntegration, RUNTIME_TIMEOUT_MS)
       .then(async (integration) => {
         if (integration)
           await boundedPromise(
@@ -1081,14 +1026,11 @@ export default function planExecExtension(pi: ExtensionAPI): void {
                 runtimeSessionId,
               ),
             ),
-            PROJECTION_TIMEOUT_MS,
+            RUNTIME_TIMEOUT_MS,
           );
       })
       .catch(() => undefined);
-    void boundedPromise(
-      sweepAbandonment(defaultRegistry),
-      PROJECTION_TIMEOUT_MS,
-    )
+    void boundedPromise(sweepAbandonment(defaultRegistry), RUNTIME_TIMEOUT_MS)
       .then((sweep) => {
         if (!sweep) return;
         const notice = abandonedRunsNotice(sweep);
@@ -1132,16 +1074,16 @@ export default function planExecExtension(pi: ExtensionAPI): void {
     void retirement.settled
       .finally(() => retirements.delete(retirement))
       .catch(() => undefined);
-    void boundedPromise(runtimeIntegration, PROJECTION_TIMEOUT_MS)
+    void boundedPromise(runtimeIntegration, RUNTIME_TIMEOUT_MS)
       .then(async (integration) => {
         if (integration)
           await boundedPromise(
             Promise.resolve(integration.dispose()),
-            PROJECTION_TIMEOUT_MS,
+            RUNTIME_TIMEOUT_MS,
           );
       })
       .catch(() => undefined);
-    await boundedPromise(retirement.settled, PROJECTION_TIMEOUT_MS).catch(
+    await boundedPromise(retirement.settled, RUNTIME_TIMEOUT_MS).catch(
       () => undefined,
     );
     // Status is session-scoped in Pi, so the next session starts clean.
@@ -1775,14 +1717,6 @@ export function formatRunStatus(
     lines.push(
       `stats report: ${run.statsReport.state} — ${run.statsReport.error ?? run.statsReport.summary}`,
     );
-  if (run.taskProjection?.state === 'degraded')
-    lines.push(
-      `task projection: degraded — ${run.taskProjection.error ?? 'unknown error'}`,
-    );
-  else if (run.taskProjection?.state === 'ready')
-    lines.push(
-      `task projection: ready (${run.taskProjection.scope ?? 'unknown scope'}${run.taskProjection.listPath ? `, ${run.taskProjection.listPath}` : ''})`,
-    );
   if (operation?.lastObservedAt)
     lines.push(
       `last observation: ${new Date(operation.lastObservedAt).toISOString()}`,
@@ -1853,7 +1787,7 @@ export function formatRunStatus(
 }
 
 function taskStatusLines(run: PlanExecRun): string[] {
-  const summary = taskProjectionSummary(run);
+  const summary = taskSummary(run);
   if (summary.total === 0) return [];
   const lines = [
     `tasks: ${summary.accepted}/${summary.total} accepted; ready ${summary.ready}; running ${summary.running}; retry ${summary.retry}; dependency ${summary.dependency}; external ${summary.external}`,
@@ -2875,7 +2809,7 @@ async function pathExists(path: string): Promise<boolean | undefined> {
 interface CommandDependencies {
   controller: PlanExecController;
   startBackgroundController: StartBackgroundController;
-  syncProjection: SyncProjection;
+  syncRuntime: SyncRuntime;
   checkRuntime: RuntimeCheck;
   runtimeProblems: RuntimeProbe;
   doctorProbe: EvidenceProbe;
@@ -2903,16 +2837,6 @@ function mutateCommand<T>(
   operation: () => Promise<T>,
 ): Promise<T> {
   return dependencies.mutate ? dependencies.mutate(operation) : operation();
-}
-
-export function shouldRepairProjectionForSession(
-  run: PlanExecRun,
-  sessionId: string,
-): boolean {
-  return (
-    run.lease?.sessionId === sessionId ||
-    run.taskProjection?.sessionId === sessionId
-  );
 }
 
 /**
@@ -2962,31 +2886,28 @@ export function shouldStopBackgroundController(run: PlanExecRun): boolean {
   );
 }
 
-async function repairProjectionForRead(
+async function syncRuntimeForRead(
   args: string[],
   ctx: ExtensionCommandContext,
-  syncProjection: SyncProjection,
+  syncRuntime: SyncRuntime,
 ): Promise<void> {
   const sessionId = ctx.sessionManager.getSessionId();
   const selector = args.find((arg) => !arg.startsWith('--'));
   const selected = selector ? await defaultRegistry.get(selector) : undefined;
   const runs = selected
     ? matchesContext(selected, ctx.cwd) &&
-      (selected.lease?.sessionId === sessionId ||
-        selected.taskProjection?.sessionId === sessionId)
+      matchesRunSession(selected, sessionId)
       ? [selected]
       : []
     : (await defaultRegistry.list()).filter(
         (run) =>
-          matchesContext(run, ctx.cwd) &&
-          (run.lease?.sessionId === sessionId ||
-            run.taskProjection?.sessionId === sessionId),
+          matchesContext(run, ctx.cwd) && matchesRunSession(run, sessionId),
       );
   for (const run of runs) {
     try {
-      await syncProjection(run, projectionContext(ctx));
+      await syncRuntime(run, runtimeContext(ctx));
     } catch {
-      // The read still reports registry truth when a cache repair cannot land.
+      // The read still reports registry truth when Fleet is unavailable.
     }
   }
 }
@@ -2999,7 +2920,7 @@ export async function handleCommand(
   const {
     controller,
     startBackgroundController,
-    syncProjection,
+    syncRuntime,
     checkRuntime,
     runtimeProblems,
     doctorProbe,
@@ -3015,7 +2936,7 @@ export async function handleCommand(
     subcommand === EXEC_ACTION.RUNS ||
     subcommand === EXEC_ACTION.DOCTOR
   )
-    await repairProjectionForRead(rest, ctx, syncProjection);
+    await syncRuntimeForRead(rest, ctx, syncRuntime);
   const read = await execRead(defaultRegistry, subcommand, rest, {
     probe: doctorProbe,
     problems: runtimeProblems,
@@ -3088,7 +3009,7 @@ export async function handleCommand(
     (await handoff(
       ctx,
       started,
-      syncProjection,
+      syncRuntime,
       undefined,
       false,
       dependencies.handoffLifecycle,
@@ -3096,7 +3017,7 @@ export async function handleCommand(
   )
     return undefined;
   if (dependencies.isSessionClosed?.()) return undefined;
-  const run = await syncProjection(started, projectionContext(ctx));
+  const run = await syncRuntime(started, runtimeContext(ctx));
   startBackgroundController(
     run,
     ctx.sessionManager.getSessionId(),
@@ -3108,7 +3029,7 @@ export async function handleCommand(
           handoff(
             ctx,
             prepared,
-            syncProjection,
+            syncRuntime,
             undefined,
             true,
             dependencies.handoffLifecycle,
@@ -3240,7 +3161,7 @@ async function runAction(
   ctx: ExtensionCommandContext,
   dependencies: CommandDependencies,
 ): Promise<string | undefined> {
-  const { startBackgroundController, syncProjection } = dependencies;
+  const { startBackgroundController, syncRuntime } = dependencies;
   if (action === EXEC_ACTION.STOP && rest.includes('--force')) {
     const selectors = rest.filter((arg) => arg !== '--force');
     if (
@@ -3310,7 +3231,7 @@ async function runAction(
       .catch(() => undefined);
   };
   if (outcome === EXEC_ACTION.PAUSE) {
-    const paused = await syncProjection(
+    const paused = await syncRuntime(
       await mutateCommand(dependencies, async () =>
         requestStatus(
           retiring
@@ -3319,21 +3240,21 @@ async function runAction(
           EXEC_ACTION.PAUSE,
         ),
       ),
-      projectionContext(ctx),
+      runtimeContext(ctx),
     );
     const superseded = supersededCommandMessage(paused, dependencies);
     if (superseded) return superseded;
     startCleanup(paused);
     return `Run ${shortRunId(paused.id)} paused; its current attempt is stopping and its checkpoint is preserved. Use /exec resume ${paused.id} to continue after confirmed exit.`;
   }
-  const cancelled = await syncProjection(
+  const cancelled = await syncRuntime(
     await mutateCommand(dependencies, async () =>
       requestStatus(
         retiring ? resolved : await defaultRegistry.claim(resolved, sessionId),
         EXEC_ACTION.CANCEL,
       ),
     ),
-    projectionContext(ctx),
+    runtimeContext(ctx),
   );
   const superseded = supersededCommandMessage(cancelled, dependencies);
   if (superseded) return superseded;
@@ -3354,7 +3275,7 @@ async function resumeRun(
   const {
     controller,
     startBackgroundController,
-    syncProjection,
+    syncRuntime,
     checkRuntime,
     doctorProbe,
   } = dependencies;
@@ -3391,7 +3312,7 @@ async function resumeRun(
   const handedOff = await handoffToWorktree(
     ctx,
     run,
-    syncProjection,
+    syncRuntime,
     `resume ${run.id}${adoptCurrentBranch ? ' --adopt-current-branch' : ''}${retryTask ? ` ${TASK_RETRY_OPTION}` : ''}${recoveryModel ? ` ${RECOVERY_MODEL_OPTION} ${recoveryModel}` : ''}`,
     false,
     dependencies.handoffLifecycle,
@@ -3417,7 +3338,7 @@ async function resumeRun(
     );
     if (!accepted) throw new Error('Branch adoption cancelled.');
     if (dependencies.isSessionClosed?.()) return recovered.note;
-    const rebound = await syncProjection(
+    const rebound = await syncRuntime(
       await mutateCommand(dependencies, () =>
         controller.rebindBranchAndResume(
           run.id,
@@ -3425,7 +3346,7 @@ async function resumeRun(
           run.stopGeneration ?? 0,
         ),
       ),
-      projectionContext(ctx),
+      runtimeContext(ctx),
     );
     const superseded = supersededCommandMessage(rebound, dependencies);
     if (superseded) return superseded;
@@ -3434,7 +3355,7 @@ async function resumeRun(
   }
   const reviewedPlanHash = await reviewedPlanHashForResume(run, ctx);
   if (dependencies.isSessionClosed?.()) return recovered.note;
-  const resumed = await syncProjection(
+  const resumed = await syncRuntime(
     await mutateCommand(dependencies, () =>
       controller.resume(
         run.id,
@@ -3446,7 +3367,7 @@ async function resumeRun(
         run.stopGeneration ?? 0,
       ),
     ),
-    projectionContext(ctx),
+    runtimeContext(ctx),
   );
   const superseded = supersededCommandMessage(resumed, dependencies);
   if (superseded) return superseded;
@@ -3464,19 +3385,15 @@ async function skipStage(
   ctx: ExtensionCommandContext,
   dependencies: CommandDependencies,
 ): Promise<string | undefined> {
-  const {
-    controller,
-    startBackgroundController,
-    syncProjection,
-    checkRuntime,
-  } = dependencies;
+  const { controller, startBackgroundController, syncRuntime, checkRuntime } =
+    dependencies;
   const sessionId = ctx.sessionManager.getSessionId();
   await checkRuntime();
   const reason = parseSkipReason(rest.slice(1));
   const handedOff = await handoffToWorktree(
     ctx,
     run,
-    syncProjection,
+    syncRuntime,
     `skip ${run.id} --reason ${reason}`,
     false,
     dependencies.handoffLifecycle,
@@ -3500,11 +3417,11 @@ async function skipStage(
   );
   if (!accepted) throw new Error('Force-skip cancelled.');
   if (dependencies.isSessionClosed?.()) return undefined;
-  const skipped = await syncProjection(
+  const skipped = await syncRuntime(
     await mutateCommand(dependencies, () =>
       controller.skip(run.id, sessionId, reason, run.stopGeneration ?? 0),
     ),
-    projectionContext(ctx),
+    runtimeContext(ctx),
   );
   startBackgroundController(skipped, sessionId, ctx.cwd, ctx);
   return `Run ${shortRunId(skipped.id)} force-skip requested: ${skipped.status} (${skipped.stage}).\nUse /exec status ${skipped.id} for live progress.`;
@@ -3581,7 +3498,7 @@ export function canHandoffPreparedWorktree(run: PlanExecRun): boolean {
 async function handoffToWorktree(
   ctx: ExtensionCommandContext,
   run: PlanExecRun,
-  syncProjection: SyncProjection,
+  syncRuntime: SyncRuntime,
   followUp?: string,
   automatic = false,
   lifecycle?: HandoffLifecycle,
@@ -3592,7 +3509,7 @@ async function handoffToWorktree(
     return await prepareSessionHandoff(
       ctx,
       run,
-      syncProjection,
+      syncRuntime,
       followUp,
       automatic,
       lifecycle?.isClosed ?? (() => false),
@@ -3606,7 +3523,7 @@ async function handoffToWorktree(
 async function prepareSessionHandoff(
   ctx: ExtensionCommandContext,
   run: PlanExecRun,
-  syncProjection: SyncProjection,
+  syncRuntime: SyncRuntime,
   followUp: string | undefined,
   automatic: boolean,
   isClosed: () => boolean,
@@ -3691,7 +3608,7 @@ async function prepareSessionHandoff(
       },
     });
     if (!result.cancelled) {
-      void syncProjection(claimed, {
+      void syncRuntime(claimed, {
         cwd: targetSession.getCwd(),
         sessionId: targetSession.getSessionId(),
         runtimeSessionId: targetSessionFile,
@@ -4298,8 +4215,6 @@ export function execSetup(): string {
     ...requiredSetupCommands(),
     'Optional standalone Fusion panels (strict plan-exec review remains unsupported):',
     sourceInstallCommand('@alexeiled/pi-fusion'),
-    'Optional task visibility (not required for execution):',
-    sourceInstallCommand('@tintinweb/pi-tasks'),
     'No Git dependency pins are required for the default subagent review backend.',
     '',
     'Restart Pi after upgrading installed packages. Use /reload for local source/config changes. Use /exec help for commands.',

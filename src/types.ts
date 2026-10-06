@@ -555,18 +555,8 @@ export interface PlanExecRun {
   pendingStageSkip?: PendingStageSkip;
   branchRebindings: BranchRebinding[];
   progressPath?: string;
-  taskProjection?: {
-    version?: 1;
-    state?: 'ready' | 'degraded';
-    owner?: 'pi-plan-exec';
-    sessionId: string;
-    scope?: 'session';
-    listPath?: string;
-    packageVersion?: string;
-    revision?: number;
-    taskIds: Record<string, string>;
-    error?: string;
-  };
+  /** Presentation/history attribution only; control authority remains the lease. */
+  ownerSessionId?: string;
   activeOperation?: ActiveOperation;
   failedOperation?: ActiveOperation;
   /** Explicit stop: incomplete task or unmet goal, no automatic retry, resumable after confirmation. */

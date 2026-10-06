@@ -17,12 +17,12 @@ import { onTestFinished, test } from 'vitest';
 import { bridgeRequestDigest } from '../src/bridge.js';
 import { PlanExecController } from '../src/controller.js';
 import type { RunCommand } from '../src/git.js';
+import { formatRunStatus, formatRunWidget } from '../src/index.js';
 import { prepareIsolationDirectory } from '../src/isolation.js';
 import { runCommands } from '../src/lanes.js';
 import { parsePlan } from '../src/plan.js';
 import { RunRegistry } from '../src/registry.js';
 import { required } from '../src/required.js';
-import { TaskProjector } from '../src/task-projection.js';
 import { DEFAULT_FROZEN_RUN_CONFIG } from '../src/types.js';
 
 const execute = promisify(execFile);
@@ -273,7 +273,7 @@ test('explicit isolation preserves legacy uncertainty and creates one independen
   assert.equal(f.fences(), 1);
 });
 
-test('a stale UI context cannot write projection files back to the quarantined tree', async () => {
+test('rendering isolated recovery never writes task files to either checkout', async () => {
   const f = await fixture();
   const target = join(f.root, 'new');
   const run = await f.controller.recoverIsolated(
@@ -283,16 +283,14 @@ test('a stale UI context cannot write projection files back to the quarantined t
     true,
   );
   assert.equal(run.isolationRecovery?.state, 'active');
-  const projected = await new TaskProjector(f.registry).sync(f.run, {
-    cwd: f.old,
-    sessionId: 'stale-session',
-  });
-  await assert.rejects(
-    readFile(join(f.old, '.pi/tasks/tasks-stale-session.json')),
-    { code: 'ENOENT' },
-  );
-  assert.equal(projected.taskProjection?.state, 'ready');
-  assert.ok(projected.taskProjection?.listPath?.startsWith(target));
+  formatRunStatus(f.run);
+  formatRunWidget(run);
+  for (const cwd of [f.old, target])
+    await assert.rejects(
+      readFile(join(cwd, '.pi/tasks/tasks-stale-session.json')),
+      { code: 'ENOENT' },
+    );
+  assert.equal((await f.registry.get(run.id))?.worktreeCwd, run.worktreeCwd);
 });
 
 test('isolation materializes an explicitly approved plan newer than the accepted commit', async () => {

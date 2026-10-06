@@ -95,7 +95,7 @@ export class PlanExecRuntimeIntegration {
     this.ensureProvider();
     const desired = new Set(
       runs
-        .filter((run) => matchesContextRun(run, ownerSessionId))
+        .filter((run) => matchesRunSession(run, ownerSessionId))
         .map((run) => run.id),
     );
     const desiredExternal = new Set([...desired].map(externalRunId));
@@ -122,7 +122,7 @@ export class PlanExecRuntimeIntegration {
       if (!desired.has(runId)) this.unregister(runId);
     }
     for (const run of runs) {
-      if (matchesContextRun(run, ownerSessionId))
+      if (matchesRunSession(run, ownerSessionId))
         this.sync(run, runtimeSessionId);
     }
   }
@@ -258,10 +258,6 @@ function externalRecord(
   sessionId: string,
   id: string,
 ): ExternalRunRecord {
-  const projectionError =
-    run.taskProjection?.state === 'degraded'
-      ? (run.taskProjection.error ?? 'unknown projection error')
-      : undefined;
   return {
     id,
     sessionId,
@@ -269,9 +265,7 @@ function externalRecord(
     label: `PlanExec ${run.planPath !== undefined ? basename(run.planPath) : `goal ${run.goal?.hash ?? run.id}`}`,
     state: externalState(run),
     currentAction: run.stage,
-    preview: projectionError
-      ? `Task projection degraded: ${projectionError}`
-      : `${run.status} · ${run.stage}`,
+    preview: `${run.status} · ${run.stage}`,
     startedAt: run.createdAt,
     updatedAt: run.updatedAt,
     ...(isTerminalStatus(run.status) ? { endedAt: run.updatedAt } : {}),
@@ -287,11 +281,11 @@ function externalRunUpdate(record: ExternalRunRecord): ExternalRunUpdate {
   ) as ExternalRunUpdate;
 }
 
-function matchesContextRun(run: PlanExecRun, sessionId: string): boolean {
-  return (
-    run.lease?.sessionId === sessionId ||
-    run.taskProjection?.sessionId === sessionId
-  );
+export function matchesRunSession(
+  run: PlanExecRun,
+  sessionId: string,
+): boolean {
+  return run.lease?.sessionId === sessionId || run.ownerSessionId === sessionId;
 }
 
 function externalState(run: PlanExecRun): ExternalRunState {

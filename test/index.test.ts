@@ -69,7 +69,6 @@ import planExecExtension, {
   runtimeIntegrationProblem,
   sameMachineRefusal,
   settledRunLines,
-  shouldRepairProjectionForSession,
   shouldStopBackgroundController,
   sweepAbandonment,
 } from '../src/index.js';
@@ -81,7 +80,6 @@ import { LocalOperationFailedError } from '../src/local-operation.js';
 import { RunRegistry } from '../src/registry.js';
 import { required } from '../src/required.js';
 import { PlanExecRuntimeIntegration } from '../src/runtime-integration.js';
-import { TaskProjector } from '../src/task-projection.js';
 import {
   DEFAULT_FROZEN_RUN_CONFIG,
   EXEC_ACTION,
@@ -243,11 +241,11 @@ test('worktree selection recognizes a symlink alias without a redundant session 
 });
 
 for (const status of ['paused', 'completed'] as const)
-  test(`startup renders a selected foreign-session ${status} run without a projection`, async (t) => {
+  test(`startup renders a selected foreign-session ${status} run without session attribution`, async (t) => {
     const held = run({ status });
     delete held.activeOperation;
     delete held.lease;
-    delete held.taskProjection;
+    delete held.ownerSessionId;
     const { registry, directory } = await seedDirectory([held]);
     t.after(() => rm(directory, { recursive: true, force: true }));
     t.mock.method(
@@ -271,6 +269,66 @@ for (const status of ['paused', 'completed'] as const)
     assert.ok(h.footer());
     await h.emit('session_shutdown');
   });
+
+test('legacy terminal history is visible without rewriting registry or task files', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'exec-read-only-history-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const taskDirectory = join(root, '.pi', 'tasks');
+  await mkdir(taskDirectory, { recursive: true });
+  const taskFile = join(taskDirectory, 'tasks-history-session.json');
+  const foreignTasks = '{"foreign":"owned elsewhere"}\n';
+  await writeFile(taskFile, foreignTasks);
+  const legacy = {
+    ...retiredRun({ repositoryRoot: root, worktreeCwd: root }),
+    taskProjection: {
+      version: 1,
+      owner: 'pi-plan-exec',
+      scope: 'session',
+      sessionId: 'history-session',
+      state: 'degraded',
+      error: 'old cache error',
+      taskIds: {},
+    },
+  };
+  const { registry, directory } = await seedDirectory([legacy]);
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const before = await snapshotRuns(directory);
+  t.mock.method(
+    RunRegistry.prototype,
+    'listWithErrors',
+    registry.listWithErrors.bind(registry),
+  );
+  t.mock.method(RunRegistry.prototype, 'get', registry.get.bind(registry));
+  const rows: PlanExecRun[] = [];
+  t.mock.method(
+    PlanExecRuntimeIntegration.prototype,
+    'sync',
+    (run: PlanExecRun) => {
+      rows.push(run);
+    },
+  );
+  const h = executionHarness(root, 'history-session');
+  t.after(() => h.emit('session_shutdown'));
+  await h.emit('session_start');
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await h.command(`status ${legacy.id}`);
+  await h.command('show');
+  assert.ok(h.widget());
+  assert.ok(
+    rows.some(
+      (run) => run.id === legacy.id && run.ownerSessionId === 'history-session',
+    ),
+  );
+  assert.doesNotMatch(
+    h.notifications.join('\n'),
+    /task projection|old cache error/i,
+  );
+  assert.deepEqual(await snapshotRuns(directory), before);
+  assert.equal(await readFile(taskFile, 'utf8'), foreignTasks);
+  assert.deepEqual(await readdir(taskDirectory), [
+    'tasks-history-session.json',
+  ]);
+});
 
 test('TUI strip reads the active theme again after invalidation', async (t) => {
   const held = run({ status: 'completed' });
@@ -303,10 +361,10 @@ test('TUI strip reads the active theme again after invalidation', async (t) => {
   await h.emit('session_shutdown');
 });
 
-test('projection routes use native transcript identity while leases and task rows keep UUIDs', async (t) => {
+test('Fleet routes use native transcript identity while attribution keeps UUIDs', async (t) => {
   const held = run({
     status: 'paused',
-    taskProjection: { sessionId: 'native-routing', taskIds: {} },
+    ownerSessionId: 'native-routing',
   });
   delete held.activeOperation;
   delete held.lease;
@@ -319,20 +377,11 @@ test('projection routes use native transcript identity while leases and task row
   );
   t.mock.method(RunRegistry.prototype, 'get', registry.get.bind(registry));
   const nativeIds: string[] = [];
-  const taskIds: string[] = [];
   t.mock.method(
     PlanExecRuntimeIntegration.prototype,
     'sync',
     (_run: PlanExecRun, sessionId: string) => {
       nativeIds.push(sessionId);
-    },
-  );
-  t.mock.method(
-    TaskProjector.prototype,
-    'sync',
-    async (run: PlanExecRun, options: { sessionId: string }) => {
-      taskIds.push(options.sessionId);
-      return run;
     },
   );
   const h = executionHarness(held.repositoryRoot, 'native-routing');
@@ -343,12 +392,7 @@ test('projection routes use native transcript identity while leases and task row
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.ok(nativeIds.length > 0);
   assert.ok(nativeIds.every((id) => id === '/tmp/native-routing.jsonl'));
-  assert.ok(taskIds.length > 0);
-  assert.ok(taskIds.every((id) => id === 'native-routing'));
-  assert.equal(
-    (await registry.get(held.id))?.taskProjection?.sessionId,
-    'native-routing',
-  );
+  assert.equal((await registry.get(held.id))?.ownerSessionId, 'native-routing');
   await h.emit('session_shutdown');
 });
 
@@ -375,12 +419,12 @@ test('status keeps native cancellation refusal separate from healthy observation
   );
 });
 
-test('hanging task projection cannot retain completed background work', {
+test('terminal registry observations promptly update Fleet', {
   timeout: 5000,
 }, async (t) => {
   const held = run({
     status: 'paused',
-    taskProjection: { sessionId: 'hanging-projection', taskIds: {} },
+    ownerSessionId: 'runtime-history',
   });
   delete held.activeOperation;
   delete held.lease;
@@ -392,15 +436,6 @@ test('hanging task projection cannot retain completed background work', {
     registry.listWithErrors.bind(registry),
   );
   t.mock.method(RunRegistry.prototype, 'get', registry.get.bind(registry));
-  let release!: (run: PlanExecRun) => void;
-  t.mock.method(
-    TaskProjector.prototype,
-    'sync',
-    () =>
-      new Promise<PlanExecRun>((resolve) => {
-        release = resolve;
-      }),
-  );
   const snapshots: string[] = [];
   t.mock.method(
     PlanExecRuntimeIntegration.prototype,
@@ -409,7 +444,7 @@ test('hanging task projection cannot retain completed background work', {
       snapshots.push(run.status);
     },
   );
-  const h = executionHarness(held.repositoryRoot, 'hanging-projection');
+  const h = executionHarness(held.repositoryRoot, 'runtime-history');
   await h.emit('session_start');
   await new Promise<void>((resolve) => setImmediate(resolve));
   const current = required((await registry.listWithErrors()).runs[0]);
@@ -417,7 +452,6 @@ test('hanging task projection cannot retain completed background work', {
   await h.command(`status ${completed.id}`);
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.ok(snapshots.includes('completed'));
-  release(completed);
   await h.emit('session_shutdown');
 });
 
@@ -425,7 +459,7 @@ for (const owner of ['same-host', 'other-host', 'unleased'] as const)
   test(`unpolled ${owner} run stays an amber snapshot on startup and explicit show`, async (t) => {
     const held = run({ status: 'running', userStopped: owner === 'unleased' });
     delete held.activeOperation;
-    delete held.taskProjection;
+    delete held.ownerSessionId;
     if (owner === 'unleased') delete held.lease;
     else
       held.lease = {
@@ -464,7 +498,7 @@ test('only a locally owned successful poll paints live progress; poll failure re
   const held = run({ status: 'running' });
   delete held.lease;
   delete held.activeOperation;
-  delete held.taskProjection;
+  delete held.ownerSessionId;
   const { registry, directory } = await seedDirectory([held]);
   t.after(() => rm(directory, { recursive: true, force: true }));
   t.mock.method(
@@ -474,7 +508,7 @@ test('only a locally owned successful poll paints live progress; poll failure re
   );
   t.mock.method(RunRegistry.prototype, 'get', registry.get.bind(registry));
   t.mock.method(
-    TaskProjector.prototype,
+    PlanExecRuntimeIntegration.prototype,
     'sync',
     async (run: PlanExecRun) => run,
   );
@@ -544,7 +578,7 @@ for (const staleCompletion of [false, true])
       registry.abandonmentBackupPath.bind(registry),
     );
     t.mock.method(
-      TaskProjector.prototype,
+      PlanExecRuntimeIntegration.prototype,
       'sync',
       async (current: PlanExecRun) => current,
     );
@@ -619,7 +653,7 @@ test('cross-project stop still handles terminal results and retires its timer', 
     registry.updateIfCurrent.bind(registry),
   );
   t.mock.method(
-    TaskProjector.prototype,
+    PlanExecRuntimeIntegration.prototype,
     'sync',
     async (current: PlanExecRun) => current,
   );
@@ -674,7 +708,7 @@ test('goal resume refuses permanent abandonment without announcing a resume', as
   await h.emit('session_shutdown');
 });
 
-test('a pause waiting on projection cannot restart a removed force-stopped run', async (t) => {
+test('a pause waiting on its registry write cannot restart a removed force-stopped run', async (t) => {
   const held = run({
     status: 'running',
     lease: { ...liveLease(), sessionId: 'pause-force-owner' },
@@ -689,11 +723,6 @@ test('a pause waiting on projection cannot restart a removed force-stopped run',
     registry.listWithErrors.bind(registry),
   );
   t.mock.method(RunRegistry.prototype, 'claim', registry.claim.bind(registry));
-  t.mock.method(
-    RunRegistry.prototype,
-    'updateIfCurrent',
-    registry.updateIfCurrent.bind(registry),
-  );
   t.mock.method(
     RunRegistry.prototype,
     'abandon',
@@ -717,15 +746,17 @@ test('a pause waiting on projection cannot restart a removed force-stopped run',
   const delayed = new Promise<void>((resolve) => {
     release = resolve;
   });
+  const writeCurrent = registry.updateIfCurrent.bind(registry);
   t.mock.method(
-    TaskProjector.prototype,
-    'sync',
-    async (current: PlanExecRun) => {
-      if (current.status === 'paused') {
+    RunRegistry.prototype,
+    'updateIfCurrent',
+    async (...args: Parameters<RunRegistry['updateIfCurrent']>) => {
+      const written = await writeCurrent(...args);
+      if (written.applied && written.run.status === 'paused') {
         entered();
         await delayed;
       }
-      return current;
+      return written;
     },
   );
   const tick = t.mock.method(PlanExecController.prototype, 'tick', async () => {
@@ -783,7 +814,7 @@ test('force stop stays dismissed through late updates, branch navigation, and a 
     registry.abandonmentBackupPath.bind(registry),
   );
   t.mock.method(
-    TaskProjector.prototype,
+    PlanExecRuntimeIntegration.prototype,
     'sync',
     async (current: PlanExecRun) => current,
   );
@@ -845,16 +876,11 @@ test('branch navigation restores cached visibility without querying the registry
   await h.emit('session_shutdown');
 });
 
-test('display controls persist independently of stopped run state and late projection', async (t) => {
+test('display controls persist independently of stopped run state', async (t) => {
   const paused = run({
     status: 'paused',
     userStopped: true,
-    taskProjection: {
-      state: 'degraded',
-      sessionId: 'display-session',
-      taskIds: {},
-      error: 'missing plan',
-    },
+    ownerSessionId: 'display-session',
   });
   delete paused.activeOperation;
   delete paused.lease;
@@ -865,11 +891,6 @@ test('display controls persist independently of stopped run state and late proje
     RunRegistry.prototype,
     'listWithErrors',
     registry.listWithErrors.bind(registry),
-  );
-  t.mock.method(
-    TaskProjector.prototype,
-    'sync',
-    async (run: PlanExecRun) => run,
   );
   const held = required((await registry.listWithErrors()).runs[0]);
   const h = executionHarness(held.repositoryRoot, 'display-session', entries);
@@ -1232,26 +1253,6 @@ test('runtime prerequisite check identifies missing provider extensions', () => 
   );
 });
 
-test('reload repairs terminal projections owned by the current session', () => {
-  const terminal = retiredRun({
-    taskProjection: {
-      version: 1,
-      state: 'ready',
-      owner: 'pi-plan-exec',
-      sessionId: 'session-1',
-      scope: 'session',
-      revision: 1,
-      taskIds: {},
-    },
-  });
-
-  assert.equal(shouldRepairProjectionForSession(terminal, 'session-1'), true);
-  assert.equal(
-    shouldRepairProjectionForSession(terminal, 'foreign-session'),
-    false,
-  );
-});
-
 test('start paths preserve spaces and accept quoted explicit worktree paths', () => {
   for (const input of [
     'docs/plans/my  plan.md',
@@ -1332,10 +1333,7 @@ test('help and setup explain the installed command surface', () => {
   );
   assert.match(execSetup(), /No Git dependency pins are required/);
   assert.match(execSetup(), /strict plan-exec review remains unsupported/);
-  assert.match(
-    execSetup(),
-    /^pi install -l npm:@tintinweb\/pi-tasks@0\.9\.0$/m,
-  );
+  assert.doesNotMatch(execSetup(), /pi-tasks/);
 });
 
 test('setup installs the released bridge and fusion pins', () => {
@@ -1353,10 +1351,7 @@ test('setup installs the released bridge and fusion pins', () => {
     /^pi install npm:(?:pi-subagents|@alexeiled\/pi-plan-exec)$/m,
   );
   assert.doesNotMatch(execSetup(), /pi-subagents-codex-fix/);
-  assert.match(
-    execSetup(),
-    /Optional task visibility \(not required for execution\)/,
-  );
+  assert.doesNotMatch(execSetup(), /Optional task visibility/);
 });
 
 test('cancel cannot bypass a pending force-skip', () => {
@@ -4666,7 +4661,7 @@ test('a saved session waits for durable Git lane creation and recovers creation 
       started = run;
       afterTick = handoff;
     },
-    syncProjection: async (run) => run,
+    syncRuntime: async (run) => run,
     checkRuntime: async () => undefined,
     runtimeProblems: async () => [],
     doctorProbe: async () => ({}),
@@ -4870,7 +4865,7 @@ test("explicit pause from an unrelated session polls a dead owner's worker until
   });
   const response = await handleCommand(`pause ${held.id}`, ctx, {
     controller,
-    syncProjection: async (run) => run,
+    syncRuntime: async (run) => run,
     checkRuntime: async () => undefined,
     runtimeProblems: async () => [],
     doctorProbe: async () => ({}),
@@ -5039,7 +5034,7 @@ for (const phase of [
       },
     );
     t.mock.method(
-      TaskProjector.prototype,
+      PlanExecRuntimeIntegration.prototype,
       'sync',
       async (current: PlanExecRun) => current,
     );
@@ -5161,7 +5156,7 @@ test("a queued resume from another directory cannot override a replacement sessi
     registry.updateIfCurrent.bind(registry),
   );
   t.mock.method(
-    TaskProjector.prototype,
+    PlanExecRuntimeIntegration.prototype,
     'sync',
     async (current: PlanExecRun) => current,
   );
@@ -5236,7 +5231,7 @@ test('stop needs no UI and its final intent survives session replacement', {
   );
   t.mock.method(RunRegistry.prototype, 'claim', registry.claim.bind(registry));
   t.mock.method(
-    TaskProjector.prototype,
+    PlanExecRuntimeIntegration.prototype,
     'sync',
     async (current: PlanExecRun) => current,
   );
@@ -5257,7 +5252,7 @@ test('stop needs no UI and its final intent survives session replacement', {
 });
 
 for (const interruption of ['shutdown', 'new-owner', 'own-switch'] as const) {
-  test(`worktree handoff fences ${interruption} without waiting for projection or reclaiming another lease`, {
+  test(`worktree handoff fences ${interruption} without waiting for Fleet or reclaiming another lease`, {
     timeout: 5_000,
   }, async (t) => {
     const initialCwd = process.cwd();
@@ -5311,18 +5306,18 @@ for (const interruption of ['shutdown', 'new-owner', 'own-switch'] as const) {
     t.mock.method(PlanExecController.prototype, 'tick', async () => {
       assert.fail('The source must not restart after handoff shutdown.');
     });
-    let projectionCalls = 0;
-    let releaseProjection!: () => void;
-    const projection = new Promise<void>((resolve) => {
-      releaseProjection = resolve;
+    let runtimeCalls = 0;
+    let releaseRuntime!: () => void;
+    const runtimePending = new Promise<void>((resolve) => {
+      releaseRuntime = resolve;
     });
-    t.after(releaseProjection);
+    t.after(releaseRuntime);
     t.mock.method(
-      TaskProjector.prototype,
+      PlanExecRuntimeIntegration.prototype,
       'sync',
       async (current: PlanExecRun) => {
-        projectionCalls++;
-        await projection;
+        runtimeCalls++;
+        await runtimePending;
         return current;
       },
     );
@@ -5416,7 +5411,7 @@ for (const interruption of ['shutdown', 'new-owner', 'own-switch'] as const) {
           : targetOwner.sessionId,
     );
     assert.equal(switchCalls, interruption === 'own-switch' ? 1 : 0);
-    assert.equal(projectionCalls, interruption === 'own-switch' ? 1 : 0);
+    assert.equal(runtimeCalls, interruption === 'own-switch' ? 1 : 0);
     assert.deepEqual(errors, []);
     assert.equal(process.cwd(), initialCwd);
   });
@@ -5499,7 +5494,7 @@ for (const reason of ['new', 'reload'] as const) {
       },
     );
     t.mock.method(
-      TaskProjector.prototype,
+      PlanExecRuntimeIntegration.prototype,
       'sync',
       async (current: PlanExecRun) => current,
     );
@@ -5826,23 +5821,24 @@ for (const status of [
   'completed',
   'completed_with_findings',
 ] as const)
-  test(`projection repair cannot postpone cleanup of a legacy ${status} run`, async () => {
+  test(`metadata updates cannot postpone cleanup of a legacy ${status} run`, async () => {
     const cancelled = retiredRun({ status, updatedAt: PAST_RETENTION });
     const registry = await seedRegistry([cancelled]);
     assert.equal(isRemovableRun(cancelled), true);
-    const projected = await registry.updateTaskProjection(cancelled, {
-      version: 1,
-      state: 'degraded',
-      owner: 'pi-plan-exec',
-      sessionId: 'session',
-      revision: cancelled.revision ?? 1,
-      taskIds: {},
-      error: 'fixture',
-    });
-    assert.equal(projected.revision, cancelled.revision ?? 1);
-    assert.ok(projected.updatedAt > cancelled.updatedAt);
-    assert.equal(projected.retiredAt, cancelled.updatedAt);
-    assert.equal(isRemovableRun(projected), true);
+    const metadataUpdated = await registry
+      .updateIfCurrent(
+        { ...cancelled, wakeReason: 'Concurrent metadata observation' },
+        cancelled.updatedAt,
+        true,
+      )
+      .then((result) => {
+        assert.equal(result.applied, true);
+        return result.run;
+      });
+    assert.equal(metadataUpdated.revision, cancelled.revision ?? 1);
+    assert.ok(metadataUpdated.updatedAt > cancelled.updatedAt);
+    assert.equal(metadataUpdated.retiredAt, cancelled.updatedAt);
+    assert.equal(isRemovableRun(metadataUpdated), true);
   });
 test('retention is measured from when a run finished, not from its last write', () => {
   // A lease release writes the record after the run is over, so `updatedAt`

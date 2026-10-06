@@ -199,10 +199,7 @@ export function removalRefusal(run: PlanExecRun): string | undefined {
   return undefined;
 }
 
-/**
- * The global orchestration store. It is deliberately separate from pi-tasks:
- * pi-tasks is session-scoped UI projection, while this record survives adoption.
- */
+/** The durable global orchestration store, including session attribution. */
 export class RunRegistry {
   constructor(private readonly directory = RUNS_DIRECTORY) {}
 
@@ -561,7 +558,7 @@ export class RunRegistry {
       )
         return { run: current, applied: false };
       const updatedAt = nextUpdatedAt(current.updatedAt);
-      // Final runs keep their retention anchor through projection repair and
+      // Final runs keep their retention anchor through metadata updates and
       // lease release. Older final records retain their existing cleanup age.
       const retiredAt =
         run.retiredAt ??
@@ -585,28 +582,6 @@ export class RunRegistry {
     }
   }
 
-  async updateTaskProjection(
-    run: PlanExecRun,
-    taskProjection: NonNullable<PlanExecRun['taskProjection']>,
-  ): Promise<PlanExecRun> {
-    let current = (await this.get(run.id)) ?? run;
-    if (current.status === RUN_STATUS.ABANDONED) return current;
-    for (let attempt = 0; attempt < CLAIM_CAS_RETRIES; attempt += 1) {
-      if ((current.executionGeneration ?? 0) !== (run.executionGeneration ?? 0))
-        return current;
-      const written = await this.updateIfCurrent(
-        { ...current, taskProjection },
-        current.updatedAt,
-        true,
-      );
-      if (written.applied) return written.run;
-      current = written.run;
-    }
-    throw new Error(
-      `Run ${run.id} changed repeatedly while repairing its task projection.`,
-    );
-  }
-
   async claim(run: PlanExecRun, sessionId: string): Promise<PlanExecRun> {
     if (!sessionId.trim())
       throw new Error('A Pi session ID is required to claim a run.');
@@ -623,6 +598,7 @@ export class RunRegistry {
       const claimed = await this.updateIfCurrent(
         {
           ...current,
+          ownerSessionId: sessionId,
           lease: {
             sessionId,
             pid: process.pid,
@@ -848,7 +824,14 @@ function parseRun(raw: string, runId: string): PlanExecRun {
 function migrateLegacyRun(value: Record<string, unknown>): PlanExecRun {
   const stage = value.stage === 'tasks' ? RUN_STAGE.PROJECT_TASKS : value.stage;
   const config = isRecord(value.config) ? value.config : {};
-  const legacy = value as unknown as PlanExecRun & { blockedTask?: unknown };
+  // Old projection metadata is read only for history attribution, never retained
+  // as a writable cache or used as execution authority.
+  const { taskProjection, ...record } = value;
+  const legacy = record as unknown as PlanExecRun & { blockedTask?: unknown };
+  const ownerSessionId =
+    legacy.ownerSessionId === undefined
+      ? legacyProjectionSessionId(taskProjection)
+      : legacy.ownerSessionId;
   const blocked =
     legacy.blocked ??
     (isRecord(legacy.blockedTask)
@@ -861,6 +844,7 @@ function migrateLegacyRun(value: Record<string, unknown>): PlanExecRun {
       : undefined);
   const migrated: PlanExecRun = {
     ...legacy,
+    ...(ownerSessionId !== undefined ? { ownerSessionId } : {}),
     revision:
       typeof value.revision === 'number' && Number.isInteger(value.revision)
         ? value.revision
@@ -952,9 +936,28 @@ function migrateLegacyRun(value: Record<string, unknown>): PlanExecRun {
   return migrated;
 }
 
+function validSessionId(value: unknown): value is string {
+  return (
+    typeof value === 'string' && value.length > 0 && value.trim() === value
+  );
+}
+
+function legacyProjectionSessionId(value: unknown): string | undefined {
+  if (
+    !isRecord(value) ||
+    !validSessionId(value.sessionId) ||
+    (value.version !== undefined && value.version !== 1) ||
+    (value.owner !== undefined && value.owner !== 'pi-plan-exec') ||
+    (value.scope !== undefined && value.scope !== 'session')
+  )
+    return undefined;
+  return value.sessionId;
+}
+
 function assertRun(run: PlanExecRun): void {
   assertRunId(run.id);
   if (
+    (run.ownerSessionId !== undefined && !validSessionId(run.ownerSessionId)) ||
     !RUN_STAGES.includes(run.stage) ||
     !RUN_STATUSES.includes(run.status) ||
     !Number.isInteger(run.revision) ||

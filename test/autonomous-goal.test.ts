@@ -561,6 +561,8 @@ test('startGoal reports its allocated run to the caller', async (t) => {
     checks: CHECK,
     onRunAllocated: (run) => {
       allocated = run;
+      assert.equal(run.ownerSessionId, 'session');
+      assert.equal(run.lease, undefined);
     },
   });
   assert.ok(
