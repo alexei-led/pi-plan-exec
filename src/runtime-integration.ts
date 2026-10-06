@@ -141,6 +141,11 @@ export class PlanExecRuntimeIntegration {
     )
       this.unregister(run.id);
 
+    if (run.status === RUN_STATUS.ABANDONED) {
+      this.observedAt.set(rowKey, run.updatedAt);
+      this.unregister(run.id);
+      return;
+    }
     const record = externalRecord(run, sessionId, externalId);
     const currentOwner = ownership.get(rowKey);
     if (currentOwner && currentOwner.generation > this.generation) return;
@@ -298,6 +303,7 @@ function externalState(run: PlanExecRun): ExternalRunState {
       return 'completed';
     case RUN_STATUS.FAILED:
       return 'failed';
+    case RUN_STATUS.ABANDONED:
     case RUN_STATUS.CANCELLED:
       return 'stopped';
     case RUN_STATUS.PAUSED:

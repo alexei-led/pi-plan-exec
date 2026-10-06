@@ -1,5 +1,37 @@
 # Changelog
 
+## 1.8.0 - 2026-10-06
+
+### Changed
+
+- `/exec stop` now requests final cancellation without a pause-or-cancel dialog.
+  Use `/exec pause` for resumable work, and `/exec ui on|off` for display only.
+  Legacy cancel/hide/show/clear commands remain supported.
+- `/exec stop <full-run-id> --force` permanently abandons controller management,
+  including legacy unknown launches. No automatic retries, restoration or
+  resume follow abandonment. The run disappears from progress displays and
+  the default status list, including other open observing sessions.
+- Force-stop attempts cancellation only for the exact tracked ownership.
+  Unknown workers are not reported as stopped; their operation evidence and
+  checkout reservations remain. A live foreign controller refuses the action.
+- Eligible registry artifacts are removed only after controller quiescence and
+  flushed backups. Worktrees, branches, progress files and provider journals
+  are preserved. Repeat the command to retry partial cleanup.
+- Late callbacks cannot revive abandoned runs or report successful completion.
+  Pending archive mutations recheck stop authorization.
+
+### Upgrade
+
+- Restart every Pi session sharing the registry after upgrading. Change scripts that relied on the old stop
+  chooser to `/exec pause` for resumable stops.
+- Force-stop is irreversible abandonment, not recovery or proof of worker
+  death. Inspect retained records by full ID or `status --all`; do not
+  downgrade or use older cleanup while abandoned records remain: older versions
+  reject the new status but their corrupt-record cleanup can erase its reservation.
+- No dependency upgrade or live journal migration is required.
+
+[Full changes](https://github.com/alexei-led/pi-plan-exec/compare/v1.7.1...v1.8.0)
+
 ## 1.7.1 - 2026-10-06
 
 ### Fixed

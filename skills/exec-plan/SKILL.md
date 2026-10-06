@@ -29,8 +29,9 @@ Never replace controller recovery with a manually launched subagent.
   its install command, and prints one next command per run. Pi also points at it
   at session start when its startup sweep finds an abandoned run.
 - Inspect one run: `/exec status <full-run-id>`.
-- Hide the strip and footer immediately: `/exec hide`. Execution continues.
-- Restore the display without resuming work: `/exec show [full-run-id]`.
+- Hide the strip and footer immediately: `/exec ui off`. Execution continues.
+- Restore the display without resuming work: `/exec ui on`.
+- Compatibility display aliases: `/exec hide`, `/exec show [full-run-id]`.
 - Dismiss the displayed run: `/exec clear [full-run-id]`. This does not cancel
   execution or delete recovery evidence. No `--apply`; preferences survive reload
   in the active Pi session branch.
@@ -61,9 +62,16 @@ with an `Evidence:` line creates `waiting_external`; the controller records it
 and schedules an automatic wake. Generic blocker wording never proves an
 external prerequisite.
 
-- Stop a run and choose the outcome: `/exec stop <full-run-id>`. It asks whether
-  to pause (resumable) or cancel (final, worktree preserved). It needs a human
-  to answer, so an agent uses the scripted path below.
+- Pause resumably: `/exec pause <full-run-id>`.
+- Stop finally: `/exec stop <full-run-id>`. No outcome dialog. Wait for
+  `cancelled` before claiming worker retirement.
+- End management permanently: `/exec stop <full-run-id> --force`. Requires
+  explicit operator approval of abandonment. Stops automatic recovery and hides
+  the run across restarts; attempts exact-operation cancellation but never
+  equates delivery with worker exit. Unknown ownership retains a hidden record
+  and checkout reservation. Eligible registry artifacts are backed up and
+  removed; worktrees, branches, progress and provider journals stay.
+  Read [permanent force-stop](references/recovery.md#permanent-force-stop).
 - Retire terminal run records: `/exec cleanup` previews and deletes nothing;
   `/exec cleanup --apply` deletes. A terminal run becomes removable 7 days
   after completion or cancellation; projection repair does not restart the clock.
@@ -84,10 +92,9 @@ those cases.
 
 ## Scripted path for agents
 
-`/exec stop`, `/exec skip`, and some `/exec resume` branches ask a question. A
-worker subagent has no human to answer one, so every prompt has a
-non-interactive equivalent. These names and flags are absent from `/exec help`
-on purpose; they still work, and this is where they are collected.
+`/exec pause` and `/exec stop` work without UI. `/exec skip` and some resume
+branches still require confirmation. Use the supported flags below where
+available; do not bypass a human-only confirmation.
 
 Retired names, each still dispatching to its replacement and saying so once:
 
@@ -100,11 +107,8 @@ Retired names, each still dispatching to its replacement and saying so once:
 - `/exec setup` → `/exec status`, which reports a missing package with its
   install command.
 - `/exec adopt <full-run-id>` → `/exec resume <full-run-id>`.
-- `/exec pause <full-run-id>` → `/exec stop` without the question. It cancels
-  the current attempt, preserves the checkpoint, and leaves the run resumable
-  after cleanup.
-- `/exec cancel <full-run-id>` → `/exec stop` without the question. It is final
-  and preserves the worktree.
+- `/exec cancel <full-run-id>` → `/exec stop`. Deprecated compatibility alias;
+  final cancellation preserves the worktree. `pause` is a primary command.
 
 Flags that answer a prompt in advance:
 
@@ -231,9 +235,8 @@ Bounded compatibility is an explicit frozen choice with its `timeoutMs`; any
 timeout classification is diagnostic only and never authorizes a replacement
 child.
 
-`/exec status` names `/exec stop <id>` because it writes for a human at a
-keyboard, and `/exec stop` asks whether to pause or to cancel. An agent has
-nobody to answer that: take the scripted path above.
+`/exec status` names the same commands for humans and agents. Ordinary stop
+requests final cancellation; force-stop is irreversible abandonment, not recovery.
 
 ## Recover a stuck run
 
@@ -293,8 +296,9 @@ second writer.
 - Do not edit the worktree until status evidence rules out a live writer.
 - `/exec resume` on a run another session owns is an active takeover that may
   advance work. Inspect first.
-- Cancelling records `cancel_pending`; cancellation is complete only when
-  status says `cancelled`.
+- Ordinary stop records `cancel_pending`; cancellation is complete only when
+  status says `cancelled`. Force-stop records `abandoned`, which ends management
+  but does not prove worker exit. Never resume an abandoned run.
 - Preserve the worktree and run artifacts on every failed recovery attempt.
 - Changing globally installed Pi packages requires explicit user approval.
 

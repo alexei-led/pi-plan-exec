@@ -191,6 +191,29 @@ async function fixture(
   };
 }
 
+test('force abandonment preserves isolated recovery lineage and every quarantined reservation', async () => {
+  const f = await fixture();
+  const isolated = await f.controller.recoverIsolated(
+    f.run.id,
+    'owner',
+    join(f.root, 'new'),
+    true,
+  );
+  const result = await f.controller.forceStop(f.run.id, 'owner');
+  assert.equal(result.run.status, 'abandoned');
+  assert.equal(result.removed, false);
+  assert.deepEqual(
+    result.run.quarantinedExecutions,
+    isolated.quarantinedExecutions,
+  );
+  assert.deepEqual(result.run.isolationRecovery, isolated.isolationRecovery);
+  await assert.rejects(
+    () => f.registry.assertExclusive({ ...f.run, id: 'other' }),
+    /already exists/,
+  );
+  assert.equal(f.spawns(), 0);
+});
+
 test('explicit isolation preserves legacy uncertainty and creates one independent same-run writer', async () => {
   const f = await fixture();
   const target = join(f.root, 'new');

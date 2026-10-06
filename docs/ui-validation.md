@@ -38,7 +38,10 @@ Twelve accepted implementation tasks can still mean review/checking, not complet
 | `/exec show [run-id]` | Restore display, optionally pin one run | No |
 | `/exec clear [run-id]` | Dismiss one displayed run | No |
 | `/exec status [run-id]` | Read diagnostics, paths and evidence | No |
-| `/exec stop [run-id]` | Choose pause or cancellation | Yes |
+| `/exec pause [run-id]` | Pause resumably | Yes |
+| `/exec stop [run-id]` | Final cancellation without a dialog | Yes |
+| `/exec stop <run-id> --force` | End management permanently; retain unresolved ownership | Yes |
+| `/exec ui on\|off` | Toggle the display without changing execution | No |
 | `/exec cleanup --apply` | Remove eligible terminal registry records | No worker control; deletes evidence |
 
 Hide/clear need no `--apply`. Preferences follow the active session branch and

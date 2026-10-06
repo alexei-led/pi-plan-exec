@@ -157,6 +157,18 @@ Bridge schema 7 stores stop receipts. Stop Bridge-owning Pi processes and back u
 the journal before upgrade; older Bridge cannot reopen it. Restart after package
 upgrades. Reload only local source/config. Unknown legacy launches remain unknown.
 
+## Final operator abandonment
+
+`/exec stop <id> --force` writes terminal `abandoned` before calling providers.
+It revokes controller authorization, not external process ownership. Cancellation
+delivery and retirement proof remain separate. Unknown operations keep their
+immutable identity and checkout reservation, but no automatic recovery or display
+is restored. Ordinary registry CAS writes cannot change an abandoned record.
+Only exact-operation validated retirement can release its reservation for registry
+cleanup. The pre-stop and final records are archived outside the active listing.
+No worker PID guessing, global package mutation, journal reset or worktree
+deletion is part of this action. See [recovery](../skills/exec-plan/references/recovery.md#permanent-force-stop).
+
 ## Caller, native, and process identities
 
 These identity namespaces are separate and must never be equated:
