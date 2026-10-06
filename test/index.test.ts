@@ -5878,3 +5878,19 @@ test('the settled listing hides a terminal run the moment it is a day old', () =
   assert.ok(!lines.includes(justOutside.id), '25 hours old is not');
   assert.match(lines, /1 older terminal run hidden\./);
 });
+
+test('native ambient child startup is inert before any registration or runtime access', () => {
+  const previous = process.env.PI_SUBAGENT_CHILD;
+  process.env.PI_SUBAGENT_CHILD = '1';
+  try {
+    const pi = new Proxy({} as ExtensionAPI, {
+      get(_target, property) {
+        throw new Error(`Child accessed extension API: ${String(property)}`);
+      },
+    });
+    assert.doesNotThrow(() => planExecExtension(pi));
+  } finally {
+    if (previous === undefined) delete process.env.PI_SUBAGENT_CHILD;
+    else process.env.PI_SUBAGENT_CHILD = previous;
+  }
+});

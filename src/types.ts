@@ -264,6 +264,8 @@ export interface NativeOperationMetadata {
   version: 1;
   ownerRunId: string;
   ownerSessionId: string;
+  /** Native runtime authority is the transcript path, or UUID before persistence. */
+  nativeSessionId: string;
   phase: 'prepared' | 'dispatching' | 'bound' | 'retired';
   request: {
     version: 1;
@@ -287,7 +289,7 @@ export interface NativeOperationMetadata {
   childRunId?: string;
   workflowReceiptPath?: string;
   retirement?: 'local-not-started' | 'native-proof';
-  terminalProof?: import('./bridge.js').WorkflowTerminalProof;
+  terminalProof?: import('./execution-contract.js').WorkflowTerminalProof;
 }
 
 export interface ActiveOperation {

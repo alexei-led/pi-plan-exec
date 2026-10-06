@@ -8,7 +8,7 @@ import {
   hasOwnedProcessRetirementProof,
   parseExecutionLifetime,
   supportsOwnedProcessTree,
-} from './bridge.js';
+} from './execution-contract.js';
 import {
   FUSION_PHASE,
   type FusionCapabilities,

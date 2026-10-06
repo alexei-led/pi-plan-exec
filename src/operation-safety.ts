@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { basename, isAbsolute } from 'node:path';
-import { workflowTerminalProof } from './bridge.js';
+import { workflowTerminalProof } from './execution-contract.js';
 import type {
   ActiveOperation,
   NativeOperationMetadata,
@@ -41,6 +41,7 @@ export function nativeOperationDigest(operation: ActiveOperation): string {
     executionGeneration: operation.executionGeneration ?? 0,
     ownerRunId: meta.ownerRunId,
     ownerSessionId: meta.ownerSessionId,
+    nativeSessionId: meta.nativeSessionId,
     request: meta.request,
     outputPath: meta.outputPath,
     limits: meta.limits,
@@ -158,6 +159,8 @@ export function validNativeOperation(
     meta.ownerRunId !== runId ||
     typeof meta.ownerSessionId !== 'string' ||
     !meta.ownerSessionId.trim() ||
+    typeof meta.nativeSessionId !== 'string' ||
+    !meta.nativeSessionId.trim() ||
     !['prepared', 'dispatching', 'bound', 'retired'].includes(meta.phase) ||
     !record(meta.request) ||
     meta.request.version !== 1 ||

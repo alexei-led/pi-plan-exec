@@ -4,7 +4,7 @@ import {
   type ProcessTreeOwnership,
   processTreeOwnershipCapabilities,
   supportsOwnedProcessTree,
-} from './bridge.js';
+} from './execution-contract.js';
 import { type EventBus, requestRpc } from './rpc.js';
 import type { ExecutionLifetime } from './types.js';
 

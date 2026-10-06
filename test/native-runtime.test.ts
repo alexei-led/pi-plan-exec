@@ -39,13 +39,18 @@ type Request = {
   method: string;
   params: Record<string, unknown>;
 };
-async function fixture() {
+async function fixture(sessionFile?: string) {
   const directory = await mkdtemp(join(tmpdir(), 'native-runtime-'));
   onTestFinished(() => rm(directory, { recursive: true, force: true }));
   const registry = new RunRegistry(directory);
   let session = 'session';
   const context = () =>
-    ({ sessionManager: { getSessionId: () => session } }) as ExtensionContext;
+    ({
+      sessionManager: {
+        getSessionId: () => session,
+        getSessionFile: () => sessionFile,
+      },
+    }) as ExtensionContext;
   const bus = new Bus();
   const client = new NativeRuntimeClient(bus, registry, context, {
     rpcTimeoutMs: 30,
@@ -368,8 +373,14 @@ test('registry rejects changed native request/digest and ownership', async () =>
 
 test('released public RPC publishes real proof/output with healthy and lost spawn replies', async () => {
   const f = await fixture();
+  const sessionFile = join(f.directory, 'parent-session.jsonl');
+  await writeFile(
+    sessionFile,
+    `${JSON.stringify({ type: 'session', version: 3, id: 'parent' })}\n`,
+  );
   const host = await createNativeRuntimeHost(join(f.directory, 'host'), {
     events: f.bus,
+    sessionFile,
   });
   try {
     f.setSession(host.sessionId);
@@ -389,7 +400,10 @@ test('released public RPC publishes real proof/output with healthy and lost spaw
         f.registry,
         () =>
           ({
-            sessionManager: { getSessionId: () => host.sessionId },
+            sessionManager: {
+              getSessionId: () => host.sessionId,
+              getSessionFile: () => sessionFile,
+            },
           }) as ExtensionContext,
         { rpcTimeoutMs: dropReply ? 100 : 10_000 },
       );
@@ -472,4 +486,105 @@ test('disposal settles pending RPC without permitting replay and removes listene
   await expect(f.client.operation(f.run.id, f.binding)).rejects.toThrow(
     /disposed/,
   );
+});
+
+test('native session authority is separate from the controller UUID and immutable', async () => {
+  const f = await fixture('/isolated/session.jsonl');
+  expect(f.op.native?.ownerSessionId).toBe('session');
+  expect(f.op.native?.nativeSessionId).toBe('/isolated/session.jsonl');
+  const foreign = new NativeRuntimeClient(
+    f.bus,
+    f.registry,
+    () =>
+      ({
+        sessionManager: {
+          getSessionId: () => 'session',
+          getSessionFile: () => '/other/session.jsonl',
+        },
+      }) as ExtensionContext,
+  );
+  onTestFinished(() => foreign.dispose());
+  await expect(foreign.spawn(f.run.id, f.binding)).rejects.toThrow(/session/);
+  expect(f.requests).toHaveLength(0);
+  const noFile = await fixture();
+  expect(noFile.op.native?.nativeSessionId).toBe('session');
+});
+
+function retiredDetails(summary: unknown) {
+  return {
+    workflowChildren: summary,
+    workflowTerminalProof: {
+      version: 1,
+      kind: 'workflow',
+      state: 'observed',
+      runId: 'root',
+      dispatchClosed: true,
+      observedAt: Date.now(),
+      children: [],
+    },
+  };
+}
+
+test('abandoned observation and stop are read-only and inspect retirement before delivery', async () => {
+  const f = await fixture();
+  f.setHandler((req) =>
+    f.reply(req, { details: { workflowChildren: f.summary() } }),
+  );
+  await f.client.spawn(f.run.id, f.binding);
+  await f.registry.abandon(f.run.id, 'session');
+  const before = await readFile(f.registry.authorizationPath(f.run.id), 'utf8');
+  f.setHandler((req) =>
+    f.reply(req, { details: retiredDetails(f.summary('completed')) }),
+  );
+  expect((await f.client.stopAbandoned(f.run.id, f.binding)).state).toBe(
+    'retired',
+  );
+  expect(f.requests.filter((req) => req.method === 'stop')).toHaveLength(0);
+  expect(await readFile(f.registry.authorizationPath(f.run.id), 'utf8')).toBe(
+    before,
+  );
+  await expect(f.client.operation(f.run.id, f.binding)).rejects.toThrow(
+    /abandoned/,
+  );
+  expect((await f.registry.get(f.run.id))?.status).toBe('abandoned');
+});
+
+test('abandoned stop refusal stays pending, foreign control refuses, and prepared operations never emit', async () => {
+  const f = await fixture();
+  f.setHandler((req) =>
+    f.reply(req, { details: { workflowChildren: f.summary() } }),
+  );
+  await f.client.spawn(f.run.id, f.binding);
+  await f.registry.abandon(f.run.id, 'session');
+  const before = await readFile(f.registry.authorizationPath(f.run.id), 'utf8');
+  f.setHandler((req) => {
+    if (req.method !== 'stop')
+      return f.reply(req, { details: { workflowChildren: f.summary() } });
+    f.bus.emit(`subagents:rpc:v1:reply:${req.requestId}`, {
+      version: 1,
+      requestId: req.requestId,
+      method: 'stop',
+      success: false,
+      error: { code: 'invalid_state', message: 'queued workflow' },
+    });
+  });
+  expect((await f.client.stopAbandoned(f.run.id, f.binding)).stopPending).toBe(
+    true,
+  );
+  expect(f.requests.filter((req) => req.method === 'stop')).toHaveLength(1);
+  f.setSession('foreign');
+  await expect(f.client.stopAbandoned(f.run.id, f.binding)).rejects.toThrow(
+    /session/,
+  );
+  expect(f.requests.filter((req) => req.method === 'stop')).toHaveLength(1);
+  expect(await readFile(f.registry.authorizationPath(f.run.id), 'utf8')).toBe(
+    before,
+  );
+  const prepared = await fixture();
+  await prepared.registry.abandon(prepared.run.id, 'session');
+  expect(
+    (await prepared.client.stopAbandoned(prepared.run.id, prepared.binding))
+      .operation.launchFenced,
+  ).toBe(true);
+  expect(prepared.requests).toHaveLength(0);
 });

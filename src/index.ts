@@ -372,6 +372,9 @@ async function restoreRetiredRun(
 }
 
 export default function planExecExtension(pi: ExtensionAPI): void {
+  // Released native runners load ambient extensions in child processes. A child
+  // must never restore a parent controller or acquire its execution lease.
+  if (process.env.PI_SUBAGENT_CHILD === '1') return;
   const runtimeIntegration = loadPlanExecRuntimeIntegration().catch(
     () => undefined,
   );

@@ -50,7 +50,7 @@ type NativeContext = {
   ui: Record<string, unknown>;
   sessionManager: {
     getSessionId(): string;
-    getSessionFile(): null;
+    getSessionFile(): string | null;
   };
   modelRegistry: {
     getAvailable(): never[];
@@ -124,6 +124,7 @@ export type NativeRuntimeHostOptions = {
   failAfterRegistration?: boolean;
   reattach?: boolean;
   sessionId?: string;
+  sessionFile?: string;
 };
 
 export function nativeFixtureFactoryModulePath(): string | undefined {
@@ -331,7 +332,7 @@ export async function createNativeRuntimeHost(
       ui: {},
       sessionManager: {
         getSessionId: () => currentSessionId,
-        getSessionFile: () => null,
+        getSessionFile: () => options.sessionFile ?? null,
       },
       modelRegistry: {
         getAvailable: () => [],
@@ -354,7 +355,7 @@ export async function createNativeRuntimeHost(
     const createRuntime = () => {
       state = {
         baseCwd: repository,
-        currentSessionId,
+        currentSessionId: options.sessionFile ?? currentSessionId,
         asyncJobs: new Map(),
         foregroundControls: new Map(),
         lastForegroundControlId: null,
@@ -463,7 +464,7 @@ export async function createNativeRuntimeHost(
       replaceRuntime,
       setSessionId(value: string) {
         currentSessionId = value;
-        state.currentSessionId = value;
+        state.currentSessionId = options.sessionFile ?? value;
       },
       get sessionId() {
         return currentSessionId;

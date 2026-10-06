@@ -2,13 +2,17 @@ import { randomUUID } from 'node:crypto';
 import { lstat, mkdir, readFile, realpath } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import type { ExtensionContext } from '@earendil-works/pi-coding-agent';
-import { type WorkflowTerminalProof, workflowTerminalProof } from './bridge.js';
+import {
+  type WorkflowTerminalProof,
+  workflowTerminalProof,
+} from './execution-contract.js';
 import {
   nativeBindingAllowed,
   nativeDispatchAllowed,
   nativeOperationDigest,
   nativeWorkflowIdentity,
   record,
+  validNativeOperation,
 } from './operation-safety.js';
 import type { RunRegistry } from './registry.js';
 import { required } from './required.js';
@@ -147,6 +151,7 @@ export class NativeRuntimeClient {
         version: 1,
         ownerRunId: run.id,
         ownerSessionId: sessionId,
+        nativeSessionId: this.nativeSessionId(),
         phase: 'prepared',
         request: {
           version: 1,
@@ -216,7 +221,10 @@ export class NativeRuntimeClient {
         reason: 'Disposed before dispatch; operation remains fenced.',
       };
     const reply = await this.rpc(operation.native.request, () => {
-      if (this.sessionId() !== operation.native?.ownerSessionId)
+      if (
+        this.sessionId() !== operation.native?.ownerSessionId ||
+        this.nativeSessionId() !== operation.native?.nativeSessionId
+      )
         throw new Error('Current session changed before dispatch.');
     });
     if (!reply.success)
@@ -309,7 +317,7 @@ export class NativeRuntimeClient {
       if (
         !record(status) ||
         status.runId !== op.externalRunId ||
-        status.sessionId !== op.native.ownerSessionId ||
+        status.sessionId !== op.native.nativeSessionId ||
         status.toolCallId !== `rpc-spawn-${op.native.request.requestId}` ||
         !nativeWorkflowIdentity(
           status.workflowChildren,
@@ -425,6 +433,53 @@ export class NativeRuntimeClient {
     };
   }
 
+  /** No record writes: abandonment has already revoked ordinary mutation. */
+  async observeAbandoned(
+    runId: string,
+    binding: NativeOperationBinding,
+  ): Promise<NativeObservation> {
+    const { operation } = await this.load(runId, binding, false, true);
+    if (operation.native?.phase === 'prepared')
+      return {
+        state: 'retired',
+        operation: { ...operation, launchFenced: true },
+        stopPending: false,
+      };
+    if (!operation.externalRunId)
+      return {
+        state: 'unknown',
+        operation,
+        reason:
+          'Abandoned launch has no exact native identity; checkout remains reserved.',
+      };
+    return this.observeTarget(runId, binding, operation.externalRunId, true);
+  }
+
+  /** Best effort only, after observing retirement; never adopts native authority. */
+  async stopAbandoned(
+    runId: string,
+    binding: NativeOperationBinding,
+  ): Promise<NativeObservation> {
+    const observed = await this.observeAbandoned(runId, binding);
+    if (observed.state === 'retired')
+      return { ...observed, stopPending: false };
+    const { operation } = await this.load(runId, binding, true, true);
+    if (!operation.externalRunId) return { ...observed, stopPending: true };
+    const reply = await this.call('stop', { id: operation.externalRunId });
+    return {
+      ...observed,
+      stopPending: true,
+      reason:
+        reply.success &&
+        reply.data.runId === operation.externalRunId &&
+        reply.data.state === 'stopping'
+          ? 'Stop delivered; retirement still unobserved.'
+          : reply.success
+            ? 'Malformed native stop reply.'
+            : reply.message,
+    };
+  }
+
   dispose(): void {
     this.disposed = true;
     for (const finish of [...this.pending]) finish();
@@ -434,15 +489,17 @@ export class NativeRuntimeClient {
     runId: string,
     binding: NativeOperationBinding,
     id: string,
+    abandoned = false,
   ): Promise<NativeObservation> {
     const reply = await this.call('status', { id });
     if (!reply.success)
       return {
         state: 'unknown',
-        operation: (await this.load(runId, binding)).operation,
+        operation: (await this.load(runId, binding, false, abandoned))
+          .operation,
         reason: reply.message,
       };
-    return this.observeData(runId, binding, reply.data, id);
+    return this.observeData(runId, binding, reply.data, id, abandoned);
   }
 
   private async observeData(
@@ -450,8 +507,9 @@ export class NativeRuntimeClient {
     binding: NativeOperationBinding,
     data: Record<string, unknown>,
     targetId?: string,
+    abandoned = false,
   ): Promise<NativeObservation> {
-    const { operation } = await this.load(runId, binding);
+    const { operation } = await this.load(runId, binding, false, abandoned);
     const meta = required(operation.native);
     const details = data.details;
     const identity = record(details)
@@ -518,7 +576,7 @@ export class NativeRuntimeClient {
         if (
           !record(source) ||
           source.runId !== identity.runId ||
-          source.sessionId !== meta.ownerSessionId ||
+          source.sessionId !== meta.nativeSessionId ||
           source.toolCallId !== `rpc-spawn-${meta.request.requestId}` ||
           !nativeWorkflowIdentity(source.workflowChildren, meta, identity.runId)
         )
@@ -568,7 +626,7 @@ export class NativeRuntimeClient {
       : undefined;
     // For this single synchronous main child, native may publish an empty
     // process roster. Do not synthesize an OS-process proof for the host.
-    const updated = await this.mutate(runId, binding, (op) => ({
+    const update = (op: ActiveOperation): ActiveOperation => ({
       ...op,
       externalRunId: identity.runId,
       lastObservedState: identity.state,
@@ -587,7 +645,10 @@ export class NativeRuntimeClient {
         ...(observedLimits ? { observedLimits } : {}),
         ...(proof ? { retirement: 'native-proof', terminalProof: proof } : {}),
       },
-    }));
+    });
+    const updated = abandoned
+      ? update((await this.load(runId, binding, false, true)).operation)
+      : await this.mutate(runId, binding, update);
     return {
       state: updated.native?.phase === 'retired' ? 'retired' : 'bound',
       operation: updated,
@@ -626,13 +687,16 @@ export class NativeRuntimeClient {
     runId: string,
     binding: NativeOperationBinding,
     control = false,
+    abandoned = false,
   ): Promise<{ run: PlanExecRun; operation: ActiveOperation }> {
     this.assertLive();
     const run = await this.registry.get(runId);
     if (!run) throw new Error('Native owning run not found.');
-    if (run.status === 'abandoned')
+    if (abandoned ? run.status !== 'abandoned' : run.status === 'abandoned')
       throw new Error(
-        'Run is abandoned; ordinary native writes are forbidden.',
+        abandoned
+          ? 'Read-only abandoned observation requires a final abandoned run.'
+          : 'Run is abandoned; ordinary native writes are forbidden.',
       );
     const operation = run.activeOperation ?? run.failedOperation;
     if (
@@ -640,12 +704,16 @@ export class NativeRuntimeClient {
       operation.operationId !== binding.operationId ||
       operation.requestDigest !== binding.requestDigest ||
       nativeOperationDigest(operation) !== binding.requestDigest ||
-      !nativeBindingAllowed(run, operation)
+      !(abandoned
+        ? run.activeOperation === operation &&
+          validNativeOperation(operation, run.id)
+        : nativeBindingAllowed(run, operation))
     )
       throw new Error('Native operation identity mismatch.');
     if (
       control &&
       (operation.native.ownerSessionId !== this.sessionId() ||
+        operation.native.nativeSessionId !== this.nativeSessionId() ||
         (run.lease && run.lease.sessionId !== this.sessionId()))
     )
       throw new Error('Foreign session cannot control native operation.');
@@ -694,6 +762,12 @@ export class NativeRuntimeClient {
   private sessionId(): string {
     const id = this.getContext().sessionManager.getSessionId();
     if (!id) throw new Error('Current Pi session required.');
+    return id;
+  }
+  private nativeSessionId(): string {
+    const manager = this.getContext().sessionManager;
+    const id = manager.getSessionFile() ?? manager.getSessionId();
+    if (!id) throw new Error('Current native runtime session required.');
     return id;
   }
   private assertLive(): void {

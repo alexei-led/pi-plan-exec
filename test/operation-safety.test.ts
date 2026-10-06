@@ -17,6 +17,7 @@ const operation = {
   native: {
     ownerRunId: 'run',
     ownerSessionId: 'session',
+    nativeSessionId: 'session',
     phase: 'prepared',
     request: { requestId: 'uuid' },
   },
