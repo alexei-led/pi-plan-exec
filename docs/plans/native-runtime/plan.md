@@ -629,12 +629,12 @@ Manual checks:
 - If a mandatory native contract is missing, record the release prerequisite.
   This task can document the gap; cutover cannot pass by ignoring it.
 
-- [ ] Before changes, capture `npm test` and `npm run test:runtime-smoke` baseline results, package/runtime versions, Bridge/projection source sizes and existing coverage. After this task's changes, run the full listed gates. Do not duplicate a passing test merely to rename it.
+- [x] Before changes, capture `npm test` and `npm run test:runtime-smoke` baseline results, package/runtime versions, Bridge/projection source sizes and existing coverage. After this task's changes, run the full listed gates. Do not duplicate a passing test merely to rename it.
 - [ ] Build an isolated native RPC fixture that runs a direct async worker and reviewer with the actual release, records exact launch/result/proof identities and counts real child side effects.
 - [ ] Test effective context, cwd, model, tools, output schema, output binding, turn controls, acceptance/completion behavior and timeout semantics. Distinguish unsupported options from advertised-but-broken options.
 - [ ] Add deterministic barriers for prepared intent, dispatch claim, native launch, reply delivery, binding persistence, result capture and acceptance; support dropped reply, duplicate/late completion and parent SIGKILL.
 - [ ] Characterize native status/correlation after reload and process restart, same-session versus foreign-session controls, supervisor wait and process proof when the parent dies.
-- [ ] Reproduce U1 against the actual RPC route and compare the existing tool policy without using that tool as a production fallback.
+- [x] Reproduce U1 against the actual RPC route and compare the existing tool policy without using that tool as a production fallback.
 - [ ] Resolve U2 by testing existing public structured identity/artifacts first. Record the exact supported binding mechanism or a minimal upstream proposal; never bless status-text parsing or not-found-as-absence.
 - [ ] Record U3/U4 limits and any genuinely necessary upstream bugfix reproduction. Do not change another repository, publish a PR or install a global package under this task.
 - [ ] Add the negative boundary-guard cases and map S01–S56 to retained tests, planned tests or explicitly blocked host contracts. Record which assertions require H/X rather than mocks.
