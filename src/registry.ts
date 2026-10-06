@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import {
   appendFile,
   mkdir,
+  open,
   readFile,
   realpath,
   rename,
@@ -186,6 +187,12 @@ export function removalRefusal(run: PlanExecRun): string | undefined {
     return `Run ${run.id} still has unconfirmed local command ownership.`;
   if (!isTerminalStatus(run.status))
     return `Run ${run.id} is ${run.status}; only a terminal run can be removed.`;
+  if (
+    run.activeOperation &&
+    !run.activeOperation.launchFenced &&
+    !run.activeOperation.processTreeExited
+  )
+    return `Run ${run.id} retains unconfirmed worker ownership; keep its reservation.`;
   if (run.lease && isLeaseLive(run.lease))
     return `Run ${run.id} is held by a live lease from session ${run.lease.sessionId}.`;
   return undefined;
@@ -201,6 +208,139 @@ export class RunRegistry {
   /** Read-only authorization source for a durable local command monitor. */
   authorizationPath(runId: string): string {
     return this.pathFor(runId);
+  }
+
+  abandonmentBackupPath(runId: string): string {
+    assertRunId(runId);
+    return join(this.directory, '.abandoned', runId, 'before.json');
+  }
+
+  /** The record lock revokes a tick without waiting for its provider call. */
+  async abandon(runId: string, sessionId: string): Promise<PlanExecRun> {
+    if (!sessionId.trim()) throw new Error('A Pi session ID is required.');
+    const lock = await acquireLock(this.recordLockPath(runId));
+    try {
+      const run = await this.get(runId);
+      if (!run) {
+        const archived = parseRun(
+          await readFile(
+            join(dirname(this.abandonmentBackupPath(runId)), 'run.json'),
+            'utf8',
+          ),
+          runId,
+        );
+        if (archived.status !== RUN_STATUS.ABANDONED)
+          throw new Error('Invalid abandonment archive.');
+        return archived;
+      }
+      if (run.status === RUN_STATUS.ABANDONED) {
+        // A previous call may have failed while flushing an already-renamed marker.
+        await writeLocked(this.pathFor(runId), run, this.directory);
+        return run;
+      }
+      const refusal = takeoverRefusal(run, sessionId);
+      if (refusal) throw new Error(refusal);
+      const backup = this.abandonmentBackupPath(runId);
+      await mkdir(dirname(backup), { recursive: true, mode: 0o700 });
+      // Backup precedes revocation. A retry after a crash refreshes the snapshot.
+      await writeLocked(backup, run, this.directory);
+      const now = nextUpdatedAt(run.updatedAt);
+      const abandoned: PlanExecRun = {
+        ...run,
+        status: RUN_STATUS.ABANDONED,
+        userStopped: true,
+        abandonment: { requestedAt: now, requestedBy: sessionId },
+        revision: (run.revision ?? 1) + 1,
+        updatedAt: now,
+        stopGeneration: (run.stopGeneration ?? 0) + 1,
+        executionGeneration: (run.executionGeneration ?? 0) + 1,
+        nextAttemptAt: 0,
+      };
+      if (!abandoned.activeOperation && run.failedOperation)
+        abandoned.activeOperation = run.failedOperation;
+      delete abandoned.lease;
+      delete abandoned.pendingStageSkip;
+      delete abandoned.wakeReason;
+      delete abandoned.needsAttention;
+      assertRun(abandoned);
+      await writeLocked(this.pathFor(runId), abandoned, this.directory);
+      return abandoned;
+    } finally {
+      await lock.release();
+    }
+  }
+
+  /** Only validated retirement of this exact abandoned identity may release its reservation. */
+  async retireAbandonedOperation(
+    run: PlanExecRun,
+    proof: 'launchFenced' | 'processTreeExited',
+  ): Promise<PlanExecRun> {
+    const lock = await acquireLock(this.recordLockPath(run.id));
+    try {
+      const current = await this.get(run.id);
+      if (
+        !current ||
+        current.status !== RUN_STATUS.ABANDONED ||
+        !current.activeOperation ||
+        !run.activeOperation ||
+        current.activeOperation.operationId !==
+          run.activeOperation.operationId ||
+        current.activeOperation.requestDigest !==
+          run.activeOperation.requestDigest ||
+        (current.activeOperation.externalRunId !== undefined &&
+          current.activeOperation.externalRunId !==
+            run.activeOperation.externalRunId)
+      )
+        return current ?? run;
+      const updated = {
+        ...current,
+        activeOperation: {
+          ...current.activeOperation,
+          ...(!current.activeOperation.externalRunId &&
+          run.activeOperation.externalRunId
+            ? { externalRunId: run.activeOperation.externalRunId }
+            : {}),
+          [proof]: true,
+        },
+        revision: (current.revision ?? 1) + 1,
+        updatedAt: nextUpdatedAt(current.updatedAt),
+      };
+      await writeLocked(this.pathFor(run.id), updated, this.directory);
+      return updated;
+    } finally {
+      await lock.release();
+    }
+  }
+
+  async cleanupAbandoned(run: PlanExecRun): Promise<boolean> {
+    if (run.status !== RUN_STATUS.ABANDONED)
+      throw new Error('Run is not abandoned.');
+    if (!(await this.get(run.id))) return true;
+    if (removalRefusal(run)) return false;
+    return this.remove(run.id);
+  }
+
+  /** Short direct filesystem mutations share the stop record lock, never provider waits. */
+  async withAuthorizedMutation(
+    run: PlanExecRun,
+    mutate: () => Promise<void>,
+  ): Promise<boolean> {
+    const lock = await acquireLock(this.recordLockPath(run.id));
+    try {
+      const current = await this.get(run.id);
+      if (
+        !current ||
+        current.status !== RUN_STATUS.RUNNING ||
+        current.userStopped ||
+        (current.stopGeneration ?? 0) !== (run.stopGeneration ?? 0) ||
+        (current.executionGeneration ?? 0) !== (run.executionGeneration ?? 0)
+      )
+        return false;
+      await mutate();
+      return true;
+    } finally {
+      await lock.release();
+    }
   }
 
   async appendRecoveryMessage(runId: string, message: string): Promise<void> {
@@ -283,6 +423,7 @@ export class RunRegistry {
       if (
         isTerminalStatus(existing.status) &&
         existing.status !== RUN_STATUS.FAILED &&
+        existing.status !== RUN_STATUS.ABANDONED &&
         !existing.activeOperation &&
         !existing.quarantinedExecutions?.length &&
         !existing.localOperationActive &&
@@ -408,6 +549,7 @@ export class RunRegistry {
         throw error;
       }
       if (
+        current.status === RUN_STATUS.ABANDONED ||
         current.updatedAt !== expectedUpdatedAt ||
         (run.executionGeneration ?? 0) < (current.executionGeneration ?? 0) ||
         (run.activeOperation &&
@@ -447,6 +589,7 @@ export class RunRegistry {
     taskProjection: NonNullable<PlanExecRun['taskProjection']>,
   ): Promise<PlanExecRun> {
     let current = (await this.get(run.id)) ?? run;
+    if (current.status === RUN_STATUS.ABANDONED) return current;
     for (let attempt = 0; attempt < CLAIM_CAS_RETRIES; attempt += 1) {
       if ((current.executionGeneration ?? 0) !== (run.executionGeneration ?? 0))
         return current;
@@ -580,6 +723,12 @@ export class RunRegistry {
       if (run === undefined) return false;
       const refusal = run === null ? undefined : removalRefusal(run);
       if (refusal) throw new Error(refusal);
+      if (run?.status === RUN_STATUS.ABANDONED)
+        await writeLocked(
+          join(dirname(this.abandonmentBackupPath(runId)), 'run.json'),
+          run,
+          this.directory,
+        );
       await rm(dirname(path), { recursive: true, force: true });
       return true;
     } finally {
@@ -639,11 +788,41 @@ export class RunRegistry {
   }
 }
 
-async function writeLocked(path: string, run: PlanExecRun): Promise<void> {
+async function writeLocked(
+  path: string,
+  run: PlanExecRun,
+  syncRoot?: string,
+): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
   const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
-  await writeFile(temporary, `${JSON.stringify(run, null, 2)}\n`, 'utf8');
+  if (syncRoot) {
+    const file = await open(temporary, 'wx', 0o600);
+    try {
+      await file.writeFile(`${JSON.stringify(run, null, 2)}\n`, 'utf8');
+      await file.sync();
+    } finally {
+      await file.close();
+    }
+  } else
+    await writeFile(temporary, `${JSON.stringify(run, null, 2)}\n`, 'utf8');
   await rename(temporary, path);
+  if (syncRoot) {
+    // Persist both the rename and any newly created archive directories before deletion.
+    for (
+      let directory = resolve(dirname(path));
+      ;
+      directory = dirname(directory)
+    ) {
+      const handle = await open(directory, 'r');
+      try {
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      if (directory === resolve(syncRoot) || dirname(directory) === directory)
+        break;
+    }
+  }
 }
 
 function isProcessRunning(pid: number): boolean {
@@ -781,6 +960,14 @@ function assertRun(run: PlanExecRun): void {
     (run.revision ?? 0) < 1 ||
     !Number.isFinite(run.createdAt) ||
     !Number.isFinite(run.updatedAt) ||
+    (run.status === RUN_STATUS.ABANDONED
+      ? !run.abandonment ||
+        !run.userStopped ||
+        run.lease !== undefined ||
+        !Number.isFinite(run.abandonment.requestedAt) ||
+        typeof run.abandonment.requestedBy !== 'string' ||
+        !run.abandonment.requestedBy.trim()
+      : run.abandonment !== undefined) ||
     !isIsolationState(run) ||
     !isFrozenConfig(run.config) ||
     !isAutonomousState(run) ||
@@ -892,7 +1079,9 @@ function isIsolationState(run: PlanExecRun): boolean {
     typeof recovery.id === 'string' &&
     RUN_ID.test(recovery.id) &&
     ['fenced', 'active'].includes(recovery.state) &&
-    recovery.generation === generation &&
+    (recovery.generation === generation ||
+      (run.status === RUN_STATUS.ABANDONED &&
+        recovery.generation === generation - 1)) &&
     Number.isSafeInteger(recovery.stopGeneration) &&
     recovery.stopGeneration >= 0 &&
     [

@@ -6,7 +6,7 @@ import {
 import { parseAdvisoryObservation } from './advisory-observation.js';
 import { isGoalRun, isInFlightStatus, isTerminalStatus } from './lifecycle.js';
 import { taskProjectionSummary } from './task-projection.js';
-import type { PlanExecRun } from './types.js';
+import { type PlanExecRun, RUN_STATUS } from './types.js';
 
 export type ProgressTone = 'success' | 'warning' | 'error' | 'muted';
 export interface ProgressView {
@@ -97,6 +97,13 @@ function currentProgressView(run: PlanExecRun, now: number): ProgressView {
         : 'Checkpoint saved · resume when ready',
     };
   }
+  if (run.status === RUN_STATUS.ABANDONED)
+    return {
+      ...view,
+      label: '× Abandoned',
+      tone: 'muted',
+      detail: 'Management ended · worker retirement not implied',
+    };
   if (run.status === 'cancelled')
     return {
       ...view,
@@ -334,6 +341,7 @@ export class RunPresentation {
     )
       return;
     this.runs.set(run.id, run);
+    if (run.status === RUN_STATUS.ABANDONED) this.removed.add(run.id);
   }
   reconcile(runs: PlanExecRun[]): void {
     const ids = new Set(runs.map((run) => run.id));
@@ -344,12 +352,21 @@ export class RunPresentation {
       }
     for (const run of runs) this.remember(run);
   }
+  forget(id: string): void {
+    this.runs.delete(id);
+    this.removed.add(id);
+  }
   current(): PlanExecRun | undefined {
     if (this.hidden) return undefined;
     const selected = this.selected && this.runs.get(this.selected);
-    if (selected && !this.dismissed.has(selected.id)) return selected;
+    if (
+      selected &&
+      !this.removed.has(selected.id) &&
+      !this.dismissed.has(selected.id)
+    )
+      return selected;
     return [...this.runs.values()]
-      .filter((run) => !this.dismissed.has(run.id))
+      .filter((run) => !this.removed.has(run.id) && !this.dismissed.has(run.id))
       .sort(
         (a, b) =>
           Number(isTerminalStatus(a.status)) -

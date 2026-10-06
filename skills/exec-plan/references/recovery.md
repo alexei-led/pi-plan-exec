@@ -43,12 +43,9 @@ Stale terminal output does not prove that a child stopped.
 Match it below and run its command. Never run resume or a manual subagent
 merely because a child is slow.
 
-`/exec status` writes for a human at a keyboard, so it names `/exec stop <id>`,
-which asks whether to pause or to cancel. An agent has nobody to answer that
-question: use `/exec pause <full-run-id>` or `/exec cancel <full-run-id>`
-instead. Neither asks — but all three claim the run first, so all three are
-refused with `Run <id> is controlled by another active Pi session.` while a
-live foreign lease holds it. Stop that session before trying to stop its run.
+`/exec stop <id>` requests final cancellation without a dialog; `/exec pause
+<id>` is resumable. Both refuse a live foreign controller. Use the owning
+session rather than killing an arbitrary Pi PID.
 
 ### `running, and the worker reported activity`
 
@@ -201,11 +198,55 @@ request digest. Bridge 0.5.3 adds correlated pre-launch rejection evidence.
   diagnostics. Upgrade incompatible local packages and restart Pi. If no new
   authoritative evidence exists, report the run blocked; repeated resume cannot
   supply it. Do not recreate the run, edit its journal, or manually launch a
-  replacement. Stop requests also remain pending until ownership is proven.
+  replacement. Ordinary stop requests remain pending until ownership is proven.
+  To end management instead of recovering, use permanent force-stop below.
 
 After a valid rejection is durably fenced, `/exec resume <full-run-id>` continues
 the same plan and worktree. A later pause or cancel still wins. Fresh recovery
 success does not resolve an older row that lacks proof.
+
+## Permanent force-stop
+
+Use only when the operator wants to abandon the run, not resume it:
+
+```text
+/exec stop <full-run-id> --force
+```
+
+The explicit flag and full ID authorize this exact run, without another dialog.
+The command:
+
+1. Refuses a live foreign controller. A current owner or stale/unclaimed local
+   lease is accepted, including a missing worktree.
+2. Saves the pre-stop record under `runs/.abandoned/<id>/before.json`, then
+   atomically writes `abandoned` and increments stop/execution generations.
+   Backup failure leaves the run unchanged. The final marker wins over late
+   callbacks; controller ticks, resume and ordinary writes cannot revive it.
+3. Immediately clears the display and timer. Attempts cancellation through the
+   same provider identity and local-command ownership contract. It does not
+   kill controller PIDs, guess descendants, or bypass Bridge.
+4. Removes eligible registry artifacts under `runs/<id>` only after archiving
+   the final record under `runs/.abandoned/<id>/run.json`. Unknown operations,
+   quarantined targets, local commands or an in-flight controller retain the
+   record. Cleanup failure does not undo abandonment; repeat the same command
+   to retry. There is no automatic retry after abandonment.
+
+Unknown launches remain unknown, including delayed dispatch. Their retained
+record reserves the original plan/checkouts and prevents duplicate writers.
+The evidence is deliberately retained, not fully erased. Worktrees, branches,
+progress files, provider journals and external effects are never removed or
+rolled back. Review those separately only after proving retirement.
+
+The run disappears from the default status list and all progress strips, even
+in a fresh session. `status <id>` or `status --all` can inspect a retained
+record; removed records have the printed backup path. Repeating force-stop is
+safe, including after cleanup. Never use resume to reverse abandonment.
+
+After upgrading, restart every Pi session sharing this registry before using
+force-stop. Do not downgrade or run older cleanup commands while abandoned
+ownership records remain. Older versions reject the new status, but their corrupt
+record cleanup can delete it and erase its safety reservation. No journal or
+record hand-editing is needed.
 
 ## Explicit independent-checkout recovery
 
@@ -240,7 +281,8 @@ normal verification; it is never silently copied into the new target.
 
 ## Abandoned after a Pi restart
 
-A run is **abandoned** only when all three hold at once: it claims `running`,
+The diagnostic classification **abandoned** means an interrupted owner, not the
+operator's terminal `abandoned` decision above. It applies only when all three hold: it claims `running`,
 `starting`, `skip_pending`, or `cancel_pending`; its lease is not live; and its
 operation is provably gone by a matching owned-tree process-terminal proof, an
 authoritative never-started fence, or (for an unbound launch only) v2 durable
@@ -293,7 +335,7 @@ instead and keep its worktree:
 
 ## Paused
 
-An explicit user pause (`/exec pause` or the pause choice under `/exec stop`)
+An explicit user pause (`/exec pause`)
 cancels the current attempt, preserves its stage, checkpoint, progress, and
 resumability, and waits for native or local cleanup proof. A reload restores
 pending cleanup without resuming plan work; `/exec resume` continues only after
@@ -304,7 +346,8 @@ pause. The controller records the blocker, preserves the partial lane and
 accepted baseline, and schedules automatic recovery with backoff. A retry does
 not waive the plan's approvals, release checkpoints, or verification
 requirements. Use `/exec status <full-run-id>` to inspect the next automatic
-action; use `/exec stop` only when the operator wants to pause or cancel.
+action. Use `/exec pause <full-run-id>` for a resumable pause, or
+`/exec stop <full-run-id>` for final cancellation.
 
 Only an observed `Prerequisite: credentials|permission|missing_executable|runtime`
 with an `Evidence:` line changes the task to `waiting_external`; the controller
@@ -333,7 +376,7 @@ or reattach the same operation without launching a replacement.
 An explicit user pause takes precedence. While worker exit is unconfirmed,
 use `/exec status <id>` to inspect the stop and ownership evidence.
 With no live controller, this only observes and does not restart cleanup.
-Do not use `/exec stop` to pause an already paused run: it only offers cancellation.
+Do not use `/exec stop` to pause: it requests final cancellation.
 Resume only when the operator wants execution to continue.
 
 A paused child remains controller-owned. Do not resume it directly.
@@ -524,9 +567,10 @@ child is live.
 
 ## Hide a stuck run without discarding evidence
 
-`/exec hide` immediately removes the strip and footer. `/exec clear [run-id]`
+`/exec ui off` immediately removes the strip and footer. `/exec clear [run-id]`
 dismisses one run's display. Neither needs `--apply`, touches execution state,
-deletes evidence, or proves retirement. `/exec show [run-id]` restores it.
+deletes evidence, or proves retirement. `/exec ui on` restores it. Legacy
+`/exec hide` and `/exec show [run-id]` remain supported.
 
 For Bridge cancellation, `stopAcknowledged` can mean only intent was recorded.
 Bridge 0.5.5 reports delivery separately. A pending/failed delivery is retried
@@ -632,8 +676,9 @@ not a separate finalizer child.
 
 ## Terminal states
 
-Status classifies every non-failed terminal run `finished` and names
-`/exec cleanup` as its one command; nothing here is recoverable.
+Completed and cancelled runs are classified `finished` and name `/exec cleanup`.
+Operator-abandoned records instead report ended management and retained ownership.
+Neither outcome is resumable.
 
 - `completed`: verify checkboxes, archived plan, tests, and clean/reviewed Git
   state. No resume is needed.
@@ -641,6 +686,8 @@ Status classifies every non-failed terminal run `finished` and names
   findings. Report them; use a new scoped plan only with user approval.
 - `cancelled`: terminal and not resumable. To continue later, create a new run
   only after confirming no live child and reviewing the preserved worktree.
+- `abandoned`: operator ended management permanently, not proof of worker death.
+  Hidden by default; retained unknown ownership still reserves its checkout.
 - `failed`: terminal for automatic polling but eligible for explicit recovery
   with `/exec resume <full-run-id>`.
 

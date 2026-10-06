@@ -386,17 +386,27 @@ is audited.
 
 ## Cancellation, pause, and force-skip
 
-`/exec stop` is the reader-facing verb. It offers only the outcomes the run can
-still take, asks even when one remains, and refuses without a UI; the two
-outcomes below are also the non-interactive entry points.
+`/exec stop` requests final cancellation without a dialog. `/exec pause` is
+resumable; both are usable without UI.
 
 - `pause` cancels the current attempt, waits for native or local cleanup proof,
   and preserves the stage, checkpoint, progress, and resumability.
-- `cancel` requests Bridge, Fusion, Revmux, or local-operation stop when
+- `stop` (legacy alias `cancel`) requests Bridge, Fusion, Revmux, or local-operation stop when
   possible, keeps polling through `cancel_pending`, retries provider errors
   without discarding operation state, and ends at `cancelled` only after the
   operation is terminal.
 - Both preserve the execution worktree.
+- `stop <id> --force` durably writes terminal `abandoned` under the record lock,
+  revoking controller writes before best-effort cancellation. It does not wait
+  for an unresponsive provider to decide management state. Unknown operations
+  retain their identity and checkout reservation; all abandoned records remain
+  reserved until cleanup acquires the controller lock and proves eligibility.
+  Short direct archive mutations also hold the record lock and recheck stop
+  authorization. Backups and the final marker sync file data and directory
+  entries before active artifacts can be removed. No worktree deletion or
+  process-retirement claim follows from abandonment.
+- Read-only display refreshes remove abandoned runs from observing sessions;
+  this path cannot claim a lease or start execution.
 - A branch rebind verifies the same repository, requires no active operation, and
   is recorded explicitly before resuming. Interactive `resume` asks for it when
   the run's error is an execution-branch mismatch and nothing is tracked;
