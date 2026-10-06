@@ -1,5 +1,6 @@
-import { readdir, readFile } from 'node:fs/promises';
-import { basename, dirname, join } from 'node:path';
+import { open, readdir, readFile } from 'node:fs/promises';
+import { basename, dirname, isAbsolute, join } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 import { required } from './required.js';
 import {
   EXTERNAL_OPERATION_STATE,
@@ -401,4 +402,215 @@ function text(value: unknown): string | undefined {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+export interface NativeArtifactExpectation {
+  workflowRunId: string;
+  childRunId: string;
+  workflowKey: string;
+  parentToolCallId: string;
+}
+
+export type NativeArtifactSource =
+  | { kind: 'bound-file'; path: string }
+  | { kind: 'workflow-file'; path: string; expected: NativeArtifactExpectation }
+  | {
+      kind: 'workflow-envelope';
+      value: unknown;
+      expected: NativeArtifactExpectation;
+    };
+
+const MAX_NATIVE_ARTIFACT_BYTES = 1024 * 1024;
+
+/**
+ * Paths must be caller-owned bindings, not references extracted from runtime prose.
+ * This decodes content only; retirement, success proof and candidate verification
+ * remain controller responsibilities. There is deliberately no fallback search.
+ */
+export async function readNativeArtifact(
+  source: NativeArtifactSource,
+): Promise<unknown> {
+  if (source.kind === 'workflow-envelope')
+    return decodeNativeWorkflow(source.value, source.expected);
+  if (!isAbsolute(source.path))
+    throw new Error('Native artifact requires an absolute caller-bound path.');
+  const file = await open(source.path, 'r');
+  let raw: string;
+  try {
+    if (!(await file.stat()).isFile())
+      throw new Error('Native artifact must be a regular file.');
+    const buffer = Buffer.alloc(MAX_NATIVE_ARTIFACT_BYTES + 1);
+    let size = 0;
+    while (size < buffer.length) {
+      const { bytesRead } = await file.read(
+        buffer,
+        size,
+        buffer.length - size,
+        null,
+      );
+      if (bytesRead === 0) break;
+      size += bytesRead;
+    }
+    if (size > MAX_NATIVE_ARTIFACT_BYTES)
+      throw new Error('Native artifact exceeds the size limit.');
+    raw = new TextDecoder('utf-8', { fatal: true }).decode(
+      buffer.subarray(0, size),
+    );
+  } finally {
+    await file.close();
+  }
+  if (!raw.trim()) throw new Error('Native artifact output is missing.');
+  if (source.kind === 'workflow-file')
+    return decodeNativeWorkflow(JSON.parse(raw), source.expected);
+  try {
+    return JSON.parse(raw);
+  } catch (error) {
+    // Worker/goal markers are text. The typed review parser still requires JSON.
+    if (error instanceof SyntaxError) return raw;
+    throw error;
+  }
+}
+
+function decodeNativeWorkflow(
+  value: unknown,
+  expected: NativeArtifactExpectation,
+): unknown {
+  if (
+    !text(expected.workflowRunId) ||
+    !text(expected.childRunId) ||
+    !text(expected.workflowKey) ||
+    !text(expected.parentToolCallId) ||
+    !isRecord(value) ||
+    value.mode !== 'workflow' ||
+    value.state !== 'complete' ||
+    (value.id ?? value.runId) !== expected.workflowRunId ||
+    (value.id !== undefined && value.id !== expected.workflowRunId) ||
+    (value.runId !== undefined && value.runId !== expected.workflowRunId) ||
+    (value.toolCallId !== undefined &&
+      value.toolCallId !== expected.parentToolCallId) ||
+    (value.success !== undefined && value.success !== true) ||
+    incompleteNativeResult(value)
+  )
+    throw new Error(
+      'Native workflow has mismatched identity or incomplete outcome.',
+    );
+  const inventory = value.workflowChildren;
+  const child = isRecord(inventory)
+    ? soleNativeChild(inventory.children)
+    : undefined;
+  if (
+    !isRecord(inventory) ||
+    inventory.version !== 1 ||
+    inventory.workflowRunId !== expected.workflowRunId ||
+    inventory.parentToolCallId !== expected.parentToolCallId ||
+    inventory.inventoryComplete !== true ||
+    inventory.workflowState !== 'completed' ||
+    !child ||
+    child.childId !== expected.workflowKey ||
+    child.runId !== expected.childRunId ||
+    child.state !== 'completed'
+  )
+    throw new Error(
+      'Native workflow child inventory has mismatched identity or cardinality.',
+    );
+
+  let resultOutput: unknown;
+  if (value.results !== undefined) {
+    const result = soleNativeChild(value.results);
+    if (
+      !result ||
+      result.runId !== expected.childRunId ||
+      result.workflowKey !== expected.workflowKey ||
+      result.success !== true ||
+      result.outputState !== 'present' ||
+      incompleteNativeResult(result)
+    )
+      throw new Error(
+        'Native workflow result has mismatched identity or missing child output.',
+      );
+    resultOutput = nativeChildOutput(result);
+  }
+  if (value.steps !== undefined) {
+    const step = soleNativeChild(value.steps);
+    if (
+      !step ||
+      step.runId !== expected.childRunId ||
+      step.workflowKey !== expected.workflowKey ||
+      (step.parentWorkflowRunId !== undefined &&
+        step.parentWorkflowRunId !== expected.workflowRunId) ||
+      !COMPLETED_STEP_STATES.has(String(step.status)) ||
+      incompleteNativeResult(step)
+    )
+      throw new Error(
+        'Native workflow steps have mismatched identity or cardinality.',
+      );
+  }
+  let workflowOutput: unknown;
+  if (value.workflow !== undefined) {
+    const returned = isRecord(value.workflow)
+      ? value.workflow.value
+      : undefined;
+    if (
+      !isRecord(returned) ||
+      returned.runId !== expected.childRunId ||
+      returned.key !== expected.workflowKey ||
+      returned.ok !== true ||
+      incompleteNativeResult(returned)
+    )
+      throw new Error(
+        'Native workflow return has mismatched identity or incomplete output.',
+      );
+    workflowOutput = nativeChildOutput(returned);
+  }
+  if (
+    resultOutput !== undefined &&
+    workflowOutput !== undefined &&
+    !isDeepStrictEqual(resultOutput, workflowOutput)
+  )
+    throw new Error('Native workflow contains contradictory child outputs.');
+  const output = resultOutput ?? workflowOutput;
+  if (output === undefined)
+    throw new Error('Native workflow has no authoritative child output.');
+  return output;
+}
+
+function soleNativeChild(value: unknown): Record<string, unknown> | undefined {
+  return Array.isArray(value) && value.length === 1 && isRecord(value[0])
+    ? value[0]
+    : undefined;
+}
+
+function incompleteNativeResult(value: Record<string, unknown>): boolean {
+  return (
+    [
+      'truncated',
+      'previewTruncated',
+      'detached',
+      'interrupted',
+      'stopped',
+      'timedOut',
+      'structuredOutputFailed',
+    ].some((key) => value[key] !== undefined && value[key] !== false) ||
+    (value.state !== undefined &&
+      value.state !== 'complete' &&
+      value.state !== 'completed') ||
+    value.terminalOutcome !== undefined ||
+    Boolean(value.error)
+  );
+}
+
+function nativeChildOutput(value: Record<string, unknown>): unknown {
+  const output =
+    value.structuredOutput !== undefined
+      ? value.structuredOutput
+      : text(value.output);
+  if (output === undefined || output === null)
+    throw new Error('Native workflow child output is missing.');
+  const serialized = JSON.stringify(output);
+  if (
+    serialized === undefined ||
+    Buffer.byteLength(serialized, 'utf8') > MAX_NATIVE_ARTIFACT_BYTES
+  )
+    throw new Error('Native workflow child output is malformed or excessive.');
+  return output;
 }

@@ -4,10 +4,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { onTestFinished, test } from 'vitest';
 import {
+  readNativeArtifact,
   readSettledWorkflowCompletion,
   readSubagentArtifact,
 } from '../src/artifact.js';
-import { parseReviewFindings } from '../src/review.js';
+import { parseNativeReviewReport, parseReviewFindings } from '../src/review.js';
 
 function nativeSingleResult() {
   return {
@@ -439,4 +440,256 @@ test('does not recover a detached workflow whose child failed', async () => {
     await readSettledWorkflowCompletion(result, undefined),
     undefined,
   );
+});
+
+const nativeExpectation = {
+  workflowRunId: 'workflow-root',
+  childRunId: 'child-review',
+  workflowKey: 'main',
+  parentToolCallId: 'rpc-spawn-request-uuid',
+};
+const nativeReport = {
+  schemaVersion: 1,
+  reviewedCommit: 'a'.repeat(40),
+  findings: [],
+};
+
+function nativeWorkflowResult() {
+  return {
+    id: nativeExpectation.workflowRunId,
+    runId: nativeExpectation.workflowRunId,
+    mode: 'workflow',
+    state: 'complete',
+    success: true,
+    summary: 'Decorated summary is not a review',
+    workflowChildren: {
+      version: 1,
+      parentToolCallId: nativeExpectation.parentToolCallId,
+      workflowRunId: nativeExpectation.workflowRunId,
+      inventoryComplete: true,
+      workflowState: 'completed',
+      children: [
+        {
+          childId: 'main',
+          runId: nativeExpectation.childRunId,
+          state: 'completed',
+        },
+      ],
+    },
+    results: [
+      {
+        workflowKey: 'main',
+        runId: nativeExpectation.childRunId,
+        success: true,
+        outputState: 'present',
+        structuredOutput: nativeReport,
+        output: 'Decorated child text',
+      },
+    ],
+  };
+}
+
+function nativeWorkflowStatus() {
+  const result = nativeWorkflowResult();
+  return {
+    runId: result.runId,
+    mode: result.mode,
+    state: result.state,
+    workflowChildren: result.workflowChildren,
+    steps: [
+      {
+        runId: nativeExpectation.childRunId,
+        workflowKey: 'main',
+        parentWorkflowRunId: result.runId,
+        status: 'completed',
+        recentOutput: ['NO_FINDINGS'],
+      },
+    ],
+    workflow: {
+      value: {
+        key: 'main',
+        runId: nativeExpectation.childRunId,
+        ok: true,
+        output: '',
+        structuredOutput: nativeReport,
+      },
+    },
+  };
+}
+
+test('native explicit files and structuredOutput decode without filename or text identity inference', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-native-result-'));
+  onTestFinished(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, 'owned-arbitrary-name');
+  await writeFile(path, JSON.stringify(nativeReport));
+  assert.deepEqual(
+    await readNativeArtifact({ kind: 'bound-file', path }),
+    nativeReport,
+  );
+  for (const value of [
+    nativeWorkflowResult(),
+    nativeWorkflowStatus(),
+    { ...nativeWorkflowResult(), workflow: nativeWorkflowStatus().workflow },
+  ]) {
+    assert.deepEqual(
+      await readNativeArtifact({
+        kind: 'workflow-envelope',
+        value,
+        expected: nativeExpectation,
+      }),
+      nativeReport,
+    );
+    await writeFile(path, JSON.stringify(value));
+    const report = await readNativeArtifact({
+      kind: 'workflow-file',
+      path,
+      expected: nativeExpectation,
+    });
+    assert.deepEqual(
+      parseNativeReviewReport(report, nativeReport.reviewedCommit),
+      nativeReport,
+    );
+  }
+  const marker = '<<<RALPHEX:TASK_COMPLETED>>>';
+  await writeFile(path, marker);
+  assert.equal(await readNativeArtifact({ kind: 'bound-file', path }), marker);
+  const value = nativeWorkflowResult();
+  assert.equal(
+    await readNativeArtifact({
+      kind: 'workflow-envelope',
+      expected: nativeExpectation,
+      value: {
+        ...value,
+        results: [
+          { ...value.results[0], structuredOutput: undefined, output: marker },
+        ],
+      },
+    }),
+    marker,
+  );
+});
+
+test('native workflow identity, cardinality, truncation and launch receipts fail closed', async () => {
+  const valid = nativeWorkflowResult();
+  const child = valid.results[0];
+  const status = nativeWorkflowStatus();
+  const summary = valid.workflowChildren;
+  for (const value of [
+    { ...valid, id: 'other' },
+    { ...valid, runId: 'other' },
+    { ...valid, state: 'running' },
+    { ...valid, success: false },
+    { ...valid, results: [] },
+    { ...valid, results: [child, child] },
+    { ...valid, truncated: true },
+    { ...valid, workflowChildren: undefined },
+    ...[
+      { runId: 'other' },
+      { workflowKey: 'other' },
+      { success: false },
+      { state: 'running' },
+      { detached: true },
+      { truncated: true },
+      { outputState: 'absent' },
+      { structuredOutput: undefined, output: '' },
+      { structuredOutput: null },
+      { structuredOutput: 'x'.repeat(1024 * 1024 + 1) },
+    ].map((change) => ({ ...valid, results: [{ ...child, ...change }] })),
+    ...[
+      { workflowRunId: 'other' },
+      { parentToolCallId: 'other' },
+      { inventoryComplete: false },
+      { children: [] },
+      { children: [...summary.children, ...summary.children] },
+      { children: [{ ...summary.children[0], runId: 'other' }] },
+      { children: [{ ...summary.children[0], childId: 'other' }] },
+    ].map((change) => ({
+      ...valid,
+      workflowChildren: { ...summary, ...change },
+    })),
+    { ...status, steps: [] },
+    { ...status, steps: [...status.steps, ...status.steps] },
+    {
+      ...status,
+      workflow: { value: { ...status.workflow.value, runId: 'other' } },
+    },
+    {
+      ...status,
+      workflow: { value: { ...status.workflow.value, key: 'other' } },
+    },
+    { ...status, workflow: { value: { ...status.workflow.value, ok: false } } },
+    { ...status, workflow: undefined },
+    {
+      ...status,
+      workflow: {
+        value: {
+          ...status.workflow.value,
+          structuredOutput: undefined,
+          output: '',
+        },
+      },
+    },
+    { ...status, steps: [{ ...status.steps[0], runId: 'other' }] },
+    { ...status, steps: [{ ...status.steps[0], workflowKey: 'other' }] },
+    {
+      ...valid,
+      workflow: {
+        value: {
+          ...status.workflow.value,
+          structuredOutput: { ...nativeReport, findings: ['contradictory'] },
+        },
+      },
+    },
+    {
+      ...status,
+      steps: [{ ...status.steps[0], parentWorkflowRunId: 'other' }],
+    },
+    {
+      ...valid,
+      workflow: { value: { ...status.workflow.value, key: 'other' } },
+    },
+    {
+      details: { runId: 'workflow-root' },
+      content: [{ text: JSON.stringify(nativeReport) }],
+    },
+    { runId: 'workflow-root', summary: JSON.stringify(nativeReport) },
+  ])
+    await assert.rejects(
+      readNativeArtifact({
+        kind: 'workflow-envelope',
+        value,
+        expected: nativeExpectation,
+      }),
+    );
+});
+
+test('native bound files never infer fallback output for missing, truncated or excessive reports', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pi-native-result-'));
+  onTestFinished(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, 'owned-report');
+  await writeFile(
+    join(root, 'status.json'),
+    JSON.stringify(nativeWorkflowStatus()),
+  );
+  await assert.rejects(readNativeArtifact({ kind: 'bound-file', path }));
+  await assert.rejects(
+    readNativeArtifact({ kind: 'bound-file', path: 'relative.json' }),
+  );
+  for (const raw of [
+    '',
+    JSON.stringify(nativeReport).slice(0, -1),
+    JSON.stringify({ summary: 'NO_FINDINGS' }),
+  ]) {
+    await writeFile(path, raw);
+    await assert.rejects(async () =>
+      parseNativeReviewReport(
+        await readNativeArtifact({ kind: 'bound-file', path }),
+        nativeReport.reviewedCommit,
+      ),
+    );
+  }
+  await writeFile(path, Buffer.from([0xff, 0xfe]));
+  await assert.rejects(readNativeArtifact({ kind: 'bound-file', path }));
+  await writeFile(path, 'x'.repeat(1024 * 1024 + 1));
+  await assert.rejects(readNativeArtifact({ kind: 'bound-file', path }));
 });
