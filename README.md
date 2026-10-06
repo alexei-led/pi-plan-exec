@@ -135,8 +135,9 @@ A snapshot is not a claim that the worker is healthy or still running.
 An observed operation pause is amber, not green Working. If one task waits on
 a prerequisite while another runs, the strip shows both work and the wait.
 
-- `/exec hide` removes the strip and footer immediately. Execution continues.
-- `/exec show [run-id]` restores the display, without resuming execution.
+- `/exec ui off` removes the strip and footer immediately. Execution continues.
+- `/exec ui on` restores the display, without resuming execution.
+- Legacy `hide` and `show [run-id]` remain compatibility aliases.
 - `/exec clear [run-id]` dismisses the displayed run, without deleting its record.
 - These display actions need no `--apply`. They survive reload in the same
   session. Updates cannot undo a hide or a per-run dismissal.
@@ -178,8 +179,19 @@ Run controls are separate from display controls:
   `/exec resume`. No shared Git metadata, object alternates, or old push remote is
   retained. This is not a security sandbox; refuse external-side-effect tasks.
   Quarantined trees remain reserved and prevent record cleanup.
-- `/exec stop` asks whether to pause the run (resumable) or cancel it (final,
-  worktree preserved).
+- `/exec pause [run-id]` stops the current attempt and keeps it resumable.
+- `/exec stop [run-id]` requests final cancellation, without a dialog.
+  It stays `cancel_pending` until worker retirement is proven.
+- `/exec stop <full-run-id> --force` permanently ends controller management,
+  including unresolved legacy launches. It dismisses the run across sessions
+  and restarts, revokes new work and result acceptance, and attempts cancellation
+  of the exact tracked operation. It does **not** claim an unknown worker died.
+  A live foreign controller refuses the command: use its owning session.
+  Eligible registry artifacts are removed after a durable backup; unknown
+  operations/local commands/quarantined checkouts retain their ownership record
+  and reservation. Worktrees, branches, progress files and provider journals
+  are never deleted. See [force-stop recovery](skills/exec-plan/references/recovery.md#permanent-force-stop).
+  `cancel` remains a deprecated alias for ordinary `stop`.
 - `/exec cleanup` retires run records. It previews by default and deletes
   nothing; `--apply` removes the registry entry — never the worktree, branch, or
   progress file — for terminal runs that finished more than 7 days ago.
@@ -189,7 +201,9 @@ After Pi starts or reloads, the native controller restores unfinished runs when
 their lease is claimable and reattaches durable operations by ID. The strip
 shows current state; `/exec status` holds detailed evidence. Cancellation intent
 wins over an old task state: the strip says “Cancelling” until worker exit is
-confirmed. Bridge distinguishes stop intent from delivery. Neither is exit proof. Optional task projections are visibility caches and cannot gate
+confirmed, unless the operator ends management with `stop --force`. Abandoned
+runs are hidden from the default list; inspect them by ID or with `status --all`.
+Bridge distinguishes stop intent from delivery. Neither is exit proof. Optional task projections are visibility caches and cannot gate
 recovery. Statistics are deterministic usage/task bookkeeping by default;
 `statsEnabled: true` opts into an additional report child.
 

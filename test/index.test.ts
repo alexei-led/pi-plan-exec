@@ -30,7 +30,6 @@ import planExecExtension, {
   abandonedRunsNotice,
   abandonmentProbe,
   bridgeRuntimeCompatible,
-  chooseStopOutcome,
   type EvidenceProbe,
   execCleanup,
   execHelp,
@@ -508,6 +507,152 @@ test('only a locally owned successful poll paints live progress; poll failure re
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.match(String(h.footer()), /Working/);
   await h.emit('session_shutdown');
+});
+
+test('force stop refreshes a foreign observer and a late tick never reports completion', async (t) => {
+  const held = run({
+    status: 'cancel_pending',
+    lease: { ...liveLease(), sessionId: 'force-owner' },
+    activeOperation: {
+      operationId: 'legacy',
+      service: 'bridge',
+      kind: 'implementation',
+    },
+  });
+  const { registry, directory } = await seedDirectory([held]);
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  t.mock.method(RunRegistry.prototype, 'get', registry.get.bind(registry));
+  t.mock.method(
+    RunRegistry.prototype,
+    'listWithErrors',
+    registry.listWithErrors.bind(registry),
+  );
+  t.mock.method(
+    RunRegistry.prototype,
+    'abandon',
+    registry.abandon.bind(registry),
+  );
+  t.mock.method(
+    RunRegistry.prototype,
+    'cleanupAbandoned',
+    registry.cleanupAbandoned.bind(registry),
+  );
+  t.mock.method(
+    RunRegistry.prototype,
+    'abandonmentBackupPath',
+    registry.abandonmentBackupPath.bind(registry),
+  );
+  t.mock.method(
+    TaskProjector.prototype,
+    'sync',
+    async (current: PlanExecRun) => current,
+  );
+  let release!: () => void;
+  const delayed = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const lateTick = delayed.then(async () =>
+    required(await registry.get(held.id)),
+  );
+  t.mock.method(PlanExecController.prototype, 'tick', () => lateTick);
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const owner = executionHarness(held.repositoryRoot, 'force-owner');
+  const observer = executionHarness(held.repositoryRoot, 'force-observer');
+  await owner.emit('session_start');
+  await observer.emit('session_start');
+  assert.ok(observer.widget());
+  t.mock.timers.tick(1000);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await owner.command(`stop ${held.id} --force`);
+  assert.equal((await registry.get(held.id))?.status, 'abandoned');
+  const setWidget = observer.ctx.ui.setWidget;
+  const cleared = new Promise<void>((resolve) => {
+    observer.ctx.ui.setWidget = (key, value, options) => {
+      if (Array.isArray(value)) setWidget(key, value, options);
+      else setWidget(key, value, options);
+      if (value === undefined) resolve();
+    };
+  });
+  release();
+  await lateTick;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  t.mock.timers.tick(1000);
+  await cleared;
+  assert.equal(observer.widget(), undefined);
+  assert.equal(owner.widget(), undefined);
+  assert.doesNotMatch(
+    owner.notifications.join('\n'),
+    /Plan execution .* completed\./,
+  );
+  await owner.emit('session_shutdown');
+  await observer.emit('session_shutdown');
+});
+
+test('force stop stays dismissed through late updates, branch navigation, and a fresh session', async (t) => {
+  const held = run({
+    status: 'cancel_pending',
+    activeOperation: {
+      operationId: 'legacy',
+      service: 'bridge',
+      kind: 'implementation',
+      lastObservedState: 'unknown_launch',
+    },
+  });
+  delete held.lease;
+  const { registry, directory } = await seedDirectory([held]);
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  t.mock.method(RunRegistry.prototype, 'get', registry.get.bind(registry));
+  t.mock.method(
+    RunRegistry.prototype,
+    'listWithErrors',
+    registry.listWithErrors.bind(registry),
+  );
+  t.mock.method(
+    RunRegistry.prototype,
+    'abandon',
+    registry.abandon.bind(registry),
+  );
+  t.mock.method(
+    RunRegistry.prototype,
+    'cleanupAbandoned',
+    registry.cleanupAbandoned.bind(registry),
+  );
+  t.mock.method(
+    RunRegistry.prototype,
+    'abandonmentBackupPath',
+    registry.abandonmentBackupPath.bind(registry),
+  );
+  t.mock.method(
+    TaskProjector.prototype,
+    'sync',
+    async (current: PlanExecRun) => current,
+  );
+  const tick = t.mock.method(PlanExecController.prototype, 'tick', async () => {
+    throw new Error('No tick after force');
+  });
+  const h = executionHarness(held.repositoryRoot, 'force-ui');
+  await h.command('ui on');
+  assert.ok(h.widget());
+  await h.command(`stop ${held.id} --force`);
+  assert.match(h.notifications.at(-1) ?? '', /abandoned permanently/);
+  assert.equal(h.widget(), undefined);
+  await h.command('ui on');
+  await h.emit('session_tree');
+  assert.equal(h.widget(), undefined);
+  await h.emit('session_shutdown');
+  const next = executionHarness(held.repositoryRoot, 'fresh-force-ui');
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  await next.emit('session_start');
+  t.mock.timers.tick(5000);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(next.widget(), undefined);
+  assert.equal(tick.mock.callCount(), 0);
+  await next.command(`resume ${held.id}`);
+  assert.match(
+    next.notifications.at(-1) ?? '',
+    /cannot be resumed while abandoned/,
+  );
+  await next.emit('session_shutdown');
 });
 
 test('branch navigation restores cached visibility without querying the registry', async (t) => {
@@ -2809,6 +2954,7 @@ test('the exec-plan skill documents exactly the subcommands /exec implements', a
     'hide',
     'show',
     'clear',
+    'ui',
   ]);
   const aliases = new Set<string>(EXEC_ALIAS_ACTIONS);
 
@@ -3354,41 +3500,6 @@ test('status counts a hidden-only registry instead of reporting an empty one', a
   assert.match(report, /1 older terminal run hidden\./);
 });
 
-test('stop reaches both outcomes and asks for the one it takes', async () => {
-  const running = run({ status: 'running' });
-  const asked: Array<{ title: string; options: string[] }> = [];
-  const pick = (index: number) => ({
-    hasUI: true,
-    ui: {
-      select: async (title: string, options: string[]) => {
-        asked.push({ title, options });
-        return options[index];
-      },
-    },
-  });
-
-  assert.equal(await chooseStopOutcome(running, pick(0)), EXEC_ACTION.PAUSE);
-  assert.equal(await chooseStopOutcome(running, pick(1)), EXEC_ACTION.CANCEL);
-  assert.equal(asked.length, 2, 'each stop asks before it acts');
-  assert.match(asked[0]?.title ?? '', new RegExp(running.id.slice(0, 8)));
-  assert.match(
-    required(asked[0]?.options[0]),
-    /^Pause — .*\/exec resume continues/,
-  );
-  assert.match(
-    required(asked[0]?.options[1]),
-    /^Cancel — final.*worktree is preserved/,
-  );
-
-  await assert.rejects(
-    chooseStopOutcome(running, {
-      hasUI: true,
-      ui: { select: async () => undefined },
-    }),
-    /Stop cancelled\./,
-  );
-});
-
 test('pause and cancel persist a stop fence before later recovery can run', async () => {
   const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-stop-fence-'));
   const registry = new RunRegistry(join(root, 'runs'));
@@ -3442,72 +3553,22 @@ test('paused runs keep the background probe while a child exit is unconfirmed', 
   );
 });
 
-test('stop offers only the outcomes a run can still take, and still asks', async () => {
-  const paused = run({ status: 'paused', stage: 'comprehensive_review' });
-  let offered: string[] = [];
-
-  const outcome = await chooseStopOutcome(paused, {
-    hasUI: true,
-    ui: {
-      select: async (_title: string, options: string[]) => {
-        offered = options;
-        return options[0];
-      },
-    },
-  });
-
-  assert.equal(
-    outcome,
-    EXEC_ACTION.CANCEL,
-    'a paused run has nothing to pause',
-  );
-  assert.equal(offered.length, 1);
-  // One option is still a question: a final cancel is never assumed.
-  assert.match(required(offered[0]), /^Cancel — final/);
-  assert.equal(isActionAllowed('stop', paused), true);
+test('stop is final without a dialog; pause remains a primary resumable command', () => {
+  assert.equal(isActionAllowed('stop', run({ status: 'paused' })), true);
   assert.equal(
     isActionAllowed('stop', run({ status: 'completed', stage: 'complete' })),
     false,
   );
-});
-
-test('stop refuses without a human and names both scripted verbs', async () => {
-  await assert.rejects(
-    chooseStopOutcome(run({ status: 'running' }), {
-      hasUI: false,
-      ui: { select: async () => 'Pause' },
-    }),
-    (error: Error) => {
-      assert.match(error.message, /\/exec pause <run-id>/);
-      assert.match(error.message, /\/exec cancel <run-id>/);
-      assert.match(error.message, /resumable/);
-      assert.match(error.message, /for good/);
-      return true;
-    },
-  );
-});
-
-test('the retired pause and cancel verbs still work and name their replacement', () => {
-  assert.deepEqual(runActionFor('stop'), { action: 'stop' });
-  assert.deepEqual(runActionFor('pause'), {
-    action: 'pause',
-    note: '/exec pause is now /exec stop; the old name still works and is the way to pause without a human to ask.',
-  });
+  assert.deepEqual(runActionFor('pause'), { action: 'pause' });
   assert.deepEqual(runActionFor('cancel'), {
     action: 'cancel',
-    note: '/exec cancel is now /exec stop; the old name still works and is the way to cancel without a human to ask.',
+    note: '/exec cancel is deprecated; use /exec stop. Both request final cancellation.',
   });
-  for (const alias of ['pause', 'cancel'])
-    assert.ok(
-      (EXEC_ALIAS_ACTIONS as readonly string[]).includes(alias),
-      `${alias} is a hidden alias`,
-    );
-  assert.match(execHelp(), /\/exec stop \[run-id\]/);
+  assert.match(execHelp(), /stop <run-id> --force/);
   assert.ok(
     (getExecArgumentCompletions('') ?? []).some(
-      (item) => item.value === 'stop',
+      (item) => item.value === 'pause',
     ),
-    'stop completes',
   );
 });
 
@@ -3591,16 +3652,14 @@ test('help lists every primary verb and no retired alias', () => {
   const aliases = new Set<string>(EXEC_ALIAS_ACTIONS);
   const primary = [
     ...Object.values(EXEC_ACTION).filter((action) => !aliases.has(action)),
-    'hide',
-    'show',
-    'clear',
+    'ui',
   ];
   // Only the command list is line-anchored; the hints under it are prose.
   const listed = [...help.matchAll(/^\/exec[ \t]+(?<verb>[a-z][a-z-]*)/gm)].map(
     (match) => match.groups?.verb,
   );
 
-  assert.deepEqual(listed.sort(), [...primary].sort());
+  assert.deepEqual([...new Set(listed)].sort(), [...primary].sort());
   assert.match(help, /^\/exec \[plan-path\]/m);
   for (const alias of aliases)
     assert.doesNotMatch(help, new RegExp(`/exec ${alias}`), alias);
@@ -4992,7 +5051,7 @@ test("a queued resume from another directory cannot override a replacement sessi
   await rm(root, { recursive: true, force: true });
 });
 
-test('a hanging stop dialog cannot delay retirement or mutate after session replacement', {
+test('stop needs no UI and its final intent survives session replacement', {
   timeout: 5_000,
 }, async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'exec-pending-dialog-'));
@@ -5022,33 +5081,18 @@ test('a hanging stop dialog cannot delay retirement or mutate after session repl
     async (current: PlanExecRun) => current,
   );
   const first = executionHarness(root, 'dialog-source');
-  let choose!: (label: string) => void;
-  let shown!: () => void;
-  const dialogShown = new Promise<void>((resolve) => {
-    shown = resolve;
-  });
-  let pauseLabel = '';
-  first.ctx.ui.select = async (_title, options) => {
-    pauseLabel = required(options[0]);
-    shown();
-    return new Promise<string>((resolve) => {
-      choose = resolve;
-    });
+  first.ctx.hasUI = false;
+  first.ctx.ui.select = async () => {
+    throw new Error('Stop must not ask a question');
   };
-  const command = first.command(`stop ${held.id}`);
-  await dialogShown;
+  await first.command(`stop ${held.id}`);
+  assert.equal((await registry.get(held.id))?.status, 'cancel_pending');
+  assert.equal((await registry.get(held.id))?.userStopped, true);
   await first.emit('session_shutdown');
-  assert.equal((await registry.get(held.id))?.lease, undefined);
-  const replacement = await registry.claim(
-    required(await registry.get(held.id)),
-    'dialog-replacement',
-  );
-  choose(pauseLabel);
-  await command;
-  const current = await registry.get(held.id);
-  assert.equal(current?.status, 'running');
-  assert.equal(current?.userStopped, undefined);
-  assert.deepEqual(current?.lease, replacement.lease);
+  const replacement = executionHarness(root, 'dialog-replacement');
+  await replacement.emit('session_start');
+  assert.equal((await registry.get(held.id))?.status, 'cancel_pending');
+  await replacement.emit('session_shutdown');
   await rm(root, { recursive: true, force: true });
 });
 

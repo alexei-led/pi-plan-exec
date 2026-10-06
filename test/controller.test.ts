@@ -3755,6 +3755,57 @@ test('malformed reviewer output schedules review recovery', async () => {
   assert.equal(bridge.spawnCount, 2);
 });
 
+test('force stop fences a pending archive observation and holds the checkout until tick retirement', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'force-archive-'));
+  onTestFinished(() => rm(root, { recursive: true, force: true }));
+  const planPath = join(root, 'plan.md');
+  await writeFile(planPath, '### Task 1: Implement\n- [x] Done\n');
+  const registry = new RunRegistry(join(root, 'runs'));
+  let entered!: () => void;
+  let release!: () => void;
+  const ready = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const delayed = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const controller = new PlanExecController(
+    registry,
+    new FakeBridge('unused'),
+    new FakeFusion(),
+    async (command, args) => {
+      if (args[0] === 'ls-files') {
+        entered();
+        await delayed;
+      }
+      return fakeGit(root)(command, args);
+    },
+  );
+  const run = await registry.create({
+    ...baseRun(root, planPath),
+    stage: 'archive',
+    ...archiveAcceptance(),
+  });
+  const ticking = controller.tick(run.id, 'owner');
+  await ready;
+  const result = await controller.forceStop(run.id, 'owner');
+  assert.equal(result.run.status, 'abandoned');
+  assert.equal(result.removed, false);
+  await assert.rejects(
+    () => registry.assertExclusive({ ...run, id: 'another' }),
+    /already exists/,
+  );
+  release();
+  assert.equal((await ticking).status, 'abandoned');
+  assert.match(await readFile(planPath, 'utf8'), /Task 1/);
+  await assert.rejects(
+    () => readFile(join(root, 'completed', 'plan.md')),
+    /ENOENT/,
+  );
+  assert.equal((await controller.forceStop(run.id, 'owner')).removed, true);
+  await registry.assertExclusive({ ...run, id: 'another' });
+});
+
 test('archive stages the plan move and truthful preparation progress together', async () => {
   const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
   const planPath = join(root, 'plan.md');
@@ -4123,6 +4174,132 @@ test('a reconciled run preserves its attempt and automatically schedules recover
   assert.equal(resumed.status, 'running');
   assert.equal(resumed.tasks?.['1']?.state, 'retry_wait');
   assert.ok((resumed.tasks?.['1']?.nextAttemptAt ?? 0) > Date.now());
+  assert.equal(bridge.spawnCount, 0);
+});
+
+for (const state of ['unknown', 'live', 'retired', 'unavailable'] as const) {
+  test(`force stop ${state} ownership ends management without dispatching replacement work`, async () => {
+    const root = await mkdtemp(join(tmpdir(), 'force-controller-'));
+    onTestFinished(() => rm(root, { recursive: true, force: true }));
+    const registry = new RunRegistry(join(root, 'runs'));
+    class StopBridge extends FakeBridge {
+      stops = 0;
+      override async stop(runId?: string) {
+        assert.equal(runId, 'child');
+        this.stops++;
+        return success({ state: 'stopping' });
+      }
+      override async status(runId?: string) {
+        assert.equal(runId, 'child');
+        if (state === 'unavailable') throw new Error('provider unavailable');
+        return success(
+          state === 'retired'
+            ? {
+                state: 'complete',
+                processTerminalProof: terminalProof('child', 'op', 'digest'),
+              }
+            : { state: 'running' },
+        );
+      }
+    }
+    const bridge = new StopBridge(join(root, 'result'));
+    const run = await registry.create({
+      ...baseRun(root, join(root, 'missing', 'plan.md')),
+      worktreeCwd: join(root, 'missing'),
+      status: 'cancel_pending',
+      stage: 'implementation',
+      activeOperation: {
+        operationId: 'op',
+        requestDigest: 'digest',
+        service: 'bridge',
+        kind: 'implementation',
+        ...(state === 'unknown' ? {} : { externalRunId: 'child' }),
+        lastObservedState: 'unknown_launch',
+      },
+    });
+    const controller = new PlanExecController(
+      registry,
+      bridge,
+      new FakeFusion(),
+      async () => {
+        throw new Error('No Git or replacement command is authorized');
+      },
+    );
+    const result = await controller.forceStop(run.id, 'owner');
+    assert.equal(result.run.status, 'abandoned');
+    assert.equal(result.removed, state === 'retired');
+    assert.equal(bridge.spawnCount, 0);
+    assert.equal(bridge.stops, state === 'unknown' ? 0 : 1);
+    if (!result.removed) {
+      assert.equal(
+        (await controller.tick(run.id, 'owner')).status,
+        'abandoned',
+      );
+      assert.equal(
+        (await controller.resume(run.id, 'owner')).status,
+        'abandoned',
+      );
+      await assert.rejects(
+        () => registry.assertExclusive({ ...run, id: 'other' }),
+        /already exists/,
+      );
+    }
+    const repeated = await controller.forceStop(run.id, 'owner');
+    assert.equal(repeated.run.status, 'abandoned');
+    assert.equal(bridge.spawnCount, 0);
+  });
+}
+
+test('force stop wins over a delayed legacy lookup and does not recreate its missing worktree', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'force-delayed-'));
+  onTestFinished(() => rm(root, { recursive: true, force: true }));
+  const registry = new RunRegistry(join(root, 'runs'));
+  let release!: () => void;
+  let entered!: () => void;
+  const ready = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const delayed = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  class DelayedLookup extends FakeBridge {
+    override async operation() {
+      entered();
+      await delayed;
+      return success({ state: 'unknown' });
+    }
+  }
+  const bridge = new DelayedLookup(join(root, 'result'));
+  const run = await registry.create({
+    ...baseRun(root, join(root, 'missing', 'plan.md')),
+    worktreeCwd: join(root, 'missing'),
+    status: 'cancel_pending',
+    stage: 'implementation',
+    activeOperation: {
+      operationId: 'legacy',
+      service: 'bridge',
+      kind: 'implementation',
+    },
+  });
+  const controller = new PlanExecController(
+    registry,
+    bridge,
+    new FakeFusion(),
+    async () => {
+      throw new Error('No workspace command authorized');
+    },
+  );
+  const ticking = controller.tick(run.id, 'owner');
+  await ready;
+  const stopped = await controller.forceStop(run.id, 'owner');
+  assert.equal(stopped.run.status, 'abandoned');
+  release();
+  assert.equal((await ticking).status, 'abandoned');
+  assert.equal((await registry.get(run.id))?.status, 'abandoned');
+  await assert.rejects(
+    () => readFile(join(root, 'missing', 'plan.md')),
+    /ENOENT/,
+  );
   assert.equal(bridge.spawnCount, 0);
 });
 

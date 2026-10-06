@@ -265,6 +265,7 @@ export class PlanExecController {
       )
         return run;
       if (
+        run.status === RUN_STATUS.ABANDONED ||
         run.status === RUN_STATUS.CANCELLED ||
         run.status === RUN_STATUS.CANCEL_PENDING
       )
@@ -684,6 +685,102 @@ export class PlanExecController {
     return this.advance(await this.registry.claim(run, options.sessionId));
   }
 
+  /** Final management revocation is durable before any best-effort provider call. */
+  async forceStop(
+    runId: string,
+    sessionId: string,
+    onAbandoned?: (run: PlanExecRun) => void,
+  ): Promise<{
+    run: PlanExecRun;
+    removed: boolean;
+    backupPath: string;
+    warning?: string;
+  }> {
+    let run = await this.registry.abandon(runId, sessionId);
+    onAbandoned?.(run);
+    const warnings: string[] = [];
+    try {
+      if (run.localOperationActive)
+        await cancelActiveLocalOperations(
+          this.registry.localOperationsPath(run.id),
+          run.id,
+          run.stopGeneration ?? 0,
+        );
+      const operation = run.activeOperation;
+      if (
+        operation &&
+        !operation.launchFenced &&
+        !operation.processTreeExited
+      ) {
+        const owner = bridgeOperationOwner(run, operation);
+        const reply =
+          operation.service === OPERATION_SERVICE.BRIDGE
+            ? this.bridge.cancelOperation && owner
+              ? await this.bridge.cancelOperation(operation.operationId, owner)
+              : operation.externalRunId
+                ? await this.bridge.stop(
+                    operation.externalRunId,
+                    operation.asyncDir,
+                  )
+                : undefined
+            : await (await this.reviewClient(run)).cancel(
+                operation.externalRunId,
+                operation.externalRunId ? undefined : operation.operationId,
+              );
+        if (!reply?.success)
+          warnings.push(
+            reply?.error.message ??
+              'No bound worker identity is available for stop delivery.',
+          );
+        if (
+          reply?.success &&
+          isFencedCancellation(reply.data, operation, run.id)
+        ) {
+          run = await this.registry.retireAbandonedOperation(
+            run,
+            'launchFenced',
+          );
+        } else if (operation.externalRunId) {
+          const status =
+            operation.service === OPERATION_SERVICE.BRIDGE
+              ? await this.bridgeStatus(run, operation)
+              : await (await this.reviewClient(run)).status(
+                  operation.externalRunId,
+                );
+          if (status.success && hasProcessExit(status.data, operation))
+            run = await this.registry.retireAbandonedOperation(
+              run,
+              'processTreeExited',
+            );
+          else
+            warnings.push(
+              'Worker exit is unconfirmed; its checkout remains reserved.',
+            );
+        } else
+          warnings.push(
+            'Launch remains unknown; its checkout remains reserved.',
+          );
+      }
+    } catch (error) {
+      warnings.push(error instanceof Error ? error.message : String(error));
+    }
+    run = (await this.registry.get(run.id)) ?? run;
+    let removed = false;
+    try {
+      removed = await this.registry.cleanupAbandoned(run);
+    } catch (error) {
+      warnings.push(
+        `Management ended, but registry cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    return {
+      run,
+      removed,
+      backupPath: this.registry.abandonmentBackupPath(run.id),
+      ...(warnings.length ? { warning: warnings.join(' ') } : {}),
+    };
+  }
+
   async markFailed(
     runId: string,
     error: unknown,
@@ -778,6 +875,7 @@ export class PlanExecController {
       throw new Error(
         `Isolation preparation was stopped. Review /exec recover-isolated ${existing.id} "${existing.isolationRecovery.target}" --apply before continuing.`,
       );
+    if (existing.status === RUN_STATUS.ABANDONED) return existing;
     if (explicit) await this.registry.assertExclusive(existing);
     const claimed = await this.registry.claim(existing, sessionId);
     if (
@@ -4759,7 +4857,6 @@ export class PlanExecController {
       await assertNoSymlinkPath(checkoutRoot, destination);
       if (run.progressPath)
         await assertNoSymlinkPath(checkoutRoot, run.progressPath);
-      await mkdir(dirname(destination), { recursive: true });
       const sourceExists = await pathExists(run.planPath);
       const destinationExists = await pathExists(destination);
       if (sourceExists && destinationExists)
@@ -4782,14 +4879,21 @@ export class PlanExecController {
             tracked.stderr.trim() || 'Could not inspect archived plan state.',
           );
       }
-      if (sourceExists) await rename(run.planPath, destination);
-      else if (!destinationExists)
-        throw new Error(`Plan to archive is missing: ${run.planPath}.`);
-      await appendProgressOnce(run, `Archived plan to ${destination}.`);
-      await appendProgressOnce(
+      const prepared = await this.registry.withAuthorizedMutation(
         run,
-        `Archival prepared for ${status}; waiting for owned Git commands to retire.`,
+        async () => {
+          await mkdir(dirname(destination), { recursive: true });
+          if (sourceExists) await rename(run.planPath, destination);
+          else if (!destinationExists)
+            throw new Error(`Plan to archive is missing: ${run.planPath}.`);
+          await appendProgressOnce(run, `Archived plan to ${destination}.`);
+          await appendProgressOnce(
+            run,
+            `Archival prepared for ${status}; waiting for owned Git commands to retire.`,
+          );
+        },
       );
+      if (!prepared) return (await this.registry.get(run.id)) ?? run;
 
       if (!sourceExists) {
         const tracked = await this.runCommand(
@@ -5511,6 +5615,8 @@ export class PlanExecController {
     error: string,
     preserveOperation = false,
   ): Promise<PlanExecRun> {
+    const latest = await this.registry.get(run.id);
+    if (latest?.status === RUN_STATUS.ABANDONED) return latest;
     const failedOperation = run.activeOperation ?? run.failedOperation;
     const failed = await this.registry.update({
       ...withoutOperation({
@@ -5532,6 +5638,7 @@ export class PlanExecController {
       ...(failedOperation ? { failedOperation } : {}),
       ...(preserveOperation ? { activeOperation: run.activeOperation } : {}),
     });
+    if (failed.status === RUN_STATUS.ABANDONED) return failed;
     try {
       if (error !== run.error || !run.recoveryAttempts)
         await this.registry.appendRecoveryMessage(

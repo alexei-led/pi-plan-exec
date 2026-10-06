@@ -367,7 +367,10 @@ full ID is always in front of you.
 /exec status [run-id]   No run ID: every run grouped by what it needs, any missing package, and one next command per run. With a run ID: that run in detail
 /exec resume [run-id] [--model current|provider/model]
                         Continue a stuck run: take over a dead session's lease, reconcile a provably gone worker, retry a failure in the same stage and worktree
-/exec stop [run-id]     Ask whether to pause the run (resumable) or cancel it (final, worktree preserved)
+/exec pause [run-id]    Stop the current attempt and keep it resumable
+/exec stop [run-id]     Request final cancellation without a dialog; preserve the worktree
+/exec stop <run-id> --force  Permanently abandon management, retaining unresolved ownership
+/exec ui on|off         Toggle the progress display without changing execution
 /exec cleanup [full-run-id] [--apply]
                         Preview retired runs older than 7 days; --apply deletes their registry entries only
 /exec skip <full-run-id> --reason <text>
@@ -386,6 +389,18 @@ its install command, and ends every row in exactly one next command.
 Terminal runs drop out of that listing 24 hours after their last update. The
 footer names how many are hidden and both escapes: `/exec status --all` shows
 them, `/exec cleanup` removes them.
+
+### Permanent abandonment
+
+Use `/exec stop <full-run-id> --force` to end management even when worker
+retirement cannot be established. The run is hidden across restarts and cannot
+resume. A read-only display refresh also dismisses it in other open sessions.
+Cancellation is attempted only through its exact owned identity. Unknown
+operations retain their record and checkout reservation. The run stays reserved
+until controller quiescence and retirement permit cleanup. Pre-stop/final
+records are flushed to a private archive before eligible registry artifacts are
+removed. Worktrees, branches, progress and provider journals remain.
+See [force-stop recovery](../skills/exec-plan/references/recovery.md#permanent-force-stop).
 
 ### Retiring run records
 
@@ -407,14 +422,15 @@ Removal deletes the registry entry only. The worktree, the branch, and the
 
 ### Retired names and scripted flags
 
-`/exec stop` and some `/exec resume` branches ask a question, which a headless
-caller cannot answer. Every prompt has a non-interactive equivalent, and the
-former subcommand names still dispatch. They are absent from `/exec help` on
+`/exec pause` and `/exec stop` work without UI. Some `/exec resume` branches
+still ask for confirmation; use their supported flags for scripted callers.
+Former subcommand names still dispatch. They are absent from `/exec help` on
 purpose; `/skill:exec-plan` collects them for agents. `/exec runs` and
 `/exec doctor` both read exactly what `/exec status` reads, `/exec setup` still
 prints the install commands unconditionally where `/exec status` reports them
 only when a package is missing, `/exec adopt` means `/exec resume`, and
-`/exec pause` and `/exec cancel` are `/exec stop` without the question.
+`/exec cancel` is the deprecated alias for final `/exec stop`. `/exec pause`
+is a primary resumable command, not an alias for stop.
 `/exec start` was deleted outright: it was the same code path as bare `/exec`,
 and typing it now says so instead of reading the word as a plan path.
 
@@ -610,9 +626,9 @@ Use this sequence instead:
 1. Run `/exec status` to see every run, what each one needs, and one next command
    per run. Add a full run ID for the stage, active operation, worktree, branch,
    progress path, and any error of that one run. It only observes.
-2. Run `/exec stop` when you want the run to end and pick pause or cancel at the
-   prompt. Pause cancels the current attempt, preserves its checkpoint and
-   progress, and remains resumable after cleanup. Run `/exec resume` when you are
+2. Run `/exec stop` for final cancellation, or `/exec pause` to preserve
+   resumability. Pause cancels the current attempt and preserves its checkpoint
+   and progress. Run `/exec resume` when you are
    ready to continue a paused run. If an actual supervisor request is displayed,
    answer it; a paused status alone does not prove there is a question.
    A live controller keeps polling an attached paused operation and continues

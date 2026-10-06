@@ -123,10 +123,8 @@ const ALIAS_NOTES: Record<ExecAliasAction, string> = {
     '/exec setup is now part of /exec status; the old name still works.',
   [EXEC_ACTION.ADOPT]:
     '/exec adopt is now /exec resume; the old name still works.',
-  [EXEC_ACTION.PAUSE]:
-    '/exec pause is now /exec stop; the old name still works and is the way to pause without a human to ask.',
   [EXEC_ACTION.CANCEL]:
-    '/exec cancel is now /exec stop; the old name still works and is the way to cancel without a human to ask.',
+    '/exec cancel is deprecated; use /exec stop. Both request final cancellation.',
 };
 /** Every run verb the action dispatch owns; `status` is read and answered earlier. */
 type DispatchedAction = Exclude<RunAction, typeof EXEC_ACTION.STATUS>;
@@ -138,22 +136,6 @@ const RUN_ACTIONS: Record<DispatchedAction, true> = {
   [EXEC_ACTION.SKIP]: true,
   [EXEC_ACTION.CANCEL]: true,
 };
-/** Labels lead with reversibility: it is the difference the reader chooses on. */
-const STOP_OUTCOMES = [
-  {
-    action: EXEC_ACTION.PAUSE,
-    label:
-      'Pause — stop the current attempt and keep its checkpoint; /exec resume continues after confirmed exit.',
-  },
-  {
-    action: EXEC_ACTION.CANCEL,
-    label:
-      'Cancel — final; the run stops for good and its worktree is preserved.',
-  },
-] as const;
-/** Stop asks a question, so with no human it names both scripted answers. */
-const STOP_REQUIRES_UI =
-  '/exec stop asks whether to pause or cancel and needs an interactive session. Use /exec pause <run-id> to stop the current attempt while keeping its checkpoint resumable, or /exec cancel <run-id> to stop it for good with its worktree preserved.';
 const RUN_LIST_TERMINAL_WINDOW_MS = MILLISECONDS_PER_DAY;
 /** Why a reconcile left a run alone. Each reason gets its own report line. */
 const RECONCILE_SKIP = {
@@ -207,20 +189,11 @@ function requiredSetupCommands(): string[] {
 
 /** Primary verbs only: a retired name still dispatches, but is never taught. */
 const EXEC_COMMANDS: AutocompleteItem[] = [
+  { value: 'ui', label: 'ui', description: 'Toggle plan display: ui on|off' },
   {
-    value: 'hide',
-    label: 'hide',
-    description: 'Hide plan UI without stopping execution',
-  },
-  {
-    value: 'show',
-    label: 'show',
-    description: 'Restore plan UI without resuming execution',
-  },
-  {
-    value: 'clear',
-    label: 'clear',
-    description: 'Dismiss a run display without deleting its record',
+    value: EXEC_ACTION.PAUSE,
+    label: EXEC_ACTION.PAUSE,
+    description: 'Pause current work; resume continues later',
   },
   {
     value: EXEC_ACTION.ISOLATE,
@@ -246,7 +219,7 @@ const EXEC_COMMANDS: AutocompleteItem[] = [
   {
     value: EXEC_ACTION.STOP,
     label: EXEC_ACTION.STOP,
-    description: 'Stop a run: pause it (resumable) or cancel it (final)',
+    description: 'Final cancellation; --force permanently abandons management',
   },
   {
     value: EXEC_ACTION.RESUME,
@@ -580,6 +553,8 @@ export default function planExecExtension(pi: ExtensionAPI): void {
   const lastStates = new Map<string, RunState>();
   const lastProbeErrors = new Map<string, string>();
   let presentation = new RunPresentation();
+  let displayTimer: ReturnType<typeof setInterval> | undefined;
+  let refreshingDisplay = false;
   const renderStatus = (ctx: ExtensionContext): void => {
     if (sessionClosed) return;
     const run = presentation.current();
@@ -598,7 +573,7 @@ export default function planExecExtension(pi: ExtensionAPI): void {
       const view = progressView(run, Date.now(), observing());
       ctx.ui.setStatus(
         STATUS_KEY,
-        `exec ${view.label} · /exec hide · /exec status`,
+        `exec ${view.label} · /exec ui off · /exec status`,
       );
       if (ctx.mode === 'tui') {
         ctx.ui.setWidget(STATUS_KEY, () => ({
@@ -805,7 +780,13 @@ export default function planExecExtension(pi: ExtensionAPI): void {
         | { settled: Promise<void>; retirementRunIds?: Set<string> }
         | undefined;
       try {
-        const [viewAction, viewId, ...extra] = args.trim().split(/\s+/);
+        let [viewAction, viewId, ...extra] = args.trim().split(/\s+/);
+        if (viewAction === 'ui') {
+          if (extra.length || (viewId !== 'on' && viewId !== 'off'))
+            throw new Error('Usage: /exec ui on|off');
+          viewAction = viewId === 'off' ? 'hide' : 'show';
+          viewId = undefined;
+        }
         if (
           viewAction === 'hide' ||
           viewAction === 'show' ||
@@ -873,8 +854,18 @@ export default function planExecExtension(pi: ExtensionAPI): void {
             }
           },
           handoffLifecycle,
+          onAbandoned: (run, context) => {
+            stopBackgroundController(run.id);
+            setStatus(run, context);
+            void syncProjection(run, projectionContext(context)).catch(
+              () => undefined,
+            );
+          },
         });
-        if (viewAction === EXEC_ACTION.CLEANUP) {
+        if (
+          viewAction === EXEC_ACTION.CLEANUP ||
+          viewAction === EXEC_ACTION.STOP
+        ) {
           const { runs } = await defaultRegistry.listWithErrors();
           if (sessionClosed) return;
           presentation.reconcile(
@@ -1000,6 +991,31 @@ export default function planExecExtension(pi: ExtensionAPI): void {
     const runtimeSessionId = projectionContext(ctx).runtimeSessionId;
     presentation.reconcile(contextualRuns);
     renderStatus(ctx);
+    if (displayTimer) clearInterval(displayTimer);
+    displayTimer = setInterval(() => {
+      const displayed = presentation.current();
+      if (
+        sessionClosed ||
+        refreshingDisplay ||
+        !displayed ||
+        activeControllers.has(displayed.id)
+      )
+        return;
+      refreshingDisplay = true;
+      void defaultRegistry
+        .get(displayed.id)
+        .then((current) => {
+          if (sessionClosed) return;
+          if (current) presentation.remember(current);
+          else presentation.forget(displayed.id);
+          renderStatus(ctx);
+        })
+        .catch(() => undefined)
+        .finally(() => {
+          refreshingDisplay = false;
+        });
+    }, CONTROLLER_POLL_INTERVAL_MS);
+    displayTimer.unref?.();
     for (const run of runs) {
       if (
         isLocalRun(run) &&
@@ -1073,6 +1089,7 @@ export default function planExecExtension(pi: ExtensionAPI): void {
     presentation.hide();
     renderStatus(ctx);
     sessionClosed = true;
+    if (displayTimer) clearInterval(displayTimer);
     for (const timer of activeControllers.values()) clearInterval(timer);
     activeControllers.clear();
     lastStates.clear();
@@ -1223,6 +1240,22 @@ export function recoveryGuidance(
   const commands = runCommands(run);
   const { status, resume, stop } = commands;
   const polled = evidence?.leaseLive === true;
+  if (run.status === RUN_STATUS.ABANDONED)
+    return {
+      classification: 'abandoned by operator; management ended',
+      action:
+        'No automatic recovery or resume. Unknown workers are not confirmed stopped. Retained ownership evidence reserves their checkouts; worktrees and provider journals are preserved.',
+      command: status,
+    };
+  if (
+    run.status === RUN_STATUS.CANCEL_PENDING &&
+    run.activeOperation?.lastObservedState === 'unknown_launch'
+  )
+    return {
+      classification: 'stop cannot establish worker retirement',
+      action: `To end management permanently, run ${stop} --force. This hides the run across restarts, preserves unknown ownership and never proves worker exit.`,
+      command: `${stop} --force`,
+    };
   if (isTerminal(run.status) && run.status !== RUN_STATUS.FAILED)
     return {
       classification: 'finished',
@@ -1941,6 +1974,7 @@ function nextRunCommand(run: PlanExecRun): string {
 }
 
 function isRecentlyRelevantRun(run: PlanExecRun): boolean {
+  if (run.status === RUN_STATUS.ABANDONED) return false;
   return (
     !isTerminal(run.status) ||
     Date.now() - run.updatedAt < RUN_LIST_TERMINAL_WINDOW_MS
@@ -2837,6 +2871,7 @@ interface CommandDependencies {
   isSessionClosed?: () => boolean;
   handoffLifecycle?: HandoffLifecycle;
   recordRun?: (run: PlanExecRun) => void;
+  onAbandoned?: (run: PlanExecRun, ctx: ExtensionContext) => void;
   mutate?: <T>(operation: () => Promise<T>) => Promise<T>;
 }
 
@@ -3183,15 +3218,36 @@ async function runAction(
   dependencies: CommandDependencies,
 ): Promise<string | undefined> {
   const { startBackgroundController, syncProjection } = dependencies;
-  // Only resume takes flags, so only resume parses them.
+  if (action === EXEC_ACTION.STOP && rest.includes('--force')) {
+    const selectors = rest.filter((arg) => arg !== '--force');
+    if (
+      selectors.length !== 1 ||
+      selectors[0]?.startsWith('--') ||
+      rest.filter((arg) => arg === '--force').length !== 1
+    )
+      throw new Error('Usage: /exec stop <full-run-id> --force');
+    const result = await mutateCommand(dependencies, () =>
+      dependencies.controller.forceStop(
+        required(selectors[0]),
+        ctx.sessionManager.getSessionId(),
+        (run) => dependencies.onAbandoned?.(run, ctx),
+      ),
+    );
+    return `Run ${result.run.id} abandoned permanently. No resume or automatic retries. ${result.removed ? 'Eligible registry artifacts removed.' : 'Ownership record retained; unknown work is not confirmed stopped.'} Worktrees, branches and provider journals were not deleted. Backup: ${result.backupPath}.${result.warning ? ` ${result.warning}` : ''}`;
+  }
+  if (
+    (action === EXEC_ACTION.STOP ||
+      action === EXEC_ACTION.PAUSE ||
+      action === EXEC_ACTION.CANCEL) &&
+    (rest.length > 1 || rest.some((arg) => arg.startsWith('--')))
+  )
+    throw new Error(`Usage: /exec ${action} [full-run-id]`);
   const resumeArguments =
     action === EXEC_ACTION.RESUME ? parseResumeArguments(rest) : undefined;
   if (action === EXEC_ACTION.SKIP && (!rest[0] || rest[0] === '--reason'))
     throw skipUsageError();
   // Before resolving a run, so a repository with several candidates does not
   // ask a picker question first and then refuse anyway.
-  if (action === EXEC_ACTION.STOP && !ctx.hasUI)
-    throw new Error(STOP_REQUIRES_UI);
   const resolved = await resolveRunForAction(
     action,
     resumeArguments ? resumeArguments.selector : rest[0],
@@ -3209,11 +3265,7 @@ async function runAction(
   }
   if (action === EXEC_ACTION.SKIP)
     return skipStage(resolved, rest, ctx, dependencies);
-  // Ask before claiming: an abandoned dialog must not have taken the lease.
-  const outcome =
-    action === EXEC_ACTION.STOP
-      ? await chooseStopOutcome(resolved, ctx)
-      : action;
+  const outcome = action === EXEC_ACTION.STOP ? EXEC_ACTION.CANCEL : action;
   const sessionId = ctx.sessionManager.getSessionId();
   if (dependencies.isSessionClosed?.()) return undefined;
   const retiring = retiringSession(resolved);
@@ -3425,39 +3477,6 @@ async function skipStage(
   );
   startBackgroundController(skipped, sessionId, ctx.cwd, ctx);
   return `Run ${shortRunId(skipped.id)} force-skip requested: ${skipped.status} (${skipped.stage}).\nUse /exec status ${skipped.id} for live progress.`;
-}
-
-/**
- * Offers only the outcomes this run can still take. A single remaining outcome
- * is still asked, never assumed: an unwanted final cancel is the damage this
- * question prevents.
- */
-export async function chooseStopOutcome(
-  run: PlanExecRun,
-  ctx: {
-    hasUI: boolean;
-    ui: {
-      select(title: string, options: string[]): Promise<string | undefined>;
-    };
-  },
-): Promise<typeof EXEC_ACTION.PAUSE | typeof EXEC_ACTION.CANCEL> {
-  if (!ctx.hasUI) throw new Error(STOP_REQUIRES_UI);
-  const outcomes = STOP_OUTCOMES.filter((outcome) =>
-    isActionAllowed(outcome.action, run),
-  );
-  if (outcomes.length === 0)
-    throw new Error(
-      `Run ${shortRunId(run.id)} cannot be stopped while ${run.status}.`,
-    );
-  const labels: string[] = outcomes.map((outcome) => outcome.label);
-  const choice = await ctx.ui.select(
-    `Stop run ${shortRunId(run.id)} (${run.status}/${run.stage})?`,
-    labels,
-  );
-  if (!choice) throw new Error('Stop cancelled.');
-  const selected = outcomes[labels.indexOf(choice)];
-  if (!selected) throw new Error('Stop selection returned an unknown outcome.');
-  return selected.action;
 }
 
 async function resolveRunForAction(
@@ -3726,11 +3745,8 @@ export function isActionAllowed(
   adoptCurrentBranch = false,
 ): boolean {
   if (action === EXEC_ACTION.STATUS) return true;
-  // Stop is allowed when either of its outcomes is; the reader picks which.
   if (action === EXEC_ACTION.STOP)
-    return STOP_OUTCOMES.some((outcome) =>
-      isActionAllowed(outcome.action, run),
-    );
+    return isActionAllowed(EXEC_ACTION.CANCEL, run);
   if (action === EXEC_ACTION.PAUSE)
     return (
       run.status === RUN_STATUS.STARTING || run.status === RUN_STATUS.RUNNING
@@ -4126,6 +4142,8 @@ export function pausedMessage(run: PlanExecRun): string {
 }
 
 function terminalMessage(run: PlanExecRun): string {
+  if (run.status === RUN_STATUS.ABANDONED)
+    return `Plan execution ${shortRunId(run.id)} abandoned. Management ended; worker retirement is not implied.`;
   if (run.status === RUN_STATUS.FAILED)
     return `Plan execution ${shortRunId(run.id)} failed at ${run.stage}: ${run.error ?? 'unknown error'}. Worktree preserved; use /exec status ${run.id}.`;
   if (run.status === RUN_STATUS.COMPLETED_WITH_FINDINGS)
@@ -4266,10 +4284,10 @@ export function execHelp(): string {
     `/exec resume [run-id] [${RECOVERY_MODEL_OPTION} current|provider/model]`,
     '/exec recover-isolated <full-run-id> <absolute-new-checkout> [--apply] — explicit local-files-only target change; old writer stays unknown',
     "                        Continue a stuck run: take over a dead session's lease while retaining the existing operation and saved result. Explicit pauses require resume; automatic task retries preserve their checkpoints.",
-    '/exec hide             Hide the strip and footer immediately; execution continues.',
-    '/exec show [run-id]     Restore the display without resuming execution.',
-    '/exec clear [run-id]    Dismiss the displayed run; keep execution and recovery records.',
-    '/exec stop [run-id]     Stop a run: it asks whether to pause it (resumable) or cancel it (final, worktree preserved).',
+    '/exec ui on|off         Toggle the display without changing execution.',
+    '/exec pause [run-id]    Pause current work; resume continues after confirmed exit.',
+    '/exec stop [run-id]     Request final cancellation; preserve the worktree.',
+    '/exec stop <run-id> --force  End management permanently and clean eligible registry artifacts. Unknown workers keep a hidden ownership record; no worker-exit claim or worktree deletion.',
     `/exec cleanup [full-run-id] [${CLEANUP_APPLY_OPTION}]`,
     `                        Preview retired runs older than ${CLEANUP_RETENTION_DAYS} days; ${CLEANUP_APPLY_OPTION} deletes their registry entries only.`,
     '/exec skip <full-run-id> --reason <text>',

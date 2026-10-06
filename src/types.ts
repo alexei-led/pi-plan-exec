@@ -30,7 +30,6 @@ export const EXEC_ALIAS_ACTIONS = [
   EXEC_ACTION.DOCTOR,
   EXEC_ACTION.SETUP,
   EXEC_ACTION.ADOPT,
-  EXEC_ACTION.PAUSE,
   EXEC_ACTION.CANCEL,
 ] as const;
 
@@ -70,6 +69,7 @@ export const RUN_STATUS = {
   SKIP_PENDING: 'skip_pending',
   CANCEL_PENDING: 'cancel_pending',
   CANCELLED: 'cancelled',
+  ABANDONED: 'abandoned',
   FAILED: 'failed',
   COMPLETED: 'completed',
   COMPLETED_WITH_FINDINGS: 'completed_with_findings',
@@ -439,6 +439,8 @@ export interface PlanExecRun {
   schemaVersion: 1;
   id: string;
   executionGeneration?: number;
+  /** Final operator decision, not process-retirement evidence. */
+  abandonment?: { requestedAt: number; requestedBy: string };
   isolationRecovery?: IsolationRecovery;
   quarantinedExecutions?: QuarantinedExecution[];
   /** Monotonic durable-state revision. Missing only on legacy v1 records. */
