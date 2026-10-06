@@ -1229,6 +1229,32 @@ export function recoveryGuidance(
       action: `This run is over and there is nothing to recover. Run /exec cleanup once you no longer need its record.`,
       command: commands.cleanup,
     };
+  if (run.status === RUN_STATUS.PAUSED && run.userStopped) {
+    if (leaseNamesAnotherHost(run))
+      return {
+        classification: 'paused at your request; its lease names another host',
+        action: `Run ${status} to inspect ownership without resuming. If ${run.lease?.hostname} was this machine before it was renamed, use ${resume} ${SAME_MACHINE_OPTION} only when you intend to continue execution, not merely to repair ownership. Otherwise, recover on the recorded host when ready.`,
+        command: status,
+      };
+    const stopping =
+      run.localOperationActive ||
+      (run.activeOperation &&
+        !run.activeOperation.processTreeExited &&
+        !run.activeOperation.launchFenced);
+    if (stopping)
+      return {
+        classification: 'pause requested; waiting for confirmed worker exit',
+        action: polled
+          ? `Wait while the controller stops the tracked work. Run ${status} to check for confirmed exit; resume only when you are ready to continue.`
+          : `No live controller is finishing cleanup. Run ${status} to inspect the preserved stop and ownership evidence. This only observes; it does not restart cleanup. Resume only when you intend to continue execution.`,
+        command: status,
+      };
+    return {
+      classification: 'paused at your request',
+      action: `Run ${resume} when you are ready to continue from the saved checkpoint.`,
+      command: resume,
+    };
+  }
   if (leaseNamesAnotherHost(run))
     return {
       classification: 'its lease names a machine that cannot be observed here',
@@ -1380,13 +1406,14 @@ export function recoveryGuidance(
       )
         return polled
           ? {
-              classification: 'workflow paused for supervisor input',
-              action: `Reply to the displayed supervisor request. This controller is still polling the same workflow and continues automatically after its child settles. Run ${status} to re-check; do not resume or start another run.`,
+              classification: 'operation paused',
+              action: `This controller is still polling the same operation and continues automatically after it settles. Run ${status} to inspect the pause; do not resume or start another run.`,
               command: status,
             }
           : {
-              classification: 'workflow paused for supervisor input',
-              action: `No live controller is polling it. Reply to any displayed supervisor request, then run ${resume}; it consumes the durable child result or reattaches the same workflow without launching a replacement.`,
+              classification:
+                'operation paused, with no live controller polling it',
+              action: `Run ${resume}; it consumes the durable child result or reattaches the same operation without launching a replacement. The paused state alone does not identify what it is waiting for.`,
               command: resume,
             };
       const signal = run.activeOperation.workerSignal;
@@ -1444,8 +1471,8 @@ export function recoveryGuidance(
       };
     if (run.activeOperation)
       return {
-        classification: 'workflow paused for supervisor input',
-        action: `Reply to the displayed supervisor request first and wait for its child to finish. Then run ${resume}; it consumes the durable child result or reattaches the same workflow without launching a replacement.`,
+        classification: 'paused with a tracked operation',
+        action: `Run ${resume} when ready; it consumes the durable child result or reattaches the same operation without launching a replacement. The recorded pause details are available in ${status}.`,
         command: resume,
       };
     return {

@@ -543,9 +543,8 @@ export interface PlanExecRun {
   createdAt: number;
   updatedAt: number;
   /**
-   * When the archive stage finished; cleanup measures its retention window from
-   * here. Absent on runs archived before the field existed or finished without
-   * the archive stage, which fall back to `updatedAt`.
+   * Completion/cancellation timestamp anchoring cleanup retention. Older final
+   * records fall back to `updatedAt`, preserved here on their next write.
    */
   retiredAt?: number;
   /** Stamped when an abandoned run was reset to failed, so the reset is auditable. */

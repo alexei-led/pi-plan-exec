@@ -417,12 +417,23 @@ export class RunRegistry {
           ))
       )
         return { run: current, applied: false };
+      const updatedAt = nextUpdatedAt(current.updatedAt);
+      // Final runs keep their retention anchor through projection repair and
+      // lease release. Older final records retain their existing cleanup age.
+      const retiredAt =
+        run.retiredAt ??
+        (isTerminalStatus(run.status) && run.status !== RUN_STATUS.FAILED
+          ? current.status === run.status
+            ? current.updatedAt
+            : updatedAt
+          : undefined);
       const updated: PlanExecRun = {
         ...run,
         revision: preserveRevision
           ? (current.revision ?? 1)
           : (current.revision ?? 1) + 1,
-        updatedAt: nextUpdatedAt(current.updatedAt),
+        updatedAt,
+        ...(retiredAt !== undefined ? { retiredAt } : {}),
       };
       await writeLocked(path, updated);
       return { run: updated, applied: true };

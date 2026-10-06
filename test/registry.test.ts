@@ -136,6 +136,52 @@ function thisHost(): string {
   return required(hostname().split('.')[0]);
 }
 
+for (const status of [
+  'completed',
+  'completed_with_findings',
+  'cancelled',
+] as const)
+  test(`final status ${status} keeps its retirement time across later writes`, async () => {
+    const { directory, registry } = await seedRegistry();
+    onTestFinished(() => rm(directory, { recursive: true, force: true }));
+    const run = await registry.create(runSeed());
+    const terminal = await registry.update({ ...run, status });
+    assert.equal(terminal.retiredAt, terminal.updatedAt);
+    const released = await registry.release(terminal);
+    const projected = await registry.updateTaskProjection(released, {
+      version: 1,
+      state: 'degraded',
+      owner: 'pi-plan-exec',
+      sessionId: 'session',
+      revision: released.revision ?? 1,
+      taskIds: {},
+      error: 'fixture',
+    });
+    assert.equal(projected.retiredAt, terminal.retiredAt);
+    assert.ok(projected.updatedAt > terminal.updatedAt);
+    assert.equal(projected.revision, released.revision);
+  });
+for (const status of ['running', 'paused', 'cancel_pending', 'failed'] as const)
+  test(`recoverable or unfinished status ${status} does not acquire a retirement stamp`, async () => {
+    const { directory, registry } = await seedRegistry();
+    onTestFinished(() => rm(directory, { recursive: true, force: true }));
+    const run = await registry.create(runSeed());
+    const updated = await registry.update({ ...run, status });
+    assert.equal(updated.retiredAt, undefined);
+  });
+test('a rejected terminal write does not stamp retirement', async () => {
+  const { directory, registry } = await seedRegistry();
+  onTestFinished(() => rm(directory, { recursive: true, force: true }));
+  const run = await registry.create(runSeed());
+  await registry.update({ ...run, needsAttention: true });
+  const result = await registry.updateIfCurrent(
+    { ...run, status: 'cancelled' },
+    run.updatedAt,
+  );
+  assert.equal(result.applied, false);
+  assert.equal(result.run.status, 'running');
+  assert.equal(result.run.retiredAt, undefined);
+});
 test('registry rejects a second nonterminal run in the same worktree or plan', async () => {
   const { registry } = await seedRegistry();
   const first = await registry.create(runSeed({ status: 'paused' }), {

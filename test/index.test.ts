@@ -22,7 +22,10 @@ import {
   type ExtensionCommandContext,
   SessionManager,
 } from '@earendil-works/pi-coding-agent';
-import { PlanExecController } from '../src/controller.js';
+import {
+  PLAN_STRUCTURE_CHANGED_ERROR,
+  PlanExecController,
+} from '../src/controller.js';
 import planExecExtension, {
   abandonedRunsNotice,
   abandonmentProbe,
@@ -1422,11 +1425,8 @@ test('run status classifies recovery and gives one safe next action', () => {
   const pausedWorkflow = formatRunStatus(pausedWorkflowRun, {
     leaseLive: true,
   });
-  assert.match(
-    pausedWorkflow,
-    /recovery: workflow paused for supervisor input/,
-  );
-  assert.match(pausedWorkflow, /Reply to the displayed supervisor request/);
+  assert.match(pausedWorkflow, /recovery: operation paused/);
+  assert.doesNotMatch(pausedWorkflow, /Reply to|paused for supervisor input/);
   assert.match(pausedWorkflow, /continues automatically/);
   assert.match(pausedWorkflow, /do not resume or start another run/);
 
@@ -4225,7 +4225,16 @@ test('same-machine rebinds settled and between-step leases without discarding ow
     const claimed = await registry.claim(recovered.run, 'new-session');
     assert.equal(claimed.lease?.sessionId, 'new-session');
     assert.equal(claimed.localOperationActive, true);
-    assert.match(recoveryGuidance(held).command, /--same-machine/);
+    const guidance = recoveryGuidance(held);
+    if (status === 'paused') {
+      assert.equal(guidance.command, `/exec status ${held.id}`);
+      assert.match(
+        guidance.action,
+        /--same-machine only when you intend to continue/,
+      );
+    } else {
+      assert.match(guidance.command, /--same-machine/);
+    }
   }
 });
 
@@ -5523,6 +5532,114 @@ test('cleanup does not offer --include-failed to a caller naming one run', async
   );
 });
 
+for (const polled of [true, false])
+  for (const retired of [false, true])
+    test(`user pause guidance preserves stop intent (polled=${polled}, retired=${retired})`, () => {
+      const paused = run({
+        status: 'paused',
+        userStopped: true,
+        activeOperation: {
+          operationId: 'op',
+          service: 'bridge',
+          kind: 'implementation',
+          externalRunId: 'worker',
+          processTreeExited: retired,
+        },
+      });
+      const guidance = recoveryGuidance(paused, { leaseLive: polled });
+      assert.doesNotMatch(JSON.stringify(guidance), /supervisor|reply/i);
+      if (retired) {
+        assert.match(guidance.classification, /paused/);
+        assert.match(guidance.command, /\/exec resume /);
+      } else {
+        assert.match(guidance.classification, /pause.*exit/i);
+        assert.match(guidance.command, /\/exec status /);
+        assert.equal(isActionAllowed(EXEC_ACTION.STATUS, paused), true);
+        assert.doesNotMatch(guidance.action, /choose pause|\/exec stop/);
+        if (!polled) assert.match(guidance.action, /does not restart cleanup/);
+      }
+    });
+test('a stale lease does not hide a settled user pause', () => {
+  const paused = run({
+    status: 'paused',
+    userStopped: true,
+    stopGeneration: 3,
+    lease: DEAD_LEASE,
+  });
+  delete paused.activeOperation;
+  const before = structuredClone(paused);
+  const guidance = recoveryGuidance(paused, { leaseLive: false });
+  assert.equal(guidance.classification, 'paused at your request');
+  assert.match(guidance.action, /when you are ready to continue/);
+  assert.deepEqual(paused, before);
+});
+test('a foreign lease cannot turn user-pause guidance into an ownership resume', () => {
+  const paused = run({
+    status: 'paused',
+    userStopped: true,
+    lease: { ...DEAD_LEASE, hostname: 'renamed-or-remote-host.invalid' },
+  });
+  const before = structuredClone(paused);
+  const guidance = recoveryGuidance(paused, { leaseLive: false });
+  assert.match(guidance.classification, /paused at your request/);
+  assert.equal(guidance.command, `/exec status ${paused.id}`);
+  assert.match(guidance.action, /--same-machine/);
+  assert.match(guidance.action, /only when you intend to continue/);
+  assert.deepEqual(paused, before);
+});
+for (const error of [
+  'Execution directory is on other, expected feature.',
+  PLAN_STRUCTURE_CHANGED_ERROR,
+])
+  test(`user-pause intent precedes generic recovery advice: ${error}`, () => {
+    const paused = run({ status: 'paused', userStopped: true, error });
+    delete paused.activeOperation;
+    const guidance = recoveryGuidance(paused, { leaseLive: false });
+    assert.equal(guidance.classification, 'paused at your request');
+    assert.match(guidance.action, /when you are ready to continue/);
+  });
+test('generic paused operation guidance does not invent a supervisor request', () => {
+  for (const status of ['running', 'paused'] as const) {
+    const guidance = recoveryGuidance(
+      run({
+        status,
+        activeOperation: {
+          operationId: 'op',
+          service: 'bridge',
+          kind: 'implementation',
+          externalRunId: 'worker',
+          lastObservedState: 'paused',
+        },
+      }),
+      { leaseLive: true },
+    );
+    assert.doesNotMatch(JSON.stringify(guidance), /supervisor|reply/i);
+    assert.match(guidance.classification, /paused/);
+  }
+});
+for (const status of [
+  'cancelled',
+  'completed',
+  'completed_with_findings',
+] as const)
+  test(`projection repair cannot postpone cleanup of a legacy ${status} run`, async () => {
+    const cancelled = retiredRun({ status, updatedAt: PAST_RETENTION });
+    const registry = await seedRegistry([cancelled]);
+    assert.equal(isRemovableRun(cancelled), true);
+    const projected = await registry.updateTaskProjection(cancelled, {
+      version: 1,
+      state: 'degraded',
+      owner: 'pi-plan-exec',
+      sessionId: 'session',
+      revision: cancelled.revision ?? 1,
+      taskIds: {},
+      error: 'fixture',
+    });
+    assert.equal(projected.revision, cancelled.revision ?? 1);
+    assert.ok(projected.updatedAt > cancelled.updatedAt);
+    assert.equal(projected.retiredAt, cancelled.updatedAt);
+    assert.equal(isRemovableRun(projected), true);
+  });
 test('retention is measured from when a run finished, not from its last write', () => {
   // A lease release writes the record after the run is over, so `updatedAt`
   // would restart the clock.

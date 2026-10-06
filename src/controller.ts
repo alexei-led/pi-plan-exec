@@ -3757,7 +3757,7 @@ export class PlanExecController {
     if (!waiting.applied) return waiting.run;
     await appendProgressOnceBestEffort(
       waiting.run,
-      `${operation.kind} workflow is waiting for supervisor input; the controller kept its operation attached and continued polling.`,
+      `${operation.kind} operation is paused; the controller kept it attached and continued polling.`,
     );
     return waiting.run;
   }
@@ -5492,15 +5492,18 @@ export class PlanExecController {
     stage: RunStage,
     message: string,
   ): Promise<PlanExecRun> {
-    const transitioned = await this.registry.update({
-      ...clearError(withoutOperation(run)),
-      stage,
-      status: RUN_STATUS.RUNNING,
-      nextAttemptAt: 0,
-      recoveryAttempts: 0,
-    });
-    await appendProgress(transitioned, message);
-    return transitioned;
+    const transitioned = await this.registry.updateIfCurrent(
+      {
+        ...clearError(withoutOperation(run)),
+        stage,
+        status: RUN_STATUS.RUNNING,
+        nextAttemptAt: 0,
+        recoveryAttempts: 0,
+      },
+      run.updatedAt,
+    );
+    if (transitioned.applied) await appendProgress(transitioned.run, message);
+    return transitioned.run;
   }
 
   private async fail(
