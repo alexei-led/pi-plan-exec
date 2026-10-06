@@ -553,6 +553,7 @@ export default function planExecExtension(pi: ExtensionAPI): void {
   const lastStates = new Map<string, RunState>();
   const lastProbeErrors = new Map<string, string>();
   let presentation = new RunPresentation();
+  const abandonedRuns = new Set<string>();
   let displayTimer: ReturnType<typeof setInterval> | undefined;
   let refreshingDisplay = false;
   const renderStatus = (ctx: ExtensionContext): void => {
@@ -662,7 +663,7 @@ export default function planExecExtension(pi: ExtensionAPI): void {
     if (
       sessionClosed ||
       isTerminal(initialRun.status) ||
-      presentation.isRemoved(runId) ||
+      abandonedRuns.has(runId) ||
       retiringSession(initialRun) ||
       activeControllers.has(runId)
     )
@@ -676,7 +677,7 @@ export default function planExecExtension(pi: ExtensionAPI): void {
       inFlightControllers.set(runId, ticking);
       void ticking
         .then(async (run) => {
-          if (sessionClosed || presentation.isRemoved(runId)) return run;
+          if (sessionClosed || abandonedRuns.has(runId)) return run;
           lastProbeErrors.delete(runId);
           if (handoffWhenReady && canHandoffPreparedWorktree(run)) {
             // Session startup must be able to install the target's controller.
@@ -856,8 +857,9 @@ export default function planExecExtension(pi: ExtensionAPI): void {
             }
           },
           handoffLifecycle,
-          isRunRemoved: (id) => presentation.isRemoved(id),
+          isRunRemoved: (id) => abandonedRuns.has(id),
           onAbandoned: (run, context) => {
+            abandonedRuns.add(run.id);
             stopBackgroundController(run.id);
             setStatus(run, context);
             void syncProjection(run, projectionContext(context)).catch(
@@ -915,6 +917,13 @@ export default function planExecExtension(pi: ExtensionAPI): void {
           const run = await resolveGoalRun(parsed.id);
           if (!run) throw new Error('No goal run found.');
           const resumed = await controller.resume(run.id, sessionId, true);
+          if (
+            resumed.status === RUN_STATUS.ABANDONED ||
+            abandonedRuns.has(run.id)
+          )
+            throw new Error(
+              `Goal ${shortRunId(run.id)} was abandoned permanently and cannot resume.`,
+            );
           startBackgroundController(resumed, sessionId, ctx.cwd, ctx);
           notify(
             ctx,

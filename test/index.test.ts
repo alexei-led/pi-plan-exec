@@ -216,8 +216,8 @@ function executionHarness(
     notifications,
     widget: () => widget,
     footer: () => footer,
-    command: (args: string): Promise<void> => {
-      const command = commands.get('exec');
+    command: (args: string, name = 'exec'): Promise<void> => {
+      const command = commands.get(name);
       assert.ok(command, 'exec command is not registered');
       return command.handler(args, ctx);
     },
@@ -595,6 +595,84 @@ for (const staleCompletion of [false, true])
     await owner.emit('session_shutdown');
     await observer.emit('session_shutdown');
   });
+
+test('cross-project stop still handles terminal results and retires its timer', async (t) => {
+  const held = run({
+    status: 'running',
+    repositoryRoot: '/other-project',
+    worktreeCwd: '/other-project',
+  });
+  delete held.activeOperation;
+  delete held.lease;
+  const { registry, directory } = await seedDirectory([held]);
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  t.mock.method(RunRegistry.prototype, 'get', registry.get.bind(registry));
+  t.mock.method(
+    RunRegistry.prototype,
+    'listWithErrors',
+    registry.listWithErrors.bind(registry),
+  );
+  t.mock.method(RunRegistry.prototype, 'claim', registry.claim.bind(registry));
+  t.mock.method(
+    RunRegistry.prototype,
+    'updateIfCurrent',
+    registry.updateIfCurrent.bind(registry),
+  );
+  t.mock.method(
+    TaskProjector.prototype,
+    'sync',
+    async (current: PlanExecRun) => current,
+  );
+  const tick = t.mock.method(
+    PlanExecController.prototype,
+    'tick',
+    async () => ({ ...held, status: 'cancelled' as const }),
+  );
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const h = executionHarness('/this-project', 'cross-project-stop');
+  await h.command(`stop ${held.id}`);
+  t.mock.timers.tick(1000);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  t.mock.timers.tick(5000);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(tick.mock.callCount(), 1);
+  assert.match(h.notifications.join('\n'), /cancelled/);
+  await h.emit('session_shutdown');
+});
+
+test('goal resume refuses permanent abandonment without announcing a resume', async (t) => {
+  const held = run({
+    status: 'abandoned',
+    userStopped: true,
+    abandonment: { requestedAt: 1, requestedBy: 'owner' },
+    goal: {
+      text: 'fixture',
+      hash: 'a'.repeat(12),
+      iteration: 0,
+      maxTurns: 1,
+      noProgress: 0,
+    },
+  });
+  delete held.planPath;
+  delete held.planHash;
+  delete held.lease;
+  const { registry, directory } = await seedDirectory([held]);
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  t.mock.method(RunRegistry.prototype, 'get', registry.get.bind(registry));
+  t.mock.method(
+    RunRegistry.prototype,
+    'withControllerLock',
+    registry.withControllerLock.bind(registry),
+  );
+  const h = executionHarness(held.repositoryRoot, 'goal-owner');
+  await h.command(`resume ${held.id}`, 'goal');
+  assert.match(
+    h.notifications.at(-1) ?? '',
+    /abandoned permanently and cannot resume/,
+  );
+  assert.doesNotMatch(h.notifications.at(-1) ?? '', /resumed \(/);
+  await h.emit('session_shutdown');
+});
 
 test('a pause waiting on projection cannot restart a removed force-stopped run', async (t) => {
   const held = run({

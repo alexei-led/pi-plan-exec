@@ -352,9 +352,6 @@ export class RunPresentation {
       }
     for (const run of runs) this.remember(run);
   }
-  isRemoved(id: string): boolean {
-    return this.removed.has(id);
-  }
   forget(id: string): void {
     this.runs.delete(id);
     this.removed.add(id);
