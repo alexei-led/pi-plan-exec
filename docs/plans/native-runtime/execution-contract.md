@@ -137,6 +137,17 @@ remove BridgeClient and both package dependencies/lock entries, update fixtures,
 normal-loader/packed-consumer tests and user docs. Keep manifests stable until
 replacement tests exist. One mutator in the integration worktree.
 
+The integration worktree can contain parent-owned briefing-only commits after
+272c81c; verify the common base and clean source rather than discarding them.
+
+Normal-loader safety check: background children load ambient extensions. Current
+index.ts auto-restores any claimable contextual run, with no child guard. The
+0.76.1 runner sets PI_SUBAGENT_CHILD=1 before loading those extensions and makes
+its own ambient entry point inert. Reproduce child-mode startup before activating
+our controller there; add a small inert-child guard/test if confirmed. Do not
+disable all ambient extensions, which would break custom model/MCP providers.
+Do not import private native modules to read this environment marker.
+
 Run the existing complete suite plus selected native RPC/recovery smoke and
 a clean packed consumer without removed packages. Map the plan's scenarios to
 actual tests and explicit safe limitations. Do not mark a checkbox on prose alone.
