@@ -81,6 +81,17 @@ test('projects plan tasks and pipeline stages into the pi-tasks session file', a
       ['archive', 'pending'],
     ],
   );
+  const memory = await projector.sync(projected, {
+    cwd: root,
+    sessionId: 'memory-only',
+    persistent: false,
+  });
+  assert.equal(memory.taskProjection?.state, 'degraded');
+  assert.match(memory.taskProjection?.error ?? '', /not persisted/);
+  assert.equal(
+    new TaskStore(sessionTaskPath(root, 'memory-only')).list().length,
+    0,
+  );
   assert.deepEqual(tasks[1]?.blockedBy, [tasks[0]?.id]);
   assert.deepEqual(tasks[2]?.blockedBy, [tasks[0]?.id, tasks[1]?.id]);
 });

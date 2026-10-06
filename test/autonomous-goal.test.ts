@@ -424,8 +424,9 @@ test('goal status and widget show the goal instead of plan tasks', async (t) => 
   const run = await start(f);
   assert.match(goalStatusText(run), /goal: Fix the failing tests/);
   assert.match(goalStatusText(run), /turn: 1\/20/);
-  const widget = formatRunWidget(run).join('\n');
-  assert.match(widget, /Goal .*turn 1/);
+  const widget = formatRunWidget(run, Date.now(), true).join('\n');
+  assert.match(widget, /Fix the failing tests/);
+  assert.match(widget, /Goal · Turn 1/);
   assert.doesNotMatch(widget, /accepted/);
 });
 

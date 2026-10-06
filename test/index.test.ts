@@ -10,6 +10,7 @@ import {
   readFile,
   realpath,
   rm,
+  symlink,
   writeFile,
 } from 'node:fs/promises';
 import { hostname, tmpdir } from 'node:os';
@@ -77,6 +78,7 @@ import {
 import { LocalOperationFailedError } from '../src/local-operation.js';
 import { RunRegistry } from '../src/registry.js';
 import { required } from '../src/required.js';
+import { PlanExecRuntimeIntegration } from '../src/runtime-integration.js';
 import { TaskProjector } from '../src/task-projection.js';
 import {
   DEFAULT_FROZEN_RUN_CONFIG,
@@ -130,7 +132,11 @@ function persistedSession(cwd: string, directory: string): SessionManager {
   return session;
 }
 
-function executionHarness(cwd: string, sessionId: string) {
+function executionHarness(
+  cwd: string,
+  sessionId: string,
+  entries: unknown[] = [],
+) {
   type Handler = (
     event: unknown,
     ctx: ExtensionCommandContext,
@@ -141,7 +147,12 @@ function executionHarness(cwd: string, sessionId: string) {
     { handler(args: string, ctx: ExtensionCommandContext): Promise<void> }
   >();
   const notifications: string[] = [];
+  let widget: unknown;
+  let footer: unknown;
   const pi = {
+    appendEntry(customType: string, data: unknown) {
+      entries.push({ type: 'custom', customType, data });
+    },
     events: { on() {}, emit() {} },
     on(name: string, handler: Handler) {
       events.set(name, [...(events.get(name) ?? []), handler]);
@@ -180,13 +191,18 @@ function executionHarness(cwd: string, sessionId: string) {
     sessionManager: {
       getSessionId: () => sessionId,
       getSessionFile: () => undefined,
+      getBranch: () => entries,
     },
     ui: {
       select: async (_title: string, options: string[]) =>
         options.includes('In-place') ? 'In-place' : options[0],
       confirm: async () => true,
-      setStatus() {},
-      setWidget() {},
+      setStatus(_key: string, value: unknown) {
+        footer = value;
+      },
+      setWidget(_key: string, value: unknown) {
+        widget = value;
+      },
       notify(message: string) {
         notifications.push(message);
       },
@@ -196,7 +212,9 @@ function executionHarness(cwd: string, sessionId: string) {
   return {
     ctx,
     notifications,
-    command: (args: string) => {
+    widget: () => widget,
+    footer: () => footer,
+    command: (args: string): Promise<void> => {
       const command = commands.get('exec');
       assert.ok(command, 'exec command is not registered');
       return command.handler(args, ctx);
@@ -207,6 +225,370 @@ function executionHarness(cwd: string, sessionId: string) {
     },
   };
 }
+
+test('worktree selection recognizes a symlink alias without a redundant session handoff', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'exec-context-alias-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const alias = join(root, 'alias');
+  const actual = join(root, 'actual');
+  await mkdir(actual);
+  await symlink(actual, alias);
+  const held = run({ worktreeCwd: actual, repositoryRoot: actual });
+  assert.deepEqual(
+    prioritizeRunCandidates([held, run({ id: 'other' })], alias),
+    [held],
+  );
+});
+
+for (const status of ['paused', 'completed'] as const)
+  test(`startup renders a selected foreign-session ${status} run without a projection`, async (t) => {
+    const held = run({ status });
+    delete held.activeOperation;
+    delete held.lease;
+    delete held.taskProjection;
+    const { registry, directory } = await seedDirectory([held]);
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    t.mock.method(
+      RunRegistry.prototype,
+      'listWithErrors',
+      registry.listWithErrors.bind(registry),
+    );
+    const saved = required((await registry.listWithErrors()).runs[0]);
+    const h = executionHarness(saved.repositoryRoot, 'new-session', [
+      {
+        type: 'custom',
+        customType: 'plan-exec-view',
+        data: { hidden: false, dismissed: [], selected: saved.id },
+      },
+    ]);
+    await h.emit('session_start', { reason: 'reload' });
+    assert.ok(
+      Array.isArray(h.widget()),
+      'RPC fallback must remain a string array',
+    );
+    assert.ok(h.footer());
+    await h.emit('session_shutdown');
+  });
+
+test('TUI strip reads the active theme again after invalidation', async (t) => {
+  const held = run({ status: 'completed' });
+  delete held.activeOperation;
+  delete held.lease;
+  const { registry, directory } = await seedDirectory([held]);
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  t.mock.method(
+    RunRegistry.prototype,
+    'listWithErrors',
+    registry.listWithErrors.bind(registry),
+  );
+  const h = executionHarness(held.repositoryRoot, 'theme-session');
+  Object.assign(h.ctx, { mode: 'tui' });
+  let palette = 'dark';
+  Object.defineProperty(h.ctx.ui, 'theme', {
+    get: () => ({ fg: (_tone: string, text: string) => palette + ':' + text }),
+  });
+  await h.command('show');
+  const factory = h.widget();
+  assert.ok(typeof factory === 'function');
+  const component = factory(
+    {},
+    { fg: (_tone: string, text: string) => 'stale:' + text },
+  );
+  assert.match(component.render(200).join('\n'), /dark:/);
+  palette = 'light';
+  component.invalidate();
+  assert.match(component.render(200).join('\n'), /light:/);
+  await h.emit('session_shutdown');
+});
+
+test('projection routes use native transcript identity while leases and task rows keep UUIDs', async (t) => {
+  const held = run({
+    status: 'paused',
+    taskProjection: { sessionId: 'native-routing', taskIds: {} },
+  });
+  delete held.activeOperation;
+  delete held.lease;
+  const { registry, directory } = await seedDirectory([held]);
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  t.mock.method(
+    RunRegistry.prototype,
+    'listWithErrors',
+    registry.listWithErrors.bind(registry),
+  );
+  t.mock.method(RunRegistry.prototype, 'get', registry.get.bind(registry));
+  const nativeIds: string[] = [];
+  const taskIds: string[] = [];
+  t.mock.method(
+    PlanExecRuntimeIntegration.prototype,
+    'sync',
+    (_run: PlanExecRun, sessionId: string) => {
+      nativeIds.push(sessionId);
+    },
+  );
+  t.mock.method(
+    TaskProjector.prototype,
+    'sync',
+    async (run: PlanExecRun, options: { sessionId: string }) => {
+      taskIds.push(options.sessionId);
+      return run;
+    },
+  );
+  const h = executionHarness(held.repositoryRoot, 'native-routing');
+  h.ctx.sessionManager.getSessionFile = () => '/tmp/native-routing.jsonl';
+  await h.emit('session_start');
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await h.command(`status ${held.id}`);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.ok(nativeIds.length > 0);
+  assert.ok(nativeIds.every((id) => id === '/tmp/native-routing.jsonl'));
+  assert.ok(taskIds.length > 0);
+  assert.ok(taskIds.every((id) => id === 'native-routing'));
+  assert.equal(
+    (await registry.get(held.id))?.taskProjection?.sessionId,
+    'native-routing',
+  );
+  await h.emit('session_shutdown');
+});
+
+test('status keeps native cancellation refusal separate from healthy observations', () => {
+  const status = formatRunStatus(
+    run({
+      status: 'paused',
+      activeOperation: {
+        operationId: 'op',
+        service: 'bridge',
+        kind: 'implementation',
+        lastObservedState: 'running',
+        cancellationDeliveryError: {
+          message: 'Run is paused; native RPC cannot stop it',
+          upstreamCode: 'invalid_state',
+          observedAt: 1,
+        },
+      },
+    }),
+  );
+  assert.match(
+    status,
+    /cancellation delivery: pending \(invalid_state\) — Run is paused; native RPC cannot stop it/,
+  );
+});
+
+test('hanging task projection cannot retain completed background work', {
+  timeout: 5000,
+}, async (t) => {
+  const held = run({
+    status: 'paused',
+    taskProjection: { sessionId: 'hanging-projection', taskIds: {} },
+  });
+  delete held.activeOperation;
+  delete held.lease;
+  const { registry, directory } = await seedDirectory([held]);
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  t.mock.method(
+    RunRegistry.prototype,
+    'listWithErrors',
+    registry.listWithErrors.bind(registry),
+  );
+  t.mock.method(RunRegistry.prototype, 'get', registry.get.bind(registry));
+  let release!: (run: PlanExecRun) => void;
+  t.mock.method(
+    TaskProjector.prototype,
+    'sync',
+    () =>
+      new Promise<PlanExecRun>((resolve) => {
+        release = resolve;
+      }),
+  );
+  const snapshots: string[] = [];
+  t.mock.method(
+    PlanExecRuntimeIntegration.prototype,
+    'sync',
+    (run: PlanExecRun) => {
+      snapshots.push(run.status);
+    },
+  );
+  const h = executionHarness(held.repositoryRoot, 'hanging-projection');
+  await h.emit('session_start');
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const current = required((await registry.listWithErrors()).runs[0]);
+  const completed = await registry.update({ ...current, status: 'completed' });
+  await h.command(`status ${completed.id}`);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.ok(snapshots.includes('completed'));
+  release(completed);
+  await h.emit('session_shutdown');
+});
+
+for (const owner of ['same-host', 'other-host', 'unleased'] as const)
+  test(`unpolled ${owner} run stays an amber snapshot on startup and explicit show`, async (t) => {
+    const held = run({ status: 'running', userStopped: owner === 'unleased' });
+    delete held.activeOperation;
+    delete held.taskProjection;
+    if (owner === 'unleased') delete held.lease;
+    else
+      held.lease = {
+        sessionId: 'other-session',
+        pid: process.pid,
+        hostname: owner === 'other-host' ? 'remote.invalid' : hostname(),
+        heartbeatAt: Date.now(),
+      };
+    const { registry, directory } = await seedDirectory([held]);
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    t.mock.method(
+      RunRegistry.prototype,
+      'listWithErrors',
+      registry.listWithErrors.bind(registry),
+    );
+    t.mock.method(RunRegistry.prototype, 'get', registry.get.bind(registry));
+    t.mock.method(PlanExecController.prototype, 'tick', async () =>
+      assert.fail('Viewing snapshots must not dispatch or claim'),
+    );
+    const h = executionHarness(held.repositoryRoot, 'snapshot-viewer');
+    t.mock.timers.enable({ apis: ['setInterval'] });
+    await h.emit('session_start');
+    assert.match(String(h.footer()), /Snapshot/);
+    assert.match((h.widget() as string[]).join('\n'), /No live updates here/);
+    await h.command(`show ${held.id}`);
+    assert.match(String(h.footer()), /Snapshot/);
+    const stopped = await registry.update({ ...held, status: 'failed' });
+    await h.command(`show ${stopped.id}`);
+    assert.match(String(h.footer()), /Failed/);
+    t.mock.timers.tick(2000);
+    assert.equal((await registry.get(held.id))?.status, 'failed');
+    await h.emit('session_shutdown');
+  });
+
+test('only a locally owned successful poll paints live progress; poll failure returns to snapshot', async (t) => {
+  const held = run({ status: 'running' });
+  delete held.lease;
+  delete held.activeOperation;
+  delete held.taskProjection;
+  const { registry, directory } = await seedDirectory([held]);
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  t.mock.method(
+    RunRegistry.prototype,
+    'listWithErrors',
+    registry.listWithErrors.bind(registry),
+  );
+  t.mock.method(RunRegistry.prototype, 'get', registry.get.bind(registry));
+  t.mock.method(
+    TaskProjector.prototype,
+    'sync',
+    async (run: PlanExecRun) => run,
+  );
+  let failing = false;
+  t.mock.method(PlanExecController.prototype, 'tick', async () => {
+    if (failing) throw new Error('poll unavailable');
+    return {
+      ...held,
+      lease: {
+        sessionId: 'local-observer',
+        pid: process.pid,
+        hostname: hostname(),
+        heartbeatAt: Date.now(),
+      },
+    };
+  });
+  const h = executionHarness(held.repositoryRoot, 'local-observer');
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  await h.emit('session_start');
+  assert.match(String(h.footer()), /Snapshot/);
+  t.mock.timers.tick(1000);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.match(String(h.footer()), /Working/);
+  failing = true;
+  t.mock.timers.tick(1000);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.match(String(h.footer()), /Snapshot/);
+  failing = false;
+  t.mock.timers.tick(1000);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.match(String(h.footer()), /Working/);
+  await h.emit('session_shutdown');
+});
+
+test('branch navigation restores cached visibility without querying the registry', async (t) => {
+  const held = run({ status: 'completed' });
+  delete held.activeOperation;
+  delete held.lease;
+  const { registry, directory } = await seedDirectory([held]);
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const listing = t.mock.method(
+    RunRegistry.prototype,
+    'listWithErrors',
+    registry.listWithErrors.bind(registry),
+  );
+  const entries: unknown[] = [];
+  const h = executionHarness(held.repositoryRoot, 'branch-view', entries);
+  await h.command('show');
+  const visibleBranch = [...entries];
+  await h.command('hide');
+  assert.match(h.notifications.at(-1) ?? '', /display hidden/);
+  const hiddenBranch = [...entries];
+  const reads = listing.mock.callCount();
+  entries.splice(0, entries.length, ...visibleBranch);
+  await h.emit('session_tree');
+  assert.ok(h.widget());
+  entries.splice(0, entries.length, ...hiddenBranch);
+  await h.emit('session_tree');
+  assert.equal(h.widget(), undefined);
+  assert.equal(listing.mock.callCount(), reads);
+  assert.equal((await registry.get(held.id))?.status, 'completed');
+  await h.emit('session_shutdown');
+});
+
+test('display controls persist independently of stopped run state and late projection', async (t) => {
+  const paused = run({
+    status: 'paused',
+    userStopped: true,
+    taskProjection: {
+      state: 'degraded',
+      sessionId: 'display-session',
+      taskIds: {},
+      error: 'missing plan',
+    },
+  });
+  delete paused.activeOperation;
+  delete paused.lease;
+  const { registry, directory } = await seedDirectory([paused]);
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const entries: unknown[] = [];
+  t.mock.method(
+    RunRegistry.prototype,
+    'listWithErrors',
+    registry.listWithErrors.bind(registry),
+  );
+  t.mock.method(
+    TaskProjector.prototype,
+    'sync',
+    async (run: PlanExecRun) => run,
+  );
+  const held = required((await registry.listWithErrors()).runs[0]);
+  const h = executionHarness(held.repositoryRoot, 'display-session', entries);
+  await h.command('show');
+  assert.ok(h.widget());
+  await h.command('hide');
+  assert.equal(h.widget(), undefined);
+  assert.equal(h.footer(), undefined);
+  const replacement = executionHarness(
+    held.repositoryRoot,
+    'display-session',
+    entries,
+  );
+  await replacement.emit('session_start', { reason: 'reload' });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(replacement.widget(), undefined);
+  await replacement.command('show');
+  assert.ok(replacement.widget());
+  await replacement.command('clear');
+  assert.equal(replacement.widget(), undefined);
+  assert.equal((await registry.get(held.id))?.status, 'paused');
+  assert.equal((await registry.get(held.id))?.userStopped, true);
+  await replacement.command('show --apply');
+  assert.match(replacement.notifications.at(-1) ?? '', /not found/);
+  await h.emit('session_shutdown');
+  await replacement.emit('session_shutdown');
+});
 
 test('task blocker status and pause notification explain recovery without a crash', () => {
   const blocked = run({
@@ -634,7 +1016,7 @@ test('help and setup explain the installed command surface', () => {
     assert.doesNotMatch(execHelp(), new RegExp(`/exec ${alias}`), alias);
   assert.match(
     execSetup(),
-    /pi install -l npm:@alexeiled\/pi-subagents-bridge@\^0\.5\.4$/m,
+    /pi install -l npm:@alexeiled\/pi-subagents-bridge@\^0\.5\.5$/m,
   );
   assert.match(
     execSetup(),
@@ -649,10 +1031,10 @@ test('help and setup explain the installed command surface', () => {
 });
 
 test('setup installs the released bridge and fusion pins', () => {
-  assert.match(execSetup(), /^pi install -l npm:pi-subagents@\^0\.76\.0$/m);
+  assert.match(execSetup(), /^pi install -l npm:pi-subagents@\^0\.76\.1$/m);
   assert.match(
     execSetup(),
-    /^pi install -l npm:@alexeiled\/pi-subagents-bridge@\^0\.5\.4$/m,
+    /^pi install -l npm:@alexeiled\/pi-subagents-bridge@\^0\.5\.5$/m,
   );
   assert.match(
     execSetup(),
@@ -2314,7 +2696,7 @@ test('status reports a missing package with its install commands', async () => {
   });
 
   assert.match(report, /Plan-exec prerequisites — missing: pi-subagents\./);
-  assert.match(report, /^pi install -l npm:pi-subagents@\^0\.76\.0$/m);
+  assert.match(report, /^pi install -l npm:pi-subagents@\^0\.76\.1$/m);
   assert.doesNotMatch(report, /pi-fusion/);
   assert.match(report, /No plan execution runs\. Start one with \/exec\./);
   assert.equal(
@@ -2369,7 +2751,7 @@ test('the retired read verbs still work and name their replacement', async () =>
   assert.match(doctor ?? '', /\/exec doctor is now \/exec status/);
 
   const setup = await execRead(registry, 'setup', []);
-  assert.match(setup ?? '', /^pi install -l npm:pi-subagents@\^0\.76\.0$/m);
+  assert.match(setup ?? '', /^pi install -l npm:pi-subagents@\^0\.76\.1$/m);
   assert.match(setup ?? '', /\/exec setup is now part of \/exec status/);
 
   assert.equal(await execRead(registry, 'resume', []), undefined);
@@ -2422,7 +2804,12 @@ test('the exec-plan skill documents exactly the subcommands /exec implements', a
       .map((match) => match.groups?.subcommand)
       .filter((token): token is string => Boolean(token)),
   );
-  const actions = new Set<string>(Object.values(EXEC_ACTION));
+  const actions = new Set<string>([
+    ...Object.values(EXEC_ACTION),
+    'hide',
+    'show',
+    'clear',
+  ]);
   const aliases = new Set<string>(EXEC_ALIAS_ACTIONS);
 
   assert.ok(documented.size > 0, 'no /exec subcommand was found in the skill');
@@ -3202,9 +3589,12 @@ test('required review and finalize stages never suggest force-skip', () => {
 test('help lists every primary verb and no retired alias', () => {
   const help = execHelp();
   const aliases = new Set<string>(EXEC_ALIAS_ACTIONS);
-  const primary = Object.values(EXEC_ACTION).filter(
-    (action) => !aliases.has(action),
-  );
+  const primary = [
+    ...Object.values(EXEC_ACTION).filter((action) => !aliases.has(action)),
+    'hide',
+    'show',
+    'clear',
+  ];
   // Only the command list is line-anchored; the hints under it are prose.
   const listed = [...help.matchAll(/^\/exec[ \t]+(?<verb>[a-z][a-z-]*)/gm)].map(
     (match) => match.groups?.verb,
@@ -3524,7 +3914,7 @@ test('the sweep reports how far past its budget a run has gone', async () => {
   assert.match(report, /past the explicit 100m compatibility deadline/);
 });
 
-test('widget shows a grown active compatibility budget rather than the frozen base', () => {
+test('widget omits compatibility budget diagnostics from the progress strip', () => {
   const active = run({
     config: {
       ...config,
@@ -3540,12 +3930,44 @@ test('widget shows a grown active compatibility budget rather than the frozen ba
     },
     tasks: { '1': { taskId: 1, dependsOn: [], state: 'running', attempts: 3 } },
   });
-  const widget = formatRunWidget(active).join('\n');
-  assert.match(widget, /deadline 4m compatibility mode/);
-  assert.match(widget, /Lifetime: 4m compatibility mode/);
-  assert.doesNotMatch(widget, /1m compatibility mode/);
+  const widget = formatRunWidget(active, Date.now(), true).join('\n');
+  assert.match(widget, /Working/);
+  assert.match(widget, /0\/1 accepted/);
+  assert.doesNotMatch(widget, /deadline|Lifetime|compatibility/);
+  const status = formatRunStatus(active);
+  assert.match(status, /lifetime: bounded \(240000ms\)/);
+  assert.doesNotMatch(status, /lifetime: bounded \(60000ms\)/);
 });
 
+for (const [operation, expected] of [
+  [
+    { expectedLifetime: { mode: 'bounded' as const, timeoutMs: 120000 } },
+    'bounded (120000ms)',
+  ],
+  [
+    { params: { executionLifetime: { mode: 'bounded', timeoutMs: 90000 } } },
+    'bounded (90000ms)',
+  ],
+  [{}, 'unknown (awaiting lifetime evidence)'],
+  [
+    { effectiveLifetime: { mode: 'unbounded' as const } },
+    'unbounded requested',
+  ],
+] as const)
+  test(`status uses persisted operation lifetime: ${expected}`, () => {
+    const status = formatRunStatus(
+      run({
+        activeOperation: {
+          operationId: 'op',
+          service: 'bridge',
+          kind: 'implementation',
+          ...operation,
+        },
+      }),
+    );
+    assert.ok(status.includes(`lifetime: ${expected}`));
+    assert.match(status, /review: required · subagent/);
+  });
 test('a run on another host stays live until its owner releases it', async () => {
   const remote = abandonedRun({
     lease: { ...DEAD_LEASE, hostname: 'another-host' },
@@ -3729,7 +4151,9 @@ test('--same-machine supplies a machine, never a verdict', async () => {
       asyncDir,
     },
   });
-  const { registry, directory } = await seedDirectory([stillWriting]);
+  const { registry, directory } = await Promise.resolve(
+    seedDirectory([stillWriting]),
+  );
   const before = await snapshotRuns(directory);
 
   // The assertion only changes where evidence may be gathered; a live child

@@ -1,8 +1,11 @@
 import assert from 'node:assert/strict';
+import { snapshotBackgroundWork } from 'pi-subagents/background-work';
+import { snapshotExternalRuns } from 'pi-subagents/external-runs';
 import { test } from 'vitest';
 import {
   type BackgroundWorkProvider,
   type ExternalRunRecord,
+  loadPlanExecRuntimeIntegration,
   PlanExecRuntimeIntegration,
 } from '../src/runtime-integration.js';
 import { DEFAULT_FROZEN_RUN_CONFIG, type PlanExecRun } from '../src/types.js';
@@ -81,6 +84,57 @@ function run(overrides: Partial<PlanExecRun> = {}): PlanExecRun {
     ...overrides,
   };
 }
+
+for (const runtimeId of ['/tmp/pi-tests/sessions/session-1.jsonl', 'session-1'])
+  test(`native consumers see runtime identity ${runtimeId}, not lease identity`, async () => {
+    const integration = await loadPlanExecRuntimeIntegration();
+    try {
+      integration.reconcile([run()], 'session-1', runtimeId);
+      assert.equal(snapshotExternalRuns(runtimeId).length, 1);
+      assert.equal(snapshotBackgroundWork(runtimeId).items.length, 1);
+      if (runtimeId !== 'session-1') {
+        assert.equal(snapshotExternalRuns('session-1').length, 0);
+        assert.equal(snapshotBackgroundWork('session-1').items.length, 0);
+      }
+      integration.reconcile(
+        [run({ status: 'completed', updatedAt: 3 })],
+        'session-1',
+        runtimeId,
+      );
+      assert.equal(snapshotBackgroundWork(runtimeId).items.length, 0);
+    } finally {
+      integration.dispose();
+    }
+    assert.equal(snapshotExternalRuns(runtimeId).length, 0);
+  });
+test('Fleet admission failure cannot hide active background work or leak completion', () => {
+  const api = new FakeRuntimeApi();
+  api.registerExternalRun = () => {
+    throw new Error('external run cache full');
+  };
+  const integration = new PlanExecRuntimeIntegration(api);
+  assert.doesNotThrow(() => integration.sync(run(), 'session-1'));
+  assert.equal([...api.providers.values()][0]?.listActiveWork().length, 1);
+  integration.sync(run({ status: 'completed' }), 'session-1');
+  assert.equal([...api.providers.values()][0]?.listActiveWork().length, 0);
+  integration.dispose();
+});
+test('terminal Fleet retention is bounded without dropping active work', () => {
+  const api = new FakeRuntimeApi();
+  const integration = new PlanExecRuntimeIntegration(api);
+  integration.reconcile(
+    [
+      ...Array.from({ length: 120 }, (_, i) =>
+        run({ id: `done-${i}`, status: 'completed', updatedAt: i }),
+      ),
+      run(),
+    ],
+    'session-1',
+  );
+  assert.ok(api.rows.size <= 21);
+  assert.equal([...api.providers.values()][0]?.listActiveWork().length, 1);
+  integration.dispose();
+});
 
 test('registers one PlanExec row and one background provider', () => {
   const api = new FakeRuntimeApi();
@@ -172,6 +226,32 @@ test('disposed integration cannot resurrect rows or providers', () => {
 
   assert.equal(api.rows.size, 0);
   assert.equal(api.providers.size, 0);
+});
+
+test('terminal retention eviction preserves the observation watermark', () => {
+  const api = new FakeRuntimeApi();
+  const integration = new PlanExecRuntimeIntegration(api);
+  integration.sync(run({ status: 'completed', updatedAt: 10 }), 'session-1');
+  for (let i = 0; i < 20; i++)
+    integration.sync(
+      run({ id: `new-${i}`, status: 'completed', updatedAt: 20 + i }),
+      'session-1',
+    );
+  assert.equal(api.rows.size, 20);
+  integration.sync(run({ status: 'running', updatedAt: 9 }), 'session-1');
+  assert.equal([...api.providers.values()][0]?.listActiveWork().length, 0);
+  assert.equal(api.rows.size, 20);
+  integration.dispose();
+});
+
+test('late running snapshots cannot re-add terminal work to the provider', () => {
+  const api = new FakeRuntimeApi();
+  const integration = new PlanExecRuntimeIntegration(api);
+  integration.sync(run({ status: 'completed', updatedAt: 4 }), 'session-1');
+  integration.sync(run({ status: 'running', updatedAt: 3 }), 'session-1');
+  assert.equal([...api.providers.values()][0]?.listActiveWork().length, 0);
+  assert.equal([...api.rows.values()][0]?.state, 'completed');
+  integration.dispose();
 });
 
 test('terminal runs remain visible but leave background work', () => {

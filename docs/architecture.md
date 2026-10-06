@@ -4,7 +4,7 @@
 
 `pi-plan-exec` is a deterministic controller around existing Pi extensions. It
 owns plan-specific policy, durable transitions, automatic recovery, commit
-acceptance, and provider reconciliation, not model execution or task UI.
+acceptance, and provider reconciliation, not model execution or another extension's task UI.
 
 The strict autonomous path
 requires the released `pi-subagents` runtime and matching Bridge, Fusion, and
@@ -112,7 +112,10 @@ or preserved user files.
 
 | Module | Responsibility |
 | --- | --- |
-| `src/index.ts` | `/exec` and `/goal` command surfaces, interactive selection, background controller loop |
+| `src/index.ts` | `/exec` and `/goal` commands, interactive selection, background controller loop |
+| `src/run-view.ts` | Width/theme-aware progress strip and branch-local presentation preferences |
+| `src/advisory-observation.ts` | Exact-native-run display telemetry validation, separate from execution evidence |
+| `src/runtime-integration.ts` | Optional native Fleet/background-work projection and generation-safe ownership |
 | `src/goal-loop.ts` | Goal prompt and outcome protocol, goal hash, stall and sample limits |
 | `src/controller.ts` | State transitions, operation launch/observation, automatic recovery, cancellation, acceptance |
 | `src/config.ts` | Run configuration parsing and frozen lifetime/review policy |
@@ -312,7 +315,10 @@ Local checks and bootstrap use the owned process group directly with an
 unbounded lifetime, durable grants, and user stop generation.
 
 Each plan run is also exposed as exactly one `pi-subagents` external-runs row and
-one background-work provider. Reload reconciliation uses `run.json`, replaces
+one background-work provider. Native registrations use `getSessionFile() ??
+getSessionId()`, matching pi-subagents. Durable leases and pi-tasks rows retain
+the session UUID; these are distinct identity namespaces.
+Reload reconciliation uses `run.json`, replaces
 only this extension's registrations, and never creates native child rows.
 Pi-tasks remains an optional rebuildable cache: owned tasks carry the plan
 owner, run ID, key, revision, status, and projection version. When present, its
@@ -320,9 +326,14 @@ scope, path, and package version are checked. A failed repair records visible
 degraded projection state while the controller continues.
 
 Startup restores an unfinished run when its lease is claimable, preserving an
-explicit user pause and refusing a live foreign lease. The native widget and
-status render durable task counts, dependency/retry waits, next automatic
-action, verified activity, usage, review backend, and lifetime. These are
+explicit user pause and refusing a live foreign lease. The native strip shows
+state, accepted count and current action. `/exec status` retains waits, verified
+activity, usage, review backend and the active operation's persisted lifetime.
+Presentation preferences follow the active transcript branch and refresh on
+`session_tree` without changing execution. In-flight display defaults to an
+amber snapshot. Live colors require a local polling controller, matching lease
+session/PID/host, and no outstanding polling error. That view context never
+changes durable authority. Hide is separate from cancellation. These are
 projections of `run.json`; optional pi-tasks/Fleet visibility cannot gate
 controller recovery. Projection writes coalesce one in-flight update plus the
 latest pending snapshot, and a cold technical prerequisite cannot discard an
@@ -424,9 +435,8 @@ Untrusted boundaries are validated at entry:
   promotion, and archive use durable owned commands with workspace-safe
   environment injection. Observations disable fsmonitor and optional index
   writes so Git state cannot be silently synthesized by a cache.
-- `src/types.ts` owns persisted run/status/stage/operation constants. ESLint
-  rejects raw domain values in control-flow comparisons and non-trivial magic
-  numbers in runtime source, keeping state-machine changes reviewable.
+- `src/types.ts` defines persisted run/status/stage/operation contracts.
+  TypeScript validates their shapes; Biome enforces the configured code rules.
 
 ## Further design record
 

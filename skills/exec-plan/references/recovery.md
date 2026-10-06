@@ -195,10 +195,10 @@ request digest. Bridge 0.5.3 adds correlated pre-launch rejection evidence.
 - A lost reply, legacy `dispatching` row, missing run ID, old error string, clean
   worktree, dead PID, or elapsed time is not proof that no child started.
 - Legacy rows without correlated evidence remain unresolved after upgrade.
-  pi-subagents 0.76.0 has no authoritative durable operation lookup API that can
+  pi-subagents 0.76.1 has no authoritative durable operation lookup API that can
   fill this gap. No supported force-resume or evidence importer exists.
 - Inspect `/exec status <full-run-id>` and retain the reported identity and
-  diagnostics. Upgrade incompatible local packages and reload. If no new
+  diagnostics. Upgrade incompatible local packages and restart Pi. If no new
   authoritative evidence exists, report the run blocked; repeated resume cannot
   supply it. Do not recreate the run, edit its journal, or manually launch a
   replacement. Stop requests also remain pending until ownership is proven.
@@ -518,6 +518,27 @@ Pi requires interactive confirmation, records the old/new branch, and resumes
 the same run. Do not hand-edit the durable branch or switch branches while a
 child is live.
 
+## Hide a stuck run without discarding evidence
+
+`/exec hide` immediately removes the strip and footer. `/exec clear [run-id]`
+dismisses one run's display. Neither needs `--apply`, touches execution state,
+deletes evidence, or proves retirement. `/exec show [run-id]` restores it.
+
+For Bridge cancellation, `stopAcknowledged` can mean only intent was recorded.
+Bridge 0.5.5 reports delivery separately. A pending/failed delivery is retried
+against the same immutable operation; a delivered receipt is still not exit proof.
+Native pi-subagents 0.76.1 RPC can refuse paused/queued stops. Keep the exact
+error and pending state. Never use the model-facing stop tool as a bypass.
+
+Do not remove unknown launch records because a checkout was deleted. Recovery
+diagnostics remain under the run directory in `recovery.log`, and logging does
+not recreate that checkout. Legacy missing correlation still requires proof,
+or an explicitly approved isolated-recovery operation, not repeated resume.
+
+Bridge 0.5.5 migrates the journal to schema 7. Before upgrade, stop all
+Bridge-owning Pi processes and back up the journal. Older Bridge cannot reopen
+schema 7. Stopping Pi owners does not prove an unknown worker exited.
+
 ## Provider or command unavailable
 
 If `/exec` reports missing or incompatible Bridge, Fusion, Revmux, or
@@ -527,7 +548,7 @@ pi-subagents:
    the install commands above the run list.
 2. Restore the reported project-local pinned dependency or select an explicitly
    supported backend. A missing pi-tasks projection is advisory.
-3. Run `/reload`.
+3. Restart Pi after package upgrades. Use `/reload` only for local source/config changes.
 4. Run `/exec status` and `/exec status <full-run-id>`.
 5. Use `/exec resume <full-run-id>` only to resume an explicitly paused run or
    follow a specific interactive recovery instruction in status.
@@ -582,7 +603,7 @@ async artifacts stay in place. Durable run lineage is lost, so report it.
 
 To repair the record instead, and only with the extension source available: fix
 the loader or migration with a regression test, install the repaired local
-package with user approval, run `/reload`, then retry
+package with user approval, restart Pi, then retry
 `/exec status <full-run-id>`.
 
 ## `/exec resume` is itself defective
@@ -597,7 +618,7 @@ With explicit user approval to change the installed Pi package:
 3. Patch the smallest runtime defect in a source checkout.
 4. Run focused tests, then the package's full validation.
 5. Install or link that local package according to Pi package docs.
-6. Run `/reload`.
+6. Restart Pi after a package upgrade; `/reload` suffices for local source edits.
 7. Retry `/exec status <id>` and `/exec resume <id>` on the same run.
 8. Verify the same worktree and operation identity were retained.
 

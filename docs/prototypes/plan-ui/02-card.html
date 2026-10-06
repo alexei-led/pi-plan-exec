@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>02 / Task card — Plan execution</title><link rel="stylesheet" href="prototype.css"><script src="prototype.js" defer></script></head>
+<body data-variant="card"><main>
+<div class="eyebrow">Plan execution / interface study</div>
+<h1>The next useful thing.</h1><p class="intro">A small, readable card: what is happening, how far along it is, and what happens next. No UUIDs, heartbeat clocks, or exception dumps.</p>
+<nav aria-label="Prototype options"><a href="01-strip.html">01 / Progress strip</a>
+<a href="02-card.html" aria-current="page">02 / Task card</a>
+<a href="03-inspector.html">03 / On-demand inspector</a></nav>
+<div class="controls">
+<label>Scenario <select id="scenario">
+<option value="missing">Missing worktree · your reported case</option><option value="running">Working</option><option value="review">Reviewing</option><option value="retry">Retry scheduled</option><option value="external">Needs credentials</option><option value="unknown">Worker status unknown</option><option value="stopping">Stopping · awaiting exit</option><option value="paused">Paused</option><option value="cancelled">Cancelled</option><option value="complete">Complete</option>
+</select></label><span class="spacer"></span>
+<label><input id="narrow" type="checkbox">Narrow</label><button id="theme" type="button">Light theme</button>
+<button id="show" type="button">Show UI</button>
+</div>
+<section class="terminal" aria-label="Pi terminal simulation">
+<div class="titlebar"><span>π &nbsp; pi-model-router</span><span>INTERACTIVE MOCK · NOT LIVE</span></div>
+<div class="transcript"><p class="prompt">› Implement the router UI and observability plan.</p><p><span class="accent">Plan execution</span> · isolated worktree</p><p>This preview never starts, stops, or changes a real run.</p><p>Choose a scenario above to compare the three layouts.</p></div>
+<section id="widget" class="widget card" aria-label="Plan progress">
+<div class="run-heading"><strong>Router UI &amp; observability</strong><span class="state" data-field="label"></span></div>
+<div class="progress-row"><span class="bar" data-field="bar" aria-hidden="true"></span><span data-field="count"></span><span class="muted" data-field="phase"></span></div>
+<div class="task" data-field="task"></div><div class="reason" data-field="reason"></div><div class="muted" data-field="next"></div>
+<div class="actions"><button type="button" data-action="details">Details</button><button type="button" data-action="pause">Pause</button><button type="button" data-action="cancel" class="danger">Cancel run</button><button type="button" data-action="hide">Hide</button></div>
+</section>
+<form class="editor" id="command-form"><span class="accent">›</span><input id="command" aria-label="Prototype command" placeholder="Try /exec hide, /exec show, /exec clear, /exec status" autocomplete="off"></form>
+<div class="footer"><span>pi-model-router · main</span><span id="footer-run" class="footer-run"><span data-field="footer"></span> <button type="button" data-action="details">/exec status</button></span><span>model · context 18%</span></div>
+</section>
+<p id="feedback" class="feedback" role="status">Proposed controls, not existing commands. Hide is immediate; execution is unchanged.</p>
+<div class="notes">
+<section><h2>4–6 content lines</h2><p>Recommended default. Enough context to act, without turning your editor into a log viewer.</p></section>
+<section><h2>Built for Pi, not a web dashboard</h2><p>A themed setWidget component with a text border. No footer replacement, DOM, or special terminal graphics. Web buttons model slash commands in regular terminal mode.</p></section>
+<section><h2>Visibility is not cancellation</h2><p><code>/exec hide</code> removes widget and status. <code>/exec show</code> restores them. <code>/exec clear</code> dismisses the current view, not its recovery evidence. No <code>--apply</code>.</p></section>
+</div>
+<dialog id="inspector" aria-labelledby="inspector-title">
+<div class="row"><h2 id="inspector-title">Router UI &amp; observability</h2><button type="button" class="close" data-action="close">Close · Esc</button></div>
+<p class="state" data-field="label"></p><div class="progress-row"><span class="bar" data-field="bar" aria-hidden="true"></span><span data-field="count"></span></div>
+<h3>Now</h3><p data-field="task"></p><p class="reason" data-field="reason"></p>
+<h3>Next</h3><p data-field="next"></p>
+<h3>Task position</h3><ol id="task-list"></ol>
+<div class="actions"><button type="button" data-action="pause">Pause</button><button type="button" data-action="cancel" class="danger">Cancel run</button><button type="button" data-action="hide">Hide all UI</button></div>
+<details><summary>Technical details · only when requested</summary><pre id="technical"></pre></details>
+<p class="muted">Escape closes this inspector. It does not stop the run.</p>
+</dialog>
+</main></body></html>

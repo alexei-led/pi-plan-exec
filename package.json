@@ -1,6 +1,6 @@
 {
   "name": "@alexeiled/pi-plan-exec",
-  "version": "1.6.4",
+  "version": "1.7.0",
   "description": "Turn a Markdown execution plan into an isolated, resumable Pi run - durable controller state, one writer, deliberate recovery",
   "keywords": [
     "pi-package",
@@ -57,13 +57,17 @@
   },
   "peerDependencies": {
     "@alexeiled/pi-fusion": ">=0.9.3 <1.0.0",
-    "@alexeiled/pi-subagents-bridge": ">=0.5.4 <0.6.0",
-    "@earendil-works/pi-coding-agent": "^1.0.2",
+    "@alexeiled/pi-subagents-bridge": ">=0.5.5 <0.6.0",
+    "@earendil-works/pi-coding-agent": "^1.0.4",
     "@earendil-works/pi-tui": "*",
     "@tintinweb/pi-tasks": ">=0.9.0 <0.10.0",
+    "pi-subagents": ">=0.76.1 <0.77.0",
     "typebox": "*"
   },
   "peerDependenciesMeta": {
+    "pi-subagents": {
+      "optional": true
+    },
     "@alexeiled/pi-fusion": {
       "optional": true
     },
@@ -76,13 +80,13 @@
   },
   "devDependencies": {
     "@alexeiled/pi-fusion": "^0.9.3",
-    "@alexeiled/pi-subagents-bridge": "^0.5.4",
+    "@alexeiled/pi-subagents-bridge": "^0.5.5",
     "@biomejs/biome": "2.5.14",
-    "@earendil-works/pi-coding-agent": "^1.0.2",
+    "@earendil-works/pi-coding-agent": "^1.0.4",
     "@tintinweb/pi-tasks": "0.9.0",
     "@types/node": "^24.10.0",
     "jiti": "^2.7.0",
-    "pi-subagents": "^0.76.0",
+    "pi-subagents": "^0.76.1",
     "typescript": "^7.0.2",
     "vitest": "^5.0.1"
   }

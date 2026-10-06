@@ -62,6 +62,46 @@ const config = {
 
 type RunSeed = Parameters<RunRegistry['create']>[0];
 
+for (const diagnostic of [
+  null,
+  {},
+  { message: '', observedAt: 1 },
+  { message: 'refused', observedAt: -1 },
+  { message: 'refused', observedAt: 1.5 },
+  { message: 'refused', observedAt: 1, upstreamCode: 42 },
+]) {
+  test(`registry rejects malformed cancellation diagnostics ${JSON.stringify(diagnostic)}`, async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), 'cancel-diagnostic-schema-'),
+    );
+    onTestFinished(() => rm(directory, { recursive: true, force: true }));
+    const registry = new RunRegistry(directory);
+    const run = await registry.create(
+      runSeed({
+        activeOperation: {
+          operationId: 'op',
+          service: 'bridge',
+          kind: 'implementation',
+        },
+      }),
+    );
+    await writeFile(
+      registry.authorizationPath(run.id),
+      JSON.stringify({
+        ...run,
+        activeOperation: {
+          ...run.activeOperation,
+          cancellationDeliveryError: diagnostic,
+        },
+      }),
+    );
+    await assert.rejects(
+      () => registry.get(run.id),
+      /Invalid plan-exec run registry entry/,
+    );
+  });
+}
+
 /** The create payload every registry test starts from. */
 function runSeed(overrides: Partial<RunSeed> = {}): RunSeed {
   return {

@@ -69,6 +69,8 @@ interface ProjectionTarget {
 }
 
 export interface TaskProjectionOptions {
+  /** False for Pi --no-session: pi-tasks uses an in-memory store. */
+  persistent?: boolean;
   cwd: string;
   sessionId: string;
 }
@@ -275,6 +277,10 @@ export function sessionTaskPath(cwd: string, sessionId: string): string {
 async function resolveProjectionTarget(
   options: TaskProjectionOptions,
 ): Promise<ProjectionTarget> {
+  if (options.persistent === false)
+    throw new Error(
+      'Pi session is not persisted; pi-tasks uses memory and has no projection file.',
+    );
   if (!options.sessionId.trim())
     throw new Error('Pi session ID is required for pi-tasks projection.');
   const packageVersion = piTasksPackageVersion();

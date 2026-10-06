@@ -4458,6 +4458,223 @@ test('pause persists cancellation before RPC and early resume cannot replace the
   assert.equal(f.worker.launches.length, 2);
 });
 
+for (const wrong of ['runId', 'operationId', 'requestDigest'] as const)
+  test(`foreign delivered receipt cannot suppress cancellation retry: ${wrong}`, async (t) => {
+    const f = await fixture(t);
+    let run = await f.controller.tick(f.run.id, 'session');
+    const operation = required(run.activeOperation);
+    let calls = 0;
+    Object.assign(f.worker, {
+      cancelOperation: async () => {
+        calls++;
+        return ok({
+          cancellationDelivery: 'delivered',
+          runId: operation.externalRunId,
+          operationId: operation.operationId,
+          requestDigest: operation.requestDigest,
+          [wrong]: 'foreign',
+        });
+      },
+    });
+    run = await f.registry.update({
+      ...run,
+      status: 'paused',
+      userStopped: true,
+      stopGeneration: 1,
+    });
+    run = await f.controller.advance(run);
+    assert.equal(run.activeOperation?.stopDeliveredTo, undefined);
+    run = await due(f.registry, run);
+    await f.controller.tick(run.id, 'session');
+    assert.equal(calls, 2);
+    assert.equal(f.worker.launches.length, 1);
+  });
+
+test('advisory observations cannot become verified progress or retirement', async (t) => {
+  const f = await fixture(t);
+  let run = await f.controller.tick(f.run.id, 'session');
+  const operation = required(run.activeOperation);
+  const before = run.tasks?.['1']?.lastVerifiedActivityAt;
+  f.worker.status = async (id) =>
+    ok({
+      state: 'running',
+      advisoryObservation: {
+        version: 1,
+        source: 'pi-subagents.async-status-snapshot',
+        runId: id,
+        generatedAt: Date.now(),
+        activity: {
+          currentTool: 'bash',
+          lastActivityAt: Date.now(),
+          toolCount: 99,
+        },
+        omitted: { runs: 0, children: 0, byteLimitExceeded: false },
+        terminationReason: 'execution_lifetime_expired',
+        processTreeExited: true,
+      },
+    });
+  run = await f.controller.tick(run.id, 'session');
+  assert.equal(
+    run.activeOperation?.advisoryObservation?.activity?.currentTool,
+    'bash',
+  );
+  assert.equal(run.activeOperation?.operationId, operation.operationId);
+  assert.equal(run.activeOperation?.processTreeExited, undefined);
+  assert.equal(run.activeOperation?.budgetGrowthGranted, undefined);
+  assert.equal(run.tasks?.['1']?.lastVerifiedActivityAt, before);
+  assert.equal(f.worker.launches.length, 1);
+});
+
+test('recovery history persists each distinct failure once', async (t) => {
+  const f = await fixture(t);
+  let run = await f.registry.update({
+    ...f.run,
+    progressPath: join(f.root, 'progress.txt'),
+  });
+  await rm(required(run.planPath));
+  run = await f.controller.tick(run.id, 'session');
+  const firstError = required(run.error);
+  const log = join(
+    dirname(f.registry.authorizationPath(run.id)),
+    'recovery.log',
+  );
+  assert.ok((await readFile(log, 'utf8')).includes(firstError));
+  run = await f.controller.tick((await due(f.registry, run)).id, 'session');
+  assert.equal(
+    (await readFile(log, 'utf8')).split('Recovery at ').length - 1,
+    1,
+  );
+  await writeFile(required(run.planPath), 'not a task');
+  run = await f.controller.tick((await due(f.registry, run)).id, 'session');
+  assert.notEqual(run.error, firstError);
+  assert.equal(
+    (await readFile(log, 'utf8')).split('Recovery at ').length - 1,
+    2,
+  );
+});
+test('recovery history write failure cannot suppress optional progress logging', async (t) => {
+  const f = await fixture(t);
+  let run = await f.registry.update({
+    ...f.run,
+    progressPath: join(f.root, 'progress.txt'),
+  });
+  await mkdir(
+    join(dirname(f.registry.authorizationPath(run.id)), 'recovery.log'),
+  );
+  await rm(required(run.planPath));
+  run = await f.controller.tick(run.id, 'session');
+  assert.ok(run.error);
+  assert.match(
+    await readFile(required(run.progressPath), 'utf8'),
+    /Automatic recovery scheduled/,
+  );
+});
+
+test('pending native cancellation errors survive observations and restart until delivered', async (t) => {
+  const f = await fixture(t);
+  let run = await f.controller.tick(f.run.id, 'session');
+  const operation = required(run.activeOperation);
+  let delivered = false;
+  Object.assign(f.worker, {
+    cancelOperation: async () =>
+      ok({
+        operationId: operation.operationId,
+        requestDigest: operation.requestDigest,
+        runId: operation.externalRunId,
+        cancellationDelivery: delivered ? 'delivered' : 'pending',
+        cancellationRequested: true,
+        ...(delivered
+          ? {}
+          : {
+              error: 'Run is paused; native RPC cannot stop it',
+              upstreamCode: 'invalid_state',
+            }),
+      }),
+  });
+  run = await f.registry.update({
+    ...run,
+    status: 'paused',
+    userStopped: true,
+    stopGeneration: 1,
+  });
+  run = await f.controller.advance(run);
+  assert.equal(
+    run.activeOperation?.cancellationDeliveryError?.message,
+    'Run is paused; native RPC cannot stop it',
+  );
+  assert.equal(
+    run.activeOperation?.cancellationDeliveryError?.upstreamCode,
+    'invalid_state',
+  );
+  const restarted = new PlanExecController(
+    f.registry,
+    f.worker,
+    fusion,
+    command,
+    f.localExecutor,
+  );
+  run = await due(f.registry, required(await f.registry.get(run.id)));
+  run = await restarted.tick(run.id, 'session');
+  assert.equal(
+    run.activeOperation?.cancellationDeliveryError?.upstreamCode,
+    'invalid_state',
+  );
+  assert.equal(run.activeOperation?.lastStatusError, undefined);
+  delivered = true;
+  run = await due(f.registry, run);
+  run = await restarted.tick(run.id, 'session');
+  assert.equal(run.activeOperation?.cancellationDeliveryError, undefined);
+  assert.equal(run.activeOperation?.stopDeliveredTo, operation.externalRunId);
+  assert.equal(run.activeOperation?.processTreeExited, undefined);
+  assert.equal(f.worker.launches.length, 1);
+});
+
+test('intent-only cancellation and legacy acknowledgements retry the same operation until delivery', async (t) => {
+  const f = await fixture(t);
+  let run = await f.controller.tick(f.run.id, 'session');
+  const operation = required(run.activeOperation);
+  const requests: string[] = [];
+  Object.assign(f.worker, {
+    cancelOperation: async (id: string) => {
+      requests.push(id);
+      return ok({
+        operationId: id,
+        requestDigest: operation.requestDigest,
+        runId: operation.externalRunId,
+        state: 'unknown',
+        cancellationRequested: true,
+        cancellationDelivery: requests.length < 2 ? 'pending' : 'delivered',
+      });
+    },
+  });
+  run = await f.registry.update({
+    ...run,
+    status: 'paused',
+    userStopped: true,
+    stopGeneration: 1,
+    activeOperation: { ...operation, stopAcknowledged: true },
+  });
+  run = await f.controller.advance(run);
+  assert.equal(requests.length, 1);
+  assert.equal(run.activeOperation?.processTreeExited, undefined);
+  run = await due(f.registry, run);
+  run = await f.controller.tick(run.id, 'session');
+  assert.deepEqual(requests, [operation.operationId, operation.operationId]);
+  assert.equal(run.activeOperation?.stopDeliveredTo, operation.externalRunId);
+  assert.equal(run.activeOperation?.processTreeExited, undefined);
+  run = await due(f.registry, run);
+  const restarted = new PlanExecController(
+    f.registry,
+    f.worker,
+    fusion,
+    command,
+    f.localExecutor,
+  );
+  await restarted.tick(run.id, 'session');
+  assert.equal(requests.length, 2);
+  assert.equal(f.worker.launches.length, 1);
+});
+
 test('pause cancellation reply loss retries the same fence without claiming worker exit', async (t) => {
   const f = await fixture(t);
   let run = await f.controller.tick(f.run.id, 'session');

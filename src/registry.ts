@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import {
+  appendFile,
   mkdir,
   readFile,
   realpath,
@@ -200,6 +201,14 @@ export class RunRegistry {
   /** Read-only authorization source for a durable local command monitor. */
   authorizationPath(runId: string): string {
     return this.pathFor(runId);
+  }
+
+  async appendRecoveryMessage(runId: string, message: string): Promise<void> {
+    await appendFile(
+      join(dirname(this.pathFor(runId)), 'recovery.log'),
+      `[${new Date().toISOString()}] ${message}\n`,
+      'utf8',
+    );
   }
 
   localOperationsPath(runId: string): string {
@@ -1078,6 +1087,24 @@ function isAutonomousState(run: PlanExecRun): boolean {
     if (
       operation?.stopAcknowledged !== undefined &&
       typeof operation.stopAcknowledged !== 'boolean'
+    )
+      return false;
+    const cancellationError = operation?.cancellationDeliveryError;
+    if (
+      cancellationError !== undefined &&
+      (!isRecord(cancellationError) ||
+        typeof cancellationError.message !== 'string' ||
+        !cancellationError.message ||
+        (cancellationError.upstreamCode !== undefined &&
+          typeof cancellationError.upstreamCode !== 'string') ||
+        !Number.isSafeInteger(cancellationError.observedAt) ||
+        (cancellationError.observedAt as number) < 0)
+    )
+      return false;
+    if (
+      operation?.stopDeliveredTo !== undefined &&
+      (typeof operation.stopDeliveredTo !== 'string' ||
+        operation.stopDeliveredTo !== operation.externalRunId)
     )
       return false;
     if (

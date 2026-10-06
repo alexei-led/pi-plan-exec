@@ -22,7 +22,7 @@ for (const name of HOST_PACKAGES) {
       invalid.push(`${field}: ${name}`);
   }
   const expectedPeerRange =
-    name === '@earendil-works/pi-coding-agent' ? '^1.0.2' : '*';
+    name === '@earendil-works/pi-coding-agent' ? '^1.0.4' : '*';
   if (
     Object.hasOwn(packageJson.peerDependencies ?? {}, name) &&
     packageJson.peerDependencies[name] !== expectedPeerRange

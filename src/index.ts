@@ -1,5 +1,5 @@
 import type { Dirent } from 'node:fs';
-import { readFileSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
 import { access, readdir } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import { basename, isAbsolute, relative, resolve } from 'node:path';
@@ -10,12 +10,12 @@ import {
   SessionManager,
 } from '@earendil-works/pi-coding-agent';
 import type { AutocompleteItem } from '@earendil-works/pi-tui';
+import { parseAdvisoryObservation } from './advisory-observation.js';
 import {
   type BridgeCapabilities,
   BridgeClient,
   hasBoundNeverStarted,
   hasBoundOperation,
-  parseExecutionLifetime,
   processTerminalProof,
   supportsOwnedProcessTree,
 } from './bridge.js';
@@ -59,6 +59,13 @@ import {
   takeoverRefusal,
 } from './registry.js';
 import { required } from './required.js';
+import {
+  progressView,
+  RunPresentation,
+  readViewPreferences,
+  renderProgressStrip,
+  VIEW_ENTRY,
+} from './run-view.js';
 import { loadPlanExecRuntimeIntegration } from './runtime-integration.js';
 import {
   TASK_EXECUTION_STATE,
@@ -104,7 +111,6 @@ const CLEANUP_INCLUDE_FAILED_OPTION = '--include-failed';
 const CLEANUP_RETENTION_DAYS = 7;
 const MILLISECONDS_PER_DAY = 86_400_000;
 const CLEANUP_RETENTION_MS = CLEANUP_RETENTION_DAYS * MILLISECONDS_PER_DAY;
-const GOAL_WIDGET_TAIL_LIMIT = 200;
 const GOAL_STATUS_TAIL_LIMIT = 400;
 const RUNS_ALL_OPTION = '--all';
 /** Keyed by `ExecAliasAction`, so retiring another name forces a note with it. */
@@ -202,6 +208,21 @@ function requiredSetupCommands(): string[] {
 /** Primary verbs only: a retired name still dispatches, but is never taught. */
 const EXEC_COMMANDS: AutocompleteItem[] = [
   {
+    value: 'hide',
+    label: 'hide',
+    description: 'Hide plan UI without stopping execution',
+  },
+  {
+    value: 'show',
+    label: 'show',
+    description: 'Restore plan UI without resuming execution',
+  },
+  {
+    value: 'clear',
+    label: 'clear',
+    description: 'Dismiss a run display without deleting its record',
+  },
+  {
     value: EXEC_ACTION.ISOLATE,
     label: EXEC_ACTION.ISOLATE,
     description:
@@ -258,8 +279,19 @@ type RuntimeCheck = () => Promise<void>;
 type RuntimeProbe = () => Promise<string[]>;
 type SyncProjection = (
   run: PlanExecRun,
-  options: { cwd: string; sessionId: string },
+  options: { cwd: string; sessionId: string; runtimeSessionId?: string },
 ) => Promise<PlanExecRun>;
+
+function projectionContext(
+  ctx: Pick<ExtensionContext, 'cwd' | 'sessionManager'>,
+) {
+  const sessionId = ctx.sessionManager.getSessionId();
+  return {
+    cwd: ctx.cwd,
+    sessionId,
+    runtimeSessionId: ctx.sessionManager.getSessionFile?.() ?? sessionId,
+  };
+}
 
 /** Survives extension replacement while an outgoing controller finishes its tick. */
 interface SessionRetirement {
@@ -371,6 +403,7 @@ async function restoreRetiredRun(
 
 export default function planExecExtension(pi: ExtensionAPI): void {
   const projector = new TaskProjector(defaultRegistry);
+  let persistentSession = true;
   const runtimeIntegration = loadPlanExecRuntimeIntegration().catch(
     () => undefined,
   );
@@ -383,30 +416,21 @@ export default function planExecExtension(pi: ExtensionAPI): void {
     { work: Promise<PlanExecRun>; latest?: ProjectionRequest }
   >();
   const syncProjection: SyncProjection = (run, options) => {
+    void runtimeIntegration
+      .then((integration) =>
+        integration?.sync(run, options.runtimeSessionId ?? options.sessionId),
+      )
+      .catch(() => undefined);
     const pending = projectionQueues.get(run.id);
     if (pending) {
       if (!pending.latest || run.updatedAt >= pending.latest.run.updatedAt)
         pending.latest = { run, options };
       return Promise.resolve(run);
     }
-    const next = Promise.resolve()
-      .then(() => projector.sync(run, options))
-      .then(async (projected) => {
-        try {
-          const integration = await boundedPromise(
-            runtimeIntegration,
-            PROJECTION_TIMEOUT_MS,
-          );
-          if (integration)
-            await boundedPromise(
-              Promise.resolve(integration.sync(projected, options.sessionId)),
-              PROJECTION_TIMEOUT_MS,
-            );
-        } catch {
-          // Fleet visibility is a cache too; the durable run still proceeds.
-        }
-        return projected;
-      });
+    const persistent = persistentSession;
+    const next = Promise.resolve().then(() =>
+      projector.sync(run, { ...options, persistent }),
+    );
     const entry: { work: Promise<PlanExecRun>; latest?: ProjectionRequest } = {
       work: next,
     };
@@ -554,24 +578,61 @@ export default function planExecExtension(pi: ExtensionAPI): void {
     },
   };
   const lastStates = new Map<string, RunState>();
-  const setStatus = (run: PlanExecRun, ctx: ExtensionContext): void => {
+  const lastProbeErrors = new Map<string, string>();
+  let presentation = new RunPresentation();
+  const renderStatus = (ctx: ExtensionContext): void => {
     if (sessionClosed) return;
+    const run = presentation.current();
     try {
-      ctx.ui.setStatus(STATUS_KEY, compactRunStatus(run));
-      ctx.ui.setWidget(STATUS_KEY, [
-        ...formatRunWidget(run),
-        `Plan worktree: ${run.worktreeCwd}`,
-        `Git branch: ${run.branch}  ·  use !git status --short --branch for details`,
-      ]);
+      if (!run) {
+        ctx.ui.setWidget(STATUS_KEY, undefined);
+        ctx.ui.setStatus(STATUS_KEY, undefined);
+        return;
+      }
+      const observing = () =>
+        activeControllers.has(run.id) &&
+        !lastProbeErrors.has(run.id) &&
+        run.lease?.sessionId === ctx.sessionManager.getSessionId() &&
+        run.lease.pid === process.pid &&
+        isLocalRun(run);
+      const view = progressView(run, Date.now(), observing());
+      ctx.ui.setStatus(
+        STATUS_KEY,
+        `exec ${view.label} · /exec hide · /exec status`,
+      );
+      if (ctx.mode === 'tui') {
+        ctx.ui.setWidget(STATUS_KEY, () => ({
+          render: (width) =>
+            renderProgressStrip(
+              run,
+              width,
+              (tone, text) => ctx.ui.theme.fg(tone, text),
+              Date.now(),
+              observing(),
+            ),
+          invalidate() {},
+        }));
+      } else {
+        ctx.ui.setWidget(
+          STATUS_KEY,
+          renderProgressStrip(run, 100, undefined, Date.now(), observing()),
+        );
+      }
     } catch {
       // TUI/RPC teardown must never affect the durable controller.
     }
+  };
+  const setStatus = (run: PlanExecRun, ctx: ExtensionContext): void => {
+    if (sessionClosed) return;
+    presentation.remember(run);
+    renderStatus(ctx);
   };
   const stopBackgroundController = (runId: string): void => {
     const timer = activeControllers.get(runId);
     if (timer) clearInterval(timer);
     activeControllers.delete(runId);
     lastStates.delete(runId);
+    lastProbeErrors.delete(runId);
   };
   const notify = (
     ctx: ExtensionContext,
@@ -639,6 +700,7 @@ export default function planExecExtension(pi: ExtensionAPI): void {
       void ticking
         .then(async (run) => {
           if (sessionClosed) return run;
+          lastProbeErrors.delete(runId);
           if (handoffWhenReady && canHandoffPreparedWorktree(run)) {
             // Session startup must be able to install the target's controller.
             stopBackgroundController(runId);
@@ -670,7 +732,14 @@ export default function planExecExtension(pi: ExtensionAPI): void {
           // not hold the controller's next tick on a slow or broken cache.
           void (async () => {
             try {
-              setStatus(await syncProjection(run, { sessionId, cwd }), ctx);
+              setStatus(
+                await syncProjection(run, {
+                  ...projectionContext(ctx),
+                  sessionId,
+                  cwd,
+                }),
+                ctx,
+              );
             } catch {
               // A broken projection cache never holds the controller's tick.
             }
@@ -683,6 +752,9 @@ export default function planExecExtension(pi: ExtensionAPI): void {
           // the timer. In particular, this path never marks a run failed.
           const message =
             error instanceof Error ? error.message : String(error);
+          if (lastProbeErrors.get(runId) === message) return;
+          lastProbeErrors.set(runId, message);
+          renderStatus(ctx);
           notify(
             ctx,
             `Plan execution ${shortRunId(runId)} recovery probe unavailable: ${message}. Automatic retry continues.`,
@@ -733,6 +805,39 @@ export default function planExecExtension(pi: ExtensionAPI): void {
         | { settled: Promise<void>; retirementRunIds?: Set<string> }
         | undefined;
       try {
+        const [viewAction, viewId, ...extra] = args.trim().split(/\s+/);
+        if (
+          viewAction === 'hide' ||
+          viewAction === 'show' ||
+          viewAction === 'clear'
+        ) {
+          if (extra.length || (viewAction === 'hide' && viewId))
+            throw new Error(
+              'Usage: /exec hide | /exec show [run-id] | /exec clear [run-id]',
+            );
+          if (viewAction === 'show' || (viewAction === 'clear' && viewId)) {
+            const { runs } = await defaultRegistry.listWithErrors();
+            if (sessionClosed) return;
+            presentation.reconcile(
+              runs.filter((run) => matchesContext(run, ctx.cwd)),
+            );
+          }
+          if (viewAction === 'hide') presentation.hide();
+          else if (viewAction === 'show') presentation.show(viewId);
+          else presentation.clear(viewId);
+          renderStatus(ctx);
+          pi.appendEntry(VIEW_ENTRY, presentation.preferences());
+          notify(
+            ctx,
+            viewAction === 'show'
+              ? 'Plan display restored. Execution unchanged.'
+              : viewAction === 'hide'
+                ? 'Plan display hidden. Execution unchanged. /exec show restores it.'
+                : 'Plan display cleared. Execution and recovery records unchanged. /exec show restores it.',
+            'info',
+          );
+          return;
+        }
         const message = await handleCommand(args.trim(), ctx, {
           controller,
           startBackgroundController,
@@ -769,6 +874,14 @@ export default function planExecExtension(pi: ExtensionAPI): void {
           },
           handoffLifecycle,
         });
+        if (viewAction === EXEC_ACTION.CLEANUP) {
+          const { runs } = await defaultRegistry.listWithErrors();
+          if (sessionClosed) return;
+          presentation.reconcile(
+            runs.filter((run) => matchesContext(run, ctx.cwd)),
+          );
+          renderStatus(ctx);
+        }
         if (message) notify(ctx, message, 'info');
       } catch (error: unknown) {
         notify(
@@ -867,11 +980,26 @@ export default function planExecExtension(pi: ExtensionAPI): void {
     },
   });
 
+  pi.on('session_tree', (_event, ctx) => {
+    if (sessionClosed) return;
+    presentation.restorePreferences(
+      readViewPreferences(ctx.sessionManager.getBranch()),
+    );
+    renderStatus(ctx);
+  });
+
   pi.on('session_start', async (_event, ctx) => {
+    persistentSession = ctx.sessionManager.getSessionFile?.() !== undefined;
+    presentation = new RunPresentation(
+      readViewPreferences(ctx.sessionManager.getBranch?.() ?? []),
+    );
     const retiring = [...sessionRetirements()];
     const sessionId = ctx.sessionManager.getSessionId();
     const { runs, errors } = await defaultRegistry.listWithErrors();
     const contextualRuns = runs.filter((run) => matchesContext(run, ctx.cwd));
+    const runtimeSessionId = projectionContext(ctx).runtimeSessionId;
+    presentation.reconcile(contextualRuns);
+    renderStatus(ctx);
     for (const run of runs) {
       if (
         isLocalRun(run) &&
@@ -910,7 +1038,7 @@ export default function planExecExtension(pi: ExtensionAPI): void {
     }
     for (const run of contextualRuns) {
       if (shouldRepairProjectionForSession(run, sessionId))
-        void syncProjection(run, { cwd: ctx.cwd, sessionId })
+        void syncProjection(run, projectionContext(ctx))
           .then((projected) => setStatus(projected, ctx))
           .catch(() => undefined);
     }
@@ -918,7 +1046,13 @@ export default function planExecExtension(pi: ExtensionAPI): void {
       .then(async (integration) => {
         if (integration)
           await boundedPromise(
-            Promise.resolve(integration.reconcile(contextualRuns, sessionId)),
+            Promise.resolve(
+              integration.reconcile(
+                contextualRuns,
+                sessionId,
+                runtimeSessionId,
+              ),
+            ),
             PROJECTION_TIMEOUT_MS,
           );
       })
@@ -936,6 +1070,8 @@ export default function planExecExtension(pi: ExtensionAPI): void {
   });
 
   pi.on('session_shutdown', async (event, ctx) => {
+    presentation.hide();
+    renderStatus(ctx);
     sessionClosed = true;
     for (const timer of activeControllers.values()) clearInterval(timer);
     activeControllers.clear();
@@ -1479,6 +1615,30 @@ export function formatRunStatus(
     `worktree: ${run.worktreeCwd}`,
     `updated: ${new Date(run.updatedAt).toISOString()}`,
   ];
+  const advisory = parseAdvisoryObservation(
+    operation?.advisoryObservation,
+    operation?.externalRunId,
+    Date.now(),
+  );
+  const cancellationError = operation?.cancellationDeliveryError;
+  if (cancellationError)
+    lines.push(
+      `cancellation delivery: pending${cancellationError.upstreamCode ? ` (${cancellationError.upstreamCode})` : ''} — ${cancellationError.message}`,
+    );
+  if (advisory?.activity)
+    lines.push(
+      `reported activity (advisory, not verified progress): ${advisory.activity.currentTool ?? advisory.activity.state ?? 'available'}`,
+    );
+  const lifetime = activeExecutionLifetime(run);
+  lines.push(
+    'lifetime: ' +
+      (!lifetime
+        ? 'unknown (awaiting lifetime evidence)'
+        : lifetime.mode === 'unbounded'
+          ? 'unbounded requested; native child deadlines may still apply'
+          : `bounded (${lifetime.timeoutMs}ms)`),
+    `review: ${run.config.reviewRequired ? 'required' : 'optional'} · ${run.config.reviewBackend}`,
+  );
   if (run.goal !== undefined) {
     lines.push(`turn: ${run.goal.iteration}/${run.config.maxTaskIterations}`);
     if (run.goal.lastCheck)
@@ -2182,8 +2342,7 @@ async function statusOptions(
 ): Promise<StatusOptions> {
   let problems: string[] = [];
   if (sources.problems) {
-    // biome-ignore lint/nursery/useAwaitThenable: RuntimeProbe is a promise.
-    problems = await sources.problems();
+    problems = await Promise.resolve(sources.problems());
   }
   return {
     all,
@@ -2242,7 +2401,7 @@ export async function execStatus(
 /** Name the problem where the reader already is, next to the exact cure. */
 function prerequisiteLines(problems: string[]): string[] {
   return [
-    `${prerequisiteProblem(problems)} Install them, then /reload:`,
+    `${prerequisiteProblem(problems)} Install them, then restart Pi (use /reload only for local source/config changes):`,
     ...requiredSetupCommands(),
     '',
   ];
@@ -2740,7 +2899,7 @@ async function repairProjectionForRead(
       );
   for (const run of runs) {
     try {
-      await syncProjection(run, { cwd: ctx.cwd, sessionId });
+      await syncProjection(run, projectionContext(ctx));
     } catch {
       // The read still reports registry truth when a cache repair cannot land.
     }
@@ -2852,10 +3011,7 @@ export async function handleCommand(
   )
     return undefined;
   if (dependencies.isSessionClosed?.()) return undefined;
-  const run = await syncProjection(started, {
-    cwd: ctx.cwd,
-    sessionId: ctx.sessionManager.getSessionId(),
-  });
+  const run = await syncProjection(started, projectionContext(ctx));
   startBackgroundController(
     run,
     ctx.sessionManager.getSessionId(),
@@ -3061,7 +3217,7 @@ async function runAction(
           EXEC_ACTION.PAUSE,
         ),
       ),
-      { cwd: ctx.cwd, sessionId },
+      projectionContext(ctx),
     );
     startCleanup(paused);
     return `Run ${shortRunId(paused.id)} paused; its current attempt is stopping and its checkpoint is preserved. Use /exec resume ${paused.id} to continue after confirmed exit.`;
@@ -3073,7 +3229,7 @@ async function runAction(
         EXEC_ACTION.CANCEL,
       ),
     ),
-    { cwd: ctx.cwd, sessionId },
+    projectionContext(ctx),
   );
   startCleanup(cancelled);
   return `Run ${shortRunId(cancelled.id)} marked cancel-pending. Its worktree is preserved.`;
@@ -3163,7 +3319,7 @@ async function resumeRun(
           run.stopGeneration ?? 0,
         ),
       ),
-      { cwd: ctx.cwd, sessionId },
+      projectionContext(ctx),
     );
     startBackgroundController(rebound, sessionId, ctx.cwd, ctx);
     return `Run ${shortRunId(rebound.id)} adopted branch ${rebound.branch}: ${rebound.status} (${rebound.stage}).\nUse /exec status ${rebound.id} for live progress.`;
@@ -3182,7 +3338,7 @@ async function resumeRun(
         run.stopGeneration ?? 0,
       ),
     ),
-    { cwd: ctx.cwd, sessionId },
+    projectionContext(ctx),
   );
   startBackgroundController(resumed, sessionId, ctx.cwd, ctx);
   // Reported where the operator asked, not only in the progress file.
@@ -3238,7 +3394,7 @@ async function skipStage(
     await mutateCommand(dependencies, () =>
       controller.skip(run.id, sessionId, reason, run.stopGeneration ?? 0),
     ),
-    { cwd: ctx.cwd, sessionId },
+    projectionContext(ctx),
   );
   startBackgroundController(skipped, sessionId, ctx.cwd, ctx);
   return `Run ${shortRunId(skipped.id)} force-skip requested: ${skipped.status} (${skipped.stage}).\nUse /exec status ${skipped.id} for live progress.`;
@@ -3331,7 +3487,7 @@ export function prioritizeRunCandidates(
   cwd: string,
 ): PlanExecRun[] {
   const exactWorktree = candidates.filter(
-    (run) => resolve(run.worktreeCwd) === resolve(cwd),
+    (run) => contextPath(run.worktreeCwd) === contextPath(cwd),
   );
   return exactWorktree.length > 0 ? exactWorktree : candidates;
 }
@@ -3391,9 +3547,12 @@ async function prepareSessionHandoff(
   }
   if (isClosed()) return false;
   if (run.lanePreparation?.state === 'create') return false;
-  if (resolve(run.worktreeCwd) === resolve(ctx.cwd)) return false;
+  if (contextPath(run.worktreeCwd) === contextPath(ctx.cwd)) return false;
   const sourceSessionFile = ctx.sessionManager.getSessionFile();
-  if (!sourceSessionFile) return false;
+  // Pi defers the file until the first conversation message. Slash-only
+  // sessions can still control an isolated worker without forking a transcript.
+  if (!sourceSessionFile || !(await pathExists(sourceSessionFile)))
+    return false;
 
   const sourceSessionId = ctx.sessionManager.getSessionId();
   // Before the fork, not merely before the release below: `release` deletes any
@@ -3458,6 +3617,7 @@ async function prepareSessionHandoff(
       void syncProjection(claimed, {
         cwd: targetSession.getCwd(),
         sessionId: targetSession.getSessionId(),
+        runtimeSessionId: targetSessionFile,
       }).catch(() => undefined);
       return true;
     }
@@ -3513,11 +3673,19 @@ async function restoreSourceLease(
   }
 }
 
+function contextPath(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
+  }
+}
+
 function matchesContext(run: PlanExecRun, cwd: string): boolean {
-  const current = resolve(cwd);
+  const current = contextPath(cwd);
   return (
-    resolve(run.worktreeCwd) === current ||
-    isPathWithin(run.repositoryRoot, current)
+    contextPath(run.worktreeCwd) === current ||
+    isPathWithin(contextPath(run.repositoryRoot), current)
   );
 }
 
@@ -3861,156 +4029,13 @@ function observationLabel(run: PlanExecRun): string {
     : 'polling worker';
 }
 
-function compactRunStatus(run: PlanExecRun): string {
-  const projection =
-    run.taskProjection?.state === 'degraded' ? ' · projection degraded' : '';
-  const summary = taskProjectionSummary(run);
-  const taskCount =
-    summary.total > 0 ? ` · tasks ${summary.accepted}/${summary.total}` : '';
-  return `exec ${run.status} · ${run.stage} · ${activeOperationLabel(run)} · ${observationLabel(run)}${taskCount}${projection}`;
-}
-
-/**
- * Render the durable controller snapshot for the native Pi widget. Every line
- * is derived from run.json; pi-tasks is intentionally absent from this path so
- * a broken optional projection cannot block status or recovery.
- */
-export function formatRunWidget(run: PlanExecRun, now = Date.now()): string[] {
-  if (isGoalRun(run)) {
-    const goal = run.goal;
-    const lines = [
-      `Goal ${runLabel(run)}  turn ${goal.iteration}  ${run.status}`,
-    ];
-    if (run.activeOperation)
-      lines.push(
-        `Turn ${goal.iteration}: ${activeOperationLabel(run)} · deadline ${executionDeadlineLabel(run)}`,
-      );
-    else if (run.wakeReason) lines.push(`Run ${run.status}: ${run.wakeReason}`);
-    if (goal.lastCheck)
-      lines.push(
-        `Checks: ${goal.lastCheck.failures ? `failing · ${goal.lastCheck.failures.slice(0, GOAL_WIDGET_TAIL_LIMIT)}` : 'passing'}`,
-      );
-    if (run.blocked) lines.push(`Blocked: ${run.blocked.reason}`);
-    if (run.nextAttemptAt && run.nextAttemptAt > now)
-      lines.push(
-        `Next automatic action: ${relativeTimeAt(run.nextAttemptAt, now)}${run.wakeReason ? ` · ${run.wakeReason}` : ''}`,
-      );
-    return lines;
-  }
-  const summary = taskProjectionSummary(run);
-  const taskCounts = [
-    `${summary.accepted}/${summary.total} accepted`,
-    `ready ${summary.ready}`,
-    `retry ${summary.retry}`,
-    `dependency ${summary.dependency}`,
-    `external ${summary.external}`,
-  ].join('  ');
-  const lines = [
-    `${run.goal !== undefined ? 'Goal' : 'Plan'} ${runLabel(run)}  ${taskCounts}`,
-  ];
-  const tasks = Object.values(run.tasks ?? {});
-  const active = tasks.find(
-    (task) =>
-      task.state === TASK_EXECUTION_STATE.RUNNING ||
-      task.state === TASK_EXECUTION_STATE.VERIFYING,
-  );
-  const waiting = tasks.find(
-    (task) =>
-      task.state === TASK_EXECUTION_STATE.RETRY_WAIT ||
-      task.state === TASK_EXECUTION_STATE.WAITING_DEPENDENCY ||
-      task.state === TASK_EXECUTION_STATE.WAITING_EXTERNAL,
-  );
-  const dependencyWait = tasks.find(
-    (task) => task.state === TASK_EXECUTION_STATE.WAITING_DEPENDENCY,
-  );
-  if (active) {
-    const usage = usageLabel(active.usage);
-    const elapsed = active.lastScheduledAt
-      ? ` · elapsed ${elapsedLabel(now - active.lastScheduledAt)}`
-      : '';
-    lines.push(
-      `Task ${active.taskId}: ${active.state} · attempts ${active.attempts}${usage}${elapsed} · deadline ${executionDeadlineLabel(run)}`,
-    );
-  } else if (waiting) {
-    const next = waiting.nextAttemptAt
-      ? ` · next ${relativeTimeAt(waiting.nextAttemptAt, now)}`
-      : '';
-    lines.push(
-      `Task ${waiting.taskId}: ${waiting.state} · attempts ${waiting.attempts}${next}${waiting.reason ? ` · ${waiting.reason}` : ''}`,
-    );
-  } else if (run.wakeReason) {
-    lines.push(`Run ${run.status}: ${run.wakeReason}`);
-  }
-  if (run.lanePreparation) {
-    lines.push(
-      `Lane preparation: Task ${run.lanePreparation.taskId} · ${run.lanePreparation.state}${run.lanePreparation.error ? ` · ${run.lanePreparation.error}` : ''}`,
-    );
-  }
-  if (run.archiveOperation)
-    lines.push(
-      `Archive: ${run.archiveOperation.phase} · attempt ${run.archiveOperation.attempt + 1}${run.archiveOperation.phase === 'retired' ? ' · owned Git exit confirmed' : ' · owned Git exit pending'}`,
-    );
-  if (run.outputPromotion?.state === EXTERNAL_OPERATION_STATE.PENDING)
-    lines.push(
-      `Output promotion: ${run.outputPromotion.commandStarted ? 'owned Git exit pending' : 'preparing'}`,
-    );
-  if (dependencyWait) {
-    lines.push(
-      `Next automatic action: after task ${dependencyWait.dependsOn.join(', ') || 'its prerequisite'} is accepted`,
-    );
-  } else if (run.nextAttemptAt && run.nextAttemptAt > now)
-    lines.push(
-      `Next automatic action: ${relativeTimeAt(run.nextAttemptAt, now)}${run.wakeReason ? ` · ${run.wakeReason}` : ''}`,
-    );
-  const lastVerified = latestVerifiedActivity(run);
-  lines.push(
-    lastVerified
-      ? `Last verified progress: ${new Date(lastVerified).toISOString()}`
-      : 'Last verified progress: unavailable',
-  );
-  if (run.lease)
-    lines.push(
-      `Owner: Pi/${run.lease.sessionId} · heartbeat ${relativeTimeAt(run.lease.heartbeatAt, now)}`,
-    );
-  if (run.needsAttention)
-    lines.push('Needs attention: yes; automatic recovery remains scheduled');
-  if (run.activeOperation?.diagnostics) {
-    const diagnosis = run.activeOperation.diagnostics;
-    lines.push(
-      `Runner: ${diagnosis.phase ?? 'unavailable'}${diagnosis.currentTool ? ` · ${diagnosis.currentTool}` : ''} · ${diagnosis.assessment}`,
-      `Next diagnostic action: ${diagnosis.action} ${relativeTimeAt(diagnosis.nextProbeAt, now)}`,
-    );
-  }
-  const guidance = Object.values(
-    run.activeOperation?.diagnosticActions ?? {},
-  ).at(-1);
-  if (guidance)
-    lines.push(
-      `Tool guidance: ${guidance.state} · ${guidance.toolCallId} (not a repair confirmation)`,
-    );
-  if (run.taskProjection?.state === 'degraded')
-    lines.push(
-      `Projection: unavailable · ${run.taskProjection.error ?? 'unknown error'}`,
-    );
-  const usage = totalUsage(run);
-  if (usage) lines.push(`Usage: ${usage}`);
-  const reviewRequired = run.config?.reviewRequired === true;
-  const reviewBackend = run.config?.reviewBackend ?? 'unavailable';
-  lines.push(
-    `Review: ${reviewRequired ? 'required' : 'optional'} · ${reviewBackend}`,
-    `Lifetime: ${executionLifetimeLabel(run)}`,
-    `Details: /exec status ${run.id}`,
-  );
-  return lines;
-}
-
-function usageLabel(
-  usage:
-    | { inputTokens?: number; outputTokens?: number; cost?: number }
-    | undefined,
-): string {
-  const formatted = formatUsage(usage);
-  return formatted ? ` · ${formatted}` : '';
+/** Read-only compact view; detailed evidence remains in /exec status. */
+export function formatRunWidget(
+  run: PlanExecRun,
+  now = Date.now(),
+  observing = false,
+): string[] {
+  return renderProgressStrip(run, 100, undefined, now, observing);
 }
 
 function formatUsage(
@@ -4023,29 +4048,6 @@ function formatUsage(
   const parts = tokens > 0 ? [`tokens ${tokens}`] : [];
   if (usage.cost !== undefined) parts.push(`cost ${usage.cost}`);
   return parts.length > 0 ? parts.join(', ') : undefined;
-}
-
-function executionDeadlineLabel(run: PlanExecRun): string {
-  const lifetime = activeExecutionLifetime(run);
-  if (!lifetime) return 'unknown (awaiting lifetime evidence)';
-  return lifetime?.mode !== 'bounded'
-    ? 'none (unbounded)'
-    : `${elapsedLabel(lifetime.timeoutMs)} compatibility mode`;
-}
-
-function executionLifetimeLabel(run: PlanExecRun): string {
-  const lifetime = activeExecutionLifetime(run);
-  if (!lifetime) return 'unknown (awaiting lifetime evidence)';
-  const operation = run.activeOperation;
-  const expected =
-    operation?.expectedLifetime ??
-    parseExecutionLifetime(operation?.params?.executionLifetime);
-  return lifetime?.mode !== 'bounded'
-    ? operation?.effectiveLifetime?.mode === 'unbounded' &&
-      expected?.mode === 'unbounded'
-      ? 'unbounded end-to-end verified'
-      : 'unbounded requested'
-    : `${elapsedLabel(lifetime.timeoutMs)} compatibility mode`;
 }
 
 function totalUsage(run: PlanExecRun): string | undefined {
@@ -4071,19 +4073,6 @@ function totalUsage(run: PlanExecRun): string | undefined {
     ...(tokens > 0 ? [`tokens ${tokens}`] : []),
     ...(hasCost ? [`cost ${cost}`] : []),
   ].join(', ');
-}
-
-function latestVerifiedActivity(run: PlanExecRun): number | undefined {
-  return Object.values(run.tasks ?? {})
-    .map((task) => task.lastVerifiedActivityAt)
-    .filter((value): value is number => value !== undefined)
-    .sort((left, right) => right - left)[0];
-}
-
-function relativeTimeAt(timestamp: number, now: number): string {
-  const delta = timestamp - now;
-  if (delta > 0) return `in ${elapsedLabel(delta)}`;
-  return `${elapsedLabel(-delta)} ago`;
 }
 
 function boundedPromise<T>(
@@ -4237,7 +4226,7 @@ export function execSetup(): string {
     sourceInstallCommand('@tintinweb/pi-tasks'),
     'No Git dependency pins are required for the default subagent review backend.',
     '',
-    'Then run /reload. Use /exec help for commands.',
+    'Restart Pi after upgrading installed packages. Use /reload for local source/config changes. Use /exec help for commands.',
   ].join('\n');
 }
 
@@ -4250,6 +4239,9 @@ export function execHelp(): string {
     `/exec resume [run-id] [${RECOVERY_MODEL_OPTION} current|provider/model]`,
     '/exec recover-isolated <full-run-id> <absolute-new-checkout> [--apply] — explicit local-files-only target change; old writer stays unknown',
     "                        Continue a stuck run: take over a dead session's lease while retaining the existing operation and saved result. Explicit pauses require resume; automatic task retries preserve their checkpoints.",
+    '/exec hide             Hide the strip and footer immediately; execution continues.',
+    '/exec show [run-id]     Restore the display without resuming execution.',
+    '/exec clear [run-id]    Dismiss the displayed run; keep execution and recovery records.',
     '/exec stop [run-id]     Stop a run: it asks whether to pause it (resumable) or cancel it (final, worktree preserved).',
     `/exec cleanup [full-run-id] [${CLEANUP_APPLY_OPTION}]`,
     `                        Preview retired runs older than ${CLEANUP_RETENTION_DAYS} days; ${CLEANUP_APPLY_OPTION} deletes their registry entries only.`,

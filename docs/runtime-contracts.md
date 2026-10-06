@@ -2,8 +2,8 @@
 
 A run is admitted only when the selected runtime advertises explicit lifetime
 support and ownership of every operation-owned descendant. The development
-baseline uses Pi `1.0.2`, `pi-subagents@0.76.0`,
-`@alexeiled/pi-subagents-bridge@0.5.4`, and `@alexeiled/pi-fusion@0.9.3`.
+baseline uses Pi `1.0.4`, `pi-subagents@0.76.1`,
+`@alexeiled/pi-subagents-bridge@0.5.5`, and `@alexeiled/pi-fusion@0.9.3`.
 The default subagent backend needs no Git pins. The optional Revmux contract
 still depends on an unmerged upstream change; it is not a released backend.
 See the [upstream audit](upstream-audit.md) for release evidence and limits.
@@ -114,7 +114,7 @@ message. Plan-exec still requests cancellation before retiring that identity.
 
 The original error code, upstream code and message are retained separately from
 subsequent lookup diagnostics. Legacy journal rows lacking a correlated receipt
-remain unknown. pi-subagents 0.76.0 has no authoritative durable operation lookup
+remain unknown. pi-subagents 0.76.1 has no authoritative durable operation lookup
 API for retrospective absence proof. No timeout, old log string, or missing ID
 authorizes replacement work. See [recovery](../skills/exec-plan/references/recovery.md).
 
@@ -130,6 +130,32 @@ claim old-worker death. Local implementation tasks only; no shared Git metadata,
 object alternates, hardlinked working data or remotes. The new target is paused
 until resume. Old partial work is inventoried, not silently imported, and the
 quarantined target keeps its reservation. See the recovery reference above.
+
+## Stop delivery and advisory observations
+
+Bridge 0.5.5 advertises `cancellationDelivery: true`. An owner-bound cancel reply
+can report `pending` (intent saved) or `delivered` (exact native stop receipt).
+Plan-exec retries pending delivery on the same operation. It suppresses delivery
+only for a receipt bound to that operation/digest/native run, a never-started
+fence, or retirement proof. Legacy `stopAcknowledged` alone cannot suppress a
+Bridge retry. Correlated pending-delivery errors and upstream codes are stored
+separately from observation errors and remain visible through successful polls
+and restart. Delivery, launch fencing or observed retirement clears them.
+Fusion's separate cancellation contract is unchanged.
+
+Native pi-subagents 0.76.1 RPC still refuses paused/queued whole-run stops,
+despite its model-facing tool fix. Bridge preserves that error and pending intent.
+There is no tool/CLI fallback or fabricated cancellation success.
+
+Bridge's version-1 `advisoryObservation` carries bounded exact-root activity
+from the native snapshot, with omission flags. It is stored separately from
+verified progress, usage, expiry and retirement evidence. Stale, foreign,
+future-dated or malformed observations are discarded. No guessed child identity,
+cost or ETA is inferred.
+
+Bridge schema 7 stores stop receipts. Stop Bridge-owning Pi processes and back up
+the journal before upgrade; older Bridge cannot reopen it. Restart after package
+upgrades. Reload only local source/config. Unknown legacy launches remain unknown.
 
 ## Caller, native, and process identities
 
@@ -194,7 +220,11 @@ does not create an external-wait classification.
 
 Native status, the Pi widget, pi-tasks, and Fleet are advisory projections of
 `run.json`. Projection failure cannot block admission, recovery, or restart
-ownership decisions.
+ownership decisions. Fleet cache admission failure cannot remove active background
+work tracking. Native Fleet/background-work identity is the transcript path
+(`getSessionFile() ?? getSessionId()`), not the UUID retained by leases and task
+projection rows. Terminal Fleet rows are bounded to twenty per integration instance.
+A no-session Pi host has no durable pi-tasks projection file.
 
 `npm run test:runtime-smoke` is the declared host-boundary smoke check. Its
 model turns are scripted; a passing smoke run is not a live-LLM guarantee. It
@@ -215,11 +245,11 @@ promotion, and archive.
 
 The dependency pins are:
 
-- native `pi-subagents`: released `^0.76.0`;
-- Bridge: `@alexeiled/pi-subagents-bridge@^0.5.4`;
+- native `pi-subagents`: released `^0.76.1`;
+- Bridge: `@alexeiled/pi-subagents-bridge@^0.5.5`;
 - Fusion: released `@alexeiled/pi-fusion@^0.9.3`;
 - Revmux: unreleased `988904f30da351e76c29d5779c6833a6bf890b51` (PR #35);
-- Pi SDK: `^1.0.2`, validated at `1.0.2`;
+- Pi SDK: `^1.0.4`, validated at `1.0.4`;
 - optional pi-tasks projection: `>=0.9.0 <0.10.0`, session scope only.
 
 These are dependency evidence, not a claim that the full production pipeline is

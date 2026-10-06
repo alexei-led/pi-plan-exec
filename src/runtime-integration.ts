@@ -4,6 +4,7 @@ import { type PlanExecRun, RUN_STATUS } from './types.js';
 
 const EXTERNAL_SOURCE = 'pi-plan-exec';
 const PROVIDER_NAME = 'pi-plan-exec';
+const TERMINAL_ROW_LIMIT = 20;
 const OWNERSHIP_KEY = Symbol.for('pi-plan-exec.runtime-integration.owners.v1');
 
 export type ExternalRunState =
@@ -11,8 +12,7 @@ export type ExternalRunState =
   | 'running'
   | 'completed'
   | 'failed'
-  | 'stopped'
-  | 'unknown';
+  | 'stopped';
 
 export type ExternalRunUpdate = Partial<
   Omit<ExternalRunRecord, 'id' | 'sessionId' | 'source'>
@@ -25,9 +25,8 @@ export interface ExternalRunRecord {
   label: string;
   state: ExternalRunState;
   currentAction?: string;
-  progress?: string;
   preview?: string;
-  startedAt?: number;
+  startedAt: number;
   updatedAt?: number;
   endedAt?: number;
   reportPath?: string;
@@ -60,6 +59,8 @@ export interface PlanExecRuntimeApi {
 interface RegisteredRow {
   sessionId: string;
   externalId: string;
+  terminal: boolean;
+  updatedAt: number;
 }
 
 interface RuntimeOwner {
@@ -77,6 +78,7 @@ export class PlanExecRuntimeIntegration {
   private readonly generation: number;
   private readonly rows = new Map<string, RegisteredRow>();
   private readonly activeWork = new Map<string, BackgroundWorkItem>();
+  private readonly observedAt = new Map<string, number>();
   private disposeProvider: (() => void) | undefined;
   private disposed = false;
 
@@ -84,27 +86,35 @@ export class PlanExecRuntimeIntegration {
     this.generation = nextRuntimeGeneration();
   }
 
-  reconcile(runs: PlanExecRun[], sessionId: string): void {
+  reconcile(
+    runs: PlanExecRun[],
+    ownerSessionId: string,
+    runtimeSessionId = ownerSessionId,
+  ): void {
     if (this.disposed) return;
     this.ensureProvider();
     const desired = new Set(
       runs
-        .filter((run) => matchesContextRun(run, sessionId))
+        .filter((run) => matchesContextRun(run, ownerSessionId))
         .map((run) => run.id),
     );
     const desiredExternal = new Set([...desired].map(externalRunId));
     const ownership = runtimeOwnership(this.api);
-    const prefix = `${sessionId}\u0000plan-exec:`;
+    const prefix = `${runtimeSessionId}\u0000plan-exec:`;
     for (const rowKey of [...ownership.keys()]) {
       if (!rowKey.startsWith(prefix)) continue;
-      const externalId = rowKey.slice(`${sessionId}\u0000`.length);
+      const externalId = rowKey.slice(`${runtimeSessionId}\u0000`.length);
       const owned = ownership.get(rowKey);
       if (
         !desiredExternal.has(externalId) &&
         owned !== undefined &&
         (owned.token === this.token || owned.generation < this.generation)
       ) {
-        this.api.unregisterExternalRun(sessionId, externalId);
+        try {
+          this.api.unregisterExternalRun(runtimeSessionId, externalId);
+        } catch {
+          /* Display cache only. */
+        }
         ownership.delete(rowKey);
       }
     }
@@ -112,7 +122,8 @@ export class PlanExecRuntimeIntegration {
       if (!desired.has(runId)) this.unregister(runId);
     }
     for (const run of runs) {
-      if (matchesContextRun(run, sessionId)) this.sync(run, sessionId);
+      if (matchesContextRun(run, ownerSessionId))
+        this.sync(run, runtimeSessionId);
     }
   }
 
@@ -123,6 +134,7 @@ export class PlanExecRuntimeIntegration {
     const rowKey = registrationKey(sessionId, externalId);
     const ownership = runtimeOwnership(this.api);
     const previous = this.rows.get(run.id);
+    if ((this.observedAt.get(rowKey) ?? -1) > run.updatedAt) return;
     if (
       previous &&
       (previous.sessionId !== sessionId || previous.externalId !== externalId)
@@ -132,24 +144,41 @@ export class PlanExecRuntimeIntegration {
     const record = externalRecord(run, sessionId, externalId);
     const currentOwner = ownership.get(rowKey);
     if (currentOwner && currentOwner.generation > this.generation) return;
-    if (currentOwner?.token === this.token) {
-      this.api.updateExternalRun(
-        sessionId,
-        externalId,
-        externalRunUpdate(record),
-      );
-    } else {
-      this.api.unregisterExternalRun(sessionId, externalId);
-      ownership.set(rowKey, {
-        token: this.token,
-        generation: this.generation,
-      });
-      this.api.registerExternalRun(record);
-    }
-    this.rows.set(run.id, { sessionId, externalId });
+    // Keep freshness independent of the bounded Fleet display cache.
+    this.observedAt.set(rowKey, run.updatedAt);
+    this.rows.set(run.id, {
+      sessionId,
+      externalId,
+      terminal: isTerminalStatus(run.status),
+      updatedAt: run.updatedAt,
+    });
     if (isInFlightStatus(run.status))
       this.activeWork.set(externalId, { id: externalId, sessionId });
     else this.activeWork.delete(externalId);
+    const terminalRows = [...this.rows.entries()]
+      .filter(([, row]) => row.terminal)
+      .sort(([, a], [, b]) => b.updatedAt - a.updatedAt);
+    for (const [id] of terminalRows.slice(TERMINAL_ROW_LIMIT))
+      this.unregister(id);
+    if (!this.rows.has(run.id)) return;
+    try {
+      if (currentOwner?.token === this.token) {
+        this.api.updateExternalRun(
+          sessionId,
+          externalId,
+          externalRunUpdate(record),
+        );
+      } else {
+        this.api.unregisterExternalRun(sessionId, externalId);
+        this.api.registerExternalRun(record);
+        ownership.set(rowKey, {
+          token: this.token,
+          generation: this.generation,
+        });
+      }
+    } catch {
+      // Fleet admission is advisory, even when another extension filled its cache.
+    }
   }
 
   dispose(): void {
@@ -159,6 +188,7 @@ export class PlanExecRuntimeIntegration {
     this.disposeProvider = undefined;
     for (const runId of [...this.rows.keys()]) this.unregister(runId);
     this.activeWork.clear();
+    this.observedAt.clear();
   }
 
   private ensureProvider(): void {
@@ -177,7 +207,11 @@ export class PlanExecRuntimeIntegration {
     const ownership = runtimeOwnership(this.api);
     const rowKey = registrationKey(row.sessionId, row.externalId);
     if (ownership.get(rowKey)?.token === this.token) {
-      this.api.unregisterExternalRun(row.sessionId, row.externalId);
+      try {
+        this.api.unregisterExternalRun(row.sessionId, row.externalId);
+      } catch {
+        /* Display cache only. */
+      }
       ownership.delete(rowKey);
     }
     this.activeWork.delete(row.externalId);

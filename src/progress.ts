@@ -15,7 +15,8 @@ import type { PlanExecRun } from './types.js';
 
 export async function initializeProgress(run: PlanExecRun): Promise<string> {
   const path = progressPath(run);
-  await mkdir(dirname(path), { recursive: true });
+  await createProgressDirectory(join(run.worktreeCwd, '.ralphex'));
+  await createProgressDirectory(dirname(path));
   await writeFile(
     path,
     [
@@ -34,13 +35,65 @@ export async function appendProgress(
   run: PlanExecRun,
   message: string,
 ): Promise<void> {
-  if (!run.progressPath) return;
-  await mkdir(dirname(run.progressPath), { recursive: true });
-  await appendFile(
-    run.progressPath,
-    `[${new Date().toISOString()}] ${message}\n`,
-    'utf8',
+  if (!run.progressPath || !(await prepareProgressAppend(run))) return;
+  try {
+    await appendFile(
+      run.progressPath,
+      `[${new Date().toISOString()}] ${message}\n`,
+      'utf8',
+    );
+  } catch (error) {
+    if (!missingPath(error)) throw error;
+    // Recovery evidence belongs to the registry; never recreate a deleted checkout.
+  }
+}
+
+async function prepareProgressAppend(run: PlanExecRun): Promise<boolean> {
+  try {
+    if (
+      run.progressPath &&
+      (await stat(dirname(run.progressPath))).isDirectory()
+    )
+      return true;
+  } catch (error) {
+    if (!missingPath(error)) throw error;
+  }
+  // Create each level non-recursively. A missing worktree must stay missing,
+  // while a valid checkout may recreate its optional progress subdirectories.
+  try {
+    await createProgressDirectory(join(run.worktreeCwd, '.ralphex'));
+    await createProgressDirectory(
+      join(run.worktreeCwd, '.ralphex', 'progress'),
+    );
+    return true;
+  } catch (error) {
+    if (missingPath(error)) return false;
+    throw error;
+  }
+}
+
+function missingPath(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    'code' in error &&
+    (error.code === 'ENOENT' || error.code === 'ENOTDIR')
   );
+}
+
+async function createProgressDirectory(path: string): Promise<void> {
+  try {
+    await mkdir(path);
+  } catch (error) {
+    if (
+      !(
+        error instanceof Error &&
+        'code' in error &&
+        error.code === 'EEXIST' &&
+        (await stat(path)).isDirectory()
+      )
+    )
+      throw error;
+  }
 }
 
 const PROGRESS_LOCK_RETRY_MS = 25;
@@ -57,9 +110,14 @@ export async function appendProgressOnce(
   run: PlanExecRun,
   message: string,
 ): Promise<void> {
-  if (!run.progressPath) return;
-  await mkdir(dirname(run.progressPath), { recursive: true });
-  const lock = await acquireProgressLock(`${run.progressPath}.lock`);
+  if (!run.progressPath || !(await prepareProgressAppend(run))) return;
+  const lock = await acquireProgressLock(`${run.progressPath}.lock`).catch(
+    (error: unknown) => {
+      if (missingPath(error)) return undefined;
+      throw error;
+    },
+  );
+  if (!lock) return;
   try {
     let existing = '';
     try {

@@ -8,7 +8,9 @@ npm run test:all
 pi install /absolute/path/to/pi-plan-exec
 ```
 
-Reload Pi after changing the extension:
+Restart Pi after upgrading installed packages. Reload is for local extension
+source/config changes, not mixed loaded/installed package versions:
+
 
 ```text
 /reload
@@ -38,7 +40,7 @@ available for focused runs. `npm run test:all` is the local gate used by CI and
 the release workflow.
 `npm run pack:dry` rejects private host SDK/TUI/TypeBox dependencies and checks
 the final npm tarball against a runtime-only allowlist. Host packages stay peers,
-never runtime copies: Pi core uses `^1.0.2`; the other host aliases use `"*"`.
+never runtime copies: Pi core uses `^1.0.4`; the other host aliases use `"*"`.
 Development dependencies use the tested host range. The release workflow checks npm before
 it performs an actual publish. The real Pi RPC smoke test loads the package
 root and checks command registration without host-module warnings.
@@ -71,6 +73,16 @@ pre-launch rejection and one successful child workflow, not two workers.
 The model's tool call modifies only the fixture repository. No credentials are
 copied, no global package is changed, and no real run/journal is used. Retain
 the sandbox and agterm IDs as local evidence; do not publish private paths.
+
+## Progress strip validation
+
+The chosen UI and native screenshots are in [UI validation](docs/ui-validation.md).
+`test/run-view.test.ts` covers column widths, status precedence, colors and display
+preferences. Lifecycle tests cover hide/clear across reload and late projection.
+The recovery fixture uses a real Pi TUI, released Bridge/subagents and a local
+scripted model. `test/fixtures/progress-ui.ts` adds display-only states inside
+that explicitly isolated sandbox; its foreign lease prevents worker dispatch.
+It is never shipped in the npm package.
 
 ## Release
 

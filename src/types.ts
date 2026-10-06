@@ -1,3 +1,4 @@
+import type { AdvisoryObservation } from './advisory-observation.js';
 import type { OperationDiagnostics } from './diagnostics.js';
 
 export const COMPLETED_PLANS_DIRECTORY = 'completed';
@@ -273,6 +274,13 @@ export interface ActiveOperation {
   reviewedCommit?: string;
   stopRequested?: boolean;
   stopAcknowledged?: boolean;
+  /** Successful stop delivery to this exact native binding, never exit proof. */
+  stopDeliveredTo?: string;
+  cancellationDeliveryError?: {
+    message: string;
+    upstreamCode?: string;
+    observedAt: number;
+  };
   launchFenced?: boolean;
   recovery?: OperationRecovery;
   launchFailures?: number;
@@ -298,6 +306,7 @@ export interface ActiveOperation {
   budgetGrowthGranted?: boolean;
   externalPrerequisite?: ExternalPrerequisite;
   diagnostics?: OperationDiagnostics;
+  advisoryObservation?: AdvisoryObservation;
   diagnosticActions?: Record<string, DiagnosticAction>;
   reportedUsage?: {
     inputTokens?: number;

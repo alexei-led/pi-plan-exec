@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { TaskStore } from '@tintinweb/pi-tasks/dist/task-store.js';
 import { test } from 'vitest';
 import {
+  formatRunStatus,
   formatRunWidget,
   shouldAutoRestoreRun,
   shouldStopBackgroundController,
@@ -74,7 +75,7 @@ test('projection preserves explicit independent dependencies and durable state',
   assert.equal(projected.taskProjection?.state, 'ready');
 });
 
-test('widget reports waits, verified activity, usage, and explicit unbounded lifetime', () => {
+test('strip prioritizes retry and keeps usage and lifetime evidence in status', () => {
   const now = 1_000_000;
   const run = {
     ...runFixture('/repo'),
@@ -103,14 +104,21 @@ test('widget reports waits, verified activity, usage, and explicit unbounded lif
     needsAttention: true,
     usage: { inputTokens: 3_000, outputTokens: 1_800, cost: 0.4 },
   } satisfies PlanExecRun;
-  const widget = formatRunWidget(run, now);
+  const widget = formatRunWidget(run, now, true);
   assert.match(widget.join('\n'), /0\/2 accepted/);
-  assert.match(widget.join('\n'), /retry 1/);
-  assert.match(widget.join('\n'), /after task 1 is accepted/);
-  assert.match(widget.join('\n'), /Needs attention/);
-  assert.match(widget.join('\n'), /Usage: tokens 4800, cost 0.4/);
-  assert.match(widget.join('\n'), /Lifetime: unbounded requested/);
-  assert.match(widget.join('\n'), /Last verified progress/);
+  assert.match(widget.join('\n'), /Retry scheduled/);
+  assert.match(widget.join('\n'), /Retry in 25s/);
+  assert.ok(widget.length <= 3);
+  assert.doesNotMatch(
+    widget.join('\n'),
+    /after task 1|Usage:|Lifetime:|Last verified/,
+  );
+  const status = formatRunStatus(run);
+  assert.match(status, /tokens 4800, cost 0.4/);
+  assert.match(
+    status,
+    /unbounded requested; native child deadlines may still apply/,
+  );
 });
 
 test('startup restores stale or unleased runs without stealing live leases or pauses', () => {

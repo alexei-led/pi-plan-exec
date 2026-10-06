@@ -1,5 +1,46 @@
 # Changelog
 
+## 1.7.0 - 2026-10-06
+
+### Added
+
+- Compact, theme-aware progress strip with status-colored progress and accepted
+  task counts. Locally observed work and completion are green; unpolled
+  in-flight runs are amber snapshots, not claims of worker health.
+- `/exec hide`, `show [run-id]`, and `clear [run-id]` display controls without
+  `--apply`. They do not stop workers or delete recovery evidence. Preferences
+  follow the active transcript branch and survive reload.
+- On-demand worker lifetime, review backend and bounded advisory activity in
+  `/exec status`. Advisory telemetry is not verified progress or retirement proof.
+
+### Fixed
+
+- Retry stop delivery after intent-only acknowledgements and late child binding.
+  Preserve correlated cancellation refusals across successful observations and
+  restart; distinguish delivered stops from confirmed worker exit.
+- Keep recovery history and progress logging independent. Logging no longer
+  recreates a deleted execution checkout.
+- Keep background-work tracking independent of optional task/Fleet failures.
+  Use native transcript-path identity, bound terminal display retention, reject
+  stale snapshots, and handle no-session projection explicitly.
+- Avoid redundant worktree handoff for path aliases and nonexistent fresh-session
+  transcripts. Preserve stop-state precedence and task retry waits in the strip.
+- Read colors from the active Pi theme, fit narrow terminals, and remove terminal
+  escape and bidirectional control characters from display titles.
+
+### Upgrade and limits
+
+- Use Pi 1.0.4+, pi-subagents 0.76.1 (compatible 0.76.x), and Bridge 0.5.5
+  (compatible 0.5.x). Restart Pi after package upgrades; `/reload` is for local
+  source/config changes.
+- Before upgrading Bridge, stop Bridge-owning Pi processes and back up its
+  journal. Schema 7 cannot be reopened by older Bridge versions. Stopping Pi
+  owners does not prove unknown workers exited.
+- Paused/queued native RPC stops and legacy launches without identity evidence
+  remain blocked. Hiding UI never clears execution ownership.
+
+[Full changes](https://github.com/alexei-led/pi-plan-exec/compare/v1.6.4...v1.7.0)
+
 ## 1.6.4 - 2026-10-05
 
 ### Fixed

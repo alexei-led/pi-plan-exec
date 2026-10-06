@@ -29,6 +29,11 @@ Never replace controller recovery with a manually launched subagent.
   its install command, and prints one next command per run. Pi also points at it
   at session start when its startup sweep finds an abandoned run.
 - Inspect one run: `/exec status <full-run-id>`.
+- Hide the strip and footer immediately: `/exec hide`. Execution continues.
+- Restore the display without resuming work: `/exec show [full-run-id]`.
+- Dismiss the displayed run: `/exec clear [full-run-id]`. This does not cancel
+  execution or delete recovery evidence. No `--apply`; preferences survive reload
+  in the active Pi session branch.
 - Continue or recover anything stuck: `/exec resume [full-run-id]`. It takes the
   lease over from a session proven dead, reconciles a run whose worker is
   provably gone and then continues it, reconciles a running child, continues a paused
@@ -184,9 +189,14 @@ A slow or silent run is not a reason to start the plan again.
 After Pi starts or reloads, the native controller automatically restores an
 unfinished run when its lease is claimable. It preserves explicit user pauses,
 does not steal a live foreign lease, and reattaches durable operations by ID.
-The native widget and `/exec status` report task counts, dependency/retry waits,
-the next automatic action, verified activity, cumulative usage, selected review
-backend, and lifetime. Optional projection repair is visibility only and cannot
+The progress strip reports state, accepted count and current action. Healthy
+working/complete is green; waiting/uncertain/stopping amber; failed red;
+paused/cancelled muted. Stop intent takes precedence over old task state.
+`/exec status` retains paths, usage, ownership and diagnostic evidence.
+Bridge advisory observations are display-only, not verified progress or exit.
+An unpolled in-flight view is an amber Snapshot with saved details, not current
+worker health. Live colors require this session's local controller and matching
+lease. Viewing or refreshing a snapshot never claims execution ownership. Optional projection repair is visibility only and cannot
 gate recovery.
 
 ## Observe before controlling
@@ -339,6 +349,8 @@ and dependency PR links.
 The development checkout and CI use npm 12.0.2 with repository `.npmrc`
 `allow-git=root`. A packed consumer needs a project-local `allow-git=all` for
 transitive Git refs; never change global npm configuration. Run `/exec status`,
-restore the reported project-local dependency, run `/reload`, then return to the
-same run ID. Installing dependencies does not replace or complete the preserved
+restore the reported project-local dependency, restart Pi after a package
+upgrade, then return to the same run ID. `/reload` is for local source/config
+changes. Before upgrading to Bridge 0.5.5, stop Bridge-owning Pi processes and
+back up its journal; schema 7 cannot be reopened by older Bridge versions. Installing dependencies does not replace or complete the preserved
 run.

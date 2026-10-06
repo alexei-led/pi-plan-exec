@@ -17,6 +17,7 @@ import {
   sep,
 } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { parseAdvisoryObservation } from './advisory-observation.js';
 import {
   readSettledWorkflowCompletion,
   readSubagentArtifact,
@@ -3247,7 +3248,10 @@ export class PlanExecController {
     let operation = run.activeOperation;
     if (
       !operation ||
-      operation.stopAcknowledged ||
+      (operation.service !== OPERATION_SERVICE.BRIDGE &&
+        operation.stopAcknowledged) ||
+      (operation.externalRunId !== undefined &&
+        operation.stopDeliveredTo === operation.externalRunId) ||
       operation.launchFenced ||
       operation.processTreeExited
     )
@@ -3288,24 +3292,50 @@ export class PlanExecController {
         operation,
         reply?.error.message ??
           'Cancellation is awaiting the original provider operation identity.',
+        reply?.error.upstreamCode ?? reply?.error.code,
       );
     const fenced = isFencedCancellation(reply.data, operation, run.id);
+    const delivered =
+      (reply.data.cancellationDelivery === 'delivered' &&
+        reply.data.runId === operation.externalRunId &&
+        reply.data.operationId === operation.operationId &&
+        reply.data.requestDigest === operation.requestDigest) ||
+      (!this.bridge.cancelOperation &&
+        operation.externalRunId !== undefined &&
+        ['stopping', 'stopped'].includes(String(reply.data.state)));
     const current = (await this.registry.get(run.id)) ?? run;
     if (
       !sameOperationState(run, current, operation) ||
       (current.stopGeneration ?? 0) !== (run.stopGeneration ?? 0)
     )
       return current;
+    const nextOperation: ActiveOperation = {
+      ...required(current.activeOperation),
+      stopAcknowledged: true,
+      ...(delivered && operation.externalRunId
+        ? { stopDeliveredTo: operation.externalRunId }
+        : {}),
+      ...(fenced ? { launchFenced: true } : {}),
+    };
+    if (delivered || fenced) delete nextOperation.cancellationDeliveryError;
+    else if (
+      reply.data.cancellationDelivery === 'pending' &&
+      reply.data.operationId === operation.operationId &&
+      reply.data.requestDigest === operation.requestDigest &&
+      (!operation.externalRunId ||
+        reply.data.runId === undefined ||
+        reply.data.runId === operation.externalRunId)
+    ) {
+      const message = text(reply.data.error);
+      if (message)
+        nextOperation.cancellationDeliveryError = cancellationDeliveryError(
+          message,
+          text(reply.data.upstreamCode),
+        );
+    }
     return (
       await this.registry.updateIfCurrent(
-        {
-          ...current,
-          activeOperation: {
-            ...required(current.activeOperation),
-            stopAcknowledged: true,
-            ...(fenced ? { launchFenced: true } : {}),
-          },
-        },
+        { ...current, activeOperation: nextOperation },
         current.updatedAt,
       )
     ).run;
@@ -3841,6 +3871,13 @@ export class PlanExecController {
     };
     delete observedOperation.statusFailures;
     delete observedOperation.lastStatusError;
+    const advisory = parseAdvisoryObservation(
+      nativeStatus?.advisoryObservation,
+      operation.externalRunId,
+      Date.now(),
+    );
+    if (advisory) observedOperation.advisoryObservation = advisory;
+    else delete observedOperation.advisoryObservation;
     const native = parseNativeActivity(nativeActivity);
     const diagnosis = diagnoseOperation(nativeActivity, nativeStatus, {
       now: Date.now(),
@@ -3850,6 +3887,12 @@ export class PlanExecController {
         : false,
       ...(operation.diagnostics ? { prior: operation.diagnostics } : {}),
     });
+    if (
+      operation.processTreeExited ||
+      operation.launchFenced ||
+      diagnosis.assessment === 'exit_confirmed'
+    )
+      delete observedOperation.cancellationDeliveryError;
     observedOperation.diagnostics =
       diagnosis.action === 'repair_tool'
         ? { ...diagnosis, action: 'probe' }
@@ -3987,6 +4030,7 @@ export class PlanExecController {
     run: PlanExecRun,
     operation: ActiveOperation,
     error: string,
+    upstreamCode?: string,
   ): Promise<PlanExecRun> {
     const failures = (operation.statusFailures ?? 0) + 1;
     const failedRun = {
@@ -3997,7 +4041,10 @@ export class PlanExecController {
         ...operation,
         recovery: OPERATION_RECOVERY.CANCEL,
         statusFailures: failures,
-        lastStatusError: error,
+        cancellationDeliveryError: cancellationDeliveryError(
+          error,
+          upstreamCode,
+        ),
       },
     };
     return this.registry.heartbeat(failedRun);
@@ -5349,7 +5396,7 @@ export class PlanExecController {
         ? await this.bridgeStatus(run, operation)
         : await (await this.reviewClient(run)).status(operation.externalRunId);
     if (!terminal.success)
-      return this.recordCancellationFailure(
+      return this.recordObservationFailure(
         run,
         operation,
         terminal.error.message,
@@ -5483,6 +5530,15 @@ export class PlanExecController {
       ...(preserveOperation ? { activeOperation: run.activeOperation } : {}),
     });
     try {
+      if (error !== run.error || !run.recoveryAttempts)
+        await this.registry.appendRecoveryMessage(
+          failed.id,
+          `Recovery at ${failed.stage}: ${error}`,
+        );
+    } catch {
+      // run.json retains the failure even if the secondary history log is unavailable.
+    }
+    try {
       if (
         !run.archiveOperation &&
         !(
@@ -5500,6 +5556,14 @@ export class PlanExecController {
     }
     return failed;
   }
+}
+
+function cancellationDeliveryError(message: string, upstreamCode?: string) {
+  return {
+    message: message.slice(0, MAX_TERMINAL_ERROR_LENGTH),
+    observedAt: Date.now(),
+    ...(upstreamCode ? { upstreamCode: upstreamCode.slice(0, 256) } : {}),
+  };
 }
 
 function bridgeTerminalError(

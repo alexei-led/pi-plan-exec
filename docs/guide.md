@@ -46,11 +46,10 @@ Install the released packages listed in
 cache. The setup commands below pin the exact released ranges; do not change
 global npm configuration.
 
-Reload Pi after installing:
-
-```text
-/reload
-```
+Restart Pi after upgrading installed packages. For Bridge 0.5.5, stop all
+Bridge-owning Pi processes and back up its journal before upgrade. Schema 7
+cannot be reopened by older Bridge versions. `/reload` is for local source/config
+changes, not an in-place package upgrade.
 
 The frozen run defaults are explicit: `{ "mode": "unbounded" }` execution
 lifetime, one required `subagent` reviewer, and an empty fallback list (`none`).
@@ -317,6 +316,37 @@ for that run rather than starting another. Only settled completed or cancelled
 runs permit reuse. These checks cover plan-exec runs, not arbitrary editors or
 other agent processes.
 
+## Display controls
+
+The progress strip uses two lines, with one extra warning when needed.
+Healthy working/review/checking and complete states are green. Retry, external
+wait, unknown worker and stopping states are amber. Failed is red.
+Paused/cancelled is muted. State text and symbols do not depend on color.
+In-flight records not owned and polled by this session show an amber **Snapshot**
+with saved details and “No live updates here”. This includes foreign-owned runs
+and records viewed without a controller. A failed local polling request also
+returns the display to snapshot mode. `/exec show <id>` refreshes a snapshot
+without taking ownership; `/exec status <id>` reads current evidence. Settled
+terminal states keep their normal colors without requiring ongoing polling.
+
+```text
+/exec hide             Hide the strip and footer now; execution continues
+/exec show [run-id]     Restore the display; do not resume execution
+/exec clear [run-id]    Dismiss this run's display; do not delete its record
+```
+
+No `--apply` or confirmation is needed. Hide and clear without an ID act without
+waiting on the registry or worker. Show and clear with an ID re-read the registry
+to validate the selection, so a slow or unavailable registry can delay or refuse
+them. Neither writes execution state. Clear without an ID dismisses the displayed
+run; other runs can remain visible. Show without an ID restores all dismissed runs and
+selects a nonterminal run first. Use an ID to pin one run.
+
+Preferences follow the active Pi session branch and survive reload. A fresh
+session starts with its own view preference. Timers and late projection replies
+cannot undo hide/clear. These controls also apply to goal displays.
+`/exec status` remains textual and read-only. See [native screenshots](ui-validation.md).
+
 ## Commands
 
 Use `/exec help` for the same list inside Pi. Run IDs are optional for normal
@@ -393,11 +423,28 @@ which is the scoped answer to prefer.
 
 ### Following a run in flight
 
-Pi shows the execution-worktree path and branch with the current stage and active
-worker while a run is polling. Stage transitions, observation degradation, and
+Pi shows the current task and accepted-task count in a compact progress strip.
+Paths, branch, owner IDs, usage and raw errors remain in `/exec status`. Stage transitions, observation degradation, and
 terminal states generate notifications. `/exec status <full-run-id>` shows the
 last successful observation and retry count, then names the run's situation in
 plain words and one safe next action.
+
+### Cancellation and missing worktrees
+
+“Cancelling” means stop intent is saved, not that the worker exited.
+Bridge's `pending` delivery is retried against the same operation.
+A `delivered` stop receipt still needs separate retirement proof.
+The strip never lets a stale task's “running” state override cancellation.
+
+Native pi-subagents 0.76.1 RPC cannot stop some paused/queued workflows.
+The recorded refusal remains visible and pending. There is no alternate
+tool/CLI stop path. A missing child ID or manually deleted worktree does not
+prove worker exit, and cleanup cannot delete an unresolved record.
+Use hide/clear to remove the display independently.
+
+Recovery errors are retained in the run directory's `recovery.log`.
+Progress logging does not recreate a deleted execution checkout. It can recreate
+optional progress directories inside an existing checkout.
 
 ### What status can prove about a worker
 
@@ -696,10 +743,10 @@ their lease is claimable. It never steals a live foreign lease or an explicit
 user pause. Pending native or local cleanup is restored and reconciled without
 resuming plan work. A tracked operation is reattached by its durable operation
 ID; an uncertain launch remains fenced until the provider proves absence or
-terminal ownership. The native widget and `/exec status` are projections of
-`run.json`:
-they show task counts, dependency or retry waits, next automatic action,
-verified activity, usage, selected review backend, and lifetime. A broken
+terminal ownership. The strip projects state, accepted count and current action
+from `run.json`. `/exec status` retains dependency/retry waits, verified activity,
+usage, review backend and the active operation's persisted lifetime, including a
+grown budget. Missing lifetime evidence is reported as unknown. A broken
 pi-tasks/Fleet projection cannot block recovery. Projection writes coalesce one
 in-flight update and one latest snapshot; a cold technical prerequisite does not
 discard an authorized start.

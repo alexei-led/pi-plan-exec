@@ -63,14 +63,14 @@ are best-effort, matching the released runtime.
 
 ## Install and run
 
-Requires Pi `^1.0.2` (1.0.2 or later in the 1.x series).
-The development baseline is Pi `1.0.2`, `pi-subagents@0.76.0`, and
-`@alexeiled/pi-subagents-bridge@0.5.4`. Install the providers as independent Pi
+Requires Pi `^1.0.4` (1.0.4 or later in the 1.x series).
+The development baseline is Pi `1.0.4`, `pi-subagents@0.76.1`, and
+`@alexeiled/pi-subagents-bridge@0.5.5`. Install the providers as independent Pi
 packages; no Git dependency or `allow-git=all` setting is required:
 
 ```bash
-pi install -l npm:pi-subagents@0.76.0
-pi install -l npm:@alexeiled/pi-subagents-bridge@0.5.4
+pi install -l npm:pi-subagents@0.76.1
+pi install -l npm:@alexeiled/pi-subagents-bridge@0.5.5
 pi install -l /absolute/path/to/pi-plan-exec
 ```
 
@@ -82,16 +82,21 @@ backends for an unattended run; see [runtime contracts](docs/runtime-contracts.m
 `@tintinweb/pi-tasks@0.9.x` is an optional, session-scoped projection cache.
 The development checkout and CI use npm 12.0.2.
 
-Pi supplies its SDK, TUI and TypeBox modules. This extension declares them as
-`"*"` peers, never runtime dependencies. If startup reports **“Host-provided
+Pi supplies its SDK, TUI and TypeBox modules. This extension declares the SDK
+as a tested `^1.0.4` peer and TUI/TypeBox as `"*"` peers, never private runtime
+dependencies. pi-subagents is an optional versioned peer for its runtime APIs. If startup reports **“Host-provided
 extension packages must be declared in peerDependencies”**, check the
 `package.json` path in the warning: another installed extension can cause it.
 Update or fix that package's declarations; do not suppress the warning or add
 private SDK copies here. See the [upstream audit](docs/upstream-audit.md) for
 known dependency limitations and upgrade priorities.
 
-Reload Pi. From an interactive session in a Git repository, start a goal or run
-an existing executable plan:
+Restart Pi after upgrading installed packages. Bridge 0.5.5 migrates its journal:
+stop all Bridge-owning Pi processes and back up the journal before upgrading.
+Older Bridge versions cannot reopen schema 7. This does not prove unknown workers
+have stopped. Use `/reload` only for local source/config changes.
+
+From an interactive session in a Git repository, start a goal or run a plan:
 
 ```text
 /reload
@@ -116,8 +121,26 @@ progress pause the goal with a recorded reason, and a blocker pauses it until
 `/goal resume <run-id>`. `/goal status`, `/goal pause`, `/goal cancel`, and
 `/goal help` manage the run.
 
-While an execution runs, Pi shows the execution-worktree path, branch, stage, and worker.
-Four verbs cover everything after the start:
+## Progress without the noise
+
+Pi shows a two-line progress strip: plan title, state, accepted task count and
+current action. Green means healthy running or complete. Amber means waiting,
+uncertain or stopping. Failures are red; paused/cancelled runs are muted.
+Text and symbols carry the same meaning without color. In-flight runs are shown
+as amber snapshots unless this session's local controller owns and polls them.
+A snapshot is not a claim that the worker is healthy or still running.
+
+- `/exec hide` removes the strip and footer immediately. Execution continues.
+- `/exec show [run-id]` restores the display, without resuming execution.
+- `/exec clear [run-id]` dismisses the displayed run, without deleting its record.
+- These display actions need no `--apply`. They survive reload in the same
+  session. Updates cannot undo a hide or a per-run dismissal.
+- `/exec status [run-id]` keeps paths, owners, diagnostics, usage and evidence
+  available on demand.
+
+See [live Pi screenshots and checks](docs/ui-validation.md).
+
+Run controls are separate from display controls:
 
 - `/exec status` never interrupts or restarts a run. It may idempotently repair
   the advisory pi-tasks and Fleet visibility caches from `run.json`. With no
@@ -158,10 +181,10 @@ Four verbs cover everything after the start:
   `failed` runs are excluded, because their record is what `/exec resume` needs.
 
 After Pi starts or reloads, the native controller restores unfinished runs when
-their lease is claimable and reattaches durable operations by ID. Its widget and
-`/exec status` show task counts, dependency/retry waits, the next automatic
-action, verified activity, cumulative usage, selected review backend, and
-lifetime. Optional task projections are visibility caches and cannot gate
+their lease is claimable and reattaches durable operations by ID. The strip
+shows current state; `/exec status` holds detailed evidence. Cancellation intent
+wins over an old task state: the strip says “Cancelling” until worker exit is
+confirmed. Bridge distinguishes stop intent from delivery. Neither is exit proof. Optional task projections are visibility caches and cannot gate
 recovery. Statistics are deterministic usage/task bookkeeping by default;
 `statsEnabled: true` opts into an additional report child.
 

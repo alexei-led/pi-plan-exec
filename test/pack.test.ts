@@ -73,7 +73,7 @@ test('imported host packages use tested peers, never private runtime copies', as
   ]) {
     assert.equal(
       manifest.peerDependencies[name],
-      name === '@earendil-works/pi-coding-agent' ? '^1.0.2' : '*',
+      name === '@earendil-works/pi-coding-agent' ? '^1.0.4' : '*',
     );
   }
   for (const name of hostPackages) {
@@ -82,7 +82,7 @@ test('imported host packages use tested peers, never private runtime copies', as
     if (manifest.peerDependencies[name] !== undefined)
       assert.equal(
         manifest.peerDependencies[name],
-        name === '@earendil-works/pi-coding-agent' ? '^1.0.2' : '*',
+        name === '@earendil-works/pi-coding-agent' ? '^1.0.4' : '*',
       );
   }
 });
@@ -126,9 +126,10 @@ test('package manifest ships only plan-exec resources, needs no runtime dependen
   );
   assert.match(
     manifest.devDependencies?.['pi-subagents'] ?? '',
-    /^\^0\.76\.0$/,
+    /^\^0\.76\.1$/,
   );
-  assert.equal(manifest.peerDependencies['pi-subagents'], undefined);
+  assert.equal(manifest.peerDependencies['pi-subagents'], '>=0.76.1 <0.77.0');
+  assert.equal(manifest.peerDependenciesMeta['pi-subagents']?.optional, true);
   assert.equal(manifest.bundledDependencies, undefined);
   for (const packageName of ['@alexeiled/pi-fusion', '@tintinweb/pi-tasks']) {
     assert.equal(
@@ -141,7 +142,7 @@ test('package manifest ships only plan-exec resources, needs no runtime dependen
   }
   assert.equal(
     manifest.peerDependencies['@alexeiled/pi-subagents-bridge'],
-    '>=0.5.4 <0.6.0',
+    '>=0.5.5 <0.6.0',
   );
   assert.equal(
     manifest.peerDependenciesMeta['@alexeiled/pi-subagents-bridge']?.optional,
