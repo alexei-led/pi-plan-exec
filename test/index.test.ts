@@ -509,16 +509,99 @@ test('only a locally owned successful poll paints live progress; poll failure re
   await h.emit('session_shutdown');
 });
 
-test('force stop refreshes a foreign observer and a late tick never reports completion', async (t) => {
-  const held = run({
-    status: 'cancel_pending',
-    lease: { ...liveLease(), sessionId: 'force-owner' },
-    activeOperation: {
-      operationId: 'legacy',
-      service: 'bridge',
-      kind: 'implementation',
-    },
+for (const staleCompletion of [false, true])
+  test(`force stop refreshes a foreign observer and suppresses late completion (stale=${staleCompletion})`, async (t) => {
+    const held = run({
+      status: 'cancel_pending',
+      lease: { ...liveLease(), sessionId: 'force-owner' },
+      activeOperation: {
+        operationId: 'legacy',
+        service: 'bridge',
+        kind: 'implementation',
+      },
+    });
+    const { registry, directory } = await seedDirectory([held]);
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    t.mock.method(RunRegistry.prototype, 'get', registry.get.bind(registry));
+    t.mock.method(
+      RunRegistry.prototype,
+      'listWithErrors',
+      registry.listWithErrors.bind(registry),
+    );
+    t.mock.method(
+      RunRegistry.prototype,
+      'abandon',
+      registry.abandon.bind(registry),
+    );
+    t.mock.method(
+      RunRegistry.prototype,
+      'cleanupAbandoned',
+      registry.cleanupAbandoned.bind(registry),
+    );
+    t.mock.method(
+      RunRegistry.prototype,
+      'abandonmentBackupPath',
+      registry.abandonmentBackupPath.bind(registry),
+    );
+    t.mock.method(
+      TaskProjector.prototype,
+      'sync',
+      async (current: PlanExecRun) => current,
+    );
+    let release!: () => void;
+    const delayed = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const completedSnapshot = {
+      ...held,
+      status: 'completed' as const,
+      stage: 'complete' as const,
+    };
+    const lateTick = delayed.then(async () =>
+      staleCompletion
+        ? completedSnapshot
+        : required(await registry.get(held.id)),
+    );
+    t.mock.method(PlanExecController.prototype, 'tick', () => lateTick);
+    t.mock.timers.enable({ apis: ['setInterval'] });
+    const owner = executionHarness(held.repositoryRoot, 'force-owner');
+    const observer = executionHarness(held.repositoryRoot, 'force-observer');
+    await owner.emit('session_start');
+    await observer.emit('session_start');
+    assert.ok(observer.widget());
+    t.mock.timers.tick(1000);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await owner.command(`stop ${held.id} --force`);
+    assert.equal((await registry.get(held.id))?.status, 'abandoned');
+    const setWidget = observer.ctx.ui.setWidget;
+    const cleared = new Promise<void>((resolve) => {
+      observer.ctx.ui.setWidget = (key, value, options) => {
+        if (Array.isArray(value)) setWidget(key, value, options);
+        else setWidget(key, value, options);
+        if (value === undefined) resolve();
+      };
+    });
+    release();
+    await lateTick;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    t.mock.timers.tick(1000);
+    await cleared;
+    assert.equal(observer.widget(), undefined);
+    assert.equal(owner.widget(), undefined);
+    assert.doesNotMatch(
+      owner.notifications.join('\n'),
+      /Plan execution .* completed\./,
+    );
+    await owner.emit('session_shutdown');
+    await observer.emit('session_shutdown');
   });
+
+test('a pause waiting on projection cannot restart a removed force-stopped run', async (t) => {
+  const held = run({
+    status: 'running',
+    lease: { ...liveLease(), sessionId: 'pause-force-owner' },
+  });
+  delete held.activeOperation;
   const { registry, directory } = await seedDirectory([held]);
   t.after(() => rm(directory, { recursive: true, force: true }));
   t.mock.method(RunRegistry.prototype, 'get', registry.get.bind(registry));
@@ -526,6 +609,12 @@ test('force stop refreshes a foreign observer and a late tick never reports comp
     RunRegistry.prototype,
     'listWithErrors',
     registry.listWithErrors.bind(registry),
+  );
+  t.mock.method(RunRegistry.prototype, 'claim', registry.claim.bind(registry));
+  t.mock.method(
+    RunRegistry.prototype,
+    'updateIfCurrent',
+    registry.updateIfCurrent.bind(registry),
   );
   t.mock.method(
     RunRegistry.prototype,
@@ -542,50 +631,43 @@ test('force stop refreshes a foreign observer and a late tick never reports comp
     'abandonmentBackupPath',
     registry.abandonmentBackupPath.bind(registry),
   );
-  t.mock.method(
-    TaskProjector.prototype,
-    'sync',
-    async (current: PlanExecRun) => current,
-  );
+  let entered!: () => void;
   let release!: () => void;
+  const ready = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
   const delayed = new Promise<void>((resolve) => {
     release = resolve;
   });
-  const lateTick = delayed.then(async () =>
-    required(await registry.get(held.id)),
+  t.mock.method(
+    TaskProjector.prototype,
+    'sync',
+    async (current: PlanExecRun) => {
+      if (current.status === 'paused') {
+        entered();
+        await delayed;
+      }
+      return current;
+    },
   );
-  t.mock.method(PlanExecController.prototype, 'tick', () => lateTick);
-  t.mock.timers.enable({ apis: ['setInterval'] });
-  const owner = executionHarness(held.repositoryRoot, 'force-owner');
-  const observer = executionHarness(held.repositoryRoot, 'force-observer');
-  await owner.emit('session_start');
-  await observer.emit('session_start');
-  assert.ok(observer.widget());
-  t.mock.timers.tick(1000);
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  await owner.command(`stop ${held.id} --force`);
-  assert.equal((await registry.get(held.id))?.status, 'abandoned');
-  const setWidget = observer.ctx.ui.setWidget;
-  const cleared = new Promise<void>((resolve) => {
-    observer.ctx.ui.setWidget = (key, value, options) => {
-      if (Array.isArray(value)) setWidget(key, value, options);
-      else setWidget(key, value, options);
-      if (value === undefined) resolve();
-    };
+  const tick = t.mock.method(PlanExecController.prototype, 'tick', async () => {
+    throw new Error('Removed run must not poll');
   });
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const h = executionHarness(held.repositoryRoot, 'pause-force-owner');
+  const pausing = h.command(`pause ${held.id}`);
+  await ready;
+  await h.command(`stop ${held.id} --force`);
+  assert.equal(await registry.get(held.id), undefined);
   release();
-  await lateTick;
+  await pausing;
+  t.mock.timers.tick(5000);
   await new Promise<void>((resolve) => setImmediate(resolve));
-  t.mock.timers.tick(1000);
-  await cleared;
-  assert.equal(observer.widget(), undefined);
-  assert.equal(owner.widget(), undefined);
-  assert.doesNotMatch(
-    owner.notifications.join('\n'),
-    /Plan execution .* completed\./,
-  );
-  await owner.emit('session_shutdown');
-  await observer.emit('session_shutdown');
+  assert.equal(tick.mock.callCount(), 0);
+  assert.equal(h.widget(), undefined);
+  assert.match(h.notifications.at(-1) ?? '', /abandoned or removed/);
+  assert.doesNotMatch(h.notifications.at(-1) ?? '', /Use \/exec resume/);
+  await h.emit('session_shutdown');
 });
 
 test('force stop stays dismissed through late updates, branch navigation, and a fresh session', async (t) => {

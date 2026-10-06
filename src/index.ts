@@ -661,6 +661,8 @@ export default function planExecExtension(pi: ExtensionAPI): void {
     const runId = initialRun.id;
     if (
       sessionClosed ||
+      isTerminal(initialRun.status) ||
+      presentation.isRemoved(runId) ||
       retiringSession(initialRun) ||
       activeControllers.has(runId)
     )
@@ -674,7 +676,7 @@ export default function planExecExtension(pi: ExtensionAPI): void {
       inFlightControllers.set(runId, ticking);
       void ticking
         .then(async (run) => {
-          if (sessionClosed) return run;
+          if (sessionClosed || presentation.isRemoved(runId)) return run;
           lastProbeErrors.delete(runId);
           if (handoffWhenReady && canHandoffPreparedWorktree(run)) {
             // Session startup must be able to install the target's controller.
@@ -854,6 +856,7 @@ export default function planExecExtension(pi: ExtensionAPI): void {
             }
           },
           handoffLifecycle,
+          isRunRemoved: (id) => presentation.isRemoved(id),
           onAbandoned: (run, context) => {
             stopBackgroundController(run.id);
             setStatus(run, context);
@@ -2872,7 +2875,18 @@ interface CommandDependencies {
   handoffLifecycle?: HandoffLifecycle;
   recordRun?: (run: PlanExecRun) => void;
   onAbandoned?: (run: PlanExecRun, ctx: ExtensionContext) => void;
+  isRunRemoved?: (runId: string) => boolean;
   mutate?: <T>(operation: () => Promise<T>) => Promise<T>;
+}
+
+function supersededCommandMessage(
+  run: PlanExecRun,
+  dependencies: CommandDependencies,
+): string | undefined {
+  return run.status === RUN_STATUS.ABANDONED ||
+    dependencies.isRunRemoved?.(run.id)
+    ? `Run ${run.id} was abandoned or removed while this command was pending. No work was resumed.`
+    : undefined;
 }
 
 function mutateCommand<T>(
@@ -3298,6 +3312,8 @@ async function runAction(
       ),
       projectionContext(ctx),
     );
+    const superseded = supersededCommandMessage(paused, dependencies);
+    if (superseded) return superseded;
     startCleanup(paused);
     return `Run ${shortRunId(paused.id)} paused; its current attempt is stopping and its checkpoint is preserved. Use /exec resume ${paused.id} to continue after confirmed exit.`;
   }
@@ -3310,6 +3326,8 @@ async function runAction(
     ),
     projectionContext(ctx),
   );
+  const superseded = supersededCommandMessage(cancelled, dependencies);
+  if (superseded) return superseded;
   startCleanup(cancelled);
   return `Run ${shortRunId(cancelled.id)} marked cancel-pending. Its worktree is preserved.`;
 }
@@ -3400,6 +3418,8 @@ async function resumeRun(
       ),
       projectionContext(ctx),
     );
+    const superseded = supersededCommandMessage(rebound, dependencies);
+    if (superseded) return superseded;
     startBackgroundController(rebound, sessionId, ctx.cwd, ctx);
     return `Run ${shortRunId(rebound.id)} adopted branch ${rebound.branch}: ${rebound.status} (${rebound.stage}).\nUse /exec status ${rebound.id} for live progress.`;
   }
@@ -3419,6 +3439,8 @@ async function resumeRun(
     ),
     projectionContext(ctx),
   );
+  const superseded = supersededCommandMessage(resumed, dependencies);
+  if (superseded) return superseded;
   startBackgroundController(resumed, sessionId, ctx.cwd, ctx);
   // Reported where the operator asked, not only in the progress file.
   return recovered.note
