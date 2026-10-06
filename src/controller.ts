@@ -700,12 +700,17 @@ export class PlanExecController {
     onAbandoned?.(run);
     const warnings: string[] = [];
     try {
-      if (run.localOperationActive)
-        await cancelActiveLocalOperations(
+      if (run.localOperationActive) {
+        const local = await cancelActiveLocalOperations(
           this.registry.localOperationsPath(run.id),
           run.id,
           run.stopGeneration ?? 0,
         );
+        if (local.pending)
+          warnings.push(
+            local.reason ?? 'Local command retirement remains unconfirmed.',
+          );
+      }
       const operation = run.activeOperation;
       if (
         operation &&
@@ -3103,6 +3108,19 @@ export class PlanExecController {
         operation,
         'Bridge recovery lacks its original supported execution lifetime.',
       );
+    const latest = await this.registry.get(run.id);
+    if (!latest) throw new Error(`Plan execution run not found: ${run.id}`);
+    if (
+      latest.status !== RUN_STATUS.RUNNING ||
+      latest.userStopped ||
+      latest.activeOperation?.stopRequested ||
+      latest.activeOperation?.externalRunId ||
+      !sameOperationState(run, latest, operation) ||
+      (latest.stopGeneration ?? 0) !== (run.stopGeneration ?? 0) ||
+      latest.activeOperation?.requestDigest !== operation.requestDigest
+    )
+      return latest;
+    run = latest;
     const reply = await this.bridge.spawn(
       operation.operationId,
       operation.params,

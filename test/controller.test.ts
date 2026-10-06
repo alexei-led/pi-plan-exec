@@ -1829,6 +1829,72 @@ test('controller safely replays a v2 operation proven durably absent', async () 
   assert.equal(bridge.lastSpawnParams?.mission, false);
 });
 
+test('force stop wins while Bridge replay awaits capabilities even when cancellation delivery fails', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'force-replay-'));
+  onTestFinished(() => rm(root, { recursive: true, force: true }));
+  const planPath = join(root, 'plan.md');
+  await writeFile(planPath, '### Task 1: Implement\n- [ ] Do the work\n');
+  let entered!: () => void;
+  let release!: () => void;
+  const ready = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const delayed = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  class DelayedCapabilities extends DurableAbsentBridge {
+    probes = 0;
+    override async capabilities() {
+      if (++this.probes === 2) {
+        entered();
+        await delayed;
+      }
+      return super.capabilities();
+    }
+    async cancelOperation(operationId: string) {
+      assert.equal(operationId, 'replay-op');
+      return {
+        success: false as const,
+        error: { message: 'journal write failed' },
+      };
+    }
+  }
+  const registry = new RunRegistry(join(root, 'runs'));
+  const bridge = new DelayedCapabilities('unused');
+  const controller = new PlanExecController(
+    registry,
+    bridge,
+    new FakeFusion(),
+    fakeGit(root),
+  );
+  const params = {
+    agent: 'worker',
+    task: 'recover',
+    cwd: root,
+    mission: false,
+    executionLifetime: { mode: 'unbounded' },
+  };
+  const run = await registry.create({
+    ...baseRun(root, planPath),
+    stage: 'implementation',
+    activeOperation: {
+      operationId: 'replay-op',
+      service: 'bridge',
+      kind: 'implementation',
+      params,
+      requestDigest: bridgeRequestDigest(params),
+      expectedLifetime: { mode: 'unbounded' },
+    },
+  });
+  const tick = controller.tick(run.id, 'owner');
+  await ready;
+  const stopped = await controller.forceStop(run.id, 'owner');
+  assert.match(stopped.warning ?? '', /journal write failed/);
+  release();
+  assert.equal((await tick).status, 'abandoned');
+  assert.equal(bridge.spawnCount, 0);
+});
+
 test('controller refuses v2 absence without matching digest attestation', async () => {
   const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
   const planPath = join(root, 'plan.md');
@@ -4249,6 +4315,35 @@ for (const state of ['unknown', 'live', 'retired', 'unavailable'] as const) {
     assert.equal(bridge.spawnCount, 0);
   });
 }
+
+test('force stop reports unresolved local cancellation without releasing its reservation', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'force-local-'));
+  onTestFinished(() => rm(root, { recursive: true, force: true }));
+  const registry = new RunRegistry(join(root, 'runs'));
+  const run = await registry.create(
+    baseRun(root, join(root, 'missing-plan.md')),
+  );
+  const index = registry.localOperationsPath(run.id);
+  await mkdir(index, { recursive: true });
+  await writeFile(join(index, `${'a'.repeat(64)}.json`), '{}');
+  const controller = new PlanExecController(
+    registry,
+    new FakeBridge('unused'),
+    new FakeFusion(),
+    fakeGit(root),
+  );
+  const result = await controller.forceStop(run.id, 'owner');
+  assert.equal(result.run.status, 'abandoned');
+  assert.equal(result.removed, false);
+  assert.match(
+    result.warning ?? '',
+    /Local operation cancellation index is unresolved/,
+  );
+  await assert.rejects(
+    () => registry.assertExclusive({ ...run, id: 'another' }),
+    /already exists/,
+  );
+});
 
 test('force stop wins over a delayed legacy lookup and does not recreate its missing worktree', async () => {
   const root = await mkdtemp(join(tmpdir(), 'force-delayed-'));

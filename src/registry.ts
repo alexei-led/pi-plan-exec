@@ -306,12 +306,6 @@ export class RunRegistry {
     if (run.status !== RUN_STATUS.ABANDONED)
       throw new Error('Run is not abandoned.');
     if (!(await this.get(run.id))) return true;
-    // Archive is outside active records. remove rechecks ownership under both locks.
-    await writeLocked(
-      join(dirname(this.abandonmentBackupPath(run.id)), 'run.json'),
-      run,
-      this.directory,
-    );
     if (removalRefusal(run)) return false;
     return this.remove(run.id);
   }
@@ -719,6 +713,12 @@ export class RunRegistry {
       if (run === undefined) return false;
       const refusal = run === null ? undefined : removalRefusal(run);
       if (refusal) throw new Error(refusal);
+      if (run?.status === RUN_STATUS.ABANDONED)
+        await writeLocked(
+          join(dirname(this.abandonmentBackupPath(runId)), 'run.json'),
+          run,
+          this.directory,
+        );
       await rm(dirname(path), { recursive: true, force: true });
       return true;
     } finally {

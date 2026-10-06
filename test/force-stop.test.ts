@@ -129,6 +129,20 @@ test('backup failure leaves management state unchanged', async () => {
   assert.equal((await registry.get(run.id))?.status, 'cancel_pending');
 });
 
+test('ordinary cleanup enforces the final abandonment archive after an interrupted force-stop', async () => {
+  const { registry, run, directory } = await fixture();
+  const safe = { ...run };
+  delete safe.activeOperation;
+  await registry.update(safe);
+  await registry.abandon(run.id, 'owner');
+  assert.equal(await registry.remove(run.id), true);
+  const archived = JSON.parse(
+    await readFile(join(directory, '.abandoned', run.id, 'run.json'), 'utf8'),
+  );
+  assert.equal(archived.status, 'abandoned');
+  assert.equal((await registry.abandon(run.id, 'owner')).status, 'abandoned');
+});
+
 test('failed final backup never deletes the abandoned active record', async () => {
   const { registry, run, directory } = await fixture();
   const safe = { ...run };

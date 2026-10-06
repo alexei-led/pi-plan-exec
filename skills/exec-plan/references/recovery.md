@@ -346,7 +346,8 @@ pause. The controller records the blocker, preserves the partial lane and
 accepted baseline, and schedules automatic recovery with backoff. A retry does
 not waive the plan's approvals, release checkpoints, or verification
 requirements. Use `/exec status <full-run-id>` to inspect the next automatic
-action; use `/exec stop` only when the operator wants to pause or cancel.
+action. Use `/exec pause <full-run-id>` for a resumable pause, or
+`/exec stop <full-run-id>` for final cancellation.
 
 Only an observed `Prerequisite: credentials|permission|missing_executable|runtime`
 with an `Evidence:` line changes the task to `waiting_external`; the controller
