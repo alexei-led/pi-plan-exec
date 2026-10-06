@@ -59,10 +59,13 @@ After the U2 delta, the writer reran the focused Vitest probes, native smoke (4 
 
 These checks accept only the current partial characterization, not Task 1 or an upstream fix.
 
-## Local upstream candidates (unreleased)
+## Upstream fixes (PR open, unreleased)
 
-The operator approved local upstream fixes and tests only. No PR, push, tag,
-release or global package upgrade was performed. The refreshed upstream base
+The operator first approved local fixes, then requested one combined PR.
+Published [pi-subagents PR #2717](https://github.com/nicobailon/pi-subagents/pull/2717)
+from `alexei-led:fix/rpc-async-recovery`, head
+`2328b1d22f047fa281f7ce30668f684166f43084`. The PR was verified open with CI
+in progress. No merge, tag, release or global package upgrade was performed. The refreshed upstream base
 was `5da808168c097ea0d56616644773efe0f6f87938`; no open PR already covered the
 two fixes when checked.
 
@@ -96,8 +99,10 @@ Validation on the combined tree:
 - The complete unit suite under those settings had 3,823 passed, one failed
   and 17 skipped. The remaining `global-npm-root` timeout test attempted to
   read its PID file after its 500ms deadline had expired before file creation.
-  Its isolated seven-test file then passed. This is not reported as a clean
-  complete unit run; no unrelated source/test fix was applied.
+  Its isolated seven-test file then passed. That concurrent run was not clean.
+  The complete unit suite was subsequently run with the same canonical temp
+  root and `--test-concurrency=1`: 3,824 passed, zero failed, 17 skipped.
+  No source, assertions or skip rules were changed to obtain this result.
 - The complete integration suite under the same canonical temp/concurrency
   settings passed: 1,168 passed, zero failed, seven skipped.
 - Integration fixtures still logged the existing missing
@@ -112,7 +117,7 @@ Validation on the combined tree:
 Exact combined-tree commands and logs are under the upstream integration
 worktree's `tmp/native-rpc-integration/`: `typecheck.log`, `test-all.log`,
 `environment-repro.log`, `unit-canonical.log`, `global-npm-repro.log`,
-`integration-canonical.log`, `build-package.log` and `pack.json`.
+`unit-serial.log`, `integration-canonical.log`, `build-package.log` and `pack.json`.
 Unit/integration retries used the repository's existing Node test loaders and
 complete file inventories, with only TMPDIR and test concurrency changed.
 
@@ -122,4 +127,4 @@ released compatibility.
 
 ## Remaining Task 1 work
 
-Still required: exercise queued/paused stop parity against real native states; run the parent-death fault barrier; verify direct-leaf control enforcement (including structured output and actual timeout/turn limits); exercise a fresh Pi normal-loader host; and complete the S01–S56 scenario mapping. Local U1/U2 fixes are prepared but not published or released. A supported released native contract remains a cutover prerequisite. No issue, PR, push, tag or publication was performed; the operator must approve any outward-facing next step.
+Still required: exercise queued/paused stop parity against real native states; run the parent-death fault barrier; verify direct-leaf control enforcement (including structured output and actual timeout/turn limits); exercise a fresh Pi normal-loader host; and complete the S01–S56 scenario mapping. U1/U2 are published together in upstream PR #2717, but are not merged or released. A supported released native contract remains a cutover prerequisite. No upstream release or global install was performed. A separate operator-owned force-stop/command-UX lane is preparing pi-plan-exec 1.8.0; refresh this plan against its merged SHA and preserve its abandoned-run reservation/no-autorestore contract before Tasks 2–5.
