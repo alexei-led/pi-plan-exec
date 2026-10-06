@@ -711,7 +711,7 @@ export class PlanExecController {
             local.reason ?? 'Local command retirement remains unconfirmed.',
           );
       }
-      const operation = run.activeOperation;
+      let operation = run.activeOperation;
       if (
         operation &&
         !operation.launchFenced &&
@@ -739,11 +739,41 @@ export class PlanExecController {
           );
         if (
           reply?.success &&
+          reply.data.operationId === operation.operationId &&
+          reply.data.requestDigest === operation.requestDigest &&
+          operation.requestDigest
+        ) {
+          const returnedId =
+            operation.service === OPERATION_SERVICE.BRIDGE
+              ? text(reply.data.runId)
+              : fusionState(reply.data)?.runId;
+          if (!operation.externalRunId && returnedId)
+            operation = { ...operation, externalRunId: returnedId };
+          if (
+            reply.data.cancellationDelivery === 'pending' &&
+            (!operation.externalRunId ||
+              reply.data.runId === undefined ||
+              reply.data.runId === operation.externalRunId)
+          ) {
+            const deliveryError = text(reply.data.error);
+            if (deliveryError)
+              warnings.push(
+                `Cancellation delivery pending: ${deliveryError.slice(0, MAX_TERMINAL_ERROR_LENGTH)}`,
+              );
+          }
+        }
+        if (
+          reply?.success &&
           isFencedCancellation(reply.data, operation, run.id)
         ) {
           run = await this.registry.retireAbandonedOperation(
             run,
             'launchFenced',
+          );
+        } else if (reply?.success && hasProcessExit(reply.data, operation)) {
+          run = await this.registry.retireAbandonedOperation(
+            { ...run, activeOperation: operation },
+            'processTreeExited',
           );
         } else if (operation.externalRunId) {
           const status =
@@ -754,7 +784,7 @@ export class PlanExecController {
                 );
           if (status.success && hasProcessExit(status.data, operation))
             run = await this.registry.retireAbandonedOperation(
-              run,
+              { ...run, activeOperation: operation },
               'processTreeExited',
             );
           else
@@ -2454,7 +2484,23 @@ export class PlanExecController {
     );
     if (!persisted.applied) return persisted.run;
     const intended = persisted.run;
-    const reply = await (await this.reviewClient(intended)).start(
+    const launchClient = await this.reviewClient(intended);
+    const latest = await this.registry.get(intended.id);
+    if (!latest)
+      throw new Error(`Plan execution run not found: ${intended.id}`);
+    if (
+      !sameOperationState(
+        intended,
+        latest,
+        required(intended.activeOperation),
+      ) ||
+      latest.status !== RUN_STATUS.RUNNING ||
+      latest.userStopped ||
+      latest.activeOperation?.stopRequested ||
+      (latest.stopGeneration ?? 0) !== (intended.stopGeneration ?? 0)
+    )
+      return latest;
+    const reply = await launchClient.start(
       operationId,
       text(intended.activeOperation?.params?.prompt) ?? fusionPrompt(intended),
       text(intended.activeOperation?.params?.profile),

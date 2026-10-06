@@ -286,12 +286,22 @@ export class RunRegistry {
         current.activeOperation.operationId !==
           run.activeOperation.operationId ||
         current.activeOperation.requestDigest !==
-          run.activeOperation.requestDigest
+          run.activeOperation.requestDigest ||
+        (current.activeOperation.externalRunId !== undefined &&
+          current.activeOperation.externalRunId !==
+            run.activeOperation.externalRunId)
       )
         return current ?? run;
       const updated = {
         ...current,
-        activeOperation: { ...current.activeOperation, [proof]: true },
+        activeOperation: {
+          ...current.activeOperation,
+          ...(!current.activeOperation.externalRunId &&
+          run.activeOperation.externalRunId
+            ? { externalRunId: run.activeOperation.externalRunId }
+            : {}),
+          [proof]: true,
+        },
         revision: (current.revision ?? 1) + 1,
         updatedAt: nextUpdatedAt(current.updatedAt),
       };
