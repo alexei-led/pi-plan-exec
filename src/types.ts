@@ -117,6 +117,8 @@ export interface FrozenRunConfig {
   statsMaxTurns: number;
 }
 
+export const NATIVE_REVIEWER_AGENT = 'plan-exec-reviewer';
+
 export const DEFAULT_FROZEN_RUN_CONFIG = {
   executionLifetime: { mode: 'unbounded' },
   retryDelayMs: 5_000,
@@ -134,9 +136,9 @@ export const DEFAULT_FROZEN_RUN_CONFIG = {
   finalizeEnabled: true,
   workerAgent: 'worker',
   workerMaxTurns: 75,
-  reviewerAgent: 'reviewer',
+  reviewerAgent: NATIVE_REVIEWER_AGENT,
   reviewerMaxTurns: 30,
-  statsAgent: 'reviewer',
+  statsAgent: NATIVE_REVIEWER_AGENT,
   statsMaxTurns: 30,
 } as const satisfies FrozenRunConfig;
 

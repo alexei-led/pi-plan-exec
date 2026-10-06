@@ -13,7 +13,6 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { onTestFinished, type TestContext, test } from 'vitest';
 import { bridgeRequestDigest } from '../src/bridge.js';
-import { PlanExecController } from '../src/controller.js';
 import type { RunCommand } from '../src/git.js';
 import { normalizeCheckOutput, parseGoalOutcome } from '../src/goal-loop.js';
 import {
@@ -26,6 +25,7 @@ import { LocalOperationFailedError } from '../src/local-operation.js';
 import { RunRegistry } from '../src/registry.js';
 import type { BridgeResult, PlanExecRun } from '../src/types.js';
 import { createControllerLocalExecutor } from './fixtures/controller-local-executor.js';
+import { PlanExecController } from './fixtures/native-controller.js';
 
 const execute = promisify(execFile);
 const command: RunCommand = async (program, args, cwd) => {

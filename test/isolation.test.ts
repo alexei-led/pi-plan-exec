@@ -15,7 +15,6 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { onTestFinished, test } from 'vitest';
 import { bridgeRequestDigest } from '../src/bridge.js';
-import { PlanExecController } from '../src/controller.js';
 import type { RunCommand } from '../src/git.js';
 import { formatRunStatus, formatRunWidget } from '../src/index.js';
 import { prepareIsolationDirectory } from '../src/isolation.js';
@@ -24,6 +23,7 @@ import { parsePlan } from '../src/plan.js';
 import { RunRegistry } from '../src/registry.js';
 import { required } from '../src/required.js';
 import { DEFAULT_FROZEN_RUN_CONFIG } from '../src/types.js';
+import { PlanExecController } from './fixtures/native-controller.js';
 
 const execute = promisify(execFile);
 const command: RunCommand = async (program, args, cwd) => {

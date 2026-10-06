@@ -3,6 +3,7 @@ import { lstat, mkdir, readFile, realpath } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import type { ExtensionContext } from '@earendil-works/pi-coding-agent';
 import {
+  hasTerminalOwnershipProof,
   type WorkflowTerminalProof,
   workflowTerminalProof,
 } from './execution-contract.js';
@@ -41,6 +42,7 @@ export interface NativePrepareInput {
   /** Recorded as requested, NOT advertised as enforced on 0.76.1. */
   maxTurns?: number;
   outputSchema?: Record<string, unknown>;
+  reviewedCommit?: string;
 }
 export interface NativeObservation {
   state: 'prepared' | 'unknown' | 'bound' | 'retired';
@@ -49,6 +51,7 @@ export interface NativeObservation {
   workflowState?: string;
   proof?: WorkflowTerminalProof;
   stopPending?: boolean;
+  successfulChild?: boolean;
   /** Only exact, terminal, caller-bound output is returned here. */
   result?: {
     runId: string;
@@ -59,6 +62,16 @@ export interface NativeObservation {
     structuredOutput?: unknown;
     envelope: Record<string, unknown>;
   };
+}
+export interface LegacyNativeBinding {
+  operationId: string;
+  requestDigest?: string;
+}
+export interface LegacyObservation {
+  operation: ActiveOperation;
+  retired: boolean;
+  data?: Record<string, unknown>;
+  reason?: string;
 }
 type Reply =
   | { success: true; data: Record<string, unknown> }
@@ -87,6 +100,19 @@ export class NativeRuntimeClient {
       (value) => {
         void this.retainCompletion(value).catch(() => undefined);
       },
+    );
+  }
+
+  async available(): Promise<boolean> {
+    const reply = await this.call('ping', {});
+    return (
+      reply.success &&
+      reply.data.version === 1 &&
+      record(reply.data.capabilities) &&
+      reply.data.capabilities.asyncSpawn === true &&
+      reply.data.capabilities.stop === true &&
+      record(reply.data.capabilities.processTerminalProof) &&
+      reply.data.capabilities.processTerminalProof.version === 1
     );
   }
 
@@ -182,6 +208,7 @@ export class NativeRuntimeClient {
       operationId: input.operationId,
       kind: input.kind,
       service: 'native',
+      ...(input.reviewedCommit ? { reviewedCommit: input.reviewedCommit } : {}),
       executionGeneration: run.executionGeneration ?? 0,
       stopGeneration: run.stopGeneration ?? 0,
       native: {
@@ -325,6 +352,7 @@ export class NativeRuntimeClient {
       !op.asyncDir
     )
       return observed;
+    let successfulChild = false;
     try {
       const status: unknown = JSON.parse(
         await readFile(join(op.asyncDir, 'status.json'), 'utf8'),
@@ -339,22 +367,68 @@ export class NativeRuntimeClient {
           op.native,
           op.externalRunId,
         ) ||
-        !record(status.workflow) ||
-        !record(status.workflow.value)
+        !Array.isArray(status.steps) ||
+        status.steps.length !== 1 ||
+        !record(status.steps[0]) ||
+        status.steps[0].runId !== op.native.childRunId ||
+        status.steps[0].workflowKey !== 'main' ||
+        status.steps[0].status !== 'completed' ||
+        status.steps[0].error ||
+        status.steps[0].stopped ||
+        status.steps[0].interrupted
       )
-        throw new Error('Native result source identity mismatch.');
-      const child = status.workflow.value;
+        throw new Error(
+          'Native result source identity or successful child mismatch.',
+        );
+      successfulChild = true;
+      let child: Record<string, unknown>;
       if (
-        child.key !== 'main' ||
-        child.runId !== op.native.childRunId ||
-        child.ok !== true ||
-        child.state === 'running' ||
-        child.detached === true ||
-        child.interrupted === true ||
-        child.stopped === true ||
-        status.state !== 'complete'
-      )
-        throw new Error('Native workflow has no successful final main child.');
+        status.state === 'complete' &&
+        record(status.workflow) &&
+        record(status.workflow.value)
+      ) {
+        child = status.workflow.value;
+        if (
+          child.key !== 'main' ||
+          child.runId !== op.native.childRunId ||
+          child.ok !== true ||
+          child.state === 'running' ||
+          child.detached === true ||
+          child.interrupted === true ||
+          child.stopped === true
+        )
+          throw new Error(
+            'Native workflow has no successful final main child.',
+          );
+      } else {
+        // S25 only: the sole awaited child settled successfully, but the released
+        // runtime could not persist the JavaScript continuation after detachment.
+        const receipt: unknown = JSON.parse(
+          await readFile(join(op.asyncDir, 'workflow-receipt.json'), 'utf8'),
+        );
+        if (
+          status.state !== 'failed' ||
+          !record(receipt) ||
+          receipt.version !== 1 ||
+          receipt.state !== 'failed' ||
+          receipt.workflowResolution !== 'settled-awaiting-resume' ||
+          receipt.workflowRunId !== op.externalRunId ||
+          !nativeWorkflowIdentity(
+            receipt.workflowChildren,
+            op.native,
+            op.externalRunId,
+          ) ||
+          !record(receipt.entries) ||
+          Object.keys(receipt.entries).length !== 1 ||
+          !record(receipt.entries.main) ||
+          receipt.entries.main.key !== 'main' ||
+          receipt.entries.main.latestRunId !== op.native.childRunId
+        )
+          throw new Error(
+            'Native workflow has no exact settled successful child.',
+          );
+        child = receipt.entries.main;
+      }
       if (
         child.outputReference !== op.native.outputPath ||
         (child.outputPathMapping !== undefined &&
@@ -382,6 +456,7 @@ export class NativeRuntimeClient {
     } catch (error) {
       return {
         ...observed,
+        successfulChild,
         reason: error instanceof Error ? error.message : String(error),
       };
     }
@@ -414,6 +489,12 @@ export class NativeRuntimeClient {
       return { ...observed, stopPending: false };
     const id = observed.operation.externalRunId;
     if (!id) return { ...observed, stopPending: true };
+    if (observed.operation.stopDeliveredTo === id)
+      return {
+        ...observed,
+        stopPending: true,
+        reason: 'Stop delivered; retirement still unobserved.',
+      };
     await this.load(runId, binding, true);
     const reply = await this.call('stop', { id });
     const delivered =
@@ -445,6 +526,184 @@ export class NativeRuntimeClient {
         ? 'Stop delivered; retirement still unobserved.'
         : (operation.cancellationDeliveryError?.message ??
           'Stop delivery unconfirmed.'),
+    };
+  }
+
+  private async loadLegacy(
+    runId: string,
+    binding: LegacyNativeBinding,
+  ): Promise<ActiveOperation> {
+    this.assertLive();
+    const run = await this.registry.get(runId);
+    const op = run?.activeOperation ?? run?.failedOperation;
+    if (
+      op?.service !== 'bridge' ||
+      op.operationId !== binding.operationId ||
+      op.requestDigest !== binding.requestDigest
+    )
+      throw new Error('Legacy operation identity mismatch.');
+    return op;
+  }
+
+  /** Existing native identity only. No journal writes, adoption or legacy dispatch. */
+  async observeLegacy(
+    runId: string,
+    binding: LegacyNativeBinding,
+  ): Promise<LegacyObservation> {
+    const operation = await this.loadLegacy(runId, binding);
+    if (!operation.externalRunId)
+      return {
+        operation,
+        retired: false,
+        reason: `Legacy launch is unbound; explicit schema-7 snapshot import is required. No replay is authorized.`,
+      };
+    const reply = await this.call('status', { id: operation.externalRunId });
+    if (!reply.success)
+      return { operation, retired: false, reason: reply.message };
+    const details = reply.data.details;
+    if (!record(details))
+      return {
+        operation,
+        retired: false,
+        reason: 'Native legacy status omitted structured evidence.',
+      };
+    const summary = record(details.workflowChildren)
+      ? details.workflowChildren
+      : undefined;
+    let source: Record<string, unknown> | undefined;
+    const asyncDir =
+      operation.asyncDir ??
+      (typeof details.workflowReceiptPath === 'string'
+        ? dirname(details.workflowReceiptPath)
+        : undefined);
+    if (
+      asyncDir &&
+      isAbsolute(asyncDir) &&
+      basename(asyncDir) === operation.externalRunId
+    ) {
+      try {
+        const value: unknown = JSON.parse(
+          await readFile(join(asyncDir, 'status.json'), 'utf8'),
+        );
+        if (record(value) && value.runId === operation.externalRunId)
+          source = value;
+      } catch {
+        /* Missing legacy artifacts are not non-start or retirement evidence. */
+      }
+    }
+    const lifecycle = record(details.lifecycleStatus)
+      ? details.lifecycleStatus
+      : undefined;
+    const proof =
+      details.workflowTerminalProof ??
+      details.processTerminalProof ??
+      details.processTerminal ??
+      lifecycle?.processTerminal;
+    if (
+      (summary && summary.workflowRunId !== operation.externalRunId) ||
+      (!summary && (!record(proof) || proof.runId !== operation.externalRunId))
+    )
+      return {
+        operation,
+        retired: false,
+        reason: 'Legacy native identity mismatch.',
+      };
+    const data: Record<string, unknown> = {
+      ...details,
+      state: summary
+        ? summary.workflowState === 'completed'
+          ? 'complete'
+          : summary.workflowState
+        : source?.state,
+      ...(summary ? {} : { processTerminalProof: proof }),
+    };
+    const caller = binding.requestDigest
+      ? {
+          operationId: binding.operationId,
+          requestDigest: binding.requestDigest,
+        }
+      : undefined;
+    let retired = hasTerminalOwnershipProof(
+      data,
+      operation.externalRunId,
+      caller,
+    );
+    if (summary && retired) {
+      const parsed = workflowTerminalProof(
+        proof,
+        operation.externalRunId,
+        caller,
+      );
+      const steps = source?.steps;
+      retired = Boolean(
+        parsed &&
+          Array.isArray(steps) &&
+          steps.every(
+            (step) =>
+              record(step) &&
+              typeof step.async === 'boolean' &&
+              (step.async === false ||
+                parsed.children.some((child) => child.runId === step.runId)),
+          ) &&
+          parsed.children.every((child) =>
+            steps.some(
+              (step) =>
+                record(step) &&
+                step.async === true &&
+                step.runId === child.runId,
+            ),
+          ),
+      );
+      if (!retired) delete data.workflowTerminalProof;
+    }
+    return { operation, data, retired };
+  }
+
+  async resultLegacy(
+    runId: string,
+    binding: LegacyNativeBinding,
+  ): Promise<LegacyObservation> {
+    return this.observeLegacy(runId, binding);
+  }
+
+  async stopLegacy(
+    runId: string,
+    binding: LegacyNativeBinding,
+  ): Promise<LegacyObservation> {
+    const observed = await this.observeLegacy(runId, binding);
+    if (observed.retired) return observed;
+    const operation = await this.loadLegacy(runId, binding);
+    const owner = required(await this.registry.get(runId));
+    if (owner.lease && owner.lease.sessionId !== this.sessionId())
+      throw new Error('Foreign lease cannot control legacy operation.');
+    if (!operation.externalRunId || !operation.asyncDir)
+      return {
+        ...observed,
+        reason:
+          'Legacy stop lacks retained native session identity; ownership remains reserved.',
+      };
+    const source: unknown = JSON.parse(
+      await readFile(join(operation.asyncDir, 'status.json'), 'utf8'),
+    );
+    if (
+      !record(source) ||
+      source.runId !== operation.externalRunId ||
+      source.sessionId !== this.nativeSessionId()
+    )
+      throw new Error(
+        'Foreign or unknown native session cannot control legacy operation.',
+      );
+    const reply = await this.call('stop', { id: operation.externalRunId });
+    return {
+      ...observed,
+      reason:
+        reply.success &&
+        reply.data.runId === operation.externalRunId &&
+        reply.data.state === 'stopping'
+          ? 'Stop delivered; retirement still unobserved.'
+          : reply.success
+            ? 'Malformed native legacy stop receipt.'
+            : reply.message,
     };
   }
 
@@ -593,6 +852,7 @@ export class NativeRuntimeClient {
       }
     }
     let observedLimits = meta.observedLimits;
+    let sourceStatus: Record<string, unknown> | undefined;
     if (asyncDir) {
       try {
         const source: unknown = JSON.parse(
@@ -606,6 +866,7 @@ export class NativeRuntimeClient {
           !nativeWorkflowIdentity(source.workflowChildren, meta, identity.runId)
         )
           throw new Error('Native status source identity mismatch.');
+        sourceStatus = source;
         const childStep = Array.isArray(source.steps)
           ? source.steps.find(
               (step) =>
@@ -644,13 +905,31 @@ export class NativeRuntimeClient {
       ['completed', 'failed', 'stopped'].includes(identity.state)
         ? workflowTerminalProof(details.workflowTerminalProof, identity.runId)
         : undefined;
-    const proof = parsedProof?.children.every(
-      (child) => child.runId === identity.childRunId,
-    )
-      ? parsedProof
-      : undefined;
-    // For this single synchronous main child, native may publish an empty
-    // process roster. Do not synthesize an OS-process proof for the host.
+    const steps = sourceStatus?.steps;
+    const step =
+      Array.isArray(steps) && steps.length === 1 && record(steps[0])
+        ? steps[0]
+        : undefined;
+    const classified =
+      step?.runId === identity.childRunId && step?.workflowKey === 'main';
+    const proof =
+      parsedProof &&
+      Array.isArray(steps) &&
+      ((steps.length === 0 &&
+        !identity.childRunId &&
+        identity.state !== 'completed' &&
+        parsedProof.children.length === 0) ||
+        (classified &&
+          step?.async === true &&
+          parsedProof.children.length === 1 &&
+          parsedProof.children[0]?.runId === identity.childRunId) ||
+        (classified &&
+          step?.async === false &&
+          parsedProof.children.length === 0))
+        ? parsedProof
+        : undefined;
+    // Retirement follows the published closed-inventory proof AND the actual
+    // recorded execution mode, never an inferred synchronous child or empty roster.
     const update = (op: ActiveOperation): ActiveOperation => ({
       ...op,
       externalRunId: identity.runId,
@@ -780,6 +1059,8 @@ export class NativeRuntimeClient {
       const info = await lstat(expected);
       if (!info.isFile() || info.isSymbolicLink())
         throw new Error('Native output must be a regular non-symlink file.');
+      if (info.size > 1_048_576)
+        throw new Error('Native output exceeds the 1 MiB artifact limit.');
     } catch (error) {
       if (mustExist || !record(error) || error.code !== 'ENOENT') throw error;
     }

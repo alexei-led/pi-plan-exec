@@ -125,6 +125,7 @@ export type NativeRuntimeHostOptions = {
   reattach?: boolean;
   sessionId?: string;
   sessionFile?: string;
+  nativeController?: 'plan' | 'goal' | 'fix';
 };
 
 export function nativeFixtureFactoryModulePath(): string | undefined {
@@ -156,6 +157,7 @@ export async function createNativeRuntimeHost(
   let environmentRestored = false;
   let childSessionModule: ChildSessionModule | undefined;
   let registration: NativeRpcRegistration | undefined;
+  let disposeAgentEvents: (() => void) | undefined;
   let disposed = false;
   const restoreEnvironment = () => {
     if (environmentRestored) return;
@@ -168,6 +170,7 @@ export async function createNativeRuntimeHost(
   const disposeFixtureRuntime = () => {
     try {
       registration?.dispose();
+      disposeAgentEvents?.();
     } finally {
       try {
         childSessionModule?.setChildSessionFactory(undefined);
@@ -209,6 +212,8 @@ export async function createNativeRuntimeHost(
     process.env.PI_CODING_AGENT_DIR = agentDirectory;
     process.env.PI_SUBAGENTS_TEMP_ROOT = nativeTempRoot;
     process.env.PI_AUTONOMOUS_SMOKE_CALLS = callsPath;
+    if (options.nativeController)
+      process.env.PI_NATIVE_CONTROLLER_SMOKE = options.nativeController;
     process.env.GIT_CONFIG_GLOBAL = '/dev/null';
     process.env.GIT_CONFIG_NOSYSTEM = '1';
     process.env.NODE_OPTIONS = '';
@@ -349,6 +354,27 @@ export async function createNativeRuntimeHost(
       inheritSkills: false,
     }));
 
+    const owner = {
+      events,
+      on() {},
+      registerTool() {},
+      getSessionName: () => undefined,
+      sendMessage() {},
+    };
+    const agentEvents = (await jiti.import(
+      join(nativeRoot, 'src/agents/runtime-agent-events.js'),
+    )) as {
+      registerRuntimeAgentEventListener(pi: unknown): () => void;
+    };
+    const agentRegistry = (await jiti.import(
+      join(nativeRoot, 'src/agents/runtime-agent-registry.js'),
+    )) as {
+      mergeRuntimeAgents(
+        pi: unknown,
+        discovered: { agents: NativeAgent[] },
+      ): { agents: NativeAgent[] };
+    };
+    disposeAgentEvents = agentEvents.registerRuntimeAgentEventListener(owner);
     let state: NativeState;
     let executor: NativeExecutor;
 
@@ -363,7 +389,7 @@ export async function createNativeRuntimeHost(
         workflowChildStops: new Map(),
       };
       executor = createSubagentExecutor({
-        pi: { events, getSessionName: () => undefined, sendMessage() {} },
+        pi: owner,
         state,
         config: {
           worktree: false,
@@ -374,7 +400,8 @@ export async function createNativeRuntimeHost(
         tempArtifactsDir: artifactsDirectory,
         getSubagentSessionRoot: () => sessionDirectory,
         expandTilde: (value: string) => value,
-        discoverAgents: () => ({ agents }),
+        discoverAgents: () =>
+          agentRegistry.mergeRuntimeAgents(owner, { agents }),
       });
       registration = registerSubagentRpcBridge({
         events,

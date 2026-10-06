@@ -38,6 +38,9 @@ export function nativeOperationDigest(operation: ActiveOperation): string {
   return nativeDigest({
     operationId: operation.operationId,
     kind: operation.kind,
+    ...(operation.reviewedCommit
+      ? { reviewedCommit: operation.reviewedCommit }
+      : {}),
     executionGeneration: operation.executionGeneration ?? 0,
     ownerRunId: meta.ownerRunId,
     ownerSessionId: meta.ownerSessionId,

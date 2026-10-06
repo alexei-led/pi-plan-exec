@@ -87,6 +87,7 @@ import {
   type PlanExecRun,
 } from '../src/types.js';
 import { createControllerLocalExecutor } from './fixtures/controller-local-executor.js';
+import { PlanExecController as FixtureController } from './fixtures/native-controller.js';
 
 // Three distinct turn budgets on purpose: with reviewer and stats equal, a
 // stats operation routed to the reviewer budget would be invisible.
@@ -4622,7 +4623,7 @@ test('a saved session waits for durable Git lane creation and recovers creation 
       ),
     ),
   );
-  const controller = new PlanExecController(
+  const controller = new FixtureController(
     registry,
     {
       spawn: unavailable,
@@ -4826,7 +4827,16 @@ test("explicit pause from an unrelated session polls a dead owner's worker until
     spawn: unavailable,
     result: unavailable,
     adopt: unavailable,
-    status: unavailable,
+    status: async (): Promise<{
+      success: true;
+      data: Record<string, unknown>;
+    }> => {
+      const reply = await bridge.operation();
+      return {
+        success: true,
+        data: { ...reply.data, state: reply.data.status },
+      };
+    },
     operation: async () => ({
       success: true as const,
       data: {
@@ -4843,7 +4853,7 @@ test("explicit pause from an unrelated session polls a dead owner's worker until
       return { success: true as const, data: { state: 'stopping' } };
     },
   };
-  const controller = new PlanExecController(
+  const controller = new FixtureController(
     registry,
     bridge,
     {

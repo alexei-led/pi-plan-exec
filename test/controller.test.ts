@@ -16,7 +16,6 @@ import { onTestFinished, test, vi } from 'vitest';
 import { type BridgeCapabilities, bridgeRequestDigest } from '../src/bridge.js';
 import {
   PLAN_STRUCTURE_CHANGED_ERROR,
-  PlanExecController as ProductionController,
   parseWorkerSignal,
 } from '../src/controller.js';
 import { execReconcile } from '../src/index.js';
@@ -35,6 +34,7 @@ import {
   DEFAULT_FROZEN_RUN_CONFIG,
   type PlanExecRun,
 } from '../src/types.js';
+import { PlanExecController as ProductionController } from './fixtures/native-controller.js';
 
 const success = (data: Record<string, unknown>) => ({
   success: true as const,
@@ -871,7 +871,7 @@ test('model failures preserve diagnostics and schedule automatic recovery', asyn
   assert.ok((retry.tasks?.['1']?.nextAttemptAt ?? 0) > Date.now());
 });
 
-test('resume retries a failed review in the same stage with a larger review budget', async () => {
+test('resume preserves reviewer model and records unsupported larger turn request', async () => {
   const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
   const planPath = join(root, 'plan.md');
   const plan = '### Task 1: Implement\n- [x] Done\n';
@@ -907,14 +907,17 @@ test('resume retries a failed review in the same stage with a larger review budg
   assert.equal(resumed.config.reviewerModel, undefined);
   assert.equal(resumed.activeOperation?.kind, 'review');
   assert.equal(
-    resumed.activeOperation?.params?.model,
+    nativeChild(required(resumed.activeOperation)).model,
     'anthropic-work/claude-sonnet-4-6',
   );
   assert.equal(resumed.worktreeCwd, failed.worktreeCwd);
   assert.equal(resumed.branch, failed.branch);
-  assert.deepEqual(resumed.activeOperation?.params?.turnBudget, {
-    maxTurns: 75,
-  });
+  assert.equal(resumed.activeOperation?.native?.limits.requestedMaxTurns, 75);
+  assert.equal(resumed.activeOperation?.native?.limits.maxTurnsEnforced, false);
+  assert.equal(
+    nativeChild(required(resumed.activeOperation)).turnBudget,
+    undefined,
+  );
 });
 
 test('stats launches use the frozen stats model', async () => {
@@ -945,7 +948,7 @@ test('stats launches use the frozen stats model', async () => {
 
   assert.equal(launched.activeOperation?.kind, 'stats');
   assert.equal(
-    launched.activeOperation?.params?.model,
+    nativeChild(required(launched.activeOperation)).model,
     'anthropic-work/claude-haiku-4-5',
   );
 });
@@ -4570,6 +4573,14 @@ test('force stop wins over a delayed legacy lookup and does not recreate its mis
   );
   assert.equal(bridge.spawnCount, 0);
 });
+
+function nativeChild(
+  operation: import('../src/types.js').ActiveOperation,
+): Record<string, unknown> {
+  const script = String(operation.native?.request.params.script);
+  assert.ok(script.startsWith('return await runs.run("main", '));
+  return JSON.parse(script.slice('return await runs.run("main", '.length, -2));
+}
 
 function baseRun(
   root: string,

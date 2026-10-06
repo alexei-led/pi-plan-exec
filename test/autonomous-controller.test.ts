@@ -21,7 +21,6 @@ import {
   type DiagnosticGuidanceRequest,
   processTerminalProof,
 } from '../src/bridge.js';
-import { PlanExecController } from '../src/controller.js';
 import type { RunCommand } from '../src/git.js';
 import { execReconcile, reconcileForResume } from '../src/index.js';
 import type { runCommands } from '../src/lanes.js';
@@ -47,6 +46,7 @@ import {
   type PlanExecRun,
 } from '../src/types.js';
 import { createControllerLocalExecutor } from './fixtures/controller-local-executor.js';
+import { PlanExecController } from './fixtures/native-controller.js';
 
 const execute = promisify(execFile);
 

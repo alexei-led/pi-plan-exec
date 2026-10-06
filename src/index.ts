@@ -11,14 +11,7 @@ import {
 } from '@earendil-works/pi-coding-agent';
 import type { AutocompleteItem } from '@earendil-works/pi-tui';
 import { parseAdvisoryObservation } from './advisory-observation.js';
-import {
-  type BridgeCapabilities,
-  BridgeClient,
-  hasBoundNeverStarted,
-  hasBoundOperation,
-  processTerminalProof,
-  supportsOwnedProcessTree,
-} from './bridge.js';
+import { type BridgeCapabilities, supportsOwnedProcessTree } from './bridge.js';
 import {
   isDetachedWorkflowFailure,
   isExternalManualBlocker,
@@ -47,6 +40,8 @@ import {
   type ProcessTerminalProof,
   requirePlanPath,
 } from './lifecycle.js';
+import { registerNativeReviewer } from './native-reviewer.js';
+import { NativeRuntimeClient } from './native-runtime.js';
 import { readPlan } from './plan.js';
 import { appendProgress } from './progress.js';
 import {
@@ -91,7 +86,6 @@ import { workspaceCommand } from './workspace-environment.js';
 
 const defaultRegistry = new RunRegistry();
 const STATUS_KEY = 'plan-exec';
-const PROVIDER_PROBE_TIMEOUT_MS = 1_500;
 const RUNTIME_TIMEOUT_MS = 1_500;
 const COMMAND_CAS_RETRIES = 5;
 const SESSION_RETIREMENTS_KEY = Symbol.for(
@@ -386,7 +380,15 @@ export default function planExecExtension(pi: ExtensionAPI): void {
       .catch(() => undefined);
     return Promise.resolve(run);
   };
-  const bridge = new BridgeClient(pi.events);
+  let currentContext: ExtensionContext | undefined;
+  let reviewer: { dispose(): void } | undefined;
+  let reviewerProblem: string | undefined;
+  const native = new NativeRuntimeClient(
+    pi.events,
+    defaultRegistry,
+    () => required(currentContext),
+    { rpcTimeoutMs: RUNTIME_TIMEOUT_MS },
+  );
   const fusion = new FusionClient(pi.events);
   const runCommand = async (command: string, args: string[], cwd: string) => {
     const invocation = workspaceCommand(command, args);
@@ -399,77 +401,23 @@ export default function planExecExtension(pi: ExtensionAPI): void {
   };
   const controller = new PlanExecController(
     defaultRegistry,
-    bridge,
+    native,
     fusion,
     runCommand,
   );
 
-  // Bounded: a diagnosis runs right after a restart, when the bridge may not be
-  // up yet. No answer within the budget is simply no evidence.
-  const probeBridge = new BridgeClient(pi.events, PROVIDER_PROBE_TIMEOUT_MS);
-  const doctorProbe = abandonmentProbe(
-    async (operationId, run) => {
-      const digest = run.activeOperation?.requestDigest;
-      if (!digest) return undefined;
-      await probeBridge.capabilities();
-      const lookup = await probeBridge.operation(operationId, {
-        kind: 'pi-plan-exec',
-        runId: run.id,
-        key: operationId,
-        requestDigest: digest,
-      });
-      return lookup.success && lookup.data.requestDigest === digest
-        ? bridgeOperationState(lookup.data)
-        : undefined;
-    },
-    async (operation, run) => {
-      const capabilities = await probeBridge.capabilities();
-      if (capabilities.protocolVersion !== 2 || !capabilities.healthy)
-        return {};
-      if (!operation.requestDigest) return {};
-      const expectedCaller = {
-        operationId: operation.operationId,
-        requestDigest: operation.requestDigest,
-      };
-      const lookup = await probeBridge.operation(operation.operationId, {
-        kind: 'pi-plan-exec',
-        runId: run.id,
-        key: operation.operationId,
-        requestDigest: operation.requestDigest,
-      });
-      const proofData =
-        lookup.success && lookup.data.requestDigest === operation.requestDigest
-          ? lookup.data
-          : undefined;
-      const proof = operation.externalRunId
-        ? processTerminalProof(
-            processTerminalFromStatus(proofData),
-            operation.externalRunId,
-            expectedCaller,
-          )
-        : undefined;
-      return {
-        durableOperationLookup: capabilities.durableOperationLookup,
-        ...(hasBoundOperation(proofData, operation)
-          ? { operationBound: true }
-          : {}),
-        ...(proofData?.state === EXTERNAL_OPERATION_STATE.ABSENT &&
-        proofData.replaySafe === true
-          ? { replaySafe: true }
-          : {}),
-        ...(proofData?.state === RUN_STATUS.CANCELLED &&
-        hasBoundNeverStarted(proofData, operation, run.id) &&
-        proofData.cancellationRequested === true
-          ? { neverStarted: true }
-          : {}),
-        ...(proofData?.state === 'not_started' &&
-        hasBoundNeverStarted(proofData, operation, run.id)
-          ? { launchRejected: true }
-          : {}),
-        ...(proof ? { processTerminalProof: proof } : {}),
-      };
-    },
-  );
+  // Diagnostic inspection must not adopt a session or authorize legacy replay.
+  const doctorProbe = abandonmentProbe(async (_operationId, run) => {
+    const op = run.activeOperation;
+    if (!op?.requestDigest) return undefined;
+    const observation = await native.observeLegacy(run.id, {
+      operationId: op.operationId,
+      requestDigest: op.requestDigest,
+    });
+    return observation.data
+      ? String(observation.data.state ?? 'unknown')
+      : undefined;
+  });
 
   const activeControllers = new Map<string, ReturnType<typeof setInterval>>();
   const inFlightControllers = new Map<string, Promise<PlanExecRun>>();
@@ -585,24 +533,14 @@ export default function planExecExtension(pi: ExtensionAPI): void {
       pi.getAllTools().map((tool) => tool.name),
     );
     if (missingTools.length > 0) return [`missing: ${missingTools.join(', ')}`];
-    const bridgeReply = await bridge.ping();
-    const missing: string[] = [];
-    const incompatible: string[] = [];
-    if (!bridgeReply.success) missing.push('@alexeiled/pi-subagents-bridge');
-    else {
-      const capabilities = await bridge.capabilities();
-      if (!bridgeRuntimeCompatible(bridgeReply.data, capabilities))
-        incompatible.push(
-          '@alexeiled/pi-subagents-bridge >=0.5.3 (prelaunch rejection evidence, durable lookup, direct owned-agent spawn, and explicit lifetime support required)',
-        );
-    }
     return [
-      ...(missing.length > 0 ? [`missing: ${missing.join(', ')}`] : []),
-      ...(incompatible.length > 0
-        ? [`incompatible: ${incompatible.join(', ')}`]
-        : []),
+      ...((await native.available())
+        ? []
+        : ['pi-subagents public native RPC is unavailable or incompatible']),
+      ...(reviewerProblem ? [reviewerProblem] : []),
     ];
   };
+
   const checkRuntime: RuntimeCheck = async () => {
     // Dispatch admission belongs to the durable controller; cold probes must
     // not discard an otherwise authorized plan or resume request.
@@ -733,6 +671,7 @@ export default function planExecExtension(pi: ExtensionAPI): void {
       'Execute a checked Markdown plan with worktree isolation, progress, reviews, and recovery; use /exec help for commands',
     getArgumentCompletions: getExecArgumentCompletions,
     handler: async (args, ctx) => {
+      currentContext = ctx;
       if (sessionClosed) return;
       let currentMutation:
         | { settled: Promise<void>; retirementRunIds?: Set<string> }
@@ -855,6 +794,7 @@ export default function planExecExtension(pi: ExtensionAPI): void {
         .map((value) => ({ value, label: value }));
     },
     handler: async (args, ctx) => {
+      currentContext = ctx;
       const sessionId = ctx.sessionManager.getSessionId();
       const parsed = parseGoalCommand(args);
       try {
@@ -947,6 +887,14 @@ export default function planExecExtension(pi: ExtensionAPI): void {
   });
 
   pi.on('session_start', async (_event, ctx) => {
+    currentContext = ctx;
+    reviewer?.dispose();
+    try {
+      reviewer = registerNativeReviewer(pi.events);
+      reviewerProblem = undefined;
+    } catch (error) {
+      reviewerProblem = error instanceof Error ? error.message : String(error);
+    }
     presentation = new RunPresentation(
       readViewPreferences(ctx.sessionManager.getBranch?.() ?? []),
     );
@@ -1043,6 +991,8 @@ export default function planExecExtension(pi: ExtensionAPI): void {
   });
 
   pi.on('session_shutdown', async (event, ctx) => {
+    native.dispose();
+    reviewer?.dispose();
     presentation.hide();
     renderStatus(ctx);
     sessionClosed = true;
@@ -2773,24 +2723,6 @@ function nextCommand(diagnosis: RunDiagnosis): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function processTerminalFromStatus(data: unknown): unknown {
-  if (!isRecord(data)) return undefined;
-  if (isRecord(data.processTerminalProof)) return data.processTerminalProof;
-  if (isRecord(data.processTerminal)) return data.processTerminal;
-  const details = data.details;
-  if (!isRecord(details)) return undefined;
-  const lifecycleStatus = details.lifecycleStatus;
-  if (!isRecord(lifecycleStatus)) return undefined;
-  return lifecycleStatus.processTerminal;
-}
-
-function bridgeOperationState(
-  data: Record<string, unknown>,
-): string | undefined {
-  const state = data.state;
-  return typeof state === 'string' && state.trim() ? state.trim() : undefined;
 }
 
 /**

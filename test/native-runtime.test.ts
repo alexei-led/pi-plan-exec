@@ -454,6 +454,41 @@ test('released public RPC publishes real proof/output with healthy and lost spaw
         'status.json',
       );
       const originalStatus = await readFile(statusPath, 'utf8');
+      const actualStatus = JSON.parse(originalStatus);
+      expect(actualStatus.steps).toHaveLength(1);
+      expect(typeof actualStatus.steps[0].async).toBe('boolean');
+      if (actualStatus.steps[0].async) {
+        expect(observed.proof?.children).toHaveLength(1);
+        expect(observed.proof?.children[0]?.runId).toBe(
+          actualStatus.steps[0].runId,
+        );
+      } else expect(observed.proof?.children).toHaveLength(0);
+      // The exact S25 receipt can recover a successful child without replaying
+      // the failed JavaScript wrapper or accepting arbitrary failure output.
+      const receiptPath = join(
+        required(observed.operation.asyncDir),
+        'workflow-receipt.json',
+      );
+      const receiptText = await readFile(receiptPath, 'utf8');
+      const receipt = JSON.parse(receiptText);
+      const detached = JSON.parse(originalStatus);
+      detached.state = 'failed';
+      detached.workflowChildren.workflowState = 'failed';
+      delete detached.workflow.value;
+      receipt.state = 'failed';
+      receipt.workflowResolution = 'settled-awaiting-resume';
+      receipt.workflowChildren = detached.workflowChildren;
+      await writeFile(statusPath, JSON.stringify(detached));
+      await writeFile(receiptPath, JSON.stringify(receipt));
+      expect((await client.result(f.run.id, binding)).result?.output).toBe(
+        result.result?.output,
+      );
+      receipt.entries.main.latestRunId = 'foreign-child';
+      await writeFile(receiptPath, JSON.stringify(receipt));
+      expect((await client.result(f.run.id, binding)).result).toBeUndefined();
+      await writeFile(receiptPath, receiptText);
+      await writeFile(statusPath, originalStatus);
+
       const wrongSource = JSON.parse(originalStatus);
       wrongSource.sessionId = 'foreign';
       await writeFile(statusPath, JSON.stringify(wrongSource));
@@ -533,8 +568,29 @@ test('abandoned observation and stop are read-only and inspect retirement before
   await f.client.spawn(f.run.id, f.binding);
   await f.registry.abandon(f.run.id, 'session');
   const before = await readFile(f.registry.authorizationPath(f.run.id), 'utf8');
+  const asyncDir = join(f.directory, 'root');
+  await mkdir(asyncDir);
+  await writeFile(
+    join(asyncDir, 'status.json'),
+    JSON.stringify({
+      runId: 'root',
+      sessionId: 'session',
+      toolCallId: `rpc-spawn-${required(f.op.native).request.requestId}`,
+      workflowChildren: f.summary('completed'),
+      steps: [
+        {
+          runId: 'child',
+          workflowKey: 'main',
+          async: false,
+          status: 'completed',
+        },
+      ],
+    }),
+  );
   f.setHandler((req) =>
-    f.reply(req, { details: retiredDetails(f.summary('completed')) }),
+    f.reply(req, {
+      details: { ...retiredDetails(f.summary('completed')), asyncDir },
+    }),
   );
   expect((await f.client.stopAbandoned(f.run.id, f.binding)).state).toBe(
     'retired',
@@ -641,5 +697,297 @@ test('correlated completion retains binding after lost reply without replay or l
   );
   f.client.dispose();
   expect(f.bus.listeners.has('subagent:async-complete')).toBe(false);
+  expect(f.requests.filter((req) => req.method === 'spawn')).toHaveLength(1);
+});
+
+test('actual async child classification requires its exact nonempty proof roster', async () => {
+  const f = await fixture();
+  const asyncDir = join(f.directory, 'root');
+  await mkdir(asyncDir);
+  const source = {
+    runId: 'root',
+    sessionId: 'session',
+    toolCallId: `rpc-spawn-${required(f.op.native).request.requestId}`,
+    workflowChildren: f.summary('completed'),
+    steps: [
+      { runId: 'child', workflowKey: 'main', async: true, status: 'completed' },
+    ],
+  };
+  await writeFile(join(asyncDir, 'status.json'), JSON.stringify(source));
+  const details = { ...retiredDetails(source.workflowChildren), asyncDir };
+  f.setHandler((req) => f.reply(req, { details }));
+  expect((await f.client.spawn(f.run.id, f.binding)).state).toBe('bound');
+  expect((await f.client.operation(f.run.id, f.binding)).state).toBe('bound');
+  const proof = {
+    version: 1,
+    state: 'observed',
+    runId: 'child',
+    runnerProcessInstanceId: 'actual-child',
+    observedAt: Date.now(),
+    instances: [],
+  };
+  f.setHandler((req) =>
+    f.reply(req, {
+      details: {
+        ...details,
+        workflowTerminalProof: {
+          ...details.workflowTerminalProof,
+          children: [proof],
+        },
+      },
+    }),
+  );
+  expect((await f.client.operation(f.run.id, f.binding)).state).toBe('retired');
+});
+
+test('native controller force-stop abandons before provider calls and cannot revive', async () => {
+  const { PlanExecController } = await import('../src/controller.js');
+  const f = await fixture();
+  const asyncDir = join(f.directory, 'root');
+  await mkdir(asyncDir);
+  const source = {
+    runId: 'root',
+    sessionId: 'session',
+    toolCallId: `rpc-spawn-${required(f.op.native).request.requestId}`,
+    workflowChildren: f.summary(),
+    steps: [
+      { runId: 'child', workflowKey: 'main', async: false, status: 'running' },
+    ],
+  };
+  await writeFile(join(asyncDir, 'status.json'), JSON.stringify(source));
+  let retired = false;
+  let stoppedAfterAbandon = false;
+  f.setHandler(async (req) => {
+    if (req.method === 'stop') {
+      expect((await f.registry.get(f.run.id))?.status).toBe('abandoned');
+      expect(
+        await readFile(f.registry.abandonmentBackupPath(f.run.id), 'utf8'),
+      ).toContain(f.run.id);
+      stoppedAfterAbandon = true;
+      retired = true;
+      source.workflowChildren = f.summary('completed');
+      required(source.steps[0]).status = 'completed';
+      await writeFile(join(asyncDir, 'status.json'), JSON.stringify(source));
+      f.reply(req, { runId: 'root', state: 'stopping' });
+      return;
+    }
+    f.reply(req, {
+      details: {
+        asyncDir,
+        ...(retired
+          ? retiredDetails(f.summary('completed'))
+          : { workflowChildren: f.summary() }),
+      },
+    });
+  });
+  await f.client.spawn(f.run.id, f.binding);
+  const refuse = async () => {
+    throw new Error('No Fusion allowed');
+  };
+  const controller = new PlanExecController(
+    f.registry,
+    f.client,
+    {
+      start: refuse,
+      status: refuse,
+      result: refuse,
+      adopt: refuse,
+      cancel: refuse,
+    },
+    async () => ({ code: 0, stdout: '', stderr: '' }),
+  );
+  const stopped = await controller.forceStop(f.run.id, 'session');
+  expect(stoppedAfterAbandon).toBe(true);
+  expect(stopped.run.status).toBe('abandoned');
+  expect(stopped.run.activeOperation?.processTreeExited).toBe(true);
+  const spawnCount = f.requests.filter((req) => req.method === 'spawn').length;
+  await expect(f.client.spawn(f.run.id, f.binding)).rejects.toThrow();
+  expect(f.requests.filter((req) => req.method === 'spawn')).toHaveLength(
+    spawnCount,
+  );
+});
+
+test('legacy observation and same-session stop retain the original digest without dispatch', async () => {
+  const f = await fixture();
+  const asyncDir = join(f.directory, 'root');
+  await mkdir(asyncDir);
+  await writeFile(
+    join(asyncDir, 'status.json'),
+    JSON.stringify({
+      runId: 'root',
+      sessionId: 'session',
+      state: 'running',
+      steps: [{ runId: 'child', async: false }],
+    }),
+  );
+  const original = {
+    operationId: 'legacy',
+    service: 'bridge' as const,
+    kind: 'implementation' as const,
+    requestDigest: 'original-digest',
+    params: { immutable: 'original' },
+    externalRunId: 'root',
+    asyncDir,
+  };
+  await f.registry.update({ ...f.run, activeOperation: original });
+  const binding = { operationId: 'legacy', requestDigest: 'original-digest' };
+  f.setHandler((req) =>
+    f.reply(
+      req,
+      req.method === 'stop'
+        ? { runId: 'root', state: 'stopping' }
+        : { details: { workflowChildren: f.summary() } },
+    ),
+  );
+  expect((await f.client.observeLegacy(f.run.id, binding)).retired).toBe(false);
+  expect((await f.client.stopLegacy(f.run.id, binding)).reason).toMatch(
+    /retirement still unobserved/,
+  );
+  f.setSession('other-session');
+  await expect(f.client.stopLegacy(f.run.id, binding)).rejects.toThrow(
+    /session/,
+  );
+  expect((await f.registry.get(f.run.id))?.activeOperation).toEqual(original);
+  expect(f.requests.filter((req) => req.method === 'spawn')).toHaveLength(0);
+  expect(f.requests.filter((req) => req.method === 'stop')).toHaveLength(1);
+});
+
+test('no-child failed workflow can retire but never supply task success', async () => {
+  const f = await fixture();
+  const asyncDir = join(f.directory, 'root');
+  await mkdir(asyncDir);
+  const summary = { ...f.summary('failed'), children: [] };
+  await writeFile(
+    join(asyncDir, 'status.json'),
+    JSON.stringify({
+      runId: 'root',
+      sessionId: 'session',
+      toolCallId: `rpc-spawn-${required(f.op.native).request.requestId}`,
+      workflowChildren: summary,
+      state: 'failed',
+      steps: [],
+    }),
+  );
+  f.setHandler((req) =>
+    f.reply(req, { details: { ...retiredDetails(summary), asyncDir } }),
+  );
+  expect((await f.client.spawn(f.run.id, f.binding)).state).toBe('retired');
+  expect((await f.client.result(f.run.id, f.binding)).result).toBeUndefined();
+});
+
+test('bound historical native ID without a digest is observed read-only, while unbound identity stays fenced', async () => {
+  const f = await fixture();
+  const op = {
+    operationId: 'historical',
+    service: 'bridge' as const,
+    kind: 'implementation' as const,
+    externalRunId: 'leaf',
+  };
+  await f.registry.update({ ...f.run, activeOperation: op });
+  f.setHandler((req) =>
+    f.reply(req, {
+      details: {
+        processTerminalProof: {
+          version: 1,
+          runId: 'leaf',
+          state: 'observed',
+          runnerProcessInstanceId: 'leaf-instance',
+          instances: [],
+          observedAt: Date.now(),
+        },
+      },
+    }),
+  );
+  const before = await readFile(f.registry.authorizationPath(f.run.id), 'utf8');
+  expect(
+    (await f.client.observeLegacy(f.run.id, { operationId: op.operationId }))
+      .retired,
+  ).toBe(true);
+  expect(await readFile(f.registry.authorizationPath(f.run.id), 'utf8')).toBe(
+    before,
+  );
+  await f.registry.updateLatest(f.run.id, (run) => ({
+    ...run,
+    activeOperation: {
+      operationId: op.operationId,
+      service: 'bridge',
+      kind: 'implementation',
+    },
+  }));
+  const count = f.requests.length;
+  expect(
+    (await f.client.observeLegacy(f.run.id, { operationId: op.operationId }))
+      .retired,
+  ).toBe(false);
+  expect(f.requests).toHaveLength(count);
+});
+
+test('native controller pause observes exact retirement without accepting output or relaunching', async () => {
+  const { PlanExecController } = await import('../src/controller.js');
+  const f = await fixture();
+  const asyncDir = join(f.directory, 'root');
+  await mkdir(asyncDir);
+  let stopped = false;
+  const source = {
+    runId: 'root',
+    sessionId: 'session',
+    toolCallId: `rpc-spawn-${required(f.op.native).request.requestId}`,
+    workflowChildren: f.summary(),
+    steps: [
+      { runId: 'child', workflowKey: 'main', async: false, status: 'running' },
+    ],
+  };
+  await writeFile(join(asyncDir, 'status.json'), JSON.stringify(source));
+  f.setHandler(async (req) => {
+    if (req.method === 'stop') {
+      stopped = true;
+      source.workflowChildren = f.summary('completed');
+      required(source.steps[0]).status = 'completed';
+      await writeFile(join(asyncDir, 'status.json'), JSON.stringify(source));
+      f.reply(req, { runId: 'root', state: 'stopping' });
+    } else
+      f.reply(req, {
+        details: {
+          asyncDir,
+          ...(stopped
+            ? retiredDetails(source.workflowChildren)
+            : { workflowChildren: source.workflowChildren }),
+        },
+      });
+  });
+  await f.client.spawn(f.run.id, f.binding);
+  await f.registry.updateLatest(f.run.id, (run) => ({
+    ...run,
+    status: 'paused',
+    userStopped: true,
+    stopGeneration: 1,
+  }));
+  const refuse = async () => {
+    throw new Error('Pause cannot run workspace commands or Fusion');
+  };
+  const controller = new PlanExecController(
+    f.registry,
+    f.client,
+    {
+      start: refuse,
+      status: refuse,
+      result: refuse,
+      adopt: refuse,
+      cancel: refuse,
+    },
+    refuse,
+  );
+  const paused = await controller.tick(f.run.id, 'session');
+  expect(paused.status).toBe('paused');
+  expect(paused.userStopped).toBe(true);
+  expect(paused.activeOperation?.processTreeExited).toBe(true);
+  expect(paused.stage).toBe('implementation');
+  await controller.tick(f.run.id, 'session');
+  expect(f.requests.filter((req) => req.method === 'spawn')).toHaveLength(1);
+  await f.registry.updateLatest(f.run.id, (run) => ({
+    ...run,
+    status: 'cancel_pending',
+  }));
+  expect((await controller.tick(f.run.id, 'session')).status).toBe('cancelled');
   expect(f.requests.filter((req) => req.method === 'spawn')).toHaveLength(1);
 });

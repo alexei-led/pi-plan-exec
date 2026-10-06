@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import {
   appendFileSync,
+  existsSync,
   mkdirSync,
   readFileSync,
   writeFileSync,
@@ -15,6 +16,29 @@ export default function scriptedSessions() {
     async create(launch) {
       const listeners = new Set();
       const messages = [];
+      const tools = new Map();
+      if (launch.runtime.structuredOutput) {
+        for (const hook of launch.hooks)
+          hook.factory({
+            on() {},
+            registerTool(tool) {
+              tools.set(tool.name, tool);
+            },
+            events: {
+              on() {
+                return () => {};
+              },
+              emit() {},
+            },
+            getAllTools() {
+              return [];
+            },
+            getActiveTools() {
+              return [];
+            },
+            setActiveTools() {},
+          });
+      }
       const sessionId = randomUUID();
       const sessionFile =
         launch.storage.kind === 'file' ? launch.storage.sessionFile : undefined;
@@ -38,11 +62,34 @@ export default function scriptedSessions() {
         async prompt() {
           const agent = launch.runtime.agent;
           assert.ok(
-            agent === 'worker' || agent === 'reviewer',
+            agent === 'worker' ||
+              agent === 'reviewer' ||
+              agent === 'plan-exec-reviewer',
             `Unexpected smoke agent: ${agent}`,
           );
           let output = 'NO_FINDINGS';
-          if (agent === 'worker') {
+          if (
+            agent === 'worker' &&
+            process.env.PI_NATIVE_CONTROLLER_SMOKE === 'fix' &&
+            readFileSync(join(launch.cwd, 'plan.md'), 'utf8').includes(
+              '- [x] Deliver fixture',
+            )
+          ) {
+            writeFileSync(
+              join(launch.cwd, 'metadata.txt'),
+              'reviewed fixture metadata\n',
+            );
+            execFileSync('git', ['add', 'metadata.txt'], {
+              cwd: launch.cwd,
+              env: fixtureGitEnvironment(),
+            });
+            execFileSync(
+              'git',
+              ['commit', '-m', 'Fix reviewer metadata finding'],
+              { cwd: launch.cwd, env: fixtureGitEnvironment() },
+            );
+            output = 'Review finding fixed and committed.';
+          } else if (agent === 'worker') {
             const planPath = join(launch.cwd, 'plan.md');
             assert.match(
               readFileSync(planPath, 'utf8'),
@@ -68,7 +115,10 @@ export default function scriptedSessions() {
                 env: fixtureGitEnvironment(),
                 stdio: 'pipe',
               });
-            output = 'Task completed and committed.';
+            output =
+              process.env.PI_NATIVE_CONTROLLER_SMOKE === 'goal'
+                ? '<<<RALPHEX:GOAL_DONE>>>'
+                : 'Task completed and committed.';
           } else {
             assert.equal(
               readFileSync(join(launch.cwd, 'result.txt'), 'utf8'),
@@ -79,11 +129,55 @@ export default function scriptedSessions() {
               stdio: 'pipe',
             });
           }
+          if (agent !== 'worker' && process.env.PI_NATIVE_CONTROLLER_SMOKE)
+            output = JSON.stringify({
+              schemaVersion: 1,
+              reviewedCommit: execFileSync('git', ['rev-parse', 'HEAD'], {
+                cwd: launch.cwd,
+                encoding: 'utf8',
+              }).trim(),
+              findings:
+                process.env.PI_NATIVE_CONTROLLER_SMOKE === 'fix' &&
+                !existsSync(join(launch.cwd, 'metadata.txt'))
+                  ? [
+                      {
+                        severity: 'MAJOR',
+                        summary: 'Required fixture metadata is missing',
+                        evidence:
+                          'metadata.txt does not exist in the reviewed checkout.',
+                        suggestion:
+                          'Add metadata.txt with reviewed fixture metadata.',
+                      },
+                    ]
+                  : [],
+            });
           appendFileSync(
             process.env.PI_AUTONOMOUS_SMOKE_CALLS,
             `${JSON.stringify({ agent, cwd: launch.cwd, pid: process.pid, executionLifetime: launch.runtime?.executionLifetime ?? null, output })}\n`,
           );
           emit({ type: 'agent_start' });
+          if (launch.runtime.structuredOutput) {
+            const tool = tools.get('structured_output');
+            assert.ok(
+              tool,
+              'Real native structured output tool must be installed',
+            );
+            const args = { value: JSON.parse(output) };
+            emit({
+              type: 'tool_execution_start',
+              toolName: 'structured_output',
+              toolCallId: 'fixture-structured',
+              args,
+            });
+            const result = await tool.execute('fixture-structured', args);
+            emit({
+              type: 'tool_execution_end',
+              toolName: 'structured_output',
+              toolCallId: 'fixture-structured',
+              result,
+              isError: false,
+            });
+          }
           emit({
             type: 'message_end',
             message: {
