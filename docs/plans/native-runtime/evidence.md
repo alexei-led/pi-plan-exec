@@ -2,7 +2,7 @@
 
 ## Scope and state
 
-This is a partial Task 1 characterization only. Production dispatch, `src/`, package manifests, upstream sources, and plan checkboxes were not changed. Task 1 is incomplete; no U1–U4 cutover claim is made.
+This is a partial Task 1 characterization. Production plan-exec dispatch, `src/` and package manifests are unchanged. Three evidence checkpoints are checked in the plan, but Task 1 is incomplete and no U1–U4 cutover claim is made. Separately authorized local upstream candidates and their validation are recorded below.
 
 Worktree branch: `plan/native-runtime-safety-kernel`. Baseline commit: `581c22a923daa32e72f05324c2b18c4fe3a64159`.
 
@@ -122,4 +122,4 @@ released compatibility.
 
 ## Remaining Task 1 work
 
-Still required: exercise queued/paused stop parity against real native states; run the parent-death fault barrier; verify direct-leaf control enforcement (including structured output and actual timeout/turn limits); exercise a fresh Pi normal-loader host; and complete the S01–S56 scenario mapping. U2 is a confirmed release prerequisite for cutover, not permission to implement the kernel. Parent must decide whether to pursue the minimal upstream correlation fix; no upstream source, issue, PR, or publication was touched.
+Still required: exercise queued/paused stop parity against real native states; run the parent-death fault barrier; verify direct-leaf control enforcement (including structured output and actual timeout/turn limits); exercise a fresh Pi normal-loader host; and complete the S01–S56 scenario mapping. Local U1/U2 fixes are prepared but not published or released. A supported released native contract remains a cutover prerequisite. No issue, PR, push, tag or publication was performed; the operator must approve any outward-facing next step.
