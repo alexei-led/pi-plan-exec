@@ -3,6 +3,7 @@ import {
   mkdtemp,
   readdir,
   readFile,
+  realpath,
   rm,
   symlink,
   writeFile,
@@ -384,6 +385,11 @@ test('released public RPC publishes real proof/output with healthy and lost spaw
   });
   try {
     f.setSession(host.sessionId);
+    f.run = await f.registry.updateLatest(f.run.id, (run) => ({
+      ...run,
+      repositoryRoot: host.repository,
+      worktreeCwd: host.repository,
+    }));
     const emit = f.bus.emit.bind(f.bus);
     for (const dropReply of [false, true]) {
       f.bus.emit = (name, value) => {
@@ -1112,4 +1118,51 @@ test('native request digest binds controller task, review iteration and candidat
     ).rejects.toThrow();
   }
   expect(f.requests).toHaveLength(0);
+});
+
+test('native cwd is the canonical authorized execution target, including nested lanes', async () => {
+  const f = await fixture();
+  const other = join(f.directory, 'unreserved');
+  const lane = join(f.directory, 'task-lane', 'nested');
+  await mkdir(other);
+  await mkdir(lane, { recursive: true });
+  await expect(
+    f.client.prepare(f.run, {
+      operationId: 'escape',
+      kind: 'implementation',
+      agent: 'worker',
+      task: 'Do work',
+      cwd: other,
+    }),
+  ).rejects.toThrow(/authorized execution target/);
+  const authorized = await f.registry.updateLatest(f.run.id, (run) => ({
+    ...run,
+    worktreeCwd: lane,
+  }));
+  const prepared = await f.client.prepare(authorized, {
+    operationId: 'lane',
+    kind: 'implementation',
+    agent: 'worker',
+    task: 'Do work',
+    cwd: lane,
+  });
+  expect(prepared.native?.request.params.cwd).toBe(await realpath(lane));
+  expect(prepared.native?.request.params.script).toContain(
+    JSON.stringify(await realpath(lane)),
+  );
+  await f.registry.update({ ...authorized, activeOperation: prepared });
+  await f.registry.updateLatest(f.run.id, (run) => ({
+    ...run,
+    worktreeCwd: other,
+  }));
+  await expect(
+    f.client.spawn(f.run.id, {
+      operationId: prepared.operationId,
+      requestDigest: required(prepared.requestDigest),
+    }),
+  ).rejects.toThrow(/authorized execution target/);
+  expect(f.requests).toHaveLength(0);
+  expect((await f.registry.get(f.run.id))?.activeOperation?.native?.phase).toBe(
+    'prepared',
+  );
 });

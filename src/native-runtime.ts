@@ -171,6 +171,14 @@ export class NativeRuntimeClient {
       (!Number.isSafeInteger(input.maxTurns) || input.maxTurns < 1)
     )
       throw new Error('Invalid requested maxTurns.');
+    const requestedCwd = input.cwd ?? run.worktreeCwd;
+    if (!isAbsolute(requestedCwd) || !isAbsolute(run.worktreeCwd))
+      throw new Error('Native cwd must be absolute.');
+    const cwd = await realpath(requestedCwd);
+    if (cwd !== (await realpath(run.worktreeCwd)))
+      throw new Error(
+        'Native cwd differs from the authorized execution target.',
+      );
     const requestId = randomUUID();
     const runDirectory = await realpath(
       dirname(this.registry.authorizationPath(run.id)),
@@ -188,8 +196,6 @@ export class NativeRuntimeClient {
     if ((await realpath(outputDirectory)) !== outputDirectory)
       throw new Error('Native output directory must not traverse symlinks.');
     const outputPath = join(outputDirectory, 'main.txt');
-    const cwd = input.cwd ?? run.worktreeCwd;
-    if (!isAbsolute(cwd)) throw new Error('Native cwd must be absolute.');
     const timeout =
       lifetime.mode === 'bounded' ? { timeoutMs: lifetime.timeoutMs } : {};
     const child = {
@@ -267,6 +273,7 @@ export class NativeRuntimeClient {
         operation,
         reason: 'Dispatch revoked; no spawn emitted.',
       };
+    await this.checkExecutionTarget(run, operation);
     await this.checkOutputPath(runId, operation);
     const claimed = await this.registry.updateIfCurrent(
       {
@@ -281,7 +288,13 @@ export class NativeRuntimeClient {
     );
     if (!claimed.applied) return this.operation(runId, binding);
     // Re-read authorization after fsync and before the synchronous bus emit.
+    const checked = await this.load(runId, binding, true);
+    await this.checkExecutionTarget(checked.run, checked.operation);
+    // Re-read after filesystem canonicalization. A new target cannot borrow an
+    // earlier operation's authority, even when another writer forgot an epoch.
     const fresh = await this.load(runId, binding, true);
+    if (fresh.run.worktreeCwd !== checked.run.worktreeCwd)
+      throw new Error('Native execution target changed before dispatch.');
     if (this.stopIntent(fresh.run, fresh.operation))
       return this.retireNotStarted(runId, binding);
     if (this.disposed)
@@ -1045,6 +1058,23 @@ export class NativeRuntimeClient {
     }
     throw new Error('Native operation changed repeatedly; retry observation.');
   }
+  private async checkExecutionTarget(
+    run: PlanExecRun,
+    operation: ActiveOperation,
+  ): Promise<void> {
+    const cwd = operation.native?.request.params.cwd;
+    if (
+      typeof cwd !== 'string' ||
+      !isAbsolute(cwd) ||
+      !isAbsolute(run.worktreeCwd) ||
+      (await realpath(cwd)) !== cwd ||
+      (await realpath(run.worktreeCwd)) !== cwd
+    )
+      throw new Error(
+        'Native cwd differs from the authorized execution target.',
+      );
+  }
+
   private async checkOutputPath(
     runId: string,
     op: ActiveOperation,
