@@ -125,6 +125,50 @@ Published-runtime cutover remains blocked. These local candidates do not
 authorize relaxing unknown-launch fences or pinning an unreleased build as
 released compatibility.
 
+## Merge coordination with force-stop / 1.8.0
+
+Both parent sessions confirmed this order and ownership:
+
+1. The `feat/exec-force-stop-ux` lane owns its feature PR integration and the
+   operator-authorized 1.8.0 tag/release. This migration lane does not merge to
+   pi-plan-exec main, tag, or bump its version.
+2. Force-stop lands first after that lane's final review and CI. Its owner sends
+   the final PR and immutable merged main SHA.
+3. This lane merges that exact SHA into `plan/native-runtime-safety-kernel`
+   without rewriting history, refreshes the migration design against the new
+   contract, and reruns combined focused checks before production work.
+4. A future migration-to-main merge needs renewed coordination. Task 1 remains
+   partial and upstream PR #2717 is not a released runtime prerequisite yet.
+
+Early conflict check: the common base is `757b6a3`. A read-only
+`git merge-tree --write-tree b77674b 4bb0a6e` produced a clean merge tree.
+The migration branch changes six plan/evidence/native-test files; the force-stop
+branch changes twenty files, with no path overlap. This is not a real merge or
+a final compatibility claim. The force-stop lane was still applying review
+fixes in registry/controller/force-stop tests, so repeat the check against its
+final reviewed SHA.
+
+Semantic requirements to preserve after refresh:
+
+- Terminal operator `abandoned` is a durable management decision, not proof of
+  worker retirement; no automatic restore, resume or default UI resurrection.
+- Ordinary CAS writes cannot revive an abandoned run. Native replay/dispatch
+  must recheck stop and execution generations after asynchronous admission.
+- Preserve unknown active and failed operation identity plus every quarantined
+  target. All abandoned checkouts stay reserved until controller-lock quiescence
+  and cleanup eligibility are proven.
+- Sync the backup/final abandonment marker before cleanup or provider calls.
+  Flush the final archive inside the removal lock before deleting active state.
+- Cancellation remains exact-operation best effort. Delivery, abandonment and
+  process-retirement proof stay separate; missing evidence never frees a writer.
+- Older registry cleanup must not operate on new abandoned record shapes.
+
+Before claiming combined compatibility, run the native contract/smoke checks
+together with `test/force-stop.test.ts`, controller, registry, lifecycle,
+isolation, run-view/runtime-integration and the separate node:test index suite.
+Do not modify the other lane's worktree or treat its in-progress release commit
+as the agreed integration target.
+
 ## Remaining Task 1 work
 
 Still required: exercise queued/paused stop parity against real native states; run the parent-death fault barrier; verify direct-leaf control enforcement (including structured output and actual timeout/turn limits); exercise a fresh Pi normal-loader host; and complete the S01–S56 scenario mapping. U1/U2 are published together in upstream PR #2717, but are not merged or released. A supported released native contract remains a cutover prerequisite. No upstream release or global install was performed. A separate operator-owned force-stop/command-UX lane is preparing pi-plan-exec 1.8.0; refresh this plan against its merged SHA and preserve its abandoned-run reservation/no-autorestore contract before Tasks 2–5.
