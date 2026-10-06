@@ -75,10 +75,12 @@ pi install -l /absolute/path/to/pi-plan-exec
 ```
 
 The default review backend is one required subagent reviewer with an empty
-fallback list (`none`). Fusion `0.9.3` is current, but cannot satisfy this
-extension's strict review ownership contract. Revmux's required lifecycle
-support is still in an unmerged PR, not its latest release. Do not select these
-backends for an unattended run; see [runtime contracts](docs/runtime-contracts.md).
+fallback list (`none`). Fusion `0.9.3` is the tested baseline; that stack does
+not satisfy this extension's strict review ownership contract. Compatibility
+requires advertised lifetime, durable lookup and process-tree proof capabilities;
+a newer version alone does not establish support. Revmux's required lifecycle
+support is still in an unmerged PR. Use these backends only with a verified
+runtime contract; see [runtime contracts](docs/runtime-contracts.md).
 `@tintinweb/pi-tasks@0.9.x` is an optional, session-scoped projection cache.
 The development checkout and CI use npm 12.0.2.
 
@@ -128,7 +130,10 @@ current action. Green means healthy running or complete. Amber means waiting,
 uncertain or stopping. Failures are red; paused/cancelled runs are muted.
 Text and symbols carry the same meaning without color. In-flight runs are shown
 as amber snapshots unless this session's local controller owns and polls them.
+Snapshots retain the saved execution label, such as **Cancelling · Snapshot**.
 A snapshot is not a claim that the worker is healthy or still running.
+An observed operation pause is amber, not green Working. If one task waits on
+a prerequisite while another runs, the strip shows both work and the wait.
 
 - `/exec hide` removes the strip and footer immediately. Execution continues.
 - `/exec show [run-id]` restores the display, without resuming execution.

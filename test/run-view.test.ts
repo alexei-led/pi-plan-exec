@@ -141,6 +141,90 @@ test('unknown launch is amber, never healthy from controller heartbeat', () => {
   assert.equal(view.tone, 'warning');
   assert.match(view.label, /unknown/i);
 });
+test('an observed operation pause is not working or proof of a question', () => {
+  const operation = {
+    operationId: 'op',
+    service: 'bridge',
+    kind: 'implementation',
+    lastObservedState: 'paused',
+  } as const;
+  const paused = run({ activeOperation: operation });
+  for (const observing of [true, false]) {
+    const view = progressView(paused, 1_000, observing);
+    assert.equal(view.tone, 'warning');
+    assert.match(view.label, /Operation paused/);
+    assert.doesNotMatch(view.detail, /implementing|supervisor|reply/i);
+    assert.equal(view.label.includes('Snapshot'), !observing);
+  }
+  assert.match(
+    progressView(
+      {
+        ...paused,
+        activeOperation: { ...operation, lastStatusError: 'offline' },
+      },
+      1_000,
+      true,
+    ).label,
+    /unknown/i,
+  );
+});
+for (const state of ['running', 'verifying'] as const)
+  test(`active ${state} work stays visible alongside an external wait`, () => {
+    const view = progressView(
+      run({
+        needsAttention: true,
+        tasks: {
+          '1': {
+            taskId: 1,
+            state: 'waiting_external',
+            attempts: 1,
+            dependsOn: [],
+          },
+          '2': { taskId: 2, state, attempts: 1, dependsOn: [] },
+        },
+      }),
+      1_000,
+      true,
+    );
+    assert.match(view.label, /Working.*1 task waiting/);
+    assert.match(
+      view.detail,
+      new RegExp(
+        `Task 2.*${state === 'running' ? 'implementing' : 'verifying'}`,
+      ),
+    );
+    assert.equal(view.tone, 'warning');
+  });
+test('an external wait does not necessarily require human input', () => {
+  const view = progressView(
+    run({
+      tasks: {
+        '1': {
+          taskId: 1,
+          state: 'waiting_external',
+          attempts: 1,
+          dependsOn: [],
+        },
+      },
+    }),
+    1_000,
+    true,
+  );
+  assert.match(view.label, /Waiting on prerequisite/);
+  assert.doesNotMatch(view.label, /Needs input/);
+});
+test('snapshot labels retain cancellation and pending pause intent', () => {
+  for (const [patch, expected] of [
+    [{ status: 'cancel_pending' }, /Cancelling.*Snapshot/],
+    [{ status: 'paused', localOperationActive: true }, /Pausing.*Snapshot/],
+    [{ status: 'skip_pending' }, /Stopping optional stage.*Snapshot/],
+  ] as const) {
+    const view = progressView(run(patch));
+    assert.match(view.label, expected);
+    assert.equal(view.tone, 'warning');
+    assert.match(view.warning ?? '', /No live updates/);
+  }
+});
 test('all tasks accepted does not complete required review', () => {
   const view = progressView(
     run({

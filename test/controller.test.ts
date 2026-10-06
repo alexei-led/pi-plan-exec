@@ -1223,6 +1223,57 @@ test('same-session concurrent resumes launch one operation', async () => {
   );
 });
 
+test('projection contention cannot log an unapplied stage transition', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'exec-transition-cas-'));
+  onTestFinished(() => rm(root, { recursive: true, force: true }));
+  const planPath = join(root, 'plan.md');
+  const progressPath = join(root, 'progress.log');
+  await writeFile(planPath, '### Task 1: Implement\n- [ ] Work\n');
+  await writeFile(progressPath, '');
+  const registry = new RunRegistry(join(root, 'runs'));
+  const run = await registry.create({
+    ...baseRun(root, planPath),
+    progressPath,
+  });
+  const bridge = new FakeBridge(join(root, 'none.json'));
+  const git = fakeGit(root);
+  let project = true;
+  const controller = new PlanExecController(
+    registry,
+    bridge,
+    new FakeFusion(),
+    async (...args) => {
+      if (project) {
+        project = false;
+        await registry.updateTaskProjection(run, {
+          version: 1,
+          state: 'degraded',
+          owner: 'pi-plan-exec',
+          sessionId: 'session',
+          revision: run.revision ?? 1,
+          taskIds: {},
+          error: 'fixture',
+        });
+      }
+      return git(args[0], args[1]);
+    },
+  );
+
+  const conflicted = await controller.advance(run);
+  assert.equal(conflicted.stage, 'resolve');
+  assert.equal(await readFile(progressPath, 'utf8'), '');
+  const advanced = await controller.advance(conflicted);
+  assert.equal(advanced.stage, 'project_tasks');
+  assert.equal(advanced.id, run.id);
+  assert.equal(advanced.stopGeneration, run.stopGeneration);
+  assert.deepEqual(advanced.taskAttempts, conflicted.taskAttempts);
+  assert.equal(bridge.spawnCount, 0);
+  const log = await readFile(progressPath, 'utf8');
+  assert.equal(
+    log.split('Plan validated; projecting task list.').length - 1,
+    1,
+  );
+});
 test('controller cancels a stopped review without advancing later stages', async () => {
   const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
   const planPath = join(root, 'plan.md');
@@ -1251,6 +1302,7 @@ test('controller cancels a stopped review without advancing later stages', async
     },
   };
 
+  const beforeCancellation = Date.now();
   let cancelled = await controller.advance(await registry.update(cancelling));
   if (cancelled.status === 'cancel_pending')
     cancelled = await controller.advance(
@@ -1263,6 +1315,19 @@ test('controller cancels a stopped review without advancing later stages', async
   );
   assert.equal(cancelled.stage, 'comprehensive_review');
   assert.equal(cancelled.activeOperation, undefined);
+  assert.ok(cancelled.retiredAt !== undefined);
+  assert.ok(cancelled.retiredAt >= beforeCancellation);
+  const projected = await registry.updateTaskProjection(cancelled, {
+    version: 1,
+    state: 'degraded',
+    owner: 'pi-plan-exec',
+    sessionId: 'session',
+    revision: cancelled.revision ?? 1,
+    taskIds: {},
+    error: 'fixture',
+  });
+  assert.equal(projected.retiredAt, cancelled.retiredAt);
+  assert.equal(bridge.spawnCount, 0);
 });
 
 test('paused runs retain a terminal child until resume applies its completion', async () => {
@@ -1301,19 +1366,24 @@ test('paused runs retain a terminal child until resume applies its completion', 
   assert.equal(resumed.activeOperation, undefined);
 });
 
-test('detached workflow keeps polling the same operation for supervisor recovery', async () => {
+test('paused workflow keeps polling the same operation without inferring a question', async () => {
   const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
+  onTestFinished(() => rm(root, { recursive: true, force: true }));
   const planPath = join(root, 'plan.md');
+  const progressPath = join(root, 'progress.log');
   await writeFile(planPath, '### Task 1: Implement\n- [x] Done\n');
   const registry = new RunRegistry(join(root, 'runs'));
+  const bridge = new PausedWorkflowBridge(join(root, 'none.json'));
+  bridge.statusText = 'State: paused';
   const controller = new PlanExecController(
     registry,
-    new PausedWorkflowBridge(join(root, 'none.json')),
+    bridge,
     new FakeFusion(),
     fakeGit(root),
   );
   const run = await registry.create({
     ...baseRun(root, planPath),
+    progressPath,
     stage: 'stats',
     activeOperation: {
       operationId: 'run-1',
@@ -1330,7 +1400,19 @@ test('detached workflow keeps polling the same operation for supervisor recovery
   assert.equal(waiting.status, 'running');
   assert.equal(waiting.stage, 'stats');
   assert.equal(waiting.activeOperation?.externalRunId, 'workflow-1');
-  assert.match(waiting.activeOperation?.terminalError ?? '', /supervisor/i);
+  assert.equal(waiting.activeOperation?.terminalError, 'State: paused');
+  assert.equal(bridge.spawnCount, 0);
+  const progress = await readFile(progressPath, 'utf8');
+  assert.match(progress, /operation is paused/);
+  assert.doesNotMatch(progress, /supervisor input/);
+  assert.equal(
+    waiting.activeOperation?.operationId,
+    run.activeOperation?.operationId,
+  );
+  assert.equal(
+    waiting.activeOperation?.requestDigest,
+    run.activeOperation?.requestDigest,
+  );
   assert.equal(waiting.failedOperation, undefined);
   assert.equal(waiting.error, undefined);
 });
@@ -4284,15 +4366,18 @@ class UnattestedAbsentBridge extends DurableAbsentBridge {
 }
 
 class PausedWorkflowBridge extends FakeBridge {
+  statusText?: string;
   override async status(runId = 'run-1') {
     return success({
       state: 'paused',
       processTerminalProof: terminalProof(runId, 'run-1', 'digest-workflow-1'),
-      text: [
-        'State: paused',
-        "Error: Run 'main' detached: waiting for supervisor reply",
-        'Detached for intercom coordination: reviewer.',
-      ].join('\n'),
+      text:
+        this.statusText ??
+        [
+          'State: paused',
+          "Error: Run 'main' detached: waiting for supervisor reply",
+          'Detached for intercom coordination: reviewer.',
+        ].join('\n'),
     });
   }
 }

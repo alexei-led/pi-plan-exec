@@ -323,14 +323,18 @@ A run without an active operation or task blocker is classified
 /exec resume <full-run-id>
 ```
 
-A run with an active workflow is classified `workflow paused for supervisor
-input`. Answer the displayed supervisor request first. A live controller keeps
-polling the same workflow and continues automatically after the child settles;
-use `/exec status <id>` to re-check and do not resume it. If no live controller
-holds the run, use `/exec resume <id>` after the reply. Resume consumes the
-durable completed-child result, or reattaches the same workflow when it has not
-settled yet. It does not launch a replacement while that operation is
-unresolved.
+An observed pause in an otherwise running plan is classified `operation paused`.
+A pause alone does not prove a pending supervisor question. Answer an actual
+displayed request if present. A live controller keeps polling the same operation
+and continues automatically after it settles; use `/exec status <id>` to re-check.
+With no live controller, use `/exec resume <id>` to consume its durable result
+or reattach the same operation without launching a replacement.
+
+An explicit user pause takes precedence. While worker exit is unconfirmed,
+use `/exec status <id>` to inspect the stop and ownership evidence.
+With no live controller, this only observes and does not restart cleanup.
+Do not use `/exec stop` to pause an already paused run: it only offers cancellation.
+Resume only when the operator wants execution to continue.
 
 A paused child remains controller-owned. Do not resume it directly.
 

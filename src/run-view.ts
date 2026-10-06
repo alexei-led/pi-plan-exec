@@ -47,7 +47,7 @@ export function progressView(
   if (inFlight && !observing)
     return {
       ...view,
-      label: '◇ Snapshot',
+      label: `${view.label} · Snapshot`,
       tone: 'warning',
       detail: `Saved: ${view.detail}`,
       warning: 'No live updates here · /exec status',
@@ -144,10 +144,23 @@ function currentProgressView(run: PlanExecRun, now: number): ProgressView {
       detail: 'Checking the same operation · no replacement worker',
     };
   }
-  if (summary.external > 0 || run.activeOperation?.externalPrerequisite) {
+  if (run.activeOperation?.lastObservedState === 'paused')
     return {
       ...view,
-      label: '! Needs input',
+      label: 'Ⅱ Operation paused',
+      tone: 'warning',
+      detail: 'Still tracking the same operation · inspect /exec status',
+    };
+  if (summary.external > 0 || run.activeOperation?.externalPrerequisite) {
+    if (active && !run.activeOperation?.externalPrerequisite)
+      return {
+        ...view,
+        label: `● Working · ${summary.external} task${summary.external === 1 ? '' : 's'} waiting`,
+        tone: 'warning',
+      };
+    return {
+      ...view,
+      label: '◌ Waiting on prerequisite',
       tone: 'warning',
       detail: 'External prerequisite · inspect /exec status',
     };

@@ -66,7 +66,8 @@ external prerequisite.
   to answer, so an agent uses the scripted path below.
 - Retire terminal run records: `/exec cleanup` previews and deletes nothing;
   `/exec cleanup --apply` deletes. A terminal run becomes removable 7 days
-  after its last update. `failed` runs are excluded, because their registry
+  after completion or cancellation; projection repair does not restart the clock.
+  `failed` runs are excluded, because their registry
   entry is what `/exec resume` needs. Removal deletes the registry entry only;
   the worktree, branch, and progress file stay in place.
 - Waive an optional review or statistics stage: `/exec skip <full-run-id> --reason <text>`. Required review and final verification cannot be skipped. It is a waiver of last resort and needs a human; see below.
@@ -194,7 +195,8 @@ working/complete is green; waiting/uncertain/stopping amber; failed red;
 paused/cancelled muted. Stop intent takes precedence over old task state.
 `/exec status` retains paths, usage, ownership and diagnostic evidence.
 Bridge advisory observations are display-only, not verified progress or exit.
-An unpolled in-flight view is an amber Snapshot with saved details, not current
+An unpolled in-flight view keeps its execution label with an amber Snapshot
+qualifier and saved details, not current
 worker health. Live colors require this session's local controller and matching
 lease. Viewing or refreshing a snapshot never claims execution ownership. Optional projection repair is visibility only and cannot
 gate recovery.

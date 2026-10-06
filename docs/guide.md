@@ -321,9 +321,12 @@ other agent processes.
 The progress strip uses two lines, with one extra warning when needed.
 Healthy working/review/checking and complete states are green. Retry, external
 wait, unknown worker and stopping states are amber. Failed is red.
-Paused/cancelled is muted. State text and symbols do not depend on color.
-In-flight records not owned and polled by this session show an amber **Snapshot**
-with saved details and “No live updates here”. This includes foreign-owned runs
+User-paused/cancelled runs are muted once cleanup finishes. An observed operation
+pause is amber; it does not by itself prove a pending question. When another
+task is working, external waits appear alongside its activity rather than hiding it.
+State text and symbols do not depend on color.
+In-flight records not owned and polled by this session retain their execution
+label with an amber **Snapshot** qualifier, saved details and “No live updates here”. This includes foreign-owned runs
 and records viewed without a controller. A failed local polling request also
 returns the display to snapshot mode. `/exec show <id>` refreshes a snapshot
 without taking ownership; `/exec status <id>` reads current evidence. Settled
@@ -388,8 +391,10 @@ them, `/exec cleanup` removes them.
 
 `/exec cleanup` previews and deletes nothing. `/exec cleanup --apply` deletes.
 A run is removable only when it is terminal, no live lease holds it, and it
-finished more than 7 days ago — measured from the archive stamp when the record
-carries one, so releasing a lease does not restart the clock.
+finished more than 7 days ago. Completion and cancellation persist a retirement
+timestamp; lease release and projection repair do not restart that clock.
+Older final records without a timestamp retain their previous cleanup age on
+their next write.
 `failed` runs are excluded by default,
 because their registry entry is what `/exec resume` needs; add
 `--include-failed` to consider them, or name one full run ID to act on exactly
@@ -608,9 +613,10 @@ Use this sequence instead:
 2. Run `/exec stop` when you want the run to end and pick pause or cancel at the
    prompt. Pause cancels the current attempt, preserves its checkpoint and
    progress, and remains resumable after cleanup. Run `/exec resume` when you are
-   ready to continue a paused run. If
-   status says the workflow needs supervisor input, answer that displayed
-   request first. A live controller keeps polling and continues automatically.
+   ready to continue a paused run. If an actual supervisor request is displayed,
+   answer it; a paused status alone does not prove there is a question.
+   A live controller keeps polling an attached paused operation and continues
+   automatically when it settles, unless you stopped the plan.
    After a restart, resume consumes the finished child result or reattaches the
    same workflow without launching a duplicate.
 3. Use the full run ID from `/exec status` with another command when more than

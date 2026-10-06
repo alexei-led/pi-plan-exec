@@ -215,7 +215,9 @@ cleanup, and diagnosis cannot disagree about who holds a run.
 
 Terminal state is retired, not accumulated, in three steps:
 
-1. A successful `archive` stage stamps `retiredAt`.
+1. A successful completion or cancellation write stamps `retiredAt`. Later writes
+   preserve it; older final records without a stamp retain their previous
+   `updatedAt` as the retention anchor on their next write.
 2. `/exec status` hides terminal runs 24 hours after their last update, counting
    the hidden rows in a footer that names `--all` and `/exec cleanup`. The listing
    filter keys on terminal status plus `updatedAt`: a just-archived run is news for
