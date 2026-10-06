@@ -75,12 +75,49 @@ const REPLY_PREFIX = 'subagents:rpc:v1:reply:';
 export class NativeRuntimeClient {
   private disposed = false;
   private readonly pending = new Set<() => void>();
+  private readonly unsubscribeCompletion: (() => void) | undefined;
   constructor(
     private readonly events: EventBus,
     private readonly registry: RunRegistry,
     private readonly getContext: () => ExtensionContext,
     private readonly options: { rpcTimeoutMs?: number } = {},
-  ) {}
+  ) {
+    this.unsubscribeCompletion = events.on(
+      'subagent:async-complete',
+      (value) => {
+        void this.retainCompletion(value).catch(() => undefined);
+      },
+    );
+  }
+
+  private async retainCompletion(value: unknown): Promise<void> {
+    if (this.disposed || !record(value) || !record(value.workflowChildren))
+      return;
+    for (const run of await this.registry.list()) {
+      if (this.disposed || run.status === 'abandoned') continue;
+      const operation = run.activeOperation ?? run.failedOperation;
+      if (
+        !operation?.native ||
+        operation.native.phase === 'prepared' ||
+        !operation.requestDigest ||
+        value.sessionId !== operation.native.nativeSessionId ||
+        !nativeWorkflowIdentity(
+          value.workflowChildren,
+          operation.native,
+          operation.externalRunId,
+        )
+      )
+        continue;
+      await this.observeData(
+        run.id,
+        {
+          operationId: operation.operationId,
+          requestDigest: operation.requestDigest,
+        },
+        { details: value },
+      );
+    }
+  }
 
   async prepare(
     run: PlanExecRun,
@@ -258,35 +295,13 @@ export class NativeRuntimeClient {
       };
     if (operation.externalRunId)
       return this.observeTarget(runId, binding, operation.externalRunId);
-    // Released status snapshots supply candidates, never identity proof. No
-    // completeness assumption: omitted/expired entries remain unknown.
-    const list = await this.call('status', {});
-    if (!list.success)
-      return { state: 'unknown', operation, reason: list.message };
-    const snapshot = list.data.asyncSnapshot;
-    if (
-      record(snapshot) &&
-      snapshot.version === 1 &&
-      snapshot.kind === 'pi-subagents.async-status-snapshot' &&
-      Array.isArray(snapshot.runs)
-    ) {
-      for (const candidate of snapshot.runs.slice(0, 64)) {
-        if (
-          !record(candidate) ||
-          candidate.kind !== 'workflow' ||
-          typeof candidate.id !== 'string'
-        )
-          continue;
-        const observed = await this.observeTarget(runId, binding, candidate.id);
-        if (observed.state !== 'unknown') return observed;
-      }
-    }
-    return {
-      state: 'unknown',
-      operation,
-      reason:
-        'No exact retained workflow correlation; dispatch is fenced, not replayable.',
-    };
+    // The released runtime resolves the persisted tool-call alias. Never scan
+    // unrelated native runs or treat a missing/expired alias as replay authority.
+    return this.observeTarget(
+      runId,
+      binding,
+      `rpc-spawn-${required(operation.native).request.requestId}`,
+    );
   }
 
   status(
@@ -482,6 +497,7 @@ export class NativeRuntimeClient {
 
   dispose(): void {
     this.disposed = true;
+    this.unsubscribeCompletion?.();
     for (const finish of [...this.pending]) finish();
   }
 
@@ -499,7 +515,16 @@ export class NativeRuntimeClient {
           .operation,
         reason: reply.message,
       };
-    return this.observeData(runId, binding, reply.data, id, abandoned);
+    const operation = (await this.load(runId, binding, false, abandoned))
+      .operation;
+    const alias = `rpc-spawn-${required(operation.native).request.requestId}`;
+    return this.observeData(
+      runId,
+      binding,
+      reply.data,
+      id === alias ? undefined : id,
+      abandoned,
+    );
   }
 
   private async observeData(

@@ -36,7 +36,11 @@ syncBuiltinESMExports();
     ],
     {
       cwd: process.cwd(),
-      env: { ...process.env, PI_CODING_AGENT_DIR: join(sandbox, '.pi/agent') },
+      env: {
+        ...process.env,
+        PI_SUBAGENT_CHILD: '0',
+        PI_CODING_AGENT_DIR: join(sandbox, '.pi/agent'),
+      },
       stdio: ['pipe', 'pipe', 'pipe'],
     },
   );

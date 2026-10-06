@@ -588,3 +588,58 @@ test('abandoned stop refusal stays pending, foreign control refuses, and prepare
   ).toBe(true);
   expect(prepared.requests).toHaveLength(0);
 });
+
+test('unbound recovery targets only its persisted request alias, never snapshot candidates', async () => {
+  const f = await fixture();
+  await f.client.spawn(f.run.id, f.binding);
+  const alias = `rpc-spawn-${required(f.op.native).request.requestId}`;
+  f.setHandler((req) => {
+    expect(req.method).toBe('status');
+    expect(req.params).toEqual({ id: alias });
+    f.reply(req, { details: { workflowChildren: f.summary() } });
+  });
+  expect(
+    (await f.client.operation(f.run.id, f.binding)).operation.externalRunId,
+  ).toBe('root');
+  expect(f.requests.filter((req) => req.method === 'spawn')).toHaveLength(1);
+});
+
+test('correlated completion retains binding after lost reply without replay or late abandoned writes', async () => {
+  const f = await fixture();
+  await f.client.spawn(f.run.id, f.binding);
+  const completed = {
+    sessionId: 'session',
+    runId: 'root',
+    workflowChildren: f.summary('completed'),
+  };
+  f.bus.emit('subagent:async-complete', { ...completed, sessionId: 'foreign' });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  expect(
+    (await f.registry.get(f.run.id))?.activeOperation?.externalRunId,
+  ).toBeUndefined();
+  f.bus.emit('subagent:async-complete', completed);
+  for (let attempt = 0; attempt < 100; attempt++) {
+    if ((await f.registry.get(f.run.id))?.activeOperation?.externalRunId) break;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  expect((await f.registry.get(f.run.id))?.activeOperation?.externalRunId).toBe(
+    'root',
+  );
+  // A completion notification binds identity only; it is not retirement evidence.
+  expect(
+    (await f.registry.get(f.run.id))?.activeOperation?.processTreeExited,
+  ).not.toBe(true);
+  await f.registry.abandon(f.run.id, 'session');
+  const before = await readFile(f.registry.authorizationPath(f.run.id), 'utf8');
+  f.bus.emit('subagent:async-complete', {
+    ...completed,
+    ...retiredDetails(f.summary('completed')),
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  expect(await readFile(f.registry.authorizationPath(f.run.id), 'utf8')).toBe(
+    before,
+  );
+  f.client.dispose();
+  expect(f.bus.listeners.has('subagent:async-complete')).toBe(false);
+  expect(f.requests.filter((req) => req.method === 'spawn')).toHaveLength(1);
+});

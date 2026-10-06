@@ -107,7 +107,13 @@ test('background recovery keeps ticking through UI failure and pending Fleet pub
     },
     sendUserMessage() {},
   } as unknown as ExtensionAPI;
-  planExecExtension(pi);
+  const childRole = process.env.PI_SUBAGENT_CHILD;
+  delete process.env.PI_SUBAGENT_CHILD;
+  try {
+    planExecExtension(pi);
+  } finally {
+    if (childRole !== undefined) process.env.PI_SUBAGENT_CHILD = childRole;
+  }
   const context = {
     cwd,
     mode: 'rpc',

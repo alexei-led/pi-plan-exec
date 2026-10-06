@@ -132,6 +132,17 @@ function persistedSession(cwd: string, directory: string): SessionManager {
   return session;
 }
 
+// Parent lifecycle fixtures must not inherit the test runner's native child role.
+function initializeParentExtension(pi: ExtensionAPI): void {
+  const child = process.env.PI_SUBAGENT_CHILD;
+  delete process.env.PI_SUBAGENT_CHILD;
+  try {
+    planExecExtension(pi);
+  } finally {
+    if (child !== undefined) process.env.PI_SUBAGENT_CHILD = child;
+  }
+}
+
 function executionHarness(
   cwd: string,
   sessionId: string,
@@ -208,7 +219,7 @@ function executionHarness(
       },
     },
   } as unknown as ExtensionCommandContext;
-  planExecExtension(pi);
+  initializeParentExtension(pi);
   return {
     ctx,
     notifications,
@@ -5380,7 +5391,7 @@ for (const interruption of ['shutdown', 'new-owner', 'own-switch'] as const) {
       },
     } as unknown as ExtensionCommandContext;
     t.mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
-    planExecExtension(pi);
+    initializeParentExtension(pi);
     const command = commands.get('exec')?.handler('plan.md', ctx);
     await claimedTarget;
     const targetOwner = (await registry.get(held.id))?.lease;
@@ -5607,7 +5618,7 @@ for (const reason of ['new', 'reload'] as const) {
           },
         },
       } as unknown as ExtensionCommandContext;
-      planExecExtension(pi);
+      initializeParentExtension(pi);
       return {
         commands,
         ctx,
