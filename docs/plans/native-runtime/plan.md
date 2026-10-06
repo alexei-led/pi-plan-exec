@@ -27,7 +27,7 @@ The operator approved the preceding integration analysis and requested a single
 executable plan in an isolated worktree. This document records that design and
 its evidence so execution does not depend on chat history.
 
-Baseline: pi-plan-exec `757b6a3` / 1.7.1; Bridge `0875ed2` / 0.5.5;
+Baseline: pi-plan-exec `bc5fb6e` / 1.8.0 (merged PR #11); Bridge `0875ed2` / 0.5.5;
 pi-subagents 0.76.1; Pi 1.0.4; pi-tasks 0.9.0. The two upstream documentation
 files fetched for the analysis matched the installed 0.76.1 files byte-for-byte.
 Recheck exact installed versions at execution time.
@@ -47,6 +47,7 @@ Recheck exact installed versions at execution time.
 | E11 | [DEVELOPMENT.md](../../../DEVELOPMENT.md), [smoke fixture](../../../test/autonomous-runtime-smoke.mjs) | Preserve both test runners and real detached-runner evidence |
 | E12 | Native [observability](https://github.com/nicobailon/pi-subagents/blob/main/docs/observability.md) | Completion replay/output archives are temporary; copy accepted evidence into the run record's storage |
 | E13 | Release 1.7.1 / `d1893f5`: controller transition CAS; registry retirement anchor; recoveryGuidance/progressView and their controller/index/registry/run-view tests | Preserve accurate pause intent, snapshot/activity labels, retention age and applied-transition-only logging while removing projection |
+| E14 | [Merged force-stop PR #11](https://github.com/alexei-led/pi-plan-exec/pull/11), exact SHA `bc5fb6ef800b6e88f3edeef542869bbd84a9ed3a`; registry abandonment/retirement/removal locks, controller forceStop/admission rechecks, [force-stop tests](../../../test/force-stop.test.ts) | Preserve final abandoned state, durable marker/archive, reservations, no autoresume/UI resurrection and the 1.8.0 command surface |
 
 Use the published version's docs/declarations and real-host tests as authority
 for API fields. Internal upstream source is diagnostic evidence, not permission
@@ -73,6 +74,9 @@ to import private modules into production.
   optional statistics child, and no extra mission/scheduler.
 - Preserve 1.7.1's applied-transition-only progress logging and terminal cleanup
   age across migration, result capture, lease release and advisory writes.
+- Preserve 1.8.0 permanent force-stop: abandonment ends management, not worker
+  ownership. Unknown writers and quarantined checkouts remain reserved until
+  exact retirement and controller-lock quiescence permit cleanup.
 - Every advertised recovery guarantee is demonstrated by an executable test;
   nonrecoverable uncertainty is reported as such, not disguised as self-healing.
 
@@ -100,6 +104,11 @@ Keep native operation state in the existing durable run record. Introduce only
 the typed fields and validation needed to distinguish prepared, dispatching,
 bound and retired operations. The controller must persist preparation and
 claim dispatch before calling the native transport.
+
+Reuse 1.8.0's RunRegistry abandonment marker/archive and its narrow
+retireAbandonedOperation path. They are existing operator-decision evidence,
+not the general-purpose native-operation database this plan avoids. Ordinary
+CAS and migration writes must not revive or rewrite abandoned runs.
 
 Suggested code boundaries (names may change only for an existing equivalent):
 
@@ -141,14 +150,19 @@ transcript path, native run ID or runner process-instance ID.
 The internal start method accepts the recorded run/operation identity, not an
 arbitrary prompt supplied by another extension. It must re-read and verify
 current authority before dispatch. Missing run, stale operation, changed digest,
-old generation or retired operation means no launch. This removes the need for
+old generation, abandoned run or retired operation means no launch. Recheck
+status, operation identity and both generations after asynchronous admission
+and immediately before dispatch/replay, preserving the 1.8.0 race fixes.
+This removes the need for
 Bridge's public idempotency service and infinite tombstones: an old request
 cannot recreate a deleted run or an operation no longer current.
 
 Use the existing controller lock and record lock order. Never hold the record
 lock while waiting for native RPC. A reply arriving after stop/reload is merged
 against fresh state; it may bind the already-started child but cannot erase
-stop intent, advance a stage or accept a candidate.
+stop intent, advance a stage or accept a candidate. After permanent abandonment,
+ordinary writes remain forbidden; only the existing narrow registry path may
+record validated retirement of the exact retained operation.
 
 | Stored phase | Allowed work | Recovery |
 | --- | --- | --- |
@@ -178,6 +192,14 @@ A single serialized tick reads durable state, obtains evidence, then does one
 of: observe, deliver pending stop, accept a retired result, schedule an authorized
 next attempt, or report a prerequisite/uncertain ownership. Native completion and
 readiness events only wake that loop; persisted state/status remain authoritative.
+
+Terminal operator abandonment is outside automatic recovery. Preserve
+`/exec stop <id> --force`: fsync backup and final marker, increment generations,
+revoke ordinary writes and stop polling/UI restoration before best-effort exact
+cancellation. No late callback, session reload or ordinary resume may revive it.
+Repeated explicit force-stop may retry cleanup; do not add an automatic retry.
+Ordinary `/exec stop` is final cancellation without a dialog, `/exec pause` is
+resumable, and `cancel` remains an alias. Do not restore the pre-1.8 stop dialog.
 
 Reuse current retry timing where adequate. Avoid a second recovery timer family.
 Persist the next eligible wake, cap backoff, coalesce duplicate wakes and dispose
@@ -274,7 +296,10 @@ Delete pi-tasks TaskStore integration, queues, task IDs, ready/degraded projecti
 status and package requirements. Move the useful `run.tasks` summary to the
 existing view/domain helper rather than deleting task information.
 
-Preserve progress strip, hide/show/clear, status, Fleet and background-work.
+Preserve progress strip, `/exec ui on|off`, clear, status, Fleet/background-work,
+and the legacy hide/show aliases. Abandoned runs stay removed from default views,
+active-work tracking and restored UI, even when their reservations remain.
+Visibility removal is not a release of execution ownership.
 Keep 1.7.1's execution label alongside the Snapshot qualifier (including
 Cancelling, Pausing and stopping an optional stage). An observed operation pause
 is amber, not green Working or proof of a supervisor question. When one task is
@@ -304,18 +329,23 @@ Migration is idempotent and owner/digest/generation-bound. Preserve raw legacy
 parameters and their original digest; do not recompute them as a new native
 request. Import cancellation intent and delivery receipts independently,
 including pending errors, partial results, failed operations and quarantines.
+Preserve existing abandoned records/archives as final. They are not candidates
+for resume or ordinary CAS migration; normalized read-only views and the existing
+exact-retirement cleanup path must retain their original identities.
 
 Choose the existing explicit resume/reconciliation path for applying a run
 migration; status may describe it but never claim a lease or dispatch. Creating
 new native records needs a schema discriminator that old code rejects, not a
 silent reinterpretation of `service: "bridge"`. Test that the previous
 registry refuses conflicting admission when it sees an unreadable new record.
-That refusal does not make downgrade safe: 1.7.1's explicit cleanup can delete
-an unreadable record. Do not rename the entire persisted model for aesthetics.
+That refusal does not make downgrade safe: 1.8.0 still permits explicit cleanup
+of an unrecognized corrupt record, and 1.7.1 cannot understand abandoned state.
+Do not rename the entire persisted model for aesthetics.
 
 | Legacy state | Required handling without Bridge installed |
 | --- | --- |
-| Terminal run, no active operation | Read/display/history preserved; normal cleanup rules |
+| Completed/cancelled run, no active operation | Read/display/history preserved; normal cleanup rules |
+| Operator-abandoned run or final archive | Never resume/autorestore or rewrite with ordinary CAS; retain unknown active/failed identity, quarantine and all checkout reservations until exact retirement plus locked cleanup |
 | Paused run, no unresolved operation | Preserve pause; native successor only after explicit resume |
 | Active bound single/workflow with valid artifacts | Import exact mapping; observe original identity/proof; never relaunch root |
 | Bound terminal result | Capture and validate legacy result/proof, then continue current stage once |
@@ -334,8 +364,9 @@ Never stop those hosts automatically. Live old children are not presumed dead
 when their host exits. This plan authorizes fixture migrations only.
 
 **Hard rollback condition: do not run an older controller against a registry
-containing any native-format record.** In 1.7.1 (as in 1.7.0), explicit cleanup treats an
-unrecognized record as corrupt and can delete its reservation. A new schema
+containing any native-format record.** Pre-migration releases, including 1.8.0,
+can treat an unrecognized future record as corrupt and delete its reservation.
+Additionally, do not run pre-1.8 cleanup on abandoned records. A new schema
 can stop old admission, but cannot fix an already released old cleanup command.
 Test and document both behaviors using a pinned previous-version fixture.
 
@@ -362,12 +393,21 @@ pre-write updatedAt as the anchor on its next write, including migration or
 artifact metadata updates. Running, paused, cancel_pending and recoverable failed
 records do not acquire a terminal retention stamp. A rejected CAS stamps nothing.
 The run's retiredAt is retention metadata, never native operation-exit proof.
+Keep operator abandonment on its separate 1.8.0 management/cleanup path rather
+than assigning it ordinary completed/cancelled retention semantics.
 
 Use existing reservations and locks; strengthen cleanup where needed. A
 nonterminal, failed-resumable, unretired active/failed operation or quarantine
 cannot be forgotten. For native-format records, unreadable/corrupt ownership
 must refuse deletion, including `--include-failed`; do not retain the old
 generic corrupt-record deletion shortcut for these records.
+
+All abandoned checkouts remain reserved until cleanup holds the controller lock
+and rechecks worker/local/quarantine eligibility under the record lock. Preserve
+active and failed unknown identities. Sync the final abandonment archive within
+that removal critical section before deleting the active record; backup or
+marker/archive fsync failure cannot erase the reservation. Keep short direct
+archive writes inside the existing withAuthorizedMutation boundary.
 
 No arbitrary operation-ID replay endpoint exists. Once a safely retired run is
 removed, all late events/start requests must be rejected because the owning
@@ -441,8 +481,8 @@ deterministic local model; X = separate host processes with fault barriers.
 | S15 | Extension reload, session fork/switch, process restart | New context/subscriptions; dispose old callbacks; no stale launch/acceptance | C/H/X; index lifecycle tests |
 | S16 | Long quiet tool / stale lastUpdate / no activity event | Neither timeout inference nor duplicate worker | C/H |
 | S17 | Native extension unavailable at startup or during status | Bounded probe/backoff; same operation resumes when ready | C/H |
-| S18 | Stop before dispatch | Persist fence; zero native launches; eventual paused/cancelled according to intent | C/X |
-| S19 | Stop races spawn and late successful completion | Bind child then stop; no acceptance or next task after stop generation | C/H/X |
+| S18 | Pause, ordinary stop or permanent force-stop before dispatch | Persist fence; zero native launches; paused/cancelled according to ordinary intent, or final abandoned management state without an exit claim | C/X; force-stop, controller |
+| S19 | Stop/force-stop races spawn, capability lookup or late success | Recheck status/identity/generations after admission; no acceptance, redispatch or resurrection; abandoned state rejects ordinary CAS | C/H/X; force-stop, controller |
 | S20 | Stop delivery timeout / invalid-state / lost ack / repeated stop | Intent survives; exact-run retry; delivery is not retirement | C/H |
 | S21 | Running, queued, paused, supervisor-wait child stops | Match supported native semantics; unsupported route stays pending with real reason | H; U1 gate |
 | S22 | Result says complete/failed/stopped without terminal proof | No writer release, lane rotation, promotion or replacement | P/C/H |
@@ -463,13 +503,13 @@ deterministic local model; X = separate host processes with fault barriers.
 | S37 | Promotion/archive crash, ignored files, output branch changed | Safe retry/fast-forward; preserve user files; no duplicate acceptance | C/X; autonomous-controller |
 | S38 | Optional stats failure / required review failure / explicit waiver | Stats degrade; required review cannot skip; waiver ends with findings | C; controller |
 | S39 | Explicit Fusion/Revmux, unavailable provider, fallback policy | Preserve existing supported behavior and capability refusals; no implicit new compatibility | C; fusion, review-backend |
-| S40 | Status/hide/show/clear and slash-only/no-session host | No lease claim; execution label survives Snapshot; operation pause stays amber; active work and external wait both visible; no pi-tasks requirement | P/H; run-view, index, pi-rpc-smoke |
+| S40 | Status/ui on-off/clear, legacy hide-show and no-session host | No lease claim; Snapshot retains execution label; pause/wait labels stay accurate; force-stop stays dismissed across reload/new session and leaves active-work tracking without freeing reservations | P/H; run-view, index, runtime-integration, pi-rpc-smoke |
 | S41 | Fleet failure, stale update, terminal retention, bg_wait | Display failure cannot erase active tracking; one row/provider per owned run | C/H; runtime-integration |
-| S42 | Legacy terminal/paused/active/failed/quarantined records | Outcomes match D8; old workflow result can settle once without root replay | P/C/H |
+| S42 | Legacy terminal/paused/active/failed/quarantined/abandoned records | Outcomes match D8; old workflow settles once without root replay; abandoned records/archives remain final and ordinary migration cannot revive them | P/C/H; force-stop, registry |
 | S43 | Missing/busy/corrupt/schema-unknown legacy SQLite/WAL | Fail closed, preserve database/records, never create an empty replacement | C/X |
-| S44 | Migration interrupted before/after atomic record replacement | Repeat safely with same identity; backup unchanged; no launch from migration | C/X |
+| S44 | Migration or abandonment interrupted around backup/marker/archive writes | Same identity; no launch from migration; fsync ordering and failed backup/final archive preserve reservations; repeated explicit force-stop is safe | C/X; force-stop, controller, registry |
 | S45 | Old and new runtime simultaneously present | Quiescence/admission guard blocks unsafe cutover; no double writers | H/X |
-| S46 | Cleanup races resume, corrupt native record, delayed events after deletion | Refuse unresolved cleanup; no resurrection or dispatch after safe removal | C/X; registry |
+| S46 | Cleanup races resume/force-stop, controller tick or late result | Refuse unresolved/corrupt ownership; abandoned reservations survive until controller quiescence; final archive sync inside removal lock; no resurrection after safe removal | C/X; registry, force-stop, controller |
 | S47 | Explicit isolated recovery of unknown native/legacy operation | No assertion of old death; independent repo; old generation remains reserved | C/X; isolation |
 | S48 | Removed packages absent / installed but unused | Native execution identical; no foreign widgets, TaskExecute channels or files touched | H; fresh packed consumer |
 | S49 | Public RPC boundaries malformed or request IDs mismatched | Reject late/foreign replies; listeners/timers bounded and disposed | P/H; rpc adapter |
@@ -642,7 +682,7 @@ Manual checks:
 
 ### Task 2: Implement the internal native adapter and operation safety kernel
 
-Justification: E4, E7–E9, E13; D1–D4, D9; S07–S30, S46, S49, S51, S55.
+Justification: E4, E7–E9, E13–E14; D1–D4, D9; S07–S30, S46, S49, S51, S55.
 This task implements one seam alongside the old path; it does not yet choose it
 for user runs.
 
@@ -664,7 +704,7 @@ new scheduler or second authoritative native journal.
 Impact: `gitnexus impact RunRegistry --file src/registry.ts --include-tests`.
 Verification:
 ```sh
-npm exec -- vitest run test/native-runtime.test.ts test/operation-safety.test.ts test/native-runtime-contract.test.ts test/registry.test.ts test/registry-lock.test.ts test/lifecycle.test.ts test/runtime-boundaries.test.ts
+npm exec -- vitest run test/native-runtime.test.ts test/operation-safety.test.ts test/native-runtime-contract.test.ts test/registry.test.ts test/registry-lock.test.ts test/lifecycle.test.ts test/force-stop.test.ts test/runtime-boundaries.test.ts
 node --test test/native-recovery-smoke.mjs
 npm run check
 ```
@@ -685,7 +725,7 @@ Manual checks:
 
 ### Task 3: Route controller execution and results through the native seam
 
-Justification: E3, E6–E13; D1, D4–D7; S01–S06, S15–S17, S25–S41, S51, S54–S56.
+Justification: E3, E6–E14; D1, D4–D7; S01–S06, S15–S17, S25–S41, S51, S54–S56.
 Integrate one native controller path, initially under test composition until the
 migration gate in Task 4. Do not add a permanent user backend switch.
 
@@ -695,8 +735,8 @@ Files:
 - `src/artifact.ts`, `src/review.ts`, `src/types.ts` — result/proof capture
   and typed native review contract.
 - `src/runtime-integration.ts`, `src/run-view.ts` — observer identity/state.
-- `test/controller.test.ts`, `test/autonomous-controller.test.ts`,
-  `test/autonomous-goal.test.ts`, `test/artifact.test.ts`,
+- `test/controller.test.ts`, `test/force-stop.test.ts`,
+  `test/autonomous-controller.test.ts`, `test/autonomous-goal.test.ts`, `test/artifact.test.ts`,
   `test/review.test.ts`, `test/diagnostics.test.ts`,
   `test/index.test.ts`, `test/runtime-integration.test.ts`,
   `test/native-recovery-smoke.mjs`.
@@ -711,7 +751,7 @@ private native imports or new local command runner.
 Impact: `gitnexus impact PlanExecController --file src/controller.ts --include-tests`.
 Verification:
 ```sh
-npm exec -- vitest run test/controller.test.ts test/autonomous-controller.test.ts test/autonomous-goal.test.ts test/artifact.test.ts test/review.test.ts test/diagnostics.test.ts test/runtime-integration.test.ts test/run-view.test.ts test/local-operation.test.ts test/owned-process.test.ts
+npm exec -- vitest run test/controller.test.ts test/autonomous-controller.test.ts test/autonomous-goal.test.ts test/artifact.test.ts test/review.test.ts test/diagnostics.test.ts test/runtime-integration.test.ts test/run-view.test.ts test/local-operation.test.ts test/owned-process.test.ts test/force-stop.test.ts
 node --import jiti/register --test test/index.test.ts
 node --test test/native-recovery-smoke.mjs
 npm run check
@@ -734,7 +774,7 @@ Manual checks:
 
 ### Task 4: Migrate legacy state and remove pi-tasks and Bridge dependencies
 
-Justification: E4–E6, E8, E13; D7–D9; S40–S48, S53–S56.
+Justification: E4–E6, E8, E13–E14; D7–D9; S40–S48, S53–S56.
 This is the cutover checkpoint. No live-data migration or global uninstall is
 authorized by this plan.
 
@@ -795,7 +835,7 @@ Manual checks:
 
 ### Task 5: Final verification, documentation and execution handoff
 
-Justification: E1–E13; D1–D9; all S01–S56. This task certifies the migration,
+Justification: E1–E14; D1–D9; all S01–S56. This task certifies the migration,
 not merely a green unit suite.
 
 Files:
@@ -872,7 +912,9 @@ All of the following are required, not inferred from workflow success:
 ## Safety notes and rollback
 
 Execute this plan using a separately installed, pinned stable pi-plan-exec
-controller, or an operator-managed implementation session. Do not hot-reload
+controller compatible with the 1.8.0 abandoned-state contract, or an
+operator-managed implementation session. Do not use an older controller or
+cleanup tool against a shared registry containing abandoned records. Do not hot-reload
 the code being refactored into the controller currently writing it. A local
 development worktree is the target, not the live extension installation.
 
@@ -919,7 +961,9 @@ These reviews assess the plan, not an implementation. The subsequent 1.7.1
 refresh was checked against the release diff and its regression tests. It adds
 E13/S55/S56 and strengthens S25/S40 without changing the native architecture.
 The public-native correlation and stop-contract probes remain implementation
-prerequisites.
+prerequisites. The 1.8.0 refresh incorporates merged PR #11 without changing task
+headings, dependencies or checkbox text; existing executable progress is retained.
+The combined-tree test results are recorded in evidence.md.
 
 ## Execution handoff
 

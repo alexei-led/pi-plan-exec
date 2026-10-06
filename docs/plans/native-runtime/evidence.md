@@ -2,9 +2,9 @@
 
 ## Scope and state
 
-This is a partial Task 1 characterization. Production plan-exec dispatch, `src/` and package manifests are unchanged. Three evidence checkpoints are checked in the plan, but Task 1 is incomplete and no U1–U4 cutover claim is made. Separately authorized local upstream candidates and their validation are recorded below.
+This is a partial Task 1 characterization, not a native-runtime cutover. The branch now includes the other lane's merged 1.8.0 force-stop implementation; this lane's own changes remain plan, tests and evidence. Three checkpoints are checked in the plan, but Task 1 is incomplete and no U1–U4 cutover claim is made. The upstream fixes and their validation are recorded below.
 
-Worktree branch: `plan/native-runtime-safety-kernel`. Baseline commit: `581c22a923daa32e72f05324c2b18c4fe3a64159`.
+Worktree branch: `plan/native-runtime-safety-kernel`. Initial characterization baseline commit: `581c22a923daa32e72f05324c2b18c4fe3a64159`.
 
 Installed versions: npm `12.0.2`, pi-subagents `0.76.1`, Bridge `0.5.5`, Pi `1.0.4`. The test-only factory seam verifies pi-subagents `0.76.1` before importing its private source modules. `npm ci` reported one high-severity audit finding; it was not triaged or changed.
 
@@ -132,11 +132,17 @@ Both parent sessions confirmed this order and ownership:
 1. The `feat/exec-force-stop-ux` lane owns its feature PR integration and the
    operator-authorized 1.8.0 tag/release. This migration lane does not merge to
    pi-plan-exec main, tag, or bump its version.
-2. Force-stop lands first after that lane's final review and CI. Its owner sends
-   the final PR and immutable merged main SHA.
-3. This lane merges that exact SHA into `plan/native-runtime-safety-kernel`
-   without rewriting history, refreshes the migration design against the new
-   contract, and reruns combined focused checks before production work.
+2. Force-stop landed first in [PR #11](https://github.com/alexei-led/pi-plan-exec/pull/11),
+   immutable merge `bc5fb6ef800b6e88f3edeef542869bbd84a9ed3a`. GitHub confirmed
+   the merged state and matching feature head. Its owner retained release authority.
+   Release [v1.8.0](https://github.com/alexei-led/pi-plan-exec/releases/tag/v1.8.0)
+   is published; the parent independently checked the release target and peeled
+   tag both resolve to that exact merge SHA. The release owner reported successful
+   provenance publication and tarball verification. No global upgrade was performed here.
+3. This lane merged that exact SHA without rewriting history, producing
+   `a410e22b548a08809958dd9695f7f4a47c85d0e9`. The merge was clean. Plan baseline
+   and compatibility requirements now reflect 1.8.0; headings, dependencies,
+   checkbox text and completed checkpoints remain unchanged.
 4. A future migration-to-main merge needs renewed coordination. Task 1 remains
    partial and upstream PR #2717 is not a released runtime prerequisite yet.
 
@@ -144,9 +150,9 @@ Early conflict check: the common base is `757b6a3`. A read-only
 `git merge-tree --write-tree b77674b 4bb0a6e` produced a clean merge tree.
 The migration branch changes six plan/evidence/native-test files; the force-stop
 branch changes twenty files, with no path overlap. This is not a real merge or
-a final compatibility claim. The force-stop lane was still applying review
-fixes in registry/controller/force-stop tests, so repeat the check against its
-final reviewed SHA.
+a final compatibility claim. That earlier check preceded the final safety fixes. The read-only merge-tree
+check was repeated against `c7bbc1f` and the final `bc5fb6e` before the actual
+clean merge; no conflicted files or manual resolutions were required.
 
 Semantic requirements to preserve after refresh:
 
@@ -163,12 +169,25 @@ Semantic requirements to preserve after refresh:
   process-retirement proof stay separate; missing evidence never frees a writer.
 - Older registry cleanup must not operate on new abandoned record shapes.
 
-Before claiming combined compatibility, run the native contract/smoke checks
-together with `test/force-stop.test.ts`, controller, registry, lifecycle,
-isolation, run-view/runtime-integration and the separate node:test index suite.
-Do not modify the other lane's worktree or treat its in-progress release commit
-as the agreed integration target.
+Combined-tree verification completed on `a410e22b`:
+
+- `npm run check` passed (same four non-failing baseline suggestions).
+- `npm test` passed: 626 Vitest tests in 33 files and 143 node lifecycle/UI tests.
+  This includes force-stop, controller, registry, lifecycle, isolation,
+  run-view/runtime-integration and the native contract fixtures.
+- `npm run test:runtime-smoke` passed: two tests.
+- `node --test test/native-recovery-smoke.mjs` passed: four tests.
+- `npm run pack:dry` passed.
+
+Logs: `.pi/native-runtime-parent/force-stop-merge/`. Package/lock changes from
+1.7.1 to 1.8.0 only change the root version, so existing checkout-local locked
+dependencies were reused. No global install, live registry, other worktree,
+main checkout, tag or release was changed by this integration.
+
+These checks establish that the current characterization branch coexists with
+1.8.0. The native safety-kernel migration is not implemented, so its future
+abandonment compatibility still requires the planned tests.
 
 ## Remaining Task 1 work
 
-Still required: exercise queued/paused stop parity against real native states; run the parent-death fault barrier; verify direct-leaf control enforcement (including structured output and actual timeout/turn limits); exercise a fresh Pi normal-loader host; and complete the S01–S56 scenario mapping. U1/U2 are published together in upstream PR #2717, but are not merged or released. A supported released native contract remains a cutover prerequisite. No upstream release or global install was performed. A separate operator-owned force-stop/command-UX lane is preparing pi-plan-exec 1.8.0; refresh this plan against its merged SHA and preserve its abandoned-run reservation/no-autorestore contract before Tasks 2–5.
+Still required: exercise queued/paused stop parity against real native states; run the parent-death fault barrier; verify direct-leaf control enforcement (including structured output and actual timeout/turn limits); exercise a fresh Pi normal-loader host; and complete the S01–S56 scenario mapping. U1/U2 are published together in upstream PR #2717, but are not merged or released. A supported released native contract remains a cutover prerequisite. No upstream release or global install was performed. Force-stop/command-UX PR #11 is merged into this branch and its 1.8.0 abandonment/reservation/no-autorestore contract is incorporated into the plan. Preserve that contract in Tasks 2–5; those production tasks have not started.
