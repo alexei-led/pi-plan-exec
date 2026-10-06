@@ -59,6 +59,67 @@ After the U2 delta, the writer reran the focused Vitest probes, native smoke (4 
 
 These checks accept only the current partial characterization, not Task 1 or an upstream fix.
 
+## Local upstream candidates (unreleased)
+
+The operator approved local upstream fixes and tests only. No PR, push, tag,
+release or global package upgrade was performed. The refreshed upstream base
+was `5da808168c097ea0d56616644773efe0f6f87938`; no open PR already covered the
+two fixes when checked.
+
+Separate pi-subagents branches:
+
+- `fix/rpc-stop-parity`, commit `37601c5a`: reuse the tool's existing stop
+  delivery and proof-backed paused sealing policy in RPC. Keep the successful
+  `stopping` acknowledgement separate from lifecycle/retirement proof.
+- `fix/rpc-direct-correlation`, commit `00147dba`: retain the existing
+  tool-call ID through direct async launch, runner status rewrites and terminal
+  result. Reuse the existing indexed alias resolver and existing structured
+  runId/toolCallId fields. No new RPC method, scan, journal or idempotency claim.
+
+Independent read-only reviews found no confirmed code defects in the inspected
+seams. The parent checked complete diffs and added the public contract wording.
+The stop review did not locate this downstream evidence file in the upstream
+checkout; its code review and the parent's reproduction cover different evidence.
+
+Combined branch `integration/native-rpc-fixes` contains cherry-picks
+`089b8ce3` and `2328b1d2`. Component and integration worktrees were clean
+after their commits. They remain separate from both repositories' main checkouts.
+
+Validation on the combined tree:
+
+- `npm run typecheck` passed.
+- First `npm run test:all` stopped in unit tests: 3,813 passed, 11 failed,
+  17 skipped. Failures included macOS socket-path length, noncanonical
+  /var versus /private/var paths, path truncation and a short fixture deadline.
+- With `TMPDIR=/private/tmp` and `--test-concurrency=4`, all 99 cases in the
+  initially failing groups passed unchanged. No assertions were disabled.
+- The complete unit suite under those settings had 3,823 passed, one failed
+  and 17 skipped. The remaining `global-npm-root` timeout test attempted to
+  read its PID file after its 500ms deadline had expired before file creation.
+  Its isolated seven-test file then passed. This is not reported as a clean
+  complete unit run; no unrelated source/test fix was applied.
+- The complete integration suite under the same canonical temp/concurrency
+  settings passed: 1,168 passed, zero failed, seven skipped.
+- Integration fixtures still logged the existing missing
+  `(deps.parentWake ?? deps.pi).sendMessage` callback warning. No unrelated
+  notification implementation change was made.
+- `npm run build:pkg` and local tarball creation passed. The tarball retains
+  the package's 0.76.1 version string but is an unreleased development artifact,
+  not evidence that published 0.76.1 contains these fixes.
+- Extension API documentation links and Git whitespace checks passed.
+- The baseline npm audit warning remains untriaged and unchanged.
+
+Exact combined-tree commands and logs are under the upstream integration
+worktree's `tmp/native-rpc-integration/`: `typecheck.log`, `test-all.log`,
+`environment-repro.log`, `unit-canonical.log`, `global-npm-repro.log`,
+`integration-canonical.log`, `build-package.log` and `pack.json`.
+Unit/integration retries used the repository's existing Node test loaders and
+complete file inventories, with only TMPDIR and test concurrency changed.
+
+Published-runtime cutover remains blocked. These local candidates do not
+authorize relaxing unknown-launch fences or pinning an unreleased build as
+released compatibility.
+
 ## Remaining Task 1 work
 
 Still required: exercise queued/paused stop parity against real native states; run the parent-death fault barrier; verify direct-leaf control enforcement (including structured output and actual timeout/turn limits); exercise a fresh Pi normal-loader host; and complete the S01–S56 scenario mapping. U2 is a confirmed release prerequisite for cutover, not permission to implement the kernel. Parent must decide whether to pursue the minimal upstream correlation fix; no upstream source, issue, PR, or publication was touched.
