@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.7.1 - 2026-10-06
+
+### Fixed
+
+- Show paused operations as paused, not working. Keep active work visible when
+  another task waits on an external prerequisite.
+- Preserve user-pause intent in recovery guidance, including stale and
+  renamed-host leases. A paused state no longer implies a supervisor question.
+- Keep execution state visible alongside the Snapshot qualifier, including
+  pending cancellation and pause cleanup.
+- Log stage transitions only after their saved state changes successfully.
+- Preserve completion and cancellation cleanup timestamps across task-projection
+  repair and lease release. Older final records keep their previous cleanup age.
+
+### Documentation
+
+- Describe Fusion 0.9.3 as the tested baseline, not the current version.
+  Strict review compatibility depends on advertised runtime capabilities.
+
+### Upgrade
+
+- Restart Pi after updating plan-exec. Dependencies and dispatch/retry policy
+  are unchanged. Bridge and native background-work registration are unchanged.
+
+[Full changes](https://github.com/alexei-led/pi-plan-exec/compare/v1.7.0...v1.7.1)
+
 ## 1.7.0 - 2026-10-06
 
 ### Added
