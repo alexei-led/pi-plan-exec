@@ -991,3 +991,125 @@ test('native controller pause observes exact retirement without accepting output
   expect((await controller.tick(f.run.id, 'session')).status).toBe('cancelled');
   expect(f.requests.filter((req) => req.method === 'spawn')).toHaveLength(1);
 });
+
+test('cancellation recovery binds a lost launch but cannot consume a successful review or revive the run', async () => {
+  const { PlanExecController } = await import('../src/controller.js');
+  const f = await fixture();
+  const op = await f.client.prepare(f.run, {
+    operationId: 'review',
+    kind: 'review',
+    agent: 'reviewer',
+    task: 'Review only',
+    reviewedCommit: 'a'.repeat(40),
+  });
+  await f.registry.update({
+    ...f.run,
+    stage: 'comprehensive_review',
+    activeOperation: op,
+  });
+  const binding = {
+    operationId: op.operationId,
+    requestDigest: required(op.requestDigest),
+  };
+  await f.client.spawn(f.run.id, binding); // Lost reply, dispatch remains fenced.
+  const asyncDir = join(f.directory, 'root');
+  await mkdir(asyncDir);
+  const summary = {
+    ...f.summary('completed'),
+    parentToolCallId: `rpc-spawn-${required(op.native).request.requestId}`,
+  };
+  await writeFile(
+    join(asyncDir, 'status.json'),
+    JSON.stringify({
+      runId: 'root',
+      sessionId: 'session',
+      toolCallId: summary.parentToolCallId,
+      workflowChildren: summary,
+      state: 'complete',
+      steps: [
+        {
+          runId: 'child',
+          workflowKey: 'main',
+          async: false,
+          status: 'completed',
+        },
+      ],
+    }),
+  );
+  let observations = 0;
+  f.setHandler((req) => {
+    observations++;
+    if (observations === 1) {
+      f.bus.emit(`subagents:rpc:v1:reply:${req.requestId}`, {
+        version: 1,
+        requestId: req.requestId,
+        method: req.method,
+        success: false,
+        error: { code: 'not_found', message: 'Temporarily unavailable' },
+      });
+    } else f.reply(req, { details: { ...retiredDetails(summary), asyncDir } });
+  });
+  await f.registry.updateLatest(f.run.id, (run) => ({
+    ...run,
+    status: 'cancel_pending',
+    userStopped: true,
+    stopGeneration: 1,
+  }));
+  const refuse = async () => {
+    throw new Error('Cancellation cannot verify or accept a review');
+  };
+  const controller = new PlanExecController(
+    f.registry,
+    f.client,
+    {
+      start: refuse,
+      status: refuse,
+      result: refuse,
+      adopt: refuse,
+      cancel: refuse,
+    },
+    refuse,
+  );
+  const pending = await controller.tick(f.run.id, 'session');
+  expect(pending.status).toBe('cancel_pending');
+  expect(pending.stage).toBe('comprehensive_review');
+  expect(pending.activeOperation?.externalRunId).toBe('root');
+  expect(pending.reviewedCommit).toBeUndefined();
+  await f.registry.updateLatest(f.run.id, (run) => ({
+    ...run,
+    nextAttemptAt: 0,
+  }));
+  expect((await controller.tick(f.run.id, 'session')).status).toBe('cancelled');
+  expect(f.requests.filter((req) => req.method === 'spawn')).toHaveLength(1);
+});
+
+test('native request digest binds controller task, review iteration and candidate before dispatch', async () => {
+  const f = await fixture();
+  const op = await f.client.prepare(f.run, {
+    operationId: 'bound-review',
+    kind: 'review',
+    agent: 'reviewer',
+    task: 'Review task two',
+    taskId: 2,
+    reviewIteration: 3,
+    reviewedCommit: 'a'.repeat(40),
+  });
+  await f.registry.update({
+    ...f.run,
+    stage: 'comprehensive_review',
+    activeOperation: op,
+  });
+  for (const change of [
+    { taskId: 4 },
+    { reviewIteration: 5 },
+    { reviewedCommit: 'b'.repeat(40) },
+  ]) {
+    await expect(
+      f.registry.update({
+        ...required(await f.registry.get(f.run.id)),
+        activeOperation: { ...op, ...change },
+      }),
+    ).rejects.toThrow();
+  }
+  expect(f.requests).toHaveLength(0);
+});

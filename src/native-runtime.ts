@@ -43,6 +43,8 @@ export interface NativePrepareInput {
   maxTurns?: number;
   outputSchema?: Record<string, unknown>;
   reviewedCommit?: string;
+  taskId?: number;
+  reviewIteration?: number;
 }
 export interface NativeObservation {
   state: 'prepared' | 'unknown' | 'bound' | 'retired';
@@ -208,6 +210,10 @@ export class NativeRuntimeClient {
       operationId: input.operationId,
       kind: input.kind,
       service: 'native',
+      ...(input.taskId !== undefined ? { taskId: input.taskId } : {}),
+      ...(input.reviewIteration !== undefined
+        ? { reviewIteration: input.reviewIteration }
+        : {}),
       ...(input.reviewedCommit ? { reviewedCommit: input.reviewedCommit } : {}),
       executionGeneration: run.executionGeneration ?? 0,
       stopGeneration: run.stopGeneration ?? 0,

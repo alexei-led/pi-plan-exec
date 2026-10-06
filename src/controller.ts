@@ -2673,6 +2673,10 @@ export class PlanExecController {
     const prepared = await this.native.prepare(run, {
       operationId,
       kind: input.kind,
+      ...(input.taskId !== undefined ? { taskId: input.taskId } : {}),
+      ...(input.reviewIteration !== undefined
+        ? { reviewIteration: input.reviewIteration }
+        : {}),
       agent: input.agent,
       task: boundedContinuationPrompt(
         run,
@@ -2780,7 +2784,9 @@ export class PlanExecController {
           current.activeOperation,
           observed.error.message,
         );
-      return current.activeOperation?.externalRunId
+      return current.status === RUN_STATUS.RUNNING &&
+        !current.userStopped &&
+        current.activeOperation?.externalRunId
         ? this.observeWorker(current, current.activeOperation)
         : current;
     }
@@ -3208,6 +3214,7 @@ export class PlanExecController {
     run: PlanExecRun,
     operation: ActiveOperation,
   ): Promise<PlanExecRun> {
+    if (run.status !== RUN_STATUS.RUNNING || run.userStopped) return run;
     const status = await this.workerStatus(run, operation);
     if (!status.success)
       return this.recordObservationFailure(
@@ -3281,15 +3288,18 @@ export class PlanExecController {
             'Retired native operation has no validated successful child output; replacement remains fenced.',
         );
       const captured = result.result;
-      await durableJson(
-        join(dirname(captured.outputPath), 'controller-result.json'),
-        {
-          operationId: operation.operationId,
-          requestDigest: operation.requestDigest,
-          proof: result.proof,
-          result: captured,
-        },
+      const retained = await this.registry.withAuthorizedMutation(current, () =>
+        durableJson(
+          join(dirname(captured.outputPath), 'controller-result.json'),
+          {
+            operationId: operation.operationId,
+            requestDigest: operation.requestDigest,
+            proof: result.proof,
+            result: captured,
+          },
+        ),
       );
+      if (!retained) return required(await this.registry.get(run.id));
       return this.finishWorkerOperation(
         current,
         operation,

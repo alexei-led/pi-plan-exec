@@ -38,6 +38,10 @@ export function nativeOperationDigest(operation: ActiveOperation): string {
   return nativeDigest({
     operationId: operation.operationId,
     kind: operation.kind,
+    ...(operation.taskId !== undefined ? { taskId: operation.taskId } : {}),
+    ...(operation.reviewIteration !== undefined
+      ? { reviewIteration: operation.reviewIteration }
+      : {}),
     ...(operation.reviewedCommit
       ? { reviewedCommit: operation.reviewedCommit }
       : {}),
