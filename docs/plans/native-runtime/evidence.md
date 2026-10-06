@@ -188,6 +188,20 @@ These checks establish that the current characterization branch coexists with
 1.8.0. The native safety-kernel migration is not implemented, so its future
 abandonment compatibility still requires the planned tests.
 
+## Operator revision: do not wait for upstream
+
+The operator explicitly requested completing the remaining migration even if
+upstream PR #2717 is never merged. The selected baseline is now one keyed public
+native workflow per operation on unmodified 0.76.1, with caller-owned operation
+state and bound outputs. Direct-leaf optimization is deferred rather than adding
+conditional backends. Missing identity/proof remains fenced; upstream fixes are
+optional improvements, not installation/cutover prerequisites.
+
+See [execution contract](execution-contract.md) for the component boundaries.
+This approved revision changes the prior direct-leaf/release-gated plan text;
+completed evidence checkpoints are retained. No active /exec controller is used
+for this operator-managed implementation.
+
 ## Remaining Task 1 work
 
 Still required: exercise queued/paused stop parity against real native states; run the parent-death fault barrier; verify direct-leaf control enforcement (including structured output and actual timeout/turn limits); exercise a fresh Pi normal-loader host; and complete the S01–S56 scenario mapping. U1/U2 are published together in upstream PR #2717, but are not merged or released. A supported released native contract remains a cutover prerequisite. No upstream release or global install was performed. Force-stop/command-UX PR #11 is merged into this branch and its 1.8.0 abandonment/reservation/no-autorestore contract is incorporated into the plan. Preserve that contract in Tasks 2–5; those production tasks have not started.

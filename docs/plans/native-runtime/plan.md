@@ -16,6 +16,13 @@ gate. Do not execute this plan merely because it exists.
 upstream fix is claimed by this document. Package versions below are the
 investigated baseline, not promises about later releases.
 
+**Execution policy (operator-approved revision):** complete the migration on
+released pi-subagents 0.76.1 without waiting for upstream PR #2717. Use one keyed
+native workflow per operation because this release preserves workflow request
+identity where direct leaves lose it. This is the selected normal path, not a
+silent fallback. Upstream fixes remain optional improvements. Unknown launch or
+retirement evidence stays fenced, never a reason to duplicate work.
+
 **Scope:** native execution transport, durable operation safety, legacy recovery,
 result contracts, projection/dependency removal, and regression verification.
 Keep the existing plan parser, scheduler, Git acceptance rules, owned local
@@ -69,7 +76,9 @@ to import private modules into production.
   never authorize new work; same-operation stop delivery can still retry.
 - Both `/exec` and `/goal`, native review/fix/stats, local checks, worktree
   handoff, status, cleanup and legacy recovery satisfy the matrix below.
-- Routine single-agent execution has no artificial workflow root.
+- Routine execution uses one small keyed workflow through the public native
+  RPC. No Bridge extension, second scheduler or conditional direct/workflow
+  backend is required. The wrapper has a tested recovery purpose on 0.76.1.
 - Defaults remain one required reviewer, no implicit backend fallback, no
   optional statistics child, and no extra mission/scheduler.
 - Preserve 1.7.1's applied-transition-only progress logging and terminal cleanup
@@ -231,12 +240,17 @@ the user to restore it. A new session may inspect supported evidence but cannot
 forge ownership. When old parent death prevents a valid terminal proof, report
 the actual limitation and preserve the existing explicit isolated-recovery path.
 
-### D5 — Direct leaves by default; workflows only for real composition
+### D5 — One keyed native workflow on the released baseline
 
-Worker, fixer, default reviewer and optional stats are direct async RPC leaves.
-Set fresh context, controller-owned cwd, `worktree: false`,
-`mission: false`, and disable native acceptance only where the controller
-provides the acceptance contract. Verify actual support for turn limits,
+Worker, fixer, default reviewer and optional stats each use public RPC `spawn`
+with a generated script that awaits exactly one stable `main` child. Persist the
+RPC request UUID before dispatch. Bind recovery through its exact workflow
+`parentToolCallId`/`workflowRunId` summary or a correlated native event, not status
+text. Bind outputs under the run directory before launch. There is one execution
+shape on 0.76.1; do not add a version switch or depend on an unmerged patch.
+
+Set fresh context, controller-owned cwd, `worktree: false`, `mission: false`,
+and disable native acceptance only where the controller provides acceptance. Verify actual support for turn limits,
 completion guard and every forwarded field; accepting an unknown schema field
 does not prove enforcement.
 
@@ -247,7 +261,8 @@ a default deadline. Record the limit visibly. A confirmed timeout with retiremen
 can follow existing bounded continuation rules; silence cannot.
 
 No new fanout, named resource or retained-resume dependency is required by this
-migration. The current one-reviewer default needs no workflow. If an already
+migration. The current one-reviewer default uses the same small recovery wrapper,
+not a new multi-review pipeline. Direct-leaf optimization is deferred. If an already
 supported composite is found during characterization, preserve it through
 public RPC `script`/named resource inputs, stable keys, awaited `runs.run` or
 `runs.all`, and captured child references; do not enable it as a new feature.
@@ -446,11 +461,16 @@ before proposing another.
 
 Upstream source work uses its own separate worktree when separately authorized.
 Opening PRs, publishing packages, upgrading global installations and editing
-user settings need explicit approval. A blocked release dependency is recorded
-as `Prerequisite: runtime` with evidence, not bypassed by CLI/tool fallback.
-A local fixture against an upstream patch is development evidence, not released
-compatibility. Do not enable the new production path until its required contract
-gates pass on the pinned released package.
+user settings need explicit approval. A missing required runtime is recorded as `Prerequisite: runtime` with evidence,
+not bypassed by CLI/tool fallback. PR #2717 is not an installation prerequisite.
+A local fixture against its patch is development evidence only. Enable the new
+path when its selected keyed-workflow contract passes on unmodified 0.76.1.
+
+Known limitations have explicit behavior: observe proof before requesting stop
+when a child already retired; retain and retry pending stop intent when the old
+RPC rejects a queued/paused target; preserve user force-stop abandonment. If a
+reply/binding/proof cannot be recovered, keep the exact operation fenced with a
+clear next action. Do not pretend the published API has durable absence proof.
 
 ## Supported-scenario and test matrix
 
@@ -469,7 +489,7 @@ deterministic local model; X = separate host processes with fault barriers.
 | S03 | Untracked/tracked plan, approved structural change, dirty partial lane | Preserve approved checkbox facts, history and ancestry; refuse unapproved drift | C; autonomous-controller |
 | S04 | `/goal` intermediate answer, done claim, failing checks | Continue until committed checks/review pass; no plan file invented | C/H; autonomous-goal |
 | S05 | Goal stall, turn budget, blocker, deleted/skipped tests | Existing pause/confirmation policy; explicit resume only where required | P/C; goal-loop, autonomous-goal |
-| S06 | Native worker, fixer, reviewer, optional stats | Direct leaf; exact effective agent/model/cwd/tools; one launch per authorized attempt | H; new native-runtime contracts |
+| S06 | Native worker, fixer, reviewer, optional stats | One keyed workflow, exact effective agent/model/cwd/tools; one child per authorized attempt; no removed package loaded | H; native-runtime contracts |
 | S07 | Concurrent starts/resumes through path aliases | One reservation/dispatch; loser observes/refuses without overwriting state | C/X; registry, controller |
 | S08 | Crash before preparation / prepared before dispatch claim | Zero workers; valid prepared intent may start once after safe claim | C/X; new operation-safety |
 | S09 | Crash after dispatch claim before event emit | No blind replay; unknown outcome fenced unless authoritative correlation resolves it | C/X |
@@ -497,7 +517,7 @@ deterministic local model; X = separate host processes with fault barriers.
 | S31 | Typed review clean/blocking/minor/malformed/wrong candidate | Required review cannot falsely pass; fixes re-review current SHA; minor findings retain correct terminal status | P/C/H; review, review-backend |
 | S32 | Missing/truncated output, deleted temporary result, retained archive | Prefer bound complete captured evidence; missing evidence blocks acceptance | P/H; artifact |
 | S33 | Output schema/tool ceiling conflict, missing agent/skill | Fail admission or proven non-start; never widen tools to satisfy schema | H |
-| S34 | Frozen native controls actually enforced | Max turns, model scope, tool limits and completion behavior verified, not merely echoed | H |
+| S34 | Native controls and unsupported legacy knobs | Model/tool/output and requested timeout behavior tested; unsupported turn/end-to-end-unbounded guarantees reported honestly, never inferred from echoed params | H |
 | S35 | Local required check/bootstrap interrupted or orphaned | Existing owned-process cancellation and retirement remain unchanged | C/X; local-operation, owned-process |
 | S36 | Dirty/untracked candidate, wrong ancestry, changed branch | No checkbox/prose-only acceptance; confirmations remain required | C; controller, owned-git |
 | S37 | Promotion/archive crash, ignored files, output branch changed | Safe retry/fast-forward; preserve user files; no duplicate acceptance | C/X; autonomous-controller |
@@ -652,8 +672,9 @@ Files:
 
 Preconditions: clean implementation worktree; baseline package versions recorded;
 no user run/journal/global settings touched.
-Postconditions: direct-leaf behavior and every upstream gap are reproducible;
-the old execution path still passes baseline checks.
+Postconditions: selected workflow behavior and released-runtime limitations are
+reproducible; the old execution path still passes baseline checks. Direct-leaf
+probes remain diagnostic evidence, not a prerequisite for selecting that path.
 Fitness gate: establish baseline counts/imports and a guard for new native
 modules; do not falsely require old dependencies to disappear before Task 4.
 Impact: `gitnexus impact BridgeClient --file src/bridge.ts --include-tests`.
@@ -741,11 +762,11 @@ Files:
   `test/index.test.ts`, `test/runtime-integration.test.ts`,
   `test/native-recovery-smoke.mjs`.
 
-Preconditions: Task 2 kernel gates pass; upstream-dependent production behavior
-is not claimed until its exact released contract passes.
-Postconditions: the test-composed controller runs plans/goals through direct
-native leaves and accepts only durable validated results; domain behavior is
-unchanged.
+Preconditions: Task 2 kernel gates pass against unmodified 0.76.1. No behavior
+from unpublished upstream changes is required or claimed.
+Postconditions: the controller runs plans/goals through keyed native workflows
+and accepts only durable validated results; domain and 1.8.0 force-stop behavior
+remain unchanged.
 Fitness gate: controller has one native launch path; no Workflow replay loop,
 private native imports or new local command runner.
 Impact: `gitnexus impact PlanExecController --file src/controller.ts --include-tests`.
@@ -763,14 +784,14 @@ Manual checks:
 
 - [ ] Replace Bridge-shaped controller assumptions with the normalized native seam for worker/fixer/reviewer/stats, preserving original operation, task, review and stop generations.
 - [ ] Preserve local Git/check/bootstrap execution, accepted-baseline verification, partial task lanes, promotion/archive and explicit review-backend selection. Do not broaden Fusion/Revmux compatibility.
-- [ ] Use direct leaves with fresh context, controller-owned cwd/worktree and no mission; remove new-run single-child workflow wrappers rather than replacing them with a named one-child resource.
+- [ ] Use one awaited keyed workflow with fresh child context, controller-owned cwd/worktree and no mission. Bind outputs and recovery identity explicitly; do not add a second direct-leaf backend or require an upstream patch.
 - [ ] Define a minimal typed native reviewer schema and semantic checks. Bind candidate SHA and operation; keep native text review parsing only for imported old results.
 - [ ] Bind new outputs under run-owned storage and atomically capture complete result/usage/proof before acceptance. Fail closed on missing/truncated/wrong-identity artifacts or capture failure.
 - [ ] Connect completion/readiness wake hints to the existing serialized loop with periodic reconciliation/backoff as fallback. Test duplicate wakes, load-order delay and disposed contexts cannot start work.
 - [ ] Preserve automatic recovery, one-attempt model overrides and D4's 1.7.1 user-pause precedence without inventing supervisor questions. Keep stage logging conditional on applied CAS (S56); remove duplicate branches only with equivalent tests.
 - [ ] Keep supervisor waits on the original child. Preserve native session authority across plan lease takeover; surface the exact safe action when another session cannot control it.
 - [ ] Exercise S01–S41, S51 and S54–S56 through the native test composition, including independent lanes, nested cwd, review/fix, goal continuation and local-operation retirement. Count launches and accepted commits.
-- [ ] Run the gates, record any unresolved upstream prerequisites as blockers for Task 4, and commit the integrated seam without removing the old migration evidence.
+- [ ] Run the gates on unmodified 0.76.1, record supported behavior and safe outcomes for unresolved observations, and commit the integrated seam without removing old migration evidence. Do not wait for upstream PR #2717.
 
 ### Task 4: Migrate legacy state and remove pi-tasks and Bridge dependencies
 
@@ -798,9 +819,10 @@ Files:
   `test/recovery-agterm.mjs`, `test/recovery-agterm.test.ts`,
   `test/autonomous-runtime-smoke.mjs` — migrate fixtures off installed Bridge.
 
-Preconditions: Tasks 1–3 pass; required U1/U2 contract needs are either satisfied
-by a pinned released native version or explicitly block this task. No hidden
-text-scraping/CLI fallback is accepted.
+Preconditions: Tasks 1–3 pass on unmodified released pi-subagents 0.76.1 using
+the selected keyed-workflow contract. U1/U2 patches are not required. Missing
+identity/proof cases have tested non-duplicating recovery or explicit fencing.
+No hidden text-scraping/CLI fallback is accepted.
 Postconditions: new runs need neither package; supported old records remain
 readable/recoverable or correctly fenced without installing Bridge.
 Fitness gate: boundary tests and packed manifest reject both dependencies and
@@ -903,7 +925,9 @@ All of the following are required, not inferred from workflow success:
   behaviors remain covered; upstream limitations are accurately exposed.
   The 1.7.1 pause/display, CAS logging and retention fixes have native-path
   regressions, including their replacement fixtures after pi-tasks removal.
-- Required native contract gaps have released fixes or prevent cutover.
+- Unmodified pi-subagents 0.76.1 passes the selected workflow contract. Missing
+  optional upstream fixes do not block normal execution; unresolved identity or
+  retirement remains explicitly fenced without false completion.
 - The implementation has no new scheduler/database/daemon, automatic backend
   fallback, generic policy DSL, or unused workflow-resource framework.
 - Documentation names what heals automatically and what needs a decision.
@@ -960,8 +984,8 @@ Their confirmed findings were incorporated before handoff:
 These reviews assess the plan, not an implementation. The subsequent 1.7.1
 refresh was checked against the release diff and its regression tests. It adds
 E13/S55/S56 and strengthens S25/S40 without changing the native architecture.
-The public-native correlation and stop-contract probes remain implementation
-prerequisites. The 1.8.0 refresh incorporates merged PR #11 without changing task
+The selected public-native workflow correlation and stop-contract probes remain
+implementation prerequisites; direct-leaf correlation fixes are optional. The 1.8.0 refresh incorporates merged PR #11 without changing task
 headings, dependencies or checkbox text; existing executable progress is retained.
 The combined-tree test results are recorded in evidence.md.
 
