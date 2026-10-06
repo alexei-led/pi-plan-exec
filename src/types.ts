@@ -141,6 +141,7 @@ export const DEFAULT_FROZEN_RUN_CONFIG = {
 } as const satisfies FrozenRunConfig;
 
 export const OPERATION_SERVICE = {
+  NATIVE: 'native',
   BRIDGE: 'bridge',
   FUSION: 'fusion',
 } as const;
@@ -259,7 +260,38 @@ export interface WorkerSignal {
   steps?: string[];
 }
 
+export interface NativeOperationMetadata {
+  version: 1;
+  ownerRunId: string;
+  ownerSessionId: string;
+  phase: 'prepared' | 'dispatching' | 'bound' | 'retired';
+  request: {
+    version: 1;
+    requestId: string;
+    method: 'spawn';
+    params: Record<string, unknown>;
+  };
+  outputPath: string;
+  limits: {
+    requestedLifetime: ExecutionLifetime;
+    requestedMaxTurns?: number;
+    childTimeout: 'native-default' | 'explicit';
+    maxTurnsEnforced: false;
+  };
+  /** Missing values mean unreported, never unbounded or enforced. */
+  observedLimits?: {
+    workflowTimeoutMs?: number;
+    childTimeoutMs?: number;
+    observedAt: number;
+  };
+  childRunId?: string;
+  workflowReceiptPath?: string;
+  retirement?: 'local-not-started' | 'native-proof';
+  terminalProof?: import('./bridge.js').WorkflowTerminalProof;
+}
+
 export interface ActiveOperation {
+  native?: NativeOperationMetadata;
   operationId: string;
   executionGeneration?: number;
   service: OperationService;

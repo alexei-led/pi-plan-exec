@@ -15,6 +15,7 @@ import { parseOperationActivity } from './diagnostics.js';
 import { worktreeIdentity } from './git.js';
 import { isSkippableStage, isTerminalStatus } from './lifecycle.js';
 import { hasActiveLocalOperations } from './local-operation.js';
+import { validNativeOperation } from './operation-safety.js';
 import { parsePlan } from './plan.js';
 import { acquireLock, LockTimeoutError } from './registry-lock.js';
 import {
@@ -1216,6 +1217,7 @@ function isAutonomousState(run: PlanExecRun): boolean {
     )
       return false;
   for (const operation of [run.activeOperation, run.failedOperation]) {
+    if (!validNativeOperation(operation, run.id)) return false;
     const commit = operation?.reviewedCommit;
     if (
       commit !== undefined &&

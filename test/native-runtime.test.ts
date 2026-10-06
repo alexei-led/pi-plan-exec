@@ -1,0 +1,475 @@
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import type { ExtensionContext } from '@earendil-works/pi-coding-agent';
+import { expect, onTestFinished, test } from 'vitest';
+import { NativeRuntimeClient } from '../src/native-runtime.js';
+import { RunRegistry } from '../src/registry.js';
+import { required } from '../src/required.js';
+import type { EventBus } from '../src/rpc.js';
+import { DEFAULT_FROZEN_RUN_CONFIG } from '../src/types.js';
+import { createNativeRuntimeHost } from './fixtures/native-runtime-host.js';
+
+class Bus implements EventBus {
+  listeners = new Map<string, Set<(value: unknown) => void>>();
+  on(name: string, fn: (value: unknown) => void) {
+    const set = this.listeners.get(name) ?? new Set();
+    set.add(fn);
+    this.listeners.set(name, set);
+    return () => {
+      set.delete(fn);
+      if (!set.size) this.listeners.delete(name);
+    };
+  }
+  emit(name: string, value: unknown) {
+    for (const fn of this.listeners.get(name) ?? []) fn(value);
+  }
+}
+
+type Request = {
+  requestId: string;
+  method: string;
+  params: Record<string, unknown>;
+};
+async function fixture() {
+  const directory = await mkdtemp(join(tmpdir(), 'native-runtime-'));
+  onTestFinished(() => rm(directory, { recursive: true, force: true }));
+  const registry = new RunRegistry(directory);
+  let session = 'session';
+  const context = () =>
+    ({ sessionManager: { getSessionId: () => session } }) as ExtensionContext;
+  const bus = new Bus();
+  const client = new NativeRuntimeClient(bus, registry, context, {
+    rpcTimeoutMs: 30,
+  });
+  onTestFinished(() => client.dispose());
+  let run = await registry.create({
+    schemaVersion: 1,
+    repositoryRoot: directory,
+    planPath: join(directory, 'plan.md'),
+    planHash: 'hash',
+    worktreeCwd: directory,
+    branch: 'feature',
+    defaultBranch: 'main',
+    status: 'running',
+    stage: 'implementation',
+    taskAttempts: {},
+    stageAttempts: {},
+    reviewFindings: [],
+    unresolvedFindings: [],
+    config: DEFAULT_FROZEN_RUN_CONFIG,
+  });
+  const op = await client.prepare(run, {
+    operationId: 'op',
+    kind: 'implementation',
+    agent: 'worker',
+    task: 'Do work',
+  });
+  run = await registry.update({ ...run, activeOperation: op });
+  const binding = {
+    operationId: op.operationId,
+    requestDigest: required(op.requestDigest),
+  };
+  const requests: Request[] = [];
+  let handler = (_request: Request): void => {};
+  bus.on('subagents:rpc:v1:request', (value) => {
+    const req = value as Request;
+    requests.push(req);
+    handler(req);
+  });
+  const reply = (req: Request, data: unknown) =>
+    bus.emit(`subagents:rpc:v1:reply:${req.requestId}`, {
+      version: 1,
+      requestId: req.requestId,
+      method: req.method,
+      success: true,
+      data,
+    });
+  const summary = (state = 'running') => ({
+    version: 1,
+    parentToolCallId: `rpc-spawn-${required(op.native).request.requestId}`,
+    workflowRunId: 'root',
+    inventoryComplete: true,
+    workflowState: state,
+    children: [
+      {
+        childId: 'main',
+        runId: 'child',
+        state: state === 'completed' ? 'completed' : 'running',
+      },
+    ],
+  });
+  return {
+    directory,
+    registry,
+    bus,
+    client,
+    run,
+    op,
+    binding,
+    requests,
+    reply,
+    summary,
+    setHandler(fn: typeof handler) {
+      handler = fn;
+    },
+    setSession(id: string) {
+      session = id;
+    },
+  };
+}
+
+test('double spawn CAS-claims once and freezes body before emit', async () => {
+  const f = await fixture();
+  f.setHandler((req) => {
+    if (req.method === 'spawn')
+      f.reply(req, {
+        details: { runId: 'root', workflowChildren: f.summary() },
+      });
+    else f.reply(req, { details: { workflowChildren: f.summary() } });
+  });
+  await Promise.all([
+    f.client.spawn(f.run.id, f.binding),
+    f.client.spawn(f.run.id, f.binding),
+  ]);
+  expect(f.requests.filter((r) => r.method === 'spawn')).toHaveLength(1);
+  expect(f.requests[0]?.params).toEqual(required(f.op.native).request.params);
+  expect((await f.registry.get(f.run.id))?.activeOperation?.externalRunId).toBe(
+    'root',
+  );
+  await expect(
+    f.client.spawn(f.run.id, { ...f.binding, requestDigest: 'wrong' }),
+  ).rejects.toThrow(/identity/);
+});
+
+test('lost response discovers only exact structured correlation; unknown is never absence or replay', async () => {
+  const f = await fixture();
+  expect((await f.client.spawn(f.run.id, f.binding)).state).toBe('unknown');
+  f.setHandler((req) =>
+    f.reply(
+      req,
+      req.params.id
+        ? { details: { workflowChildren: f.summary() } }
+        : {
+            asyncSnapshot: {
+              kind: 'pi-subagents.async-status-snapshot',
+              version: 1,
+              runs: [{ id: 'root', kind: 'workflow' }],
+            },
+          },
+    ),
+  );
+  expect((await f.client.operation(f.run.id, f.binding)).state).toBe('bound');
+  await f.client.spawn(f.run.id, f.binding);
+  expect(f.requests.filter((r) => r.method === 'spawn')).toHaveLength(1);
+});
+
+test('stop before emit retires locally without launch; foreign control and abandoned writes denied', async () => {
+  const f = await fixture();
+  f.setSession('foreign');
+  await expect(f.client.spawn(f.run.id, f.binding)).rejects.toThrow(/session/);
+  await expect(f.client.stop(f.run.id, f.binding)).rejects.toThrow(/session/);
+  f.setSession('session');
+  expect((await f.client.cancelOperation(f.run.id, f.binding)).state).toBe(
+    'retired',
+  );
+  await f.client.spawn(f.run.id, f.binding);
+  expect(f.requests).toHaveLength(0);
+  await f.registry.abandon(f.run.id, 'session');
+  await expect(f.client.spawn(f.run.id, f.binding)).rejects.toThrow(
+    /abandoned/,
+  );
+});
+
+test('late response binds after stop without overwriting stop intent; queued rejection is retryable', async () => {
+  const f = await fixture();
+  let launch: Request | undefined;
+  f.setHandler((req) => {
+    if (req.method === 'spawn') {
+      launch = req;
+      return;
+    }
+    if (req.method === 'stop')
+      f.bus.emit(`subagents:rpc:v1:reply:${req.requestId}`, {
+        version: 1,
+        requestId: req.requestId,
+        method: 'stop',
+        success: false,
+        error: { code: 'invalid_state', message: 'queued' },
+      });
+    else f.reply(req, { details: { workflowChildren: f.summary() } });
+  });
+  const spawning = f.client.spawn(f.run.id, f.binding);
+  while (!launch) await new Promise((resolve) => setTimeout(resolve, 1));
+  await f.registry.updateLatest(f.run.id, (run) => ({
+    ...run,
+    stopGeneration: 1,
+    activeOperation: { ...required(run.activeOperation), stopRequested: true },
+  }));
+  f.reply(launch, {
+    details: { runId: 'root', workflowChildren: f.summary() },
+  });
+  await spawning;
+  expect((await f.registry.get(f.run.id))?.activeOperation?.stopRequested).toBe(
+    true,
+  );
+  expect((await f.client.stop(f.run.id, f.binding)).stopPending).toBe(true);
+  expect(
+    (await f.registry.get(f.run.id))?.activeOperation?.stopAcknowledged,
+  ).not.toBe(true);
+});
+
+test('prepare records unsupported limits honestly and freezes configured agent/model into awaited child', async () => {
+  const f = await fixture();
+  const prepared = await f.client.prepare(f.run, {
+    operationId: 'limits',
+    kind: 'implementation',
+    agent: 'custom-agent',
+    model: 'provider/exact-model',
+    task: 'Keep the chosen model',
+    executionLifetime: { mode: 'unbounded' },
+    maxTurns: 75,
+  });
+  const meta = required(prepared.native);
+  expect(meta.limits).toEqual({
+    requestedLifetime: { mode: 'unbounded' },
+    requestedMaxTurns: 75,
+    childTimeout: 'native-default',
+    maxTurnsEnforced: false,
+  });
+  expect(meta.request.params.timeoutMs).toBeUndefined();
+  expect(meta.request.params.script).toContain('return await runs.run("main",');
+  expect(meta.request.params.script).toContain('"agent":"custom-agent"');
+  expect(meta.request.params.script).toContain(
+    '"model":"provider/exact-model"',
+  );
+  expect(meta.request.params.script).not.toContain('"async":true');
+  expect(meta.request.params.script).not.toContain('maxTurns');
+});
+
+test('malformed replies and unknown lookups never authorize a second spawn', async () => {
+  const f = await fixture();
+  f.setHandler((req) =>
+    f.bus.emit(`subagents:rpc:v1:reply:${req.requestId}`, {
+      version: 1,
+      requestId: 'wrong',
+      method: req.method,
+      success: true,
+      data: {},
+    }),
+  );
+  expect((await f.client.spawn(f.run.id, f.binding)).state).toBe('unknown');
+  f.setHandler((req) =>
+    f.reply(req, { text: 'Run: fake-id\\nState: complete', details: {} }),
+  );
+  expect((await f.client.spawn(f.run.id, f.binding)).state).toBe('unknown');
+  expect(f.requests.filter((req) => req.method === 'spawn')).toHaveLength(1);
+  expect((await f.registry.get(f.run.id))?.activeOperation?.native?.phase).toBe(
+    'dispatching',
+  );
+});
+
+test('wrong root, child identity and malformed published proof cannot retire ownership', async () => {
+  const f = await fixture();
+  f.setHandler((req) =>
+    f.reply(req, { details: { workflowChildren: f.summary() } }),
+  );
+  await f.client.spawn(f.run.id, f.binding);
+  for (const details of [
+    {
+      workflowChildren: { ...f.summary('completed'), workflowRunId: 'foreign' },
+    },
+    {
+      workflowChildren: {
+        ...f.summary('completed'),
+        children: [{ childId: 'main', runId: 'foreign', state: 'completed' }],
+      },
+    },
+    {
+      workflowChildren: f.summary('completed'),
+      workflowTerminalProof: {
+        version: 1,
+        kind: 'workflow',
+        state: 'observed',
+        runId: 'root',
+        dispatchClosed: false,
+        observedAt: 1,
+        children: [],
+      },
+    },
+  ]) {
+    f.setHandler((req) => f.reply(req, { details }));
+    expect((await f.client.operation(f.run.id, f.binding)).state).not.toBe(
+      'retired',
+    );
+    expect(
+      (await f.registry.get(f.run.id))?.activeOperation?.processTreeExited,
+    ).not.toBe(true);
+  }
+});
+
+test('caller-bound output rejects symlinks before any dispatch', async () => {
+  const f = await fixture();
+  const outside = join(f.directory, 'outside.txt');
+  await writeFile(outside, 'not an operation result');
+  await symlink(outside, required(f.op.native).outputPath);
+  await expect(f.client.spawn(f.run.id, f.binding)).rejects.toThrow(
+    /non-symlink/,
+  );
+  expect(f.requests).toHaveLength(0);
+});
+
+test('prepare refuses an aliased output parent without creating files outside the run', async () => {
+  const f = await fixture();
+  const outside = join(f.directory, 'outside-directory');
+  await mkdir(outside);
+  const nativeDirectory = dirname(dirname(required(f.op.native).outputPath));
+  await rm(nativeDirectory, { recursive: true });
+  await symlink(outside, nativeDirectory);
+  await expect(
+    f.client.prepare(f.run, {
+      operationId: 'other',
+      kind: 'implementation',
+      agent: 'worker',
+      task: 'Do not escape',
+    }),
+  ).rejects.toThrow(/symlinks/);
+  expect(await readdir(outside)).toEqual([]);
+});
+
+test('registry rejects changed native request/digest and ownership', async () => {
+  const f = await fixture();
+  for (const native of [
+    { ...required(f.op.native), ownerRunId: 'foreign' },
+    {
+      ...required(f.op.native),
+      request: {
+        ...required(f.op.native).request,
+        params: { script: 'different' },
+      },
+    },
+    { ...required(f.op.native), phase: 'retired', retirement: 'native-proof' },
+  ]) {
+    await writeFile(
+      f.registry.authorizationPath(f.run.id),
+      JSON.stringify({ ...f.run, activeOperation: { ...f.op, native } }),
+    );
+    await expect(f.registry.get(f.run.id)).rejects.toThrow(/Invalid plan-exec/);
+  }
+});
+
+test('released public RPC publishes real proof/output with healthy and lost spawn replies', async () => {
+  const f = await fixture();
+  const host = await createNativeRuntimeHost(join(f.directory, 'host'), {
+    events: f.bus,
+  });
+  try {
+    f.setSession(host.sessionId);
+    const emit = f.bus.emit.bind(f.bus);
+    for (const dropReply of [false, true]) {
+      f.bus.emit = (name, value) => {
+        if (
+          dropReply &&
+          name.startsWith('subagents:rpc:v1:reply:') &&
+          (value as { method?: string }).method === 'spawn'
+        )
+          return;
+        emit(name, value);
+      };
+      const client = new NativeRuntimeClient(
+        f.bus,
+        f.registry,
+        () =>
+          ({
+            sessionManager: { getSessionId: () => host.sessionId },
+          }) as ExtensionContext,
+        { rpcTimeoutMs: dropReply ? 100 : 10_000 },
+      );
+      onTestFinished(() => client.dispose());
+      const op = await client.prepare(f.run, {
+        operationId: dropReply ? 'lost-review' : 'real-worker',
+        kind: 'implementation',
+        agent: dropReply ? 'reviewer' : 'worker',
+        task: 'Deliver fixture',
+        cwd: host.repository,
+        executionLifetime: { mode: 'bounded', timeoutMs: 60_000 },
+        maxTurns: 75,
+      });
+      await f.registry.updateLatest(f.run.id, (run) => ({
+        ...run,
+        activeOperation: op,
+      }));
+      const binding = {
+        operationId: op.operationId,
+        requestDigest: required(op.requestDigest),
+      };
+      const launched = await client.spawn(f.run.id, binding);
+      expect(launched.state, launched.reason).toBe(
+        dropReply ? 'unknown' : 'bound',
+      );
+      let observed = launched;
+      for (
+        let attempt = 0;
+        attempt < 100 && observed.state !== 'retired';
+        attempt++
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        observed = await client.operation(f.run.id, binding);
+      }
+      expect(observed.state, observed.reason).toBe('retired');
+      expect(observed.proof?.kind).toBe('workflow');
+      expect(observed.operation.native?.observedLimits?.workflowTimeoutMs).toBe(
+        60_000,
+      );
+      expect(await host.calls()).toHaveLength(dropReply ? 2 : 1);
+      const result = await client.result(f.run.id, binding);
+      expect(result.result?.output, result.reason).toContain(
+        dropReply ? 'NO_FINDINGS' : 'Task completed and committed.',
+      );
+      expect(result.result?.outputPath).toBe(required(op.native).outputPath);
+      const statusPath = join(
+        required(observed.operation.asyncDir),
+        'status.json',
+      );
+      const originalStatus = await readFile(statusPath, 'utf8');
+      const wrongSource = JSON.parse(originalStatus);
+      wrongSource.sessionId = 'foreign';
+      await writeFile(statusPath, JSON.stringify(wrongSource));
+      expect((await client.result(f.run.id, binding)).result).toBeUndefined();
+      await writeFile(statusPath, originalStatus);
+      await rm(required(op.native).outputPath);
+      const outsideOutput = join(f.directory, `outside-${op.operationId}.txt`);
+      await writeFile(outsideOutput, 'forged output');
+      await symlink(outsideOutput, required(op.native).outputPath);
+      expect((await client.result(f.run.id, binding)).result).toBeUndefined();
+      const requestsBeforeStop = f.requests.filter(
+        (req) => req.method === 'stop',
+      ).length;
+      expect((await client.stop(f.run.id, binding)).stopPending).toBe(false);
+      expect(f.requests.filter((req) => req.method === 'stop')).toHaveLength(
+        requestsBeforeStop,
+      );
+      client.dispose();
+    }
+  } finally {
+    await host.dispose();
+  }
+}, 30_000);
+
+test('disposal settles pending RPC without permitting replay and removes listeners', async () => {
+  const f = await fixture();
+  f.setHandler(() => f.client.dispose());
+  expect((await f.client.spawn(f.run.id, f.binding)).state).toBe('unknown');
+  expect([...f.bus.listeners.keys()]).toEqual(['subagents:rpc:v1:request']);
+  await expect(f.client.operation(f.run.id, f.binding)).rejects.toThrow(
+    /disposed/,
+  );
+});
