@@ -635,7 +635,7 @@ Manual checks:
 - [ ] Add deterministic barriers for prepared intent, dispatch claim, native launch, reply delivery, binding persistence, result capture and acceptance; support dropped reply, duplicate/late completion and parent SIGKILL.
 - [ ] Characterize native status/correlation after reload and process restart, same-session versus foreign-session controls, supervisor wait and process proof when the parent dies.
 - [x] Reproduce U1 against the actual RPC route and compare the existing tool policy without using that tool as a production fallback.
-- [ ] Resolve U2 by testing existing public structured identity/artifacts first. Record the exact supported binding mechanism or a minimal upstream proposal; never bless status-text parsing or not-found-as-absence.
+- [x] Resolve U2 by testing existing public structured identity/artifacts first. Record the exact supported binding mechanism or a minimal upstream proposal; never bless status-text parsing or not-found-as-absence.
 - [ ] Record U3/U4 limits and any genuinely necessary upstream bugfix reproduction. Do not change another repository, publish a PR or install a global package under this task.
 - [ ] Add the negative boundary-guard cases and map S01–S56 to retained tests, planned tests or explicitly blocked host contracts. Record which assertions require H/X rather than mocks.
 - [ ] Run this task's gates, preserve sanitized evidence, and commit only its safety-net changes and checkbox updates. Leave production dispatch unchanged.

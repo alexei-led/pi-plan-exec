@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+
+import { randomUUID } from 'node:crypto';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -19,6 +21,197 @@ function reply(result) {
   assert.equal(value.version, 1);
   assert.equal(value.requestId, result.requestId);
   return value;
+}
+
+const nativeHostFixtureUrl = new URL(
+  './fixtures/native-runtime-host.ts',
+  import.meta.url,
+).href;
+const freshHostPhaseScript = [
+  "import assert from 'node:assert/strict';",
+  "import { execFileSync } from 'node:child_process';",
+  "import { readFile, writeFile } from 'node:fs/promises';",
+  "import { join } from 'node:path';",
+  `import { createNativeRuntimeHost } from ${JSON.stringify(nativeHostFixtureUrl)};`,
+  'const [phase, sandbox, sessionId] = process.argv.slice(1);',
+  "const originPath = join(sandbox, 'u2-origin.json');",
+  "const reportPath = join(sandbox, 'u2-recovery.json');",
+  'function isRecord(value) { return value !== null && typeof value === "object" && !Array.isArray(value); }',
+  'function identityFields(value, path, found = []) {',
+  '  if (Array.isArray(value)) { value.forEach((entry, index) => identityFields(entry, path + "[" + index + "]", found)); return found; }',
+  '  const object = isRecord(value) ? value : undefined;',
+  '  if (!object) return found;',
+  '  for (const [key, entry] of Object.entries(object)) {',
+  '    if (key === "text") continue;',
+  '    if (["id", "runId", "requestId", "toolCallId", "sessionId"].includes(key) && typeof entry === "string") found.push({ path: path + "." + key, key, value: entry });',
+  '    identityFields(entry, path + "." + key, found);',
+  '  }',
+  '  return found;',
+  '}',
+  'function summarize(result) {',
+  '  const envelope = isRecord(result.reply) ? result.reply : {};',
+  '  const data = isRecord(envelope.data) ? envelope.data : undefined;',
+  '  const details = isRecord(data && data.details) ? data.details : undefined;',
+  '  const lifecycle = isRecord(details && details.lifecycleStatus) ? details.lifecycleStatus : undefined;',
+  '  const proof = isRecord(lifecycle && lifecycle.processTerminal) ? lifecycle.processTerminal : undefined;',
+  '  const error = isRecord(envelope.error) ? envelope.error : undefined;',
+  '  return { delivered: result.delivered, success: envelope.success === true, error: error ? { code: error.code, message: error.message } : undefined, processTerminal: proof ? { state: proof.state, runId: proof.runId, runnerProcessInstanceId: proof.runnerProcessInstanceId } : undefined, structuredIdentityFields: identityFields(data, "data") };',
+  '}',
+  'async function waitForProof(host, runId, timeoutMs) {',
+  '  const deadline = Date.now() + timeoutMs;',
+  '  while (Date.now() < deadline) {',
+  '    const result = await host.rpc("status", { id: runId }, { timeoutMs: 5000 });',
+  '    const summary = summarize(result);',
+  '    if (summary.processTerminal && summary.processTerminal.state === "observed" && summary.processTerminal.runId === runId) return summary.processTerminal;',
+  '    await new Promise(resolve => setTimeout(resolve, 50));',
+  '  }',
+  '  throw new Error("Timed out waiting for observed native process proof for " + runId);',
+  '}',
+  'let host;',
+  'let startedRunId;',
+  'let proofObserved = false;',
+  'try {',
+  '  const origin = phase === "reattach" ? JSON.parse(await readFile(originPath, "utf8")) : undefined;',
+  '  assert.equal(phase === "reattach" ? origin.sessionId : sessionId, sessionId);',
+  '  host = await createNativeRuntimeHost(sandbox, { sessionId, reattach: phase === "reattach" });',
+  '  if (phase === "origin") {',
+  '    const starts = [];',
+  '    host.events.on("subagent:async-started", event => { if (isRecord(event)) starts.push(event); });',
+  '    const launched = await host.rpc("spawn", { agent: "worker", task: "Complete the deterministic native U2 fixture.", cwd: host.repository, context: "fresh", worktree: false, timeoutMs: 15000 }, { dropReply: true, timeoutMs: 15000 });',
+  '    assert.equal(launched.delivered, false, "spawn reply is dropped from the caller");',
+  '    const started = starts.find(event => event.agent === "worker");',
+  '    assert.ok(started && typeof started.id === "string", "native run identity was observed independently by the fixture");',
+  '    assert.equal(started.sessionId, sessionId);',
+  '    assert.equal(Object.hasOwn(started, "requestId"), false);',
+  '    startedRunId = started.id;',
+  '    const base = { sessionId, requestId: launched.requestId, nativeRunId: startedRunId, hostPid: process.pid, runnerPid: started.pid };',
+  '    await writeFile(originPath, JSON.stringify(base));',
+  '    const proof = await waitForProof(host, startedRunId, 40000);',
+  '    proofObserved = true;',
+  '    const calls = await host.calls();',
+  '    assert.equal(calls.length, 1);',
+  '    assert.equal(calls[0].agent, "worker");',
+  '    assert.notEqual(calls[0].pid, process.pid);',
+  '    const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: host.repository, encoding: "utf8" }).trim();',
+  '    await writeFile(originPath, JSON.stringify({ ...base, proof: { state: proof.state, runId: proof.runId, runnerProcessInstanceId: proof.runnerProcessInstanceId }, childPid: calls[0].pid, sideEffects: calls.length, head }));',
+  '  } else {',
+  '    assert.equal(phase, "reattach");',
+  '    assert.equal(host.sessionId, origin.sessionId);',
+  '    const requestId = origin.requestId;',
+  '    const aliasId = "rpc-spawn-" + requestId;',
+  '    const rawRequestId = summarize(await host.rpc("status", { id: requestId }, { timeoutMs: 5000 }));',
+  '    const rpcSpawnAlias = summarize(await host.rpc("status", { id: aliasId }, { timeoutMs: 5000 }));',
+  '    const untargetedStatus = summarize(await host.rpc("status", undefined, { timeoutMs: 5000 }));',
+  '    const fleetStatus = summarize(await host.rpc("status", { view: "fleet" }, { timeoutMs: 5000 }));',
+  '    const knownRunStatus = summarize(await host.rpc("status", { id: origin.nativeRunId }, { timeoutMs: 5000 }));',
+  '    const nativeStatus = JSON.parse(await readFile(join(host.asyncDirRoot, origin.nativeRunId, "status.json"), "utf8"));',
+  '    const calls = await host.calls();',
+  '    const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: host.repository, encoding: "utf8" }).trim();',
+  '    await writeFile(reportPath, JSON.stringify({ sessionId, requestId, aliasId, rawRequestId, rpcSpawnAlias, untargetedStatus, fleetStatus, knownRunStatus, nativeStatusArtifact: { runId: nativeStatus.runId, sessionId: nativeStatus.sessionId, state: nativeStatus.state, toolCallId: nativeStatus.toolCallId ?? null, processTerminal: nativeStatus.processTerminal ? { state: nativeStatus.processTerminal.state, runId: nativeStatus.processTerminal.runId, runnerProcessInstanceId: nativeStatus.processTerminal.runnerProcessInstanceId } : undefined }, publicIdentityFields: [rawRequestId, rpcSpawnAlias, untargetedStatus, fleetStatus].flatMap(value => value.structuredIdentityFields), hostPid: process.pid, childPids: calls.map(call => call.pid), sideEffects: calls.length, head }));',
+  '  }',
+  '} finally {',
+  '  if (phase === "origin" && host && startedRunId && !proofObserved) {',
+  '    try { await host.rpc("stop", { id: startedRunId }, { timeoutMs: 3000 }); await waitForProof(host, startedRunId, 10000); }',
+  '    catch (error) { await writeFile(join(sandbox, "u2-cleanup-unresolved.json"), JSON.stringify({ sessionId, runId: startedRunId, proofError: String(error) })); }',
+  '  }',
+  '  await host?.dispose();',
+  '}',
+  'if (phase !== "origin" && phase !== "reattach") throw new Error("Unknown host phase: " + phase);',
+].join('\n');
+
+async function runFreshHostPhase(
+  phase,
+  sandbox,
+  sessionId,
+  timeoutMs = 75_000,
+) {
+  const { spawn } = await import('node:child_process');
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      process.execPath,
+      [
+        '--input-type=module',
+        '-e',
+        freshHostPhaseScript,
+        phase,
+        sandbox,
+        sessionId,
+      ],
+      {
+        cwd: process.cwd(),
+        env: {
+          PATH: process.env.PATH ?? '/usr/bin:/bin',
+          HOME: join(sandbox, 'home'),
+          TMPDIR: join(sandbox, 'tmp'),
+          LANG: 'C',
+          LC_ALL: 'C',
+          GIT_CONFIG_GLOBAL: '/dev/null',
+          GIT_CONFIG_NOSYSTEM: '1',
+          NODE_OPTIONS: '',
+          NODE_PATH: '',
+        },
+        stdio: ['ignore', 'ignore', 'pipe'],
+      },
+    );
+    let stderr = '';
+    let settled = false;
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      child.kill('SIGTERM');
+    }, timeoutMs);
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.once('error', (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      reject(error);
+    });
+    child.once('close', (code, signal) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      if (code !== 0) {
+        reject(
+          new Error(
+            'Fresh native host phase ' +
+              phase +
+              ' failed: code=' +
+              code +
+              ' signal=' +
+              signal +
+              ' stderr=' +
+              stderr.slice(-4000),
+          ),
+        );
+        return;
+      }
+      resolve(child.pid);
+    });
+  });
+}
+
+function structuredBindingFields(view, candidateId, runId) {
+  const fields = view?.structuredIdentityFields ?? [];
+  const runFields = fields.filter(
+    (field) => field.key === 'runId' && field.value === runId,
+  );
+  const bindingFields = fields.filter(
+    (field) =>
+      (field.key === 'toolCallId' ||
+        field.key === 'requestId' ||
+        field.key === 'id') &&
+      field.value === candidateId,
+  );
+  return runFields.some((runField) => {
+    const runParent = runField.path.slice(0, runField.path.lastIndexOf('.'));
+    return bindingFields.some(
+      (bindingField) =>
+        bindingField.path.slice(0, bindingField.path.lastIndexOf('.')) ===
+        runParent,
+    );
+  });
 }
 
 async function waitForObservedProof(host, runId, timeoutMs = 30_000) {
@@ -66,6 +259,122 @@ async function retireKnownRuns(host, knownRuns, observedRuns) {
   }
   return unresolved;
 }
+
+test('released public status correlation after a fresh OS host process', {
+  timeout: 180_000,
+}, async (t) => {
+  const sandbox = await mkdtemp(join(tmpdir(), 'pi-plan-exec-native-u2-'));
+  const sessionId = `native-u2-${randomUUID()}`;
+  let passed = false;
+  try {
+    const originHostPid = await runFreshHostPhase('origin', sandbox, sessionId);
+    const origin = JSON.parse(
+      await readFile(join(sandbox, 'u2-origin.json'), 'utf8'),
+    );
+    assert.equal(origin.hostPid, originHostPid);
+    assert.equal(origin.sessionId, sessionId);
+    assert.equal(origin.sideEffects, 1);
+    assert.equal(origin.proof.state, 'observed');
+    assert.equal(origin.proof.runId, origin.nativeRunId);
+
+    const recoveryHostPid = await runFreshHostPhase(
+      'reattach',
+      sandbox,
+      sessionId,
+    );
+    const recovery = JSON.parse(
+      await readFile(join(sandbox, 'u2-recovery.json'), 'utf8'),
+    );
+    assert.notEqual(originHostPid, recoveryHostPid);
+    assert.notEqual(originHostPid, process.pid);
+    assert.notEqual(recoveryHostPid, process.pid);
+    assert.equal(recovery.hostPid, recoveryHostPid);
+    assert.equal(recovery.sessionId, sessionId);
+    assert.equal(recovery.sideEffects, 1);
+    assert.deepEqual(recovery.childPids, [origin.childPid]);
+    assert.ok(
+      recovery.childPids.every(
+        (pid) => pid !== originHostPid && pid !== recoveryHostPid,
+      ),
+    );
+    assert.equal(
+      recovery.head,
+      origin.head,
+      'reattach must not reset the fixture repository',
+    );
+    assert.equal(recovery.nativeStatusArtifact.runId, origin.nativeRunId);
+    assert.equal(recovery.nativeStatusArtifact.sessionId, sessionId);
+    assert.equal(recovery.nativeStatusArtifact.toolCallId, null);
+    assert.equal(recovery.rawRequestId.success, false);
+    assert.equal(recovery.rawRequestId.error?.code, 'execution_failed');
+    assert.match(
+      recovery.rawRequestId.error?.message ?? '',
+      /Async run not found/i,
+    );
+    assert.equal(recovery.rpcSpawnAlias.success, false);
+    assert.equal(recovery.rpcSpawnAlias.error?.code, 'execution_failed');
+    assert.match(
+      recovery.rpcSpawnAlias.error?.message ?? '',
+      /Async run not found/i,
+    );
+    assert.equal(
+      recovery.nativeStatusArtifact.processTerminal?.state,
+      'observed',
+    );
+
+    const knownRunProof = recovery.knownRunStatus.processTerminal;
+    assert.equal(knownRunProof?.state, 'observed');
+    assert.equal(knownRunProof?.runId, origin.nativeRunId);
+    assert.equal(typeof knownRunProof?.runnerProcessInstanceId, 'string');
+
+    const rawRecovered =
+      recovery.rawRequestId.processTerminal?.runId === origin.nativeRunId;
+    const aliasRecovered =
+      recovery.rpcSpawnAlias.processTerminal?.runId === origin.nativeRunId;
+    const publicStatusViews = [
+      recovery.rawRequestId,
+      recovery.rpcSpawnAlias,
+      recovery.untargetedStatus,
+      recovery.fleetStatus,
+    ];
+    const rawStructuredBinding = publicStatusViews.some((view) =>
+      structuredBindingFields(view, origin.requestId, origin.nativeRunId),
+    );
+    const aliasStructuredBinding = publicStatusViews.some((view) =>
+      structuredBindingFields(view, recovery.aliasId, origin.nativeRunId),
+    );
+    assert.equal(rawRecovered, false);
+    assert.equal(aliasRecovered, false);
+    assert.equal(rawStructuredBinding, false);
+    assert.equal(aliasStructuredBinding, false);
+    t.diagnostic(
+      JSON.stringify({
+        rawRequestId: {
+          success: recovery.rawRequestId.success,
+          error: recovery.rawRequestId.error,
+          exactRunProof: rawRecovered,
+        },
+        rpcSpawnAlias: {
+          success: recovery.rpcSpawnAlias.success,
+          error: recovery.rpcSpawnAlias.error,
+          exactRunProof: aliasRecovered,
+        },
+        structuredStatusBindings: {
+          rawRequestId: rawStructuredBinding,
+          rpcSpawnAlias: aliasStructuredBinding,
+        },
+        nativeStatusArtifact: recovery.nativeStatusArtifact,
+        publicIdentityFields: recovery.publicIdentityFields,
+        sideEffects: recovery.sideEffects,
+        hostPids: [originHostPid, recoveryHostPid],
+      }),
+    );
+    passed = true;
+  } finally {
+    if (passed) await rm(sandbox, { recursive: true, force: true });
+    else console.error(`Retained U2 fresh-host sandbox: ${sandbox}`);
+  }
+});
 
 test('failure cleanup leaves unproven runners unresolved after stop delivery', async () => {
   const calls = [];

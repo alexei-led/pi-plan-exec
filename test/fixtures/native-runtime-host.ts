@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { syncBuiltinESMExports } from 'node:module';
 import os from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -122,6 +122,8 @@ type ScriptedFixtureModule = {
 export type NativeRuntimeHostOptions = {
   events?: NativeEventBus;
   failAfterRegistration?: boolean;
+  reattach?: boolean;
+  sessionId?: string;
 };
 
 export function nativeFixtureFactoryModulePath(): string | undefined {
@@ -234,25 +236,33 @@ export async function createNativeRuntimeHost(
       );
     }
 
-    fixtureGit(repository, 'init', '-b', 'feature');
-    const gitConfig = [
-      ['user.email', 'native-fixture@example.test'],
-      ['user.name', 'Native Runtime Fixture'],
-      ['commit.gpgSign', 'false'],
-      ['core.hooksPath', '/dev/null'],
-    ] as const;
-    for (const [key, value] of gitConfig)
-      fixtureGit(repository, 'config', key, value);
-    await writeFile(
-      join(repository, 'plan.md'),
-      '### Task 1: Deliver fixture\n- [ ] Deliver fixture\n',
-    );
-    await writeFile(
-      join(repository, 'check.mjs'),
-      'import assert from "node:assert/strict"; import { readFileSync } from "node:fs"; assert.equal(readFileSync("result.txt", "utf8"), "autonomous runtime smoke\\n");\n',
-    );
-    fixtureGit(repository, 'add', 'plan.md', 'check.mjs');
-    fixtureGit(repository, 'commit', '-m', 'Native runtime fixture baseline');
+    if (options.reattach) {
+      await Promise.all([
+        access(join(repository, '.git')),
+        access(join(repository, 'plan.md')),
+        access(join(repository, 'check.mjs')),
+      ]);
+    } else {
+      fixtureGit(repository, 'init', '-b', 'feature');
+      const gitConfig = [
+        ['user.email', 'native-fixture@example.test'],
+        ['user.name', 'Native Runtime Fixture'],
+        ['commit.gpgSign', 'false'],
+        ['core.hooksPath', '/dev/null'],
+      ] as const;
+      for (const [key, value] of gitConfig)
+        fixtureGit(repository, 'config', key, value);
+      await writeFile(
+        join(repository, 'plan.md'),
+        '### Task 1: Deliver fixture\n- [ ] Deliver fixture\n',
+      );
+      await writeFile(
+        join(repository, 'check.mjs'),
+        'import assert from "node:assert/strict"; import { readFileSync } from "node:fs"; assert.equal(readFileSync("result.txt", "utf8"), "autonomous runtime smoke\\n");\n',
+      );
+      fixtureGit(repository, 'add', 'plan.md', 'check.mjs');
+      fixtureGit(repository, 'commit', '-m', 'Native runtime fixture baseline');
+    }
 
     const listeners = new Map<string, Set<EventHandler>>();
     const droppedReplies = new Set<string>();
@@ -313,7 +323,8 @@ export async function createNativeRuntimeHost(
     childSessionModule.setChildSessionFactoryModule(fixtureFactoryPath);
     childSessionModule.setChildSessionFactory(scriptedFixture());
 
-    let currentSessionId = `native-contract-${randomUUID()}`;
+    let currentSessionId =
+      options.sessionId ?? `native-contract-${randomUUID()}`;
     const context: NativeContext = {
       cwd: repository,
       hasUI: false,
