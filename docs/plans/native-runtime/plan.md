@@ -691,15 +691,15 @@ Manual checks:
   This task can document the gap; cutover cannot pass by ignoring it.
 
 - [x] Before changes, capture `npm test` and `npm run test:runtime-smoke` baseline results, package/runtime versions, Bridge/projection source sizes and existing coverage. After this task's changes, run the full listed gates. Do not duplicate a passing test merely to rename it.
-- [ ] Build an isolated native RPC fixture that runs a direct async worker and reviewer with the actual release, records exact launch/result/proof identities and counts real child side effects.
-- [ ] Test effective context, cwd, model, tools, output schema, output binding, turn controls, acceptance/completion behavior and timeout semantics. Distinguish unsupported options from advertised-but-broken options.
+- [x] Build an isolated native RPC fixture that runs a direct async worker and reviewer with the actual release, records exact launch/result/proof identities and counts real child side effects.
+- [x] Test effective context, cwd, model, tools, output schema, output binding, turn controls, acceptance/completion behavior and timeout semantics. Distinguish unsupported options from advertised-but-broken options.
 - [ ] Add deterministic barriers for prepared intent, dispatch claim, native launch, reply delivery, binding persistence, result capture and acceptance; support dropped reply, duplicate/late completion and parent SIGKILL.
 - [ ] Characterize native status/correlation after reload and process restart, same-session versus foreign-session controls, supervisor wait and process proof when the parent dies.
 - [x] Reproduce U1 against the actual RPC route and compare the existing tool policy without using that tool as a production fallback.
 - [x] Resolve U2 by testing existing public structured identity/artifacts first. Record the exact supported binding mechanism or a minimal upstream proposal; never bless status-text parsing or not-found-as-absence.
-- [ ] Record U3/U4 limits and any genuinely necessary upstream bugfix reproduction. Do not change another repository, publish a PR or install a global package under this task.
-- [ ] Add the negative boundary-guard cases and map S01–S56 to retained tests, planned tests or explicitly blocked host contracts. Record which assertions require H/X rather than mocks.
-- [ ] Run this task's gates, preserve sanitized evidence, and commit only its safety-net changes and checkbox updates. Leave production dispatch unchanged.
+- [x] Record U3/U4 limits and any genuinely necessary upstream bugfix reproduction. Do not change another repository, publish a PR or install a global package under this task.
+- [x] Add the negative boundary-guard cases and map S01–S56 to retained tests, planned tests or explicitly blocked host contracts. Record which assertions require H/X rather than mocks.
+- [x] Run this task's gates, preserve sanitized evidence, and commit only its safety-net changes and checkbox updates. Leave production dispatch unchanged.
 
 ### Task 2: Implement the internal native adapter and operation safety kernel
 
@@ -733,16 +733,16 @@ Manual checks:
 - Read the crash-window proof: dispatching-before-emit cannot be replayed.
 - Confirm corruption/cleanup cannot delete an unresolved writer reservation.
 
-- [ ] Define the native operation discriminator and immutable fields from D3, with explicit prepared/dispatching/bound/retired transitions and independent stop intent/delivery. Reuse current run state instead of introducing a new database.
-- [ ] Implement canonical request digest and exact identity validators, keeping caller/native/process namespaces separate. Reject stale generation, changed parameters and mismatched request/reply IDs.
-- [ ] Extend registry validation and CAS transitions so one prepared operation can claim dispatch once. Re-read authorization before emit; missing/currently different run or operation always refuses. Preserve D9's 1.7.1 retention anchors and rejected-CAS behavior (S55).
-- [ ] Implement direct async spawn, targeted status/proof reading and authorized stop through public RPC. Register bounded listeners before sending; use fresh session context; dispose idempotently.
-- [ ] Implement exact-correlation recovery using Task 1's proven public mechanism. Persist a recovered binding only after identity/owner checks; a lookup error or missing evidence stays unknown.
-- [ ] Persist and retry cancellation on the same operation. Treat queued/delivered as transport facts, retain original correlated errors, and accept retirement only through validated proof/non-start evidence.
-- [ ] Ensure late replies and events merge against the current record without clearing newer cancellation, pause or quarantine. Do not infer ownership from advisory activity.
+- [x] Define the native operation discriminator and immutable fields from D3, with explicit prepared/dispatching/bound/retired transitions and independent stop intent/delivery. Reuse current run state instead of introducing a new database.
+- [x] Implement canonical request digest and exact identity validators, keeping caller/native/process namespaces separate. Reject stale generation, changed parameters and mismatched request/reply IDs.
+- [x] Extend registry validation and CAS transitions so one prepared operation can claim dispatch once. Re-read authorization before emit; missing/currently different run or operation always refuses. Preserve D9's 1.7.1 retention anchors and rejected-CAS behavior (S55).
+- [x] Implement direct async spawn, targeted status/proof reading and authorized stop through public RPC. Register bounded listeners before sending; use fresh session context; dispose idempotently.
+- [x] Implement exact-correlation recovery using Task 1's proven public mechanism. Persist a recovered binding only after identity/owner checks; a lookup error or missing evidence stays unknown.
+- [x] Persist and retry cancellation on the same operation. Treat queued/delivered as transport facts, retain original correlated errors, and accept retirement only through validated proof/non-start evidence.
+- [x] Ensure late replies and events merge against the current record without clearing newer cancellation, pause or quarantine. Do not infer ownership from advisory activity.
 - [ ] Add restart/race cases with real registry locks and separate host processes: concurrent dispatch, dropped reply, disk failure, stop during launch, late success and old-generation events.
-- [ ] Strengthen native cleanup to refuse unreadable ownership and all unresolved active/failed/quarantined operations. Test safe removal followed by late start/completion cannot resurrect a run.
-- [ ] Run the gates and inspect the diff for duplicated controller policy. Record the minimal kernel boundary and commit it while the old production path remains selectable only by existing code.
+- [x] Strengthen native cleanup to refuse unreadable ownership and all unresolved active/failed/quarantined operations. Test safe removal followed by late start/completion cannot resurrect a run.
+- [x] Run the gates and inspect the diff for duplicated controller policy. Record the minimal kernel boundary and commit it while the old production path remains selectable only by existing code.
 
 ### Task 3: Route controller execution and results through the native seam
 
@@ -782,16 +782,16 @@ Manual checks:
 - Compare effective native limits with frozen requested policy; document any
   unsupported limit instead of silently dropping it.
 
-- [ ] Replace Bridge-shaped controller assumptions with the normalized native seam for worker/fixer/reviewer/stats, preserving original operation, task, review and stop generations.
-- [ ] Preserve local Git/check/bootstrap execution, accepted-baseline verification, partial task lanes, promotion/archive and explicit review-backend selection. Do not broaden Fusion/Revmux compatibility.
-- [ ] Use one awaited keyed workflow with fresh child context, controller-owned cwd/worktree and no mission. Bind outputs and recovery identity explicitly; do not add a second direct-leaf backend or require an upstream patch.
-- [ ] Define a minimal typed native reviewer schema and semantic checks. Bind candidate SHA and operation; keep native text review parsing only for imported old results.
-- [ ] Bind new outputs under run-owned storage and atomically capture complete result/usage/proof before acceptance. Fail closed on missing/truncated/wrong-identity artifacts or capture failure.
-- [ ] Connect completion/readiness wake hints to the existing serialized loop with periodic reconciliation/backoff as fallback. Test duplicate wakes, load-order delay and disposed contexts cannot start work.
-- [ ] Preserve automatic recovery, one-attempt model overrides and D4's 1.7.1 user-pause precedence without inventing supervisor questions. Keep stage logging conditional on applied CAS (S56); remove duplicate branches only with equivalent tests.
-- [ ] Keep supervisor waits on the original child. Preserve native session authority across plan lease takeover; surface the exact safe action when another session cannot control it.
+- [x] Replace Bridge-shaped controller assumptions with the normalized native seam for worker/fixer/reviewer/stats, preserving original operation, task, review and stop generations.
+- [x] Preserve local Git/check/bootstrap execution, accepted-baseline verification, partial task lanes, promotion/archive and explicit review-backend selection. Do not broaden Fusion/Revmux compatibility.
+- [x] Use one awaited keyed workflow with fresh child context, controller-owned cwd/worktree and no mission. Bind outputs and recovery identity explicitly; do not add a second direct-leaf backend or require an upstream patch.
+- [x] Define a minimal typed native reviewer schema and semantic checks. Bind candidate SHA and operation; keep native text review parsing only for imported old results.
+- [x] Bind new outputs under run-owned storage and atomically capture complete result/usage/proof before acceptance. Fail closed on missing/truncated/wrong-identity artifacts or capture failure.
+- [x] Connect completion/readiness wake hints to the existing serialized loop with periodic reconciliation/backoff as fallback. Test duplicate wakes, load-order delay and disposed contexts cannot start work.
+- [x] Preserve automatic recovery, one-attempt model overrides and D4's 1.7.1 user-pause precedence without inventing supervisor questions. Keep stage logging conditional on applied CAS (S56); remove duplicate branches only with equivalent tests.
+- [x] Keep supervisor waits on the original child. Preserve native session authority across plan lease takeover; surface the exact safe action when another session cannot control it.
 - [ ] Exercise S01–S41, S51 and S54–S56 through the native test composition, including independent lanes, nested cwd, review/fix, goal continuation and local-operation retirement. Count launches and accepted commits.
-- [ ] Run the gates on unmodified 0.76.1, record supported behavior and safe outcomes for unresolved observations, and commit the integrated seam without removing old migration evidence. Do not wait for upstream PR #2717.
+- [x] Run the gates on unmodified 0.76.1, record supported behavior and safe outcomes for unresolved observations, and commit the integrated seam without removing old migration evidence. Do not wait for upstream PR #2717.
 
 ### Task 4: Migrate legacy state and remove pi-tasks and Bridge dependencies
 
@@ -844,16 +844,16 @@ Manual checks:
   behavior using disposable fixtures. Verify the supported rollback preflight
   refuses every remaining native-format record, including terminal history.
 
-- [ ] Implement a read-only schema-7 legacy importer with owner/digest binding and version/size validation. Missing database never creates one; preserve original request and receipt data.
+- [x] Implement a read-only schema-7 legacy importer with owner/digest binding and version/size validation. Missing database never creates one; preserve original request and receipt data.
 - [ ] Implement idempotent fixture migration for every D8 row, including active/failed/quarantined operations, pending cancellation errors and historical workflow outputs. Migration never dispatches.
 - [ ] Add crash barriers around snapshot/import/atomic record replacement, WAL consistency cases, conflicting mappings and unsupported schemas. Preserve old data byte-for-byte where no write was authorized.
-- [ ] Add cutover quiescence checks/guidance and new-format discrimination. Test previous-version admission refusal and cleanup hazard. Make no-downgrade-with-native-records an explicit rollback preflight condition; preserve native control-session boundaries.
-- [ ] Remove TaskStore projection, queues/status/settings and task-ID metadata. Retain run.tasks summaries, explicit ownership and D7's 1.7.1 view semantics. Retarget projection-triggered CAS/retention tests without losing S55/S56 coverage.
-- [ ] Remove BridgeClient/RPC envelopes/capability emulation and default bridge installation requirements. Keep only validated proof normalization and read-only legacy compatibility needed by fixtures.
-- [ ] Select native runtime for all new operations and remove temporary test-only transition glue from production. Existing unresolved legacy roots remain observed/fenced, never silently re-executed as native leaves.
-- [ ] Remove both packages from manifest/lock and packing expectations; update recovery fixtures to intercept native RPC directly. Do not delete third-party task files, Bridge databases or global packages.
-- [ ] Implement and run `test/packed-consumer-smoke.mjs` using a real tarball and isolated consumer as specified above. Assert dependency/module-resolution absence and prove plan, goal, review, restart and stop behavior through normal Pi loading.
-- [ ] Run the complete `npm test`, runtime/crash/packed-consumer gates, check and pack guard before committing cutover. Compare production scope with baseline. Delete obsolete tests only after equivalent coverage exists; retain legacy safety regressions.
+- [x] Add cutover quiescence checks/guidance and new-format discrimination. Test previous-version admission refusal and cleanup hazard. Make no-downgrade-with-native-records an explicit rollback preflight condition; preserve native control-session boundaries.
+- [x] Remove TaskStore projection, queues/status/settings and task-ID metadata. Retain run.tasks summaries, explicit ownership and D7's 1.7.1 view semantics. Retarget projection-triggered CAS/retention tests without losing S55/S56 coverage.
+- [x] Remove BridgeClient/RPC envelopes/capability emulation and default bridge installation requirements. Keep only validated proof normalization and read-only legacy compatibility needed by fixtures.
+- [x] Select native runtime for all new operations and remove temporary test-only transition glue from production. Existing unresolved legacy roots remain observed/fenced, never silently re-executed as native leaves.
+- [x] Remove both packages from manifest/lock and packing expectations; update recovery fixtures to intercept native RPC directly. Do not delete third-party task files, Bridge databases or global packages.
+- [x] Implement and run `test/packed-consumer-smoke.mjs` using a real tarball and isolated consumer as specified above. Assert dependency/module-resolution absence and prove plan, goal, review, restart and stop behavior through normal Pi loading.
+- [x] Run the complete `npm test`, runtime/crash/packed-consumer gates, check and pack guard before committing cutover. Compare production scope with baseline. Delete obsolete tests only after equivalent coverage exists; retain legacy safety regressions.
 
 ### Task 5: Final verification, documentation and execution handoff
 
@@ -896,12 +896,12 @@ Manual checks:
   cleanup and simplicity. Human approval/publication remains outside this plan.
 
 - [ ] Close the S01–S56 mapping with exact tests/results; distinguish local Darwin, Linux CI and unrun checks. Any missing required coverage blocks completion, not just a footnote.
-- [ ] Run the full gates and normal-loader packed-consumer scenarios without either removed package; confirm fixture descendants are retired and failed-run artifacts remain available for diagnosis.
-- [ ] Wire native contract, host/crash recovery and packed-consumer smoke checks into validation/CI. Preserve bounded test runtime and capture proof/identity diagnostics on failure.
-- [ ] Update user/operator docs and installed skill sources to match actual native APIs, dependency pins, lifetime limits, self-healing cases, foreign-session restrictions and legacy migration procedure.
-- [ ] Document safe upgrade/backup and the hard rollback preflight: no older runtime against any native-format record. Explain the old cleanup hazard, lost optional pi-tasks task list and why global packages/data stay untouched.
-- [ ] Verify that running this plan with a separately pinned stable executor is supported through the final archive: do not require the executing Pi process to reload/uninstall its own controller midway.
-- [ ] Record actual removed/added code and dependencies, retained compatibility scope, and upstream issue/PR/release evidence if applicable. Do not claim a line-count improvement before measuring it.
+- [x] Run the full gates and normal-loader packed-consumer scenarios without either removed package; confirm fixture descendants are retired and failed-run artifacts remain available for diagnosis.
+- [x] Wire native contract, host/crash recovery and packed-consumer smoke checks into validation/CI. Preserve bounded test runtime and capture proof/identity diagnostics on failure.
+- [x] Update user/operator docs and installed skill sources to match actual native APIs, dependency pins, lifetime limits, self-healing cases, foreign-session restrictions and legacy migration procedure.
+- [x] Document safe upgrade/backup and the hard rollback preflight: no older runtime against any native-format record. Explain the old cleanup hazard, lost optional pi-tasks task list and why global packages/data stay untouched.
+- [x] Verify that running this plan with a separately pinned stable executor is supported through the final archive: do not require the executing Pi process to reload/uninstall its own controller midway.
+- [x] Record actual removed/added code and dependencies, retained compatibility scope, and upstream issue/PR/release evidence if applicable. Do not claim a line-count improvement before measuring it.
 - [ ] Resolve independent review findings, rerun only affected checks after fixes, and record a scoped architecture re-review of D1–D9. Commit final docs/evidence and checkbox updates; do not push, tag or release without approval.
 
 ## Acceptance criteria

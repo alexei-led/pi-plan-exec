@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
 import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { promisify } from 'node:util';
 import { createJiti } from 'jiti';
 
 const jiti = createJiti(import.meta.url);
@@ -11,6 +13,7 @@ const { NativeRuntimeClient } = await jiti.import(
   '../../src/native-runtime.ts',
 );
 const { RunRegistry } = await jiti.import('../../src/registry.ts');
+const { PlanExecController } = await jiti.import('../../src/controller.ts');
 const { DEFAULT_FROZEN_RUN_CONFIG } = await jiti.import('../../src/types.ts');
 const [phase, sandbox] = process.argv.slice(2);
 const host = await createNativeRuntimeHost(sandbox, {
@@ -25,8 +28,10 @@ const client = new NativeRuntimeClient(
   () => host.context,
 );
 let spawns = 0;
+let statusRequests = 0;
 host.events.on('subagents:rpc:v1:request', (request) => {
   if (request.method === 'spawn') spawns++;
+  if (request.method === 'status') statusRequests++;
 });
 async function waitFor(read, label) {
   const end = Date.now() + 45000;
@@ -105,12 +110,50 @@ if (phase === 'origin') {
       );
       return child?.state === 'complete' && child;
     }, 'orphan child settlement');
-    let observed;
-    for (let attempt = 0; attempt < 30; attempt++) {
-      observed = await client.operation(origin.runId, origin.binding);
-      if (observed.state === 'retired') break;
-      await new Promise((r) => setTimeout(r, 50));
+    const execute = promisify(execFile);
+    const command = async (program, args, cwd) => {
+      try {
+        return { ...(await execute(program, args, { cwd })), code: 0 };
+      } catch (error) {
+        return {
+          stdout: error.stdout ?? '',
+          stderr: error.stderr ?? '',
+          code: error.code ?? 1,
+        };
+      }
+    };
+    const unavailable = async () => {
+      throw new Error('Crash recovery must not switch to Fusion');
+    };
+    const controller = new PlanExecController(
+      registry,
+      client,
+      {
+        start: unavailable,
+        status: unavailable,
+        result: unavailable,
+        adopt: unavailable,
+        cancel: unavailable,
+      },
+      command,
+    );
+    const beforeStatus = statusRequests;
+    let run;
+    let controllerTicks = 0;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      run = await controller.tick(origin.runId, host.sessionId);
+      controllerTicks++;
+      const operation = run.activeOperation ?? run.failedOperation;
+      assert.equal(operation?.operationId, origin.binding.operationId);
+      assert.equal(operation?.requestDigest, origin.binding.requestDigest);
+      assert.equal(operation?.externalRunId, origin.rootId);
+      assert.notEqual(operation?.processTreeExited, true);
+      assert.equal(run.stage, 'implementation');
     }
+    const controllerStatusRequests = statusRequests - beforeStatus;
+    assert.ok(controllerStatusRequests > 0);
+    assert.equal(run.lease.pid, process.pid);
+    const observed = await client.operation(origin.runId, origin.binding);
     const calls = await host.calls();
     assert.equal(calls.length, 1);
     assert.equal(calls[0].pid, origin.child.pid);
@@ -128,6 +171,11 @@ if (phase === 'origin') {
       JSON.stringify(
         {
           hostPid: process.pid,
+          controllerTicks,
+          controllerStatusRequests,
+          controllerOperationId: (run.activeOperation ?? run.failedOperation)
+            .operationId,
+          controllerLeasePid: run.lease.pid,
           spawns,
           sideEffects: calls.length,
           rootId: observed.operation.externalRunId,

@@ -91,7 +91,13 @@ Update or fix that package's declarations; do not suppress the warning or add
 private SDK copies here. See the [historical upstream audit](docs/upstream-audit.md) for
 the pre-cutover investigation; current requirements are in the runtime contracts.
 
-Restart Pi after package upgrades. `/reload` is for local source/config changes.
+Before cutover, quiesce existing executors and keep a consistent registry/journal
+backup. Restart Pi after package upgrades; do not run old and new controllers
+against the same registry. `/reload` is for local source/config changes.
+**Downgrade is unsafe while native records or artifacts remain, including terminal
+history.** Older code can accept those records and delete their artifacts. Use the
+[read-only rollback preflight](DEVELOPMENT.md#rollback-preflight); never delete
+evidence merely to make that check pass.
 Legacy records are read-only data, not another backend. Already-bound native IDs
 need no journal. Unbound records can explicitly import a consistent offline
 schema-7 snapshot:
@@ -202,7 +208,7 @@ Run controls are separate from display controls:
   Eligible registry artifacts are removed after a durable backup; unknown
   operations/local commands/quarantined checkouts retain their ownership record
   and reservation. Worktrees, branches, progress files and provider journals
-  are never deleted. See [force-stop recovery](skills/exec-plan/references/recovery.md#permanent-force-stop).
+  are never deleted. See [force-stop recovery](skills/exec-plan/references/recovery.md#pause-cancel-and-permanent-force-stop).
   `cancel` remains a deprecated alias for ordinary `stop`.
 - `/exec cleanup` retires run records. It previews by default and deletes
   nothing; `--apply` removes the registry entry — never the worktree, branch, or

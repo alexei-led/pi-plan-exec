@@ -71,6 +71,10 @@ test('S23 SIGKILL after native launch barrier leaves one surviving child and no 
     assert.notEqual(recovered.hostPid, origin.hostPid);
     assert.equal(recovered.sideEffects, 1);
     assert.equal(recovered.spawns, 0);
+    assert.equal(recovered.controllerTicks, 3);
+    assert.ok(recovered.controllerStatusRequests > 0);
+    assert.equal(recovered.controllerOperationId, origin.binding.operationId);
+    assert.equal(recovered.controllerLeasePid, recovered.hostPid);
     assert.equal(recovered.rootId, origin.rootId);
     assert.equal(recovered.childRunId, origin.childRunId);
     await waitFor(() => {
