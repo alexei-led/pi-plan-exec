@@ -13,11 +13,11 @@ import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { onTestFinished, test, vi } from 'vitest';
-import { type BridgeCapabilities, bridgeRequestDigest } from '../src/bridge.js';
 import {
   PLAN_STRUCTURE_CHANGED_ERROR,
   parseWorkerSignal,
 } from '../src/controller.js';
+import { executionRequestDigest } from '../src/execution-contract.js';
 import { execReconcile } from '../src/index.js';
 import {
   LocalOperationCancelledError,
@@ -29,11 +29,12 @@ import { appendProgressOnce } from '../src/progress.js';
 import { RunRegistry } from '../src/registry.js';
 import { required } from '../src/required.js';
 import { RevmuxReviewClient } from '../src/review-backend.js';
-import {
-  type BridgeResult,
-  DEFAULT_FROZEN_RUN_CONFIG,
-  type PlanExecRun,
-} from '../src/types.js';
+import { DEFAULT_FROZEN_RUN_CONFIG, type PlanExecRun } from '../src/types.js';
+import { writeLegacyJournal } from './fixtures/legacy-journal.js';
+import type {
+  BridgeCapabilities,
+  BridgeResult,
+} from './fixtures/legacy-types.js';
 import { PlanExecController as ProductionController } from './fixtures/native-controller.js';
 
 const success = (data: Record<string, unknown>) => ({
@@ -635,7 +636,7 @@ test('TASK_FAILED keeps the run running and schedules automatic task recovery', 
   assert.equal(recovered.activeOperation?.taskId, 1);
   assert.equal(bridge.spawnCount, 1);
   assert.match(String(bridge.lastSpawnParams?.task), /TASK_FAILED/);
-  assert.equal(bridge.lastSpawnParams?.completionGuard, false);
+  assert.equal(bridge.lastSpawnParams?.completionGuard, undefined);
 });
 
 test('implementation failures do not become terminal at the legacy attempt cap', async (_t) => {
@@ -976,6 +977,7 @@ test('resume does not adopt a fixer launched during the same recovery', async ()
       { id: 'major-1', severity: 'MAJOR', summary: 'Verify this defect' },
     ],
     failedOperation: {
+      processTreeExited: true,
       operationId: 'failed-fix',
       service: 'bridge',
       kind: 'fix',
@@ -989,7 +991,10 @@ test('resume does not adopt a fixer launched during the same recovery', async ()
   assert.equal(resumed.status, 'running');
   assert.equal(resumed.activeOperation?.kind, 'fix');
   assert.equal(resumed.activeOperation?.externalRunId, 'run-1');
-  assert.equal(resumed.activeOperation?.params?.completionGuard, false);
+  assert.equal(
+    nativeChild(required(resumed.activeOperation)).completionGuard,
+    undefined,
+  );
   assert.equal(bridge.spawnCount, 1);
   assert.equal(bridge.adoptCount, 0);
 });
@@ -1118,7 +1123,7 @@ test('resume retries a failed one-pass review fixer instead of skipping the capp
   assert.equal(resumed.activeOperation?.kind, 'fix');
   assert.equal(resumed.activeOperation?.reviewIteration, 1);
   assert.match(
-    String(resumed.activeOperation?.params?.task),
+    String(nativeChild(required(resumed.activeOperation)).task),
     /FINDING: MAJOR \| Fix this defect/,
   );
 });
@@ -1515,7 +1520,7 @@ test('resume consumes a settled detached stats child without launching a replace
   assert.equal(recovered.failedOperation, undefined);
 });
 
-test('resume reattaches an unsettled detached workflow instead of duplicating it', async () => {
+test('resume observes a retired legacy wrapper with missing child artifacts without duplicating it', async () => {
   const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
   const planPath = join(root, 'plan.md');
   const plan = '### Task 1: Implement\n- [x] Done\n';
@@ -1547,8 +1552,9 @@ test('resume reattaches an unsettled detached workflow instead of duplicating it
 
   const recovered = await controller.resume(failed.id, 'session-1');
 
-  assert.equal(recovered.status, 'failed');
-  assert.match(recovered.error ?? '', /refusing blind reattachment/);
+  assert.equal(recovered.status, 'running');
+  assert.equal(recovered.activeOperation?.operationId, 'operation-1');
+  assert.equal(recovered.activeOperation?.processTreeExited, true);
   assert.equal(bridge.spawnCount, 0);
 });
 
@@ -1697,10 +1703,7 @@ test('controller refuses an untracked persisted bridge operation rather than dup
   });
   const recovered = await controller.advance(run);
   assert.equal(recovered.status, 'running');
-  assert.match(
-    recovered.error ?? '',
-    /refusing to launch a possible duplicate/,
-  );
+  assert.match(recovered.error ?? '', /fenced|no replay/);
   assert.equal(recovered.activeOperation?.externalRunId, undefined);
   assert.equal(recovered.activeOperation?.recovery, 'recovery_required');
   assert.equal(recovered.activeOperation?.lastObservedState, 'unknown_launch');
@@ -1724,7 +1727,7 @@ test('launch rejection survives restart and unknown lookup without another spawn
     return {
       success: false,
       error: {
-        code: 'upstream_error',
+        code: 'invalid_params',
         upstreamCode: 'invalid_params',
         message:
           'RPC spawn workflowScript was removed; pass inline script text as script.',
@@ -1753,11 +1756,8 @@ test('launch rejection survives restart and unknown lookup without another spawn
     failed.activeOperation?.lastLaunchError,
     'RPC spawn workflowScript was removed; pass inline script text as script.',
   );
-  assert.equal(failed.activeOperation?.lastLaunchErrorCode, 'upstream_error');
-  assert.equal(
-    failed.activeOperation?.lastLaunchUpstreamCode,
-    'invalid_params',
-  );
+  assert.equal(failed.activeOperation?.lastLaunchErrorCode, 'invalid_params');
+  assert.equal(failed.activeOperation?.lastLaunchUpstreamCode, undefined);
   assert.equal(failed.activeOperation?.recovery, 'recovery_required');
   const stored = await registry.update({
     ...required(await registry.get(run.id)),
@@ -1788,16 +1788,16 @@ test('launch rejection survives restart and unknown lookup without another spawn
   );
   assert.equal(
     recovered.activeOperation?.lastLaunchErrorCode,
-    'upstream_error',
+    'invalid_params',
   );
   assert.match(
     recovered.activeOperation?.lastStatusError ?? '',
-    /No correlated pre-launch rejection/,
+    /fenced|correlat|replay/,
   );
   assert.equal(spawnCount, 1);
 });
 
-test('controller safely replays a v2 operation proven durably absent', async () => {
+test('controller never replays a historical operation merely because its old lookup is absent', async () => {
   const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
   const planPath = join(root, 'plan.md');
   await writeFile(planPath, '### Task 1: Implement\n- [ ] Do the work\n');
@@ -1825,7 +1825,7 @@ test('controller safely replays a v2 operation proven durably absent', async () 
       kind: 'implementation',
       taskId: 1,
       params,
-      requestDigest: bridgeRequestDigest(params),
+      requestDigest: executionRequestDigest(params),
       expectedLifetime: { mode: 'unbounded' },
     },
   });
@@ -1833,75 +1833,49 @@ test('controller safely replays a v2 operation proven durably absent', async () 
   const recovered = await controller.advance(run);
 
   assert.equal(recovered.status, 'running');
-  assert.equal(recovered.activeOperation?.externalRunId, 'run-1');
-  assert.equal(recovered.activeOperation?.recovery, 'observe');
-  assert.equal(bridge.spawnCount, 1);
-  assert.equal(bridge.lastSpawnParams?.mission, false);
+  assert.equal(recovered.activeOperation?.externalRunId, undefined);
+  assert.equal(recovered.activeOperation?.operationId, 'operation-v2-absent');
+  assert.equal(bridge.spawnCount, 0);
+  assert.equal(bridge.lastSpawnParams, undefined);
 });
 
-test('force stop wins while Bridge replay awaits capabilities even when cancellation delivery fails', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'force-replay-'));
+test('force stop wins while native readiness is pending without dispatch', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'force-readiness-'));
   onTestFinished(() => rm(root, { recursive: true, force: true }));
   const planPath = join(root, 'plan.md');
   await writeFile(planPath, '### Task 1: Implement\n- [ ] Do the work\n');
-  let entered!: () => void;
-  let release!: () => void;
-  const ready = new Promise<void>((resolve) => {
-    entered = resolve;
+  let entered!: () => void, release!: () => void;
+  const ready = new Promise<void>((r) => {
+    entered = r;
   });
-  const delayed = new Promise<void>((resolve) => {
-    release = resolve;
+  const pending = new Promise<void>((r) => {
+    release = r;
   });
-  class DelayedCapabilities extends DurableAbsentBridge {
-    probes = 0;
-    override async capabilities() {
-      if (++this.probes === 2) {
-        entered();
-        await delayed;
-      }
-      return super.capabilities();
-    }
-    async cancelOperation(operationId: string) {
-      assert.equal(operationId, 'replay-op');
-      return {
-        success: false as const,
-        error: { message: 'journal write failed' },
-      };
-    }
-  }
+  const bridge = new FakeBridge('unused');
+  const capabilities = bridge.capabilities.bind(bridge);
+  bridge.capabilities = async () => {
+    entered();
+    await pending;
+    return capabilities();
+  };
   const registry = new RunRegistry(join(root, 'runs'));
-  const bridge = new DelayedCapabilities('unused');
+  const run = await registry.create({
+    ...baseRun(root, planPath),
+    stage: 'implementation',
+    planHash: parsePlan(planPath, await readFile(planPath, 'utf8')).hash,
+  });
   const controller = new PlanExecController(
     registry,
     bridge,
     new FakeFusion(),
     fakeGit(root),
   );
-  const params = {
-    agent: 'worker',
-    task: 'recover',
-    cwd: root,
-    mission: false,
-    executionLifetime: { mode: 'unbounded' },
-  };
-  const run = await registry.create({
-    ...baseRun(root, planPath),
-    stage: 'implementation',
-    activeOperation: {
-      operationId: 'replay-op',
-      service: 'bridge',
-      kind: 'implementation',
-      params,
-      requestDigest: bridgeRequestDigest(params),
-      expectedLifetime: { mode: 'unbounded' },
-    },
-  });
-  const tick = controller.tick(run.id, 'owner');
+  const ticking = controller.tick(run.id, 'owner');
   await ready;
   const stopped = await controller.forceStop(run.id, 'owner');
-  assert.match(stopped.warning ?? '', /journal write failed/);
+  assert.equal(stopped.run.status, 'abandoned');
   release();
-  assert.equal((await tick).status, 'abandoned');
+  assert.equal((await ticking).status, 'abandoned');
   assert.equal(bridge.spawnCount, 0);
 });
 
@@ -1932,14 +1906,14 @@ test('controller refuses v2 absence without matching digest attestation', async 
       kind: 'implementation',
       taskId: 1,
       params,
-      requestDigest: bridgeRequestDigest(params),
+      requestDigest: executionRequestDigest(params),
     },
   });
 
   const recovered = await controller.advance(run);
 
   assert.equal(recovered.status, 'running');
-  assert.equal(recovered.activeOperation?.recovery, 'recovery_required');
+  assert.equal(recovered.activeOperation?.externalRunId, undefined);
   assert.equal(recovered.activeOperation?.lastObservedState, 'unknown_launch');
   assert.equal(bridge.spawnCount, 0);
 });
@@ -2043,7 +2017,7 @@ test('concurrent controllers launch one review operation and record one attempt'
   const stored = await registry.get(run.id);
   assert.equal(bridge.spawnCount, 1);
   assert.equal(stored?.stageAttempts.comprehensive_review, 1);
-  assert.equal(stored?.activeOperation?.operationId, undefined);
+  assert.ok(stored?.activeOperation?.operationId);
 });
 
 test('spawn reply preserves cancel requested while launch was pending', async () => {
@@ -2112,7 +2086,9 @@ test('cancel waits for a pending spawn reply and then stops the child', async ()
   assert.equal(attached.status, 'cancel_pending');
   assert.equal(attached.activeOperation?.externalRunId, 'run-1');
 
-  const stopping = await controller.advance(attached);
+  const stopping = await controller.advance(
+    await registry.update({ ...attached, nextAttemptAt: 0 }),
+  );
   assert.ok(
     stopping.status === 'cancel_pending' || stopping.status === 'cancelled',
   );
@@ -2309,12 +2285,12 @@ test('unknown persisted launch remains recoverable without a duplicate replay', 
   const deferred = await controller.advance(run);
 
   assert.equal(deferred.status, 'running');
-  assert.match(deferred.error ?? '', /refusing to launch a possible duplicate/);
+  assert.match(deferred.error ?? '', /fenced|no replay/);
   assert.equal(deferred.activeOperation?.operationId, 'operation-pending');
   assert.equal(deferred.activeOperation?.externalRunId, undefined);
 });
 
-test('resume attaches a found bridge operation instead of spawning another child', async () => {
+test('resume imports an exact offline legacy binding instead of spawning another child', async () => {
   const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
   const planPath = join(root, 'plan.md');
   const plan = '### Task 1: Implement\n- [ ] Do the work\n';
@@ -2349,6 +2325,17 @@ test('resume attaches a found bridge operation instead of spawning another child
     },
   });
 
+  const snapshot = join(root, 'offline.sqlite');
+  await writeLegacyJournal(
+    snapshot,
+    {
+      operationId: 'run-1',
+      ownerRunId: failed.id,
+      requestDigest: 'digest-run-1',
+    },
+    { run_id: 'existing-run' },
+  );
+  await controller.importLegacyJournal(failed.id, 'session-1', snapshot);
   const resumed = await controller.resume(failed.id, 'session-1');
 
   assert.equal(resumed.activeOperation?.externalRunId, 'existing-run');
@@ -2387,7 +2374,7 @@ test('unknown bridge lookup stays recoverable without a duplicate spawn', async 
   const resumed = await controller.resume(failed.id, 'session-1');
 
   assert.equal(resumed.status, 'running');
-  assert.match(resumed.error ?? '', /launch remains unresolved/);
+  assert.match(resumed.error ?? '', /fenced|no replay/);
   assert.equal(bridge.spawnCount, 0);
 });
 
@@ -2407,13 +2394,13 @@ test('bridge lookup recovery handles pending and malformed outcomes without spaw
       name: 'unknown',
       lookup: { state: 'unknown' },
       status: 'running',
-      error: /launch remains unresolved/,
+      error: /fenced/,
     },
     {
       name: 'invalid state',
       lookup: { state: 'unexpected' },
       status: 'running',
-      error: /invalid state/,
+      error: /fenced/,
     },
     {
       name: 'found without run ID',
@@ -2422,7 +2409,7 @@ test('bridge lookup recovery handles pending and malformed outcomes without spaw
         effectiveExecutionLifetime: { mode: 'unbounded' },
       },
       status: 'running',
-      error: /omitted a run ID/,
+      error: /fenced/,
     },
   ];
   for (const testCase of cases) {
@@ -3407,7 +3394,10 @@ test('force skip does not treat an absent operation as terminal', async () => {
   assert.equal(pending.status, 'skip_pending');
   assert.equal(pending.stage, 'comprehensive_review');
   assert.equal(pending.skippedStages.length, 0);
-  assert.match(pending.activeOperation?.lastSkipError ?? '', /cannot prove/);
+  assert.match(
+    pending.activeOperation?.lastSkipError ?? '',
+    /fenced|no replay/,
+  );
 });
 
 test('force skip does not treat unknown bridge states as terminal', async () => {
@@ -3446,15 +3436,15 @@ test('force skip does not treat unknown bridge states as terminal', async () => 
   assert.equal(pending.status, 'skip_pending');
   assert.equal(pending.stage, 'comprehensive_review');
   assert.equal(pending.skippedStages.length, 0);
-  assert.equal(pending.activeOperation?.skipFailures, 1);
+  assert.equal(pending.activeOperation?.processTreeExited, undefined);
   assert.equal(bridge.stopCount, 1);
 
   const retried = await controller.advance(pending);
   assert.equal(retried.status, 'skip_pending');
-  assert.equal(retried.activeOperation?.skipFailures, 2);
+  assert.equal(retried.activeOperation?.processTreeExited, undefined);
   const failedAgain = await controller.advance(retried);
   assert.equal(failedAgain.status, 'skip_pending');
-  assert.equal(failedAgain.activeOperation?.skipFailures, 3);
+  assert.equal(failedAgain.activeOperation?.processTreeExited, undefined);
   assert.equal(failedAgain.pendingStageSkip?.stage, 'comprehensive_review');
 });
 
@@ -3743,6 +3733,7 @@ test('failed fixer recovery uses operation metadata instead of its error text', 
     stageAttempts: { smells_review: 1 },
     reviewFindings: [{ id: 'major-1', severity: 'MAJOR', summary: 'Fix it' }],
     failedOperation: {
+      processTreeExited: true,
       operationId: 'fix-1',
       service: 'bridge',
       kind: 'fix',
@@ -3757,12 +3748,12 @@ test('failed fixer recovery uses operation metadata instead of its error text', 
   assert.equal(resumed.stage, 'smells_review');
   assert.equal(resumed.activeOperation?.kind, 'fix');
   assert.match(
-    String(resumed.activeOperation?.params?.task),
+    String(nativeChild(required(resumed.activeOperation)).task),
     /FINDING: MAJOR \| Fix it/,
   );
 });
 
-test('missing reviewer output schedules automatic recovery', async () => {
+test('missing reviewer output retries bound result observation without relaunch', async () => {
   const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
   const planPath = join(root, 'plan.md');
   await writeFile(planPath, '### Task 1: Implement\n- [x] Done\n');
@@ -3785,15 +3776,18 @@ test('missing reviewer output schedules automatic recovery', async () => {
   assert.equal(waiting.status, 'running');
   assert.equal(waiting.stage, 'comprehensive_review');
   assert.equal(waiting.stageAttempts.comprehensive_review, 1);
-  assert.equal(waiting.activeOperation, undefined);
+  assert.equal(
+    waiting.activeOperation?.operationId,
+    first.activeOperation?.operationId,
+  );
   assert.ok((waiting.nextAttemptAt ?? 0) > Date.now());
   assert.equal(bridge.spawnCount, 1);
 
   const due = await registry.update({ ...waiting, nextAttemptAt: 0 });
   const retried = await controller.tick(due.id, 'session-1');
   assert.equal(retried.activeOperation?.kind, 'review');
-  assert.equal(retried.activeOperation?.reviewIteration, 2);
-  assert.equal(bridge.spawnCount, 2);
+  assert.equal(retried.activeOperation?.reviewIteration, 1);
+  assert.equal(bridge.spawnCount, 1);
 });
 
 test('malformed reviewer output schedules review recovery', async () => {
@@ -3820,7 +3814,7 @@ test('malformed reviewer output schedules review recovery', async () => {
 
   assert.equal(waiting.status, 'running');
   assert.equal(waiting.activeOperation, undefined);
-  assert.match(waiting.error ?? '', /structured FINDING/);
+  assert.match(waiting.error ?? '', /JSON|Native review/);
   assert.ok((waiting.nextAttemptAt ?? 0) > Date.now());
   assert.equal(bridge.spawnCount, 1);
 
@@ -4305,7 +4299,7 @@ for (const state of ['unknown', 'live', 'retired', 'unavailable'] as const) {
     assert.equal(result.run.status, 'abandoned');
     assert.equal(result.removed, state === 'retired');
     assert.equal(bridge.spawnCount, 0);
-    assert.equal(bridge.stops, state === 'unknown' ? 0 : 1);
+    assert.equal(bridge.stops, state === 'live' ? 1 : 0);
     if (!result.removed) {
       assert.equal(
         (await controller.tick(run.id, 'owner')).status,
@@ -4344,6 +4338,9 @@ for (const service of ['bridge', 'fusion'] as const) {
         ),
       };
       class BoundBridge extends FakeBridge {
+        override async status() {
+          return success(data);
+        }
         async cancelOperation(
           operationId: string,
           owner?: { requestDigest: string },
@@ -4370,6 +4367,7 @@ for (const service of ['bridge', 'fusion'] as const) {
           requestDigest: 'digest',
           params: { mission: false },
           service,
+          ...(service === 'bridge' ? { externalRunId: 'child' } : {}),
           kind: 'implementation',
         },
       });
@@ -4387,7 +4385,7 @@ for (const service of ['bridge', 'fusion'] as const) {
       );
       assert.equal(
         result.run.activeOperation?.externalRunId,
-        valid ? 'child' : undefined,
+        service === 'bridge' || valid ? 'child' : undefined,
       );
       assert.equal(bridge.spawnCount, 0);
     });
@@ -4399,13 +4397,14 @@ test('force stop reports identity-bound pending-delivery errors from successful 
   onTestFinished(() => rm(root, { recursive: true, force: true }));
   const registry = new RunRegistry(join(root, 'runs'));
   class PendingBridge extends FakeBridge {
-    async cancelOperation() {
-      return success({
-        operationId: 'op',
-        requestDigest: 'digest',
-        cancellationDelivery: 'pending',
-        error: 'native paused-stop refused',
-      });
+    override async status() {
+      return success({ state: 'paused' });
+    }
+    override async stop() {
+      return {
+        success: false as const,
+        error: { code: 'invalid_state', message: 'native paused-stop refused' },
+      };
     }
   }
   const run = await registry.create({
@@ -4413,6 +4412,7 @@ test('force stop reports identity-bound pending-delivery errors from successful 
     stage: 'implementation',
     activeOperation: {
       operationId: 'op',
+      externalRunId: 'recorded-child',
       requestDigest: 'digest',
       params: { mission: false },
       service: 'bridge',
@@ -4534,10 +4534,10 @@ test('force stop wins over a delayed legacy lookup and does not recreate its mis
     release = resolve;
   });
   class DelayedLookup extends FakeBridge {
-    override async operation() {
+    override async status() {
       entered();
       await delayed;
-      return success({ state: 'unknown' });
+      return success({ state: 'running' });
     }
   }
   const bridge = new DelayedLookup(join(root, 'result'));
@@ -4548,6 +4548,8 @@ test('force stop wins over a delayed legacy lookup and does not recreate its mis
     stage: 'implementation',
     activeOperation: {
       operationId: 'legacy',
+      externalRunId: 'recorded-child',
+      requestDigest: 'original-digest',
       service: 'bridge',
       kind: 'implementation',
     },
@@ -4562,9 +4564,12 @@ test('force stop wins over a delayed legacy lookup and does not recreate its mis
   );
   const ticking = controller.tick(run.id, 'owner');
   await ready;
-  const stopped = await controller.forceStop(run.id, 'owner');
-  assert.equal(stopped.run.status, 'abandoned');
+  const stopping = controller.forceStop(run.id, 'owner');
+  while ((await registry.get(run.id))?.status !== 'abandoned')
+    await new Promise((resolve) => setTimeout(resolve, 1));
   release();
+  const stopped = await stopping;
+  assert.equal(stopped.run.status, 'abandoned');
   assert.equal((await ticking).status, 'abandoned');
   assert.equal((await registry.get(run.id))?.status, 'abandoned');
   await assert.rejects(
@@ -4695,7 +4700,7 @@ class FakeBridge {
     if (params) this.lastSpawnParams = params;
     this.bindings.set(`run-${this.current}`, {
       operationId,
-      requestDigest: bridgeRequestDigest(params ?? {}),
+      requestDigest: executionRequestDigest(params ?? {}),
     });
     return success({
       runId: `run-${this.current}`,
@@ -4733,8 +4738,8 @@ class FakeBridge {
   async adopt(): Promise<BridgeResult> {
     return success({ state: 'complete' });
   }
-  async stop(): Promise<BridgeResult> {
-    return success({ state: 'stopping' });
+  async stop(runId = `run-${this.current}`): Promise<BridgeResult> {
+    return success({ state: 'stopping', runId });
   }
 
   async diagnoseOperation(
@@ -4759,7 +4764,7 @@ class FakeBridge {
   ): void {
     this.bindings.set(runId, {
       operationId,
-      requestDigest: bridgeRequestDigest(params),
+      requestDigest: executionRequestDigest(params),
     });
   }
 }
@@ -4808,7 +4813,7 @@ class DurableAbsentBridge extends FakeBridge {
     if (params) this.lastSpawnParams = params;
     return success({
       runId: `run-${this.current}`,
-      requestDigest: bridgeRequestDigest(params ?? {}),
+      requestDigest: executionRequestDigest(params ?? {}),
       operationId: operationId ?? '',
       effectiveExecutionLifetime: { mode: 'unbounded' },
     });

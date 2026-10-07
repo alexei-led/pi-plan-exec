@@ -78,10 +78,10 @@ export async function isolationPreview(
     run.goal ||
     run.stage !== 'implementation' ||
     !run.activeOperation ||
-    run.activeOperation.service !== 'bridge' ||
+    run.activeOperation.service !== 'native' ||
     run.activeOperation.kind !== 'implementation' ||
     !run.activeOperation.requestDigest ||
-    !run.activeOperation.params
+    !run.activeOperation.native
   )
     throw new Error(
       'Isolated recovery currently requires a preserved Bridge implementation attempt with its immutable request.',

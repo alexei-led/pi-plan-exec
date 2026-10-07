@@ -25,10 +25,9 @@ selected review backend. A worker saying “done” is not enough: the plan’s
 checked items, accepted commit, required checks, and a clean worktree with no
 uncommitted or untracked non-ignored files are the implementation record.
 
-> Pre-release feature. The strict controller requires the released
-> `pi-subagents` runtime plus the matching Bridge release. A worker
-> or host that cannot prove process retirement remains fenced; see
-> [runtime contracts](docs/runtime-contracts.md).
+> The default backend targets unmodified `pi-subagents@0.76.1`; no upstream
+> patch, Bridge, pi-tasks or cc-thingz is required. Unknown launch or retirement
+> evidence remains fenced. See [runtime contracts](docs/runtime-contracts.md).
 
 Local bootstrap and required-check batches run through plan-exec's owned POSIX
 process-group runner, with unbounded user-stoppable lifetime and durable
@@ -64,24 +63,23 @@ are best-effort, matching the released runtime.
 ## Install and run
 
 Requires Pi `^1.0.4` (1.0.4 or later in the 1.x series).
-The development baseline is Pi `1.0.4`, `pi-subagents@0.76.1`, and
-`@alexeiled/pi-subagents-bridge@0.5.5`. Install the providers as independent Pi
+The development baseline is Pi `1.0.4` and `pi-subagents@0.76.1`. Install them as independent Pi
 packages; no Git dependency or `allow-git=all` setting is required:
 
 ```bash
 pi install -l npm:pi-subagents@0.76.1
-pi install -l npm:@alexeiled/pi-subagents-bridge@0.5.5
 pi install -l /absolute/path/to/pi-plan-exec
 ```
 
-The default review backend is one required subagent reviewer with an empty
+The default review backend is one required readonly `plan-exec-reviewer`, registered
+through public native runtime-agent events, with an empty
 fallback list (`none`). Fusion `0.9.3` is the tested baseline; that stack does
 not satisfy this extension's strict review ownership contract. Compatibility
 requires advertised lifetime, durable lookup and process-tree proof capabilities;
 a newer version alone does not establish support. Revmux's required lifecycle
 support is still in an unmerged PR. Use these backends only with a verified
 runtime contract; see [runtime contracts](docs/runtime-contracts.md).
-`@tintinweb/pi-tasks@0.9.x` is an optional, session-scoped projection cache.
+Task summaries come from `run.tasks`; Fleet is advisory. No task-store package is used.
 The development checkout and CI use npm 12.0.2.
 
 Pi supplies its SDK, TUI and TypeBox modules. This extension declares the SDK
@@ -93,10 +91,24 @@ Update or fix that package's declarations; do not suppress the warning or add
 private SDK copies here. See the [upstream audit](docs/upstream-audit.md) for
 known dependency limitations and upgrade priorities.
 
-Restart Pi after upgrading installed packages. Bridge 0.5.5 migrates its journal:
-stop all Bridge-owning Pi processes and back up the journal before upgrading.
-Older Bridge versions cannot reopen schema 7. This does not prove unknown workers
-have stopped. Use `/reload` only for local source/config changes.
+Restart Pi after package upgrades. `/reload` is for local source/config changes.
+Legacy records are read-only data, not another backend. Already-bound native IDs
+need no journal. Unbound records can explicitly import a consistent offline
+schema-7 snapshot:
+
+```text
+/exec resume <full-run-id> --legacy-journal /absolute/path/to/offline.sqlite
+```
+
+Import preserves the original request/digest and cannot authorize replay, erase
+stop intent or revive abandoned runs. Never copy only the main file of a live
+WAL database. No default live journal is opened or migrated.
+
+New model operations use one keyed native workflow and unique run-owned output.
+Requested `maxTurns` settings are recorded but unsupported by native RPC 0.76.1.
+Unbounded workflow mode does not remove native child defaults. Bounded timeout is
+passed to both root and child; observed limits and retirement remain evidence,
+not assumptions. Typed review must match the exact commit; missing reports fail.
 
 From an interactive session in a Git repository, start a goal or run a plan:
 
@@ -149,7 +161,7 @@ See [live Pi screenshots and checks](docs/ui-validation.md).
 Run controls are separate from display controls:
 
 - `/exec status` never interrupts or restarts a run. It may idempotently repair
-  the advisory pi-tasks and Fleet visibility caches from `run.json`. With no
+  advisory Fleet visibility and task summaries from `run.json`. With no
   run ID it lists every run, groups the ones that claim a worker by the evidence
   for that claim, reports any missing package with its install command, and ends
   every row in one next command. Add a full run ID for one run in detail, or
@@ -166,9 +178,9 @@ Run controls are separate from display controls:
   supervisor reply, the live controller preserves and polls that workflow, then
   continues automatically after the reply. After a restart, resume consumes its
   durable result or reattaches the same operation; it does not launch a
-  duplicate. Missing bridge memory, a missing async directory, and v1 absence
+  duplicate. Missing native correlation, a missing async directory, and legacy absence
   are inconclusive; only a matching owned-tree terminal proof, an authoritative
-  never-started fence, or v2 durable absence for an unbound launch permits
+  local never-started fence permits
   recovery to launch again.
 - `/exec recover-isolated <full-run-id> <absolute-new-checkout>` previews an
   explicitly different recovery contract for local implementation tasks. `--apply`
@@ -203,7 +215,7 @@ shows current state; `/exec status` holds detailed evidence. Cancellation intent
 wins over an old task state: the strip says “Cancelling” until worker exit is
 confirmed, unless the operator ends management with `stop --force`. Abandoned
 runs are hidden from the default list; inspect them by ID or with `status --all`.
-Bridge distinguishes stop intent from delivery. Neither is exit proof. Optional task projections are visibility caches and cannot gate
+Native control distinguishes stop intent from delivery. Neither is exit proof. Advisory Fleet visibility cannot gate
 recovery. Statistics are deterministic usage/task bookkeeping by default;
 `statsEnabled: true` opts into an additional report child.
 
@@ -240,8 +252,8 @@ Markdown plan below `docs/plans/`.
 ```mermaid
 flowchart LR
     plan["Markdown plan"] --> controller["durable controller"]
-    controller --> bridge["pi-subagents-bridge"]
-    bridge --> worker["fresh worker / reviewer"]
+    controller --> native["public native RPC: keyed main workflow"]
+    native --> worker["fresh worker / readonly reviewer"]
     worker --> worktree["Git worktree"]
     worktree --> checks["plan checkboxes"]
     checks --> controller

@@ -1,714 +1,197 @@
 # Stuck Run Recovery
 
-Read this only for recovery. The goal is to continue the same durable plan run
-and worktree without creating another writer.
+Continue the same durable run and preserve its checkout. **Resume the plan run ID, not the child ID.** Never launch a second writer because a worker is quiet,
+a directory disappeared, a lookup is empty, or a stop request was delivered.
 
 ## Establish evidence
-
-Run these in order:
 
 ```text
 /exec status
 /exec status <full-run-id>
 ```
 
-`/exec status` with no run ID is the read-only sweep, and it comes first after a
-Pi restart or a session handoff. It groups every run that claims work in flight
-as `abandoned`, `ambiguous`, or `live`, names the evidence behind each verdict,
-prints one next command per run, and reports any missing prerequisite package
-with its install command. It writes nothing. Pi prints `Use /exec status.` at
-session start when its startup sweep finds an abandoned run.
+These are read-only views of registry ownership and supported native evidence.
+Capture the full run ID, stage/status, worktree/branch, operation ID/digest,
+native root/child IDs, progress path, current session/host and exact error.
+If unreadable, inspect `~/.pi/plan-exec/runs/<id>/run.json` read-only and use
+`git status --short --branch` in the reported checkout. Do not edit records or
+reset source to make recovery appear successful.
 
-`/exec status <full-run-id>` is the detail view for one run. It gathers the same
-live evidence the sweep does — the lease, the operation directory, and the
-bridge — so the two never disagree about whether a worker is still there.
+The default backend is unmodified pi-subagents 0.76.1. There is no Bridge
+extension or task-store prerequisite. Native request UUID and structured
+workflow inventory, not text summaries, bind a lost launch. Correlated events
+may retain identity; actual published retirement still gates acceptance.
 
-Capture:
+## Interpret status without inventing authority
 
-- full plan run ID;
-- status and stage;
-- worktree and branch;
-- active operation kind and external run ID, when present;
-- progress path and last successful observation;
-- exact error.
+- A live controller/lease means wait and observe unless the user chooses stop.
+- Activity is advisory. A snapshot is not current liveness, and silence is not
+  death. An unpolled view cannot restart a child by being displayed.
+- A prepared native request has not been emitted. Dispatching/unknown requests
+  cannot be replayed. Restore the original session and supported correlation.
+- A terminal wrapper is not sufficient proof. Actual async children need their
+  exact nonempty child proof. A no-child failed workflow cannot finish a task.
+- Missing/expired identity or proof stays fenced. Repeating resume cannot create
+  evidence; do not guess an ID from time, prompt text, paths or a dead PID.
 
-If `/exec status` cannot read the record, inspect
-`~/.pi/plan-exec/runs/<run-id>/run.json` read-only. Inspect the reported
-worktree with `git status --short --branch`. Do not edit either location yet.
-Stale terminal output does not prove that a child stopped.
+An exact successful sole child can be recovered from a
+`settled-awaiting-resume` receipt after the wrapper loses its JavaScript
+continuation. It still needs matching root/request/child identity, proof and
+bound output. Do not start another worker/reviewer merely because that wrapper
+failed; arbitrary failed output is not success.
 
-## Running or starting
-
-`/exec status` prints one classification for a run that is still in flight.
-Match it below and run its command. Never run resume or a manual subagent
-merely because a child is slow.
-
-`/exec stop <id>` requests final cancellation without a dialog; `/exec pause
-<id>` is resumable. Both refuse a live foreign controller. Use the owning
-session rather than killing an arbitrary Pi PID.
-
-### `running, and the worker reported activity`
-
-A trustworthy per-turn activity signal was read. Wait, then re-check:
+## Pause, cancel and permanent force-stop
 
 ```text
-/exec status <full-run-id>
-```
-
-### `running, but nothing proves the worker is alive`
-
-No per-turn activity signal is available, so the worker is neither confirmed
-alive nor confirmed dead. This is the normal reading for a workflow-mode run.
-Absence of a signal is not evidence of death. Wait, then re-check:
-
-```text
-/exec status <full-run-id>
-```
-
-Re-checking settles this only while something is polling. When the lease behind
-the run is dead as well, nothing is, and the wait never ends on its own. Once
-the user accepts losing the in-flight work, end it and keep the worktree:
-
-```text
+/exec pause <full-run-id>
 /exec stop <full-run-id>
+/exec stop <full-run-id> --force
 ```
 
-### `running longer than its budget allows`
+Pause preserves the checkpoint and is resumable. Ordinary stop is final
+cancellation without a dialog (`cancel` remains an alias). Both preserve newer
+stop generations over stale callbacks and refuse a live foreign controller.
+Do not use resume merely to erase an intentional pause.
 
-Only an explicitly bounded `executionLifetime` can produce this classification.
-It means the configured `timeoutMs` has passed; there is no synthetic per-turn
-allowance. Unbounded runs never receive this plan-exec classification, but a
-native child may still reach its own default timeout. The bounded
-classification is an attention hint only: it does not stop the child, consume a
-retry, or authorize a replacement. Missing activity or provider observations
-are never proof that a child stopped.
+Stop intent, delivery and retirement are different facts. A delivered receipt
+cannot clear ownership. Public native stop can refuse queued, paused or reloaded
+workflows; keep the same operation and report the pending reason. Observation
+and permitted delivery retry, not another launch.
 
-Re-check while a live controller or lease is polling:
+Force-stop backs up and durably marks `abandoned` before best-effort control.
+It ends management, not necessarily the worker. It cannot be resumed, polled
+back into life or restored by UI/reload. Unknown work, failed identities and
+quarantined checkouts stay reserved. Only exact retirement and controller-lock
+quiescence permit final fsynced registry cleanup. Worktrees, branches and native
+provider artifacts are not deleted by this command. Repeated explicit force-stop
+may retry cleanup; there is no automatic abandonment cleanup loop.
 
-```text
-/exec status <full-run-id>
-```
+On 0.76.1 an early stop can report `writer-close-unverified` despite a runner
+close. Treat that as unknown. Do not kill guessed descendants, fabricate a
+terminal flag, delete the reservation or reset its checkout. Preserve the record
+and report the native limitation to the operator.
 
-If the user accepts losing the in-flight work, stop the run and keep the
-worktree:
-
-```text
-/exec cancel <full-run-id>
-```
-
-Never start a second run for the same plan.
-
-### `the worker is gone, so nothing is running`
-
-Checked live at the moment status ran: a compatible v2 bridge supplied a
-matching owned-tree process-terminal proof for the tracked external run, an
-authoritative never-started fence covers a launch that was prevented before
-dispatch, **or** a durable operation lookup answered `absent` for an unbound
-launch. POSIX process-group observations with escaped descendants unverified do
-not qualify. Only decisive proof says no worker is writing. A missing async
-directory and a v1 bridge's missing record are diagnostics, not death proof;
-those runs remain ambiguous and must not be reconciled. With decisive proof,
-reconcile this run and continue it:
+## Resume and native session authority
 
 ```text
 /exec resume <full-run-id>
+/goal resume <full-run-id>
 ```
 
-Resume preserves the existing operation, candidate, and saved result identity,
-records the reconciliation, consumes no task attempt, and starts exactly one
-continuation. To end the run instead and keep its worktree, use
-`/exec cancel <full-run-id>`.
+Normal resume uses registry leases/CAS, the same stage, worktree and identity.
+A plan lease takeover is not native session adoption. Native controls require
+the recorded session file identity (or session UUID for an unpersisted session).
+A different session may observe supported evidence but cannot impersonate the
+original owner. Restore that session for control, or leave ownership fenced.
 
-`/exec doctor --reconcile` performs the same reconciliation for **every**
-abandoned run in the registry at once, without resuming any of them. It
-preserves each operation, candidate, and saved result identity while recording
-the evidence; it launches no replacement. It is the scripted answer for a
-restart that stranded several runs; for one named run, prefer resume. Neither
-touches a run whose lease is still live, and neither reconciles a
-`cancel_pending` run — that would erase the stop it is carrying.
-
-### `between steps`
-
-The run claims `running` or `starting` with no operation tracked at all, which
-is the gap between two stages. The controller opens the next one on its own
-tick. Wait, then re-check:
-
-```text
-/exec status <full-run-id>
-```
-
-If it never moves, its owning session is gone; the sweep classifies it
-`ambiguous`, and `/exec resume <full-run-id>` claims it and continues.
-
-### `cannot check on the worker right now`
-
-Either the provider could not be polled, or a worker was launched and plan-exec
-never learned its name. Both mean the same thing: nothing can say whether that
-worker is still writing, so a resume would risk a second writer. This is only
-printed while nothing has proven the worker gone — with decisive evidence the
-run reads `the worker is gone, so nothing is running` instead, whatever the
-failure counter says. Repair the provider; the session holding the run resumes
-polling on its own. Then re-check:
-
-```text
-/exec status <full-run-id>
-```
-
-### `its lease names a machine that is not this one`
-
-The host is stamped on the lease when the run is claimed,
-and the whole name identifies the machine — `foo.local`, `foo.lan`, and
-`foo.corp.example.com` are three different hosts, because two real machines can
-share a first label and a shared home shows both their runs. A renamed host is
-therefore foreign until the operator asserts that it was this machine:
+A foreign-host lease is not a renamed local host by assumption. Where applicable:
 
 ```text
 /exec resume <full-run-id> --same-machine
 ```
 
-The flag permits local evidence gathering. A live local controller still fences
-the claim, and an unresolved tracked worker still needs ownership evidence.
-After those checks pass, recovery rebinds the stored hostname while preserving
-operation and stop state. When the lease really names a different machine,
-recover the run there instead.
+This is an explicit machine assertion, not proof the worker exited. Live foreign
+leases and unresolved ownership still win. Recover on the original machine when
+that is what the lease names. Do not change hostnames or native session IDs in
+records to bypass the gate.
 
-### Why no per-turn activity signal may exist
+## Advanced read-only legacy snapshot import
 
-Workflow-mode providers may omit a trustworthy per-turn signal. The controller
-keeps the durable operation attached, records the last observation, and keeps
-automatic recovery scheduled. Do not convert silence into a deadline or a
-replacement launch.
-
-## Unknown launch after a Bridge RPC rejection
-
-Plan-exec 1.6.3 preserves the original launch message and structured codes
-separately from later lookup diagnostics. Status shows the operation ID and
-request digest. Bridge 0.5.3 adds correlated pre-launch rejection evidence.
-
-- A newly observed rejection is recoverable only when Bridge persisted the exact
-  RPC request ID, spawn method, pre-execution `invalid_params` code, plan owner,
-  operation ID, and request digest. The controller validates the receipt and
-  requests a durable cancellation fence before allocating a fresh operation.
-- A lost reply, legacy `dispatching` row, missing run ID, old error string, clean
-  worktree, dead PID, or elapsed time is not proof that no child started.
-- Legacy rows without correlated evidence remain unresolved after upgrade.
-  pi-subagents 0.76.1 has no authoritative durable operation lookup API that can
-  fill this gap. No supported force-resume or evidence importer exists.
-- Inspect `/exec status <full-run-id>` and retain the reported identity and
-  diagnostics. Upgrade incompatible local packages and restart Pi. If no new
-  authoritative evidence exists, report the run blocked; repeated resume cannot
-  supply it. Do not recreate the run, edit its journal, or manually launch a
-  replacement. Ordinary stop requests remain pending until ownership is proven.
-  To end management instead of recovering, use permanent force-stop below.
-
-After a valid rejection is durably fenced, `/exec resume <full-run-id>` continues
-the same plan and worktree. A later pause or cancel still wins. Fresh recovery
-success does not resolve an older row that lacks proof.
-
-## Permanent force-stop
-
-Use only when the operator wants to abandon the run, not resume it:
+Existing historical native IDs need no journal. For an unbound legacy operation:
 
 ```text
-/exec stop <full-run-id> --force
+/exec resume <full-run-id> --legacy-journal /absolute/path/to/offline.sqlite
+/goal resume <full-run-id> --legacy-journal "/absolute/path/offline snapshot.sqlite"
 ```
 
-The explicit flag and full ID authorize this exact run, without another dialog.
-The command:
+The file must be a **consistent offline schema-7 SQLite snapshot**. Prefer a
+closed/checkpointed database; a WAL snapshot must include the consistent WAL.
+Never copy only the main file of a live WAL database. The extension does not
+find/open a default live journal, construct its old service, migrate, reset,
+copy or delete it. SQLite read-only mode is not a guarantee that arbitrary live
+WAL/SHM sidecars are untouched; supply offline evidence.
 
-1. Refuses a live foreign controller. A current owner or stale/unclaimed local
-   lease is accepted, including a missing worktree.
-2. Saves the pre-stop record under `runs/.abandoned/<id>/before.json`, then
-   atomically writes `abandoned` and increments stop/execution generations.
-   Backup failure leaves the run unchanged. The final marker wins over late
-   callbacks; controller ticks, resume and ordinary writes cannot revive it.
-3. Immediately clears the display and timer. Attempts cancellation through the
-   same provider identity and local-command ownership contract. It does not
-   kill controller PIDs, guess descendants, or bypass Bridge.
-4. Removes eligible registry artifacts under `runs/<id>` only after archiving
-   the final record under `runs/.abandoned/<id>/run.json`. Unknown operations,
-   quarantined targets, local commands or an in-flight controller retain the
-   record. Cleanup failure does not undo abandonment; repeat the same command
-   to retry. There is no automatic retry after abandonment.
+Import checks the original run, operation and request digest. It preserves the
+original params/digest and records only validated binding, correlation,
+rejection/cancellation evidence under fresh CAS. Newer cancellation, generation,
+foreign lease and abandonment win. A missing digest on an unbound record cannot
+be invented. Missing, mismatched, corrupt, unsupported or busy snapshots leave
+the original identity fenced.
 
-Unknown launches remain unknown, including delayed dispatch. Their retained
-record reserves the original plan/checkouts and prevents duplicate writers.
-The evidence is deliberately retained, not fully erased. Worktrees, branches,
-progress files, provider journals and external effects are never removed or
-rolled back. Review those separately only after proving retirement.
+Import is not a spawn, absence proof, retirement proof, replay permission or
+transfer of native control. A retained stop receipt does not mean the writer
+exited. Abandoned records cannot import or resume. Do not reinstate Bridge as a
+fallback launcher.
 
-The run disappears from the default status list and all progress strips, even
-in a fresh session. `status <id>` or `status --all` can inspect a retained
-record; removed records have the printed backup path. Repeating force-stop is
-safe, including after cleanup. Never use resume to reverse abandonment.
-
-After upgrading, restart every Pi session sharing this registry before using
-force-stop. Do not downgrade or run older cleanup commands while abandoned
-ownership records remain. Older versions reject the new status, but their corrupt
-record cleanup can delete it and erase its safety reservation. No journal or
-record hand-editing is needed.
-
-## Explicit independent-checkout recovery
-
-Use this only after the operator approves changing the execution target for a
-local implementation task. It preserves the same run, but does not establish
-that the old worker died. Ordinary resume never relocates a run.
-
-1. Preview: `/exec recover-isolated <full-run-id> <absolute-new-checkout>`.
-2. Review the old/new paths, accepted baseline, interrupted task, frozen checks,
-   and any absolute/shared resources or external side effects. This path refuses
-   known deployment/payment/publishing work and pending owned local operations.
-   It is Git/filesystem isolation, not containment of malicious same-UID code.
-3. Apply: add `--apply` and answer the confirmation. A scripted owner with
-   explicit operator approval can use `--apply --confirm-local-isolation`.
-4. The controller quarantines the old generation, durably fences redispatch,
-   creates independent Git metadata/files with no remotes or object alternates,
-   and restores only the verified accepted commit and checked plan. Old partial
-   files/commits/progress stay where they were and are listed in lineage.
-5. Activation is paused. Start Pi in the reported new checkout with the same
-   registry/providers; use `/exec status <id>`, then `/exec resume <id>`.
-   Do not resume or edit the quarantined tree. Accepted tasks are not reset.
-6. Repeating the same isolation command reuses its durable target/ticket.
-   A pause/cancel during preparation prevents activation; cancellation never
-   authorizes a new attempt. A paused preparation needs explicit renewed apply
-   confirmation. Unverifiable target ownership stays blocked without overwriting it.
-
-Only implementation-stage recovery is supported by this action. Goal, review,
-finalize, archive and local-command ownership need their existing reconciliation
-paths, not an isolation bypass. Cleanup retains records that reserve an unknown
-quarantined writer. Importing old partial work requires separate review and
-normal verification; it is never silently copied into the new target.
-
-## Abandoned after a Pi restart
-
-The diagnostic classification **abandoned** means an interrupted owner, not the
-operator's terminal `abandoned` decision above. It applies only when all three hold: it claims `running`,
-`starting`, `skip_pending`, or `cancel_pending`; its lease is not live; and its
-operation is provably gone by a matching owned-tree process-terminal proof, an
-authoritative never-started fence, or (for an unbound launch only) v2 durable
-lookup with `absent`. A POSIX group-only observation, missing async directory,
-v1 absence response, or `absent` for an already-bound external run is incomplete
-evidence. Anything less is `ambiguous` and is never reset.
-
-Recover one named run — the usual case, and the smaller blast radius:
+## Independent checkout recovery
 
 ```text
-/exec resume <full-run-id>
+/exec recover-isolated <full-run-id> /absolute/new-checkout
+/exec recover-isolated <full-run-id> /absolute/new-checkout --apply
 ```
 
-Resume reconciles that run first and then continues it. Reconcile every
-abandoned run in the registry at once, continuing none of them:
-
-```text
-/exec doctor --reconcile
-```
-
-Neither launches a second worker. Per abandoned run reconciliation preserves the
-active operation, candidate, and saved result identity, records the evidence in
-the run and progress file, and leaves `taskAttempts` unchanged. A run that a
-live session reclaimed between the scan and the write is skipped, not
-overwritten.
-
-A `cancel_pending` run is never reconciled, however dead its worker: changing
-its recovery state would erase the stop it is carrying and the next resume
-could restart plan work. It still wants cancelling:
-
-```text
-/exec cancel <full-run-id>
-```
-
-An `ambiguous` run is never reset, because the evidence is incomplete. Every
-surface names the same next command for it, and which command that is turns on
-whether anything is still polling. With a live lease the controller reports
-back, so re-reading works:
-
-```text
-/exec status <full-run-id>
-```
-
-With a dead lease nothing polls, so re-reading never changes. End the run
-instead and keep its worktree:
-
-```text
-/exec stop <full-run-id>
-```
-
-## Paused
-
-An explicit user pause (`/exec pause`)
-cancels the current attempt, preserves its stage, checkpoint, progress, and
-resumability, and waits for native or local cleanup proof. A reload restores
-pending cleanup without resuming plan work; `/exec resume` continues only after
-that cleanup is reconciled.
-
-`<<<RALPHEX:TASK_FAILED>>>` with unchecked items is not an implicit global
-pause. The controller records the blocker, preserves the partial lane and
-accepted baseline, and schedules automatic recovery with backoff. A retry does
-not waive the plan's approvals, release checkpoints, or verification
-requirements. Use `/exec status <full-run-id>` to inspect the next automatic
-action. Use `/exec pause <full-run-id>` for a resumable pause, or
-`/exec stop <full-run-id>` for final cancellation.
-
-Only an observed `Prerequisite: credentials|permission|missing_executable|runtime`
-with an `Evidence:` line changes the task to `waiting_external`; the controller
-records that evidence and schedules an automatic wake. Generic blocker prose
-does not prove an external prerequisite.
-
-Older releases may have stored the same `TASK_FAILED` output as a generic
-unchecked-checkbox failure. They remain recoverable through the same plan run's
-`/exec resume`; status identifies the external blocker rather than recommending
-an unconfirmed second writer.
-
-A run without an active operation or task blocker is classified
-`paused, waiting for you to continue it`. Use:
-
-```text
-/exec resume <full-run-id>
-```
-
-An observed pause in an otherwise running plan is classified `operation paused`.
-A pause alone does not prove a pending supervisor question. Answer an actual
-displayed request if present. A live controller keeps polling the same operation
-and continues automatically after it settles; use `/exec status <id>` to re-check.
-With no live controller, use `/exec resume <id>` to consume its durable result
-or reattach the same operation without launching a replacement.
-
-An explicit user pause takes precedence. While worker exit is unconfirmed,
-use `/exec status <id>` to inspect the stop and ownership evidence.
-With no live controller, this only observes and does not restart cleanup.
-Do not use `/exec stop` to pause: it requests final cancellation.
-Resume only when the operator wants execution to continue.
-
-A paused child remains controller-owned. Do not resume it directly.
-
-## Failed
-
-Status classifies a recoverable failure `stopped, and you can continue it`.
-Inspect the stage, error, and active-operation fields first.
-
-A run from an older plan-exec version can instead read `workflow detached during
-supervisor coordination`. `/exec resume <id>` checks the durable workflow
-receipt before it does anything else. It consumes a successfully settled child,
-or restores and observes the same external operation. It never blindly replays
-that detached stage.
-
-- No active operation: `/exec resume <id>` retries the same stage in the same
-  worktree. It automatically resets a no-progress implementation retry because
-  the user explicitly requested resume. A run classified
-  `a task is blocked by something outside this run` — billing, credentials,
-  quota, network, or a manual step — asks for interactive confirmation, or
-  takes `--retry-task` from a caller with no human. Omitted dependencies remain
-  sequential, explicit `dependsOn: []` tasks are independent, and implementation
-  cannot be skipped.
-- Preserved active operation: `/exec resume <id>` adopts or looks up that exact
-  operation before retrying.
-- Operation lookup is `pending`: wait, reload if needed, then run
-  `/exec resume <full-run-id>` again.
-- Operation lookup is `found`: the controller observes it; use
-  `/exec status <full-run-id>`.
-- Operation lookup is `unknown` or the provider is unreachable: repair the
-  provider, then `/exec resume <full-run-id>`. Do not launch another child.
-- Provider reports the operation absent after an unknown launch outcome:
-  plan-exec refuses a blind replay because another writer cannot be ruled out.
-  Prove the worker is gone with `/exec status <full-run-id>`; a run it
-  classifies `abandoned` is reconciled and continued by `/exec resume <full-run-id>`.
-
-Turn limits are child launch parameters, not a plan-run terminal retry cap.
-Resume the plan run ID, not the child ID shown in pi-subagents output. A resume
-is idempotent for a healthy tracked child and reconciles it instead of creating
-another writer. Automatic recovery continues with backoff while ownership is
-known or uncertain; it never launches through an unresolved operation.
-
-Only a bounded operation with `terminationReason: execution_lifetime_expired`,
-full retirement proof, and recent verified model/tool progress can trigger
-adaptive recovery. The next bounded timeout doubles up to the native timer
-maximum and changes continuation strategy; unbounded operations and local
-checks never receive this adaptation. Heartbeats and silence are not progress.
-
-## Model or provider failure
-
-When status classifies `stopped because the model or provider could not be used`,
-the Bridge child is terminal.
-Plan-exec preserves its external run ID and terminal error and does not consume
-an implementation task attempt. Recover the same run with one of:
-
-```text
-/exec resume <full-run-id>
-/exec resume <full-run-id> --model current
-/exec resume <full-run-id> --model openai/gpt-5-codex
-```
-
-Normal resume uses the active authenticated Pi model. `current` uses that same
-model explicitly. An explicit provider/model override applies only to the
-replacement child; it does not pin later launches. Choose a model whose provider
-is authenticated and does not have the reported incompatibility or quota failure.
-Do not keep retrying the same failing model. After resume, run status again and
-verify the failed external run ID was replaced only after its terminal state was
-recorded.
-
-For a confirmed tool failure, plan-exec queues at most one durable diagnostic
-follow-up for that failure identity. `queued` is guidance only and does not prove
-repair. A pause or cancel fence wins over a late diagnostic reply; restart
-reconciles the same diagnostic action.
-
-`/exec` is a Pi UI command. If the current agent cannot invoke slash commands,
-it must give the user the exact command instead of claiming recovery ran or
-launching a child directly.
-
-## Force-skip a blocked stage
-
-The statistics stage is deterministic bookkeeping by default: `statsEnabled`
-defaults to `false`, so no report child is launched. An explicitly enabled
-statistics child is optional; a report failure is advisory, but an unknown
-child remains fenced and must be reconciled before any replacement.
-
-While Pi is running, the controller automatically reconciles the pending waiver.
-A lost launch or cancellation reply keeps the original operation identity;
-terminal wrapper state alone never proves child retirement. Restart restores
-the authorized pending waiver. Use `/exec status <full-run-id>` to inspect its
-next automatic step. A newer explicit pause or cancel takes precedence.
-
-Use this only after inspecting the findings and active operation:
-
-```text
-/exec skip <full-run-id> --reason <why the residual risk is accepted>
-```
-
-Pi asks for interactive confirmation. The controller records `skip_pending`,
-stops any tracked Bridge, Fusion, or Revmux child, and waits for terminal
-provider evidence before it advances. Do not retry, start, or manually stop a
-child while that state is pending. A skipped optional review or statistics
-stage is visibly audited, known findings remain unresolved, and the final run
-becomes `completed_with_findings`. Required review and final verification,
-implementation, and archive cannot be skipped.
-
-## Cancel pending or failed cancellation
-
-Status classifies this `waiting for the stop you asked for`.
-`/exec cancel <id>` only requests cancellation. It does not prove that the child
-stopped.
-
-Use `/exec status <id>` until status becomes `cancelled` or `failed`. If
-cancellation failed because the provider was unavailable, repair the provider,
-then use:
-
-```text
-/exec resume <full-run-id>
-```
-
-That retries cancellation. It does not resume normal plan work. Never start a
-replacement worker while cancellation is unresolved.
-
-When the worker is provably gone the classification is
-`the worker is gone, so the stop cannot land by itself`, and the run will never
-reach `cancelled` on its own. The registry-wide reset skips it — that reset
-would erase the stop it carries — so finish the cancellation instead:
-
-```text
-/exec stop <full-run-id>
-```
-
-## Stale owner or different session
-
-Status classifies this
-`someone else's session was holding this run, and it is gone`. Inspect the
-selected run before takeover:
-
-```text
-/exec status <full-run-id>
-/exec resume <full-run-id>
-/exec status <full-run-id>
-```
-
-Resume is active: it takes the dead lease over and may immediately advance the
-run. Use it only for an unfinished run whose lease is stale. Whose session ID is
-on that lease does not matter — a Pi that restarted under the same ID left a
-dead lease naming the caller, and resume takes that one over on the same terms.
-If resume hands Pi into the execution worktree, continue recovery in that
-forked session.
-
-A lease whose pid is dead on this host is stale at once, so no 30-second wait is
-needed. A lease recorded without a hostname — the shape of every record written
-before this rule existed — is judged by its heartbeat alone; wait until 30
-seconds have passed since its last beat before treating it as stale.
-
-## Plan structure changed
-
-Do not silently accept changed task structure. Status says
-`the plan file changed shape since this run started` and explains whether the
-first resume only records `paused`; if so,
-review the plan and run the interactive resume a second time. This is deliberate
-for legacy records and is safer than silently adopting a new task contract.
-
-Choose one:
-
-1. Restore the original headings, numbering, checkbox text, and checkbox count,
-   then run `/exec resume <full-run-id>`.
-2. Review the current plan, then run interactive `/exec resume <full-run-id>` to
-   confirm adopting its new structure.
-
-Headless recovery cannot approve a changed plan structure.
-
-## Execution branch changed
-
-Status classifies this `this run belongs to a branch you are not on`. If status
-or resume reports `Execution directory is on <current>, expected <recorded>`,
-inspect the current branch and worktree first. When the current
-named branch is authoritative, has no tracked child, and belongs to the same
-repository, use:
-
-```text
-/exec resume <full-run-id> --adopt-current-branch
-```
-
-Pi requires interactive confirmation, records the old/new branch, and resumes
-the same run. Do not hand-edit the durable branch or switch branches while a
-child is live.
-
-## Hide a stuck run without discarding evidence
-
-`/exec ui off` immediately removes the strip and footer. `/exec clear [run-id]`
-dismisses one run's display. Neither needs `--apply`, touches execution state,
-deletes evidence, or proves retirement. `/exec ui on` restores it. Legacy
-`/exec hide` and `/exec show [run-id]` remain supported.
-
-For Bridge cancellation, `stopAcknowledged` can mean only intent was recorded.
-Bridge 0.5.5 reports delivery separately. A pending/failed delivery is retried
-against the same immutable operation; a delivered receipt is still not exit proof.
-Native pi-subagents 0.76.1 RPC can refuse paused/queued stops. Keep the exact
-error and pending state. Never use the model-facing stop tool as a bypass.
-
-Do not remove unknown launch records because a checkout was deleted. Recovery
-diagnostics remain under the run directory in `recovery.log`, and logging does
-not recreate that checkout. Legacy missing correlation still requires proof,
-or an explicitly approved isolated-recovery operation, not repeated resume.
-
-Bridge 0.5.5 migrates the journal to schema 7. Before upgrade, stop all
-Bridge-owning Pi processes and back up the journal. Older Bridge cannot reopen
-schema 7. Stopping Pi owners does not prove an unknown worker exited.
-
-## Provider or command unavailable
-
-If `/exec` reports missing or incompatible Bridge, Fusion, Revmux, or
-pi-subagents:
-
-1. Run `/exec status`. It names each missing or incompatible package and prints
-   the install commands above the run list.
-2. Restore the reported project-local pinned dependency or select an explicitly
-   supported backend. A missing pi-tasks projection is advisory.
-3. Restart Pi after package upgrades. Use `/reload` only for local source/config changes.
-4. Run `/exec status` and `/exec status <full-run-id>`.
-5. Use `/exec resume <full-run-id>` only to resume an explicitly paused run or
-   follow a specific interactive recovery instruction in status.
-
-Reload automatically restores authorized unfinished work and pending cancellation
-cleanup. Explicit pause and stop remain in force.
-
-The current implementation draft is validated against exact dependency feature
-commits and linked PRs recorded in [runtime contracts](../../../docs/runtime-contracts.md)
-and the [active implementation plan](../../../docs/plans/2026-09-21-autonomous-execution.md).
-The public native dependency is pinned; its Darwin GUI/compiler prerequisites
-must also be available. Local checks/bootstrap and selected
-provider operations remain fenced when that dependency or its retirement proof
-is unavailable. The latest npm release alone does not supply this source contract.
-
-If `/exec` itself is missing after reload, inspect `pi list` and the Pi package
-configuration. Restore the package before touching the preserved run.
-
-## Archive failed
-
-A failed `archive` stage is resumable.
-
-Before resume, inspect:
-
-- the original plan path;
-- `docs/plans/completed/<plan-name>` or the corresponding completed directory;
-- `git status --short --branch`;
-- the archive error and progress file.
-
-If both source and completed destination exist, ask the user which copy is
-authoritative. Do not overwrite either. After the user names it, delete the
-other copy, then run `/exec resume <full-run-id>`. If Git staging or commit
-failed, fix the reported Git condition, then run `/exec resume <full-run-id>`.
-Archive retry is idempotent when the completed move already committed.
-
-## Run missing or registry corrupt
-
-A record the registry cannot parse is dropped from the run list. `/exec status`
-lists it under `unreadable run records` with its parse error and the exact
-command that removes it.
-
-There is no supported command that repairs arbitrary `run.json` content. Do not
-hand-edit the registry to make the run appear resumable. Once no external
-operation can still be alive, remove the entry:
-
-```text
-/exec cleanup <full-run-id> --apply
-```
-
-That deletes the registry entry only; the worktree, branch, progress file, and
-async artifacts stay in place. Durable run lineage is lost, so report it.
-
-To repair the record instead, and only with the extension source available: fix
-the loader or migration with a regression test, install the repaired local
-package with user approval, restart Pi, then retry
-`/exec status <full-run-id>`.
-
-## `/exec resume` is itself defective
-
-Treat a repeatable resume rejection or wrong transition as an extension bug,
-not permission to bypass the controller.
-
-With explicit user approval to change the installed Pi package:
-
-1. Preserve the run record, status output, worktree, and operation artifacts.
-2. Reproduce the state transition in a focused controller or command test.
-3. Patch the smallest runtime defect in a source checkout.
-4. Run focused tests, then the package's full validation.
-5. Install or link that local package according to Pi package docs.
-6. Restart Pi after a package upgrade; `/reload` suffices for local source edits.
-7. Retry `/exec status <id>` and `/exec resume <id>` on the same run.
-8. Verify the same worktree and operation identity were retained.
-
-Do not manually invoke implementation, review, fix, or statistics subagents
-while repairing the extension. Final verification is a controller-owned check,
-not a separate finalizer child.
-
-## Terminal states
-
-Completed and cancelled runs are classified `finished` and name `/exec cleanup`.
-Operator-abandoned records instead report ended management and retained ownership.
-Neither outcome is resumable.
-
-- `completed`: verify checkboxes, archived plan, tests, and clean/reviewed Git
-  state. No resume is needed.
-- `completed_with_findings`: terminal and not clean. Inspect progress and review
-  findings. Report them; use a new scoped plan only with user approval.
-- `cancelled`: terminal and not resumable. To continue later, create a new run
-  only after confirming no live child and reviewing the preserved worktree.
-- `abandoned`: operator ended management permanently, not proof of worker death.
-  Hidden by default; retained unknown ownership still reserves its checkout.
-- `failed`: terminal for automatic polling but eligible for explicit recovery
-  with `/exec resume <full-run-id>`.
-
-`/exec status` hides a terminal run once it is a day old; `/exec status --all`
-shows it again. A terminal record becomes removable 7 days after it finished,
-and `/exec cleanup --apply` deletes it. `failed` records are excluded until
-`--include-failed` is passed, because `/exec resume` needs them. Naming one run
-— `/exec cleanup <full-run-id> --apply` — overrides both the window and that
-exclusion; the registry still refuses a non-terminal run, a live lease, or a run
-a controller is recovering.
-
-## Verify recovery
-
-After every action, run `/exec status <id>` and confirm:
-
-- the full run ID did not change;
-- the worktree and branch did not change unexpectedly;
-- no second external operation was created;
-- status/stage moved as intended;
-- the progress file records the transition.
-
-For final completion, also verify plan checkbox truth, the relevant test/build
-checks, archived-plan location, and `git status --short --branch`. State every
-remaining finding or unverified check.
+Preview first and obtain explicit local-files-only approval. Native dispatch is
+fenced by the old registry generation before preparing the independent target.
+The old checkout and exact operation remain quarantined/reserved; shared files,
+hardlinks, symlinks, partial/ignored artifacts and foreign repository identity
+must not be smuggled into the new lane. New HEAD, checks and approved plan facts
+remain controller-owned. This is not proof the old worker stopped or permission
+to disregard external side effects.
+
+Read-only legacy import cannot revoke a historical dispatcher. Unresolved legacy
+isolation refuses before target mutation; do not replace that refusal with a
+journal write, a copied live database or a hidden backend.
+
+## Task, review and prerequisite recovery
+
+An incomplete committed task retains its lane. Independent ready tasks may use
+a clean lane from the accepted baseline; dependencies cannot be waived by
+checkbox edits. A worker `TASK_FAILED` diagnostic with observed
+`Prerequisite: credentials|permission|missing_executable|runtime` and `Evidence:`
+can enter waiting-external state. Repair that exact prerequisite; do not infer
+credentials from generic error text. Required review and frozen checks remain
+required after failure.
+
+Native review uses a readonly namespaced role and a typed report bound to the
+exact full commit. Empty findings requires successful child evidence and Git
+verification. Missing/malformed/wrong-commit reports never pass. Do not switch a
+configured agent, model or backend implicitly. If an explicit model retry is
+needed, use the existing `--model current|provider/model` resume option and keep
+the recorded original operation unchanged until it retires.
+
+Requested native turn limits are not enforced by 0.76.1. Unbounded workflow mode
+does not remove native child defaults; bounded mode passes the requested timeout
+to root and child. Time, silence and ordinary tool-timeout prose do not authorize
+a replacement. Local checks/bootstrap remain user-stoppable owned processes.
+
+## Plan, branch, archive and cleanup
+
+If plan structure changed, inspect the diff and restore the approved structure
+or use interactive resume to confirm adoption. Only checkbox completion is the
+normal worker edit. Do not accept unrelated heading/dependency changes as proof.
+If the branch changed, inspect it and use explicit interactive
+`--adopt-current-branch` only without a tracked external operation. Never reset
+branches or discard user changes to pass a check.
+
+Optional stage skip requires an explicit reason and confirmation; it cannot
+waive mandatory review/checks, and its tracked worker must retire before the
+stage advances. A cancelled or abandoned run is not a resume target. Completed
+runs need no new worker. Failed/unknown identities are not cleanup candidates.
+
+For archive failures, preserve the current commit and staged user content. The
+controller's owned Git operation must reconcile before another archive mutation.
+Inspect failures rather than manually committing arbitrary staged files. Cleanup
+previews are read-only; actual removal requires retired ownership, retention and
+lock quiescence. Hiding a widget does not hide/delete a run or change a lease.
+
+If a record is missing/corrupt, report its exact path and error and preserve the
+checkout. Do not reconstruct authority from prose, create a replacement run in
+the same reserved target or manufacture process proof.
+
+## Verify the outcome
+
+Read status again. Confirm the same run/operation identity, intended stage,
+stop intent, worktree, candidate and checks. Progress needs an applied registry
+transition; a reassuring model response or stale widget is not evidence.
+If safety cannot be proved, report the concrete missing identity/proof, preserved
+reservation and operator action needed. Never claim recovery from silence.

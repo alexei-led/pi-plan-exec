@@ -106,7 +106,7 @@ test('pack accepts the tested host peer without private runtime copies', {
   assert.match(result.stdout, /@alexeiled\/pi-plan-exec@/);
 });
 
-test('package manifest ships only plan-exec resources, needs no runtime dependency, and requires v2 bridge peers', async () => {
+test('package manifest ships only plan-exec resources, needs no runtime dependency, and requires native peers without removed packages', async () => {
   const manifest = JSON.parse(
     await readFile(join(root, 'package.json'), 'utf8'),
   ) as {
@@ -131,23 +131,22 @@ test('package manifest ships only plan-exec resources, needs no runtime dependen
   assert.equal(manifest.peerDependencies['pi-subagents'], '>=0.76.1 <0.77.0');
   assert.equal(manifest.peerDependenciesMeta['pi-subagents']?.optional, true);
   assert.equal(manifest.bundledDependencies, undefined);
-  for (const packageName of ['@alexeiled/pi-fusion', '@tintinweb/pi-tasks']) {
-    assert.equal(
-      manifest.peerDependencies[packageName],
-      packageName === '@alexeiled/pi-fusion'
-        ? '>=0.9.3 <1.0.0'
-        : '>=0.9.0 <0.10.0',
-    );
-    assert.equal(manifest.peerDependenciesMeta[packageName]?.optional, true);
-  }
   assert.equal(
-    manifest.peerDependencies['@alexeiled/pi-subagents-bridge'],
-    '>=0.5.5 <0.6.0',
+    manifest.peerDependencies['@alexeiled/pi-fusion'],
+    '>=0.9.3 <1.0.0',
   );
   assert.equal(
-    manifest.peerDependenciesMeta['@alexeiled/pi-subagents-bridge']?.optional,
+    manifest.peerDependenciesMeta['@alexeiled/pi-fusion']?.optional,
     true,
   );
+  for (const name of [
+    '@alexeiled/pi-subagents-bridge',
+    '@tintinweb/pi-tasks',
+  ]) {
+    assert.equal(manifest.peerDependencies[name], undefined);
+    assert.equal(manifest.peerDependenciesMeta[name], undefined);
+    assert.equal(manifest.devDependencies?.[name], undefined);
+  }
   assert.match(
     await readFile(
       join(root, 'skills', 'exec-plan', 'references', 'recovery.md'),

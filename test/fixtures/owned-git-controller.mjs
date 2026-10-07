@@ -33,10 +33,10 @@ if (
 }
 
 const controllerModule = await import(
-  new URL('../../src/controller.ts', import.meta.url)
+  new URL('./native-controller.ts', import.meta.url)
 );
-const bridgeModule = await import(
-  new URL('../../src/bridge.ts', import.meta.url)
+const contractModule = await import(
+  new URL('../../src/execution-contract.ts', import.meta.url)
 );
 const lanesModule = await import(
   new URL('../../src/lanes.ts', import.meta.url)
@@ -45,7 +45,7 @@ const registryModule = await import(
   new URL('../../src/registry.ts', import.meta.url)
 );
 const { PlanExecController } = controllerModule.default ?? controllerModule;
-const { bridgeRequestDigest } = bridgeModule.default ?? bridgeModule;
+const { executionRequestDigest } = contractModule.default ?? contractModule;
 const { runCommands } = lanesModule.default ?? lanesModule;
 const { RunRegistry } = registryModule.default ?? registryModule;
 
@@ -89,7 +89,7 @@ const bridge = {
     );
     return ok({
       runId: operationId,
-      requestDigest: bridgeRequestDigest(params),
+      requestDigest: executionRequestDigest(params),
       effectiveExecutionLifetime: params.executionLifetime,
     });
   },

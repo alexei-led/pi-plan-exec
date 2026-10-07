@@ -26,17 +26,17 @@ import { fileURLToPath } from 'node:url';
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const requested = resolve(process.argv[2]);
 const sandbox = join(realpathSync(dirname(requested)), basename(requested));
-const bridge = realpathSync(resolve(process.argv[3]));
+const runtimeRoot = realpathSync(resolve(process.argv[3] ?? repo));
 assert.ok(
   !existsSync(sandbox) &&
-    [repo, bridge].every((checkout) => {
+    [repo, runtimeRoot].every((checkout) => {
       const path = relative(checkout, sandbox);
       return path === '..' || path.startsWith(`..${sep}`) || isAbsolute(path);
     }),
   'Use a new sandbox outside both checkouts.',
 );
 mkdirSync(sandbox);
-for (const dir of ['home', 'agent/agents', 'rejected', 'legacy'])
+for (const dir of ['home', 'agent/agents', 'native', 'legacy'])
   mkdirSync(join(sandbox, dir), { recursive: true });
 const gitEnv = {
   PATH: process.env.PATH,
@@ -44,7 +44,7 @@ const gitEnv = {
   GIT_CONFIG_NOSYSTEM: '1',
   GIT_CONFIG_GLOBAL: '/dev/null',
 };
-for (const kind of ['rejected', 'legacy']) {
+for (const kind of ['native', 'legacy']) {
   const cwd = join(sandbox, kind);
   const git = (...args) =>
     execFileSync('git', args, { cwd, env: gitEnv, stdio: 'pipe' });
@@ -87,7 +87,10 @@ const server = http.createServer((req, res) => {
   req.on('end', () => {
     const input = JSON.parse(body);
     const oldWorker = body.includes('PLAN_EXEC_FIXTURE_OLD_WORKER');
-    const worker = oldWorker || body.includes('PLAN_EXEC_FIXTURE_WORKER');
+    const worker =
+      oldWorker ||
+      body.includes('PLAN_EXEC_FIXTURE_WORKER') ||
+      body.includes('You are `worker`');
     const hasTool = input.messages.some((message) => message.role === 'tool');
     appendFileSync(
       join(sandbox, 'model-calls.jsonl'),
@@ -211,8 +214,8 @@ writeFileSync(
   '---\nname: recovery-old-worker\ndescription: Genuine isolated old writer\nmodel: recovery/fixture\nthinking: off\ntools: bash\nsystemPromptMode: replace\ninheritProjectContext: false\ninheritSkills: false\n---\nPLAN_EXEC_FIXTURE_OLD_WORKER\nWrite only in your current old fixture checkout.\n',
 );
 const sources = [
-  join(bridge, 'node_modules/pi-subagents/index.js'),
-  join(bridge, 'src/index.ts'),
+  join(runtimeRoot, 'node_modules/pi-subagents/index.js'),
+  join(repo, 'test/fixtures/faulty-native.ts'),
   join(repo, 'src/index.ts'),
   join(repo, 'test/fixtures/recovery-host.ts'),
 ];
@@ -224,11 +227,11 @@ writeFileSync(
       version: path.includes('pi-subagents/index')
         ? JSON.parse(
             readFileSync(
-              join(bridge, 'node_modules/pi-subagents/package.json'),
+              join(runtimeRoot, 'node_modules/pi-subagents/package.json'),
             ),
           ).version
-        : path.includes(bridge)
-          ? JSON.parse(readFileSync(join(bridge, 'package.json'))).version
+        : path.includes(runtimeRoot)
+          ? JSON.parse(readFileSync(join(runtimeRoot, 'package.json'))).version
           : JSON.parse(readFileSync(join(repo, 'package.json'))).version,
     })),
     null,
@@ -243,7 +246,10 @@ if (process.argv[4] === '--server-only') {
   const child = spawn(
     process.execPath,
     [
-      join(bridge, 'node_modules/@earendil-works/pi-coding-agent/dist/cli.js'),
+      join(
+        runtimeRoot,
+        'node_modules/@earendil-works/pi-coding-agent/dist/cli.js',
+      ),
       '--no-extensions',
       '--no-skills',
       '--no-prompt-templates',
@@ -252,7 +258,7 @@ if (process.argv[4] === '--server-only') {
       ...sources.flatMap((path) => ['-e', path]),
     ],
     {
-      cwd: join(sandbox, 'rejected'),
+      cwd: join(sandbox, 'native'),
       stdio: 'inherit',
       env: {
         PATH: process.env.PATH,
@@ -263,7 +269,7 @@ if (process.argv[4] === '--server-only') {
         PI_CODING_AGENT_DIR: agent,
         PI_OFFLINE: '1',
         PLAN_EXEC_RECOVERY_SANDBOX: sandbox,
-        PLAN_EXEC_RECOVERY_BRIDGE: bridge,
+
         GIT_CONFIG_NOSYSTEM: '1',
         GIT_CONFIG_GLOBAL: '/dev/null',
       },

@@ -44,7 +44,9 @@
     "format:check": "biome format .",
     "pack:dry": "node scripts/check-pack.mjs",
     "publish:dry": "npm publish --dry-run",
-    "test:all": "npm run check && npm test && npm run pack:dry"
+    "test:all": "npm run check && npm test && npm run pack:dry",
+    "test:native-recovery": "node --test test/native-recovery-smoke.mjs",
+    "test:packed-consumer": "node --test test/packed-consumer-smoke.mjs"
   },
   "pi": {
     "extensions": [
@@ -57,10 +59,8 @@
   },
   "peerDependencies": {
     "@alexeiled/pi-fusion": ">=0.9.3 <1.0.0",
-    "@alexeiled/pi-subagents-bridge": ">=0.5.5 <0.6.0",
     "@earendil-works/pi-coding-agent": "^1.0.4",
     "@earendil-works/pi-tui": "*",
-    "@tintinweb/pi-tasks": ">=0.9.0 <0.10.0",
     "pi-subagents": ">=0.76.1 <0.77.0",
     "typebox": "*"
   },
@@ -70,20 +70,12 @@
     },
     "@alexeiled/pi-fusion": {
       "optional": true
-    },
-    "@alexeiled/pi-subagents-bridge": {
-      "optional": true
-    },
-    "@tintinweb/pi-tasks": {
-      "optional": true
     }
   },
   "devDependencies": {
     "@alexeiled/pi-fusion": "^0.9.3",
-    "@alexeiled/pi-subagents-bridge": "^0.5.5",
     "@biomejs/biome": "2.5.14",
     "@earendil-works/pi-coding-agent": "^1.0.4",
-    "@tintinweb/pi-tasks": "0.9.0",
     "@types/node": "^24.10.0",
     "jiti": "^2.7.0",
     "pi-subagents": "^0.76.1",

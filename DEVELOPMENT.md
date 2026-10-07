@@ -32,6 +32,8 @@ script (`npm run test:runtime-smoke`).
 npm run check
 npm test
 npm run test:runtime-smoke
+npm run test:native-recovery
+npm run test:packed-consumer
 npm run pack:dry
 ```
 
@@ -48,38 +50,49 @@ root and checks command registration without host-module warnings.
 The tested baseline and deferred integration work are recorded in the
 [upstream audit](docs/upstream-audit.md).
 
-## Visible recovery integration
+## Native and packed integration
 
-Run `node test/recovery-agterm.mjs <new-sandbox> <bridge-checkout> --server-only`
-in a dedicated agterm session. The sandbox must not exist, its parent must
-exist, and its canonical path must be outside both checkouts. It creates two
-isolated repositories and a local
-deterministic HTTP model. Launch the actual Pi CLI in a second agterm session
-with `session new --command`, using the sandbox's `home`, `agent`, and temporary
-directory. Load only the released pi-subagents extension, local Bridge,
-local plan-exec, and `test/fixtures/recovery-host.ts`; disable discovered
-extensions/context files. Set `PLAN_EXEC_RECOVERY_SANDBOX` and
-`PLAN_EXEC_RECOVERY_BRIDGE` to those exact paths.
+`test:runtime-smoke` launches real 0.76.1 detached workers with deterministic
+scripted sessions, verifying controller checks, typed review/fix/stats and bound
+artifacts. No removed package is loaded. `test:native-recovery` uses fresh OS
+hosts to prove keyed-workflow request correlation and exact child retirement;
+direct-leaf missing correlation remains an explicit negative case.
 
-Run `/fixture-seed` once. It sends a genuine removed-field request through
-Bridge to the native validator, tests replay, and creates a synthetic legacy
-dispatching row. Close that Pi host, then start a new one against the same
-sandbox. Use `/exec status` and the IDs in `ids.json` for status/resume.
-The rejected run must complete one task with one successful worker dispatch;
-the legacy row must stay unknown with no child. `/fixture-proof` asserts both
-and writes `proof.json`. The expected two native spawn requests are one
-pre-launch rejection and one successful child workflow, not two workers.
+`test:packed-consumer` creates a real npm tarball and a dedicated temporary
+consumer, using npm 12.0.2 to install only Pi 1.0.4, pi-subagents 0.76.1 and the
+package. It asserts that neither removed package resolves from the consumer or
+extension. A localhost OpenAI-compatible scripted model uses no user credentials
+or paid API. Pi loads packages and observer extensions normally, without
+`--no-extensions` or replacement production clients. Child-mode loading must not
+register `/exec`/`/goal` or take parent leases. Tests cover plan/goal, default
+readonly reviewer, clean/findings output, malformed/missing/wrong-commit refusal,
+a dropped public RPC reply and force-stop/restart.
 
-The model's tool call modifies only the fixture repository. No credentials are
-copied, no global package is changed, and no real run/journal is used. Retain
-the sandbox and agterm IDs as local evidence; do not publish private paths.
+The isolated preload only sets the temporary home and injects a single dropped
+public event response; it does not patch installed runtime code. Failed evidence
+is retained with its path. If an early stop yields `writer-close-unverified`, the
+passing safety case retains the isolated ownership record/workspace instead of
+pretending exit and deleting it. Do not clean unknown ownership merely to make
+tests leave an empty directory.
+
+The normal loader exposed 0.76.1's structured-output-only/file-only settlement
+failure. Schema requests now keep the bound output path but use supported inline
+settlement; marker requests remain file-only. The smoke checks actual persisted
+JSON and exact native proof, not a model summary.
+
+For optional visible manual probes, use
+`node test/recovery-agterm.mjs <new-sandbox> <runtime-root> --server-only`.
+The runtime root is a local checkout with released native/Pi dependencies, not a
+Bridge checkout. `/fixture-seed [lost-reply]` creates only isolated native intent
+and closed schema-7 fixture data. It never constructs a removed journal service.
+This selected-extension manual harness is not the packed normal-loader gate.
 
 ## Progress strip validation
 
 The chosen UI and native screenshots are in [UI validation](docs/ui-validation.md).
 `test/run-view.test.ts` covers column widths, status precedence, colors and display
 preferences. Lifecycle tests cover hide/clear across reload and late projection.
-The recovery fixture uses a real Pi TUI, released Bridge/subagents and a local
+The recovery fixture uses a real Pi TUI, released native subagents and a local
 scripted model. `test/fixtures/progress-ui.ts` adds display-only states inside
 that explicitly isolated sandbox; its foreign lease prevents worker dispatch.
 It is never shipped in the npm package.

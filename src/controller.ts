@@ -22,15 +22,14 @@ import {
   readSettledWorkflowCompletion,
   readSubagentArtifact,
 } from './artifact.js';
+import { resolveRunConfig } from './config.js';
+import { diagnoseOperation } from './diagnostics.js';
 import {
-  bridgeRequestDigest,
-  hasBoundNeverStarted,
+  executionRequestDigest,
   hasTerminalOwnershipProof,
   parseExecutionLifetime,
   supportsOwnedProcessTree,
-} from './bridge.js';
-import { resolveRunConfig } from './config.js';
-import { diagnoseOperation } from './diagnostics.js';
+} from './execution-contract.js';
 import {
   FUSION_PHASE,
   type FusionCapabilities,
@@ -82,6 +81,10 @@ import {
   requiredChecks,
   runCommands,
 } from './lanes.js';
+import {
+  hasBoundNeverStarted,
+  lookupLegacyOperation,
+} from './legacy-operation.js';
 import {
   assertPlanRun,
   isGoalRun,
@@ -180,6 +183,7 @@ type ServiceReply =
 
 export type NativeRuntime = Pick<
   NativeRuntimeClient,
+  | 'available'
   | 'prepare'
   | 'spawn'
   | 'operation'
@@ -832,6 +836,115 @@ export class PlanExecController {
     return current;
   }
 
+  /** Explicit snapshot only. Import never proves non-start, retirement or control authority. */
+  async importLegacyJournal(
+    runId: string,
+    sessionId: string,
+    journalPath: string,
+    expectedStopGeneration?: number,
+  ): Promise<PlanExecRun> {
+    if (!isAbsolute(journalPath))
+      throw new Error(
+        '--legacy-journal requires an absolute path to a consistent offline schema-7 snapshot.',
+      );
+    const result = await this.registry.withControllerLock(runId, async () => {
+      const existing = required(await this.registry.get(runId));
+      if (existing.status === RUN_STATUS.ABANDONED)
+        throw new Error('Abandoned runs cannot import or resume.');
+      if (
+        expectedStopGeneration !== undefined &&
+        (existing.stopGeneration ?? 0) !== expectedStopGeneration
+      )
+        return existing;
+      const original = existing.activeOperation ?? existing.failedOperation;
+      if (
+        original?.service !== OPERATION_SERVICE.BRIDGE ||
+        !original.requestDigest
+      )
+        throw new Error(
+          'Legacy import requires an original Bridge operation ID and request digest. No new identity is synthesized.',
+        );
+      const claimed = await this.registry.claim(existing, sessionId);
+      const lookup = await lookupLegacyOperation(journalPath, {
+        operationId: original.operationId,
+        ownerRunId: runId,
+        requestDigest: original.requestDigest,
+      });
+      if (lookup.state !== 'found')
+        throw new Error(
+          `Legacy snapshot ${lookup.state}: ${'reason' in lookup ? lookup.reason : 'field' in lookup ? lookup.field : lookup.source}. Original ownership remains fenced.`,
+        );
+      const mapping = lookup.operation;
+      if (
+        (original.externalRunId &&
+          mapping.runId &&
+          original.externalRunId !== mapping.runId) ||
+        (original.asyncDir &&
+          mapping.asyncDir &&
+          original.asyncDir !== mapping.asyncDir)
+      )
+        throw new Error(
+          'Legacy snapshot conflicts with the recorded native binding.',
+        );
+      const current = required(await this.registry.get(runId));
+      const key = current.activeOperation
+        ? 'activeOperation'
+        : 'failedOperation';
+      const op = current[key];
+      if (
+        current.status === RUN_STATUS.ABANDONED ||
+        current.status !== claimed.status ||
+        (current.stopGeneration ?? 0) !== (claimed.stopGeneration ?? 0) ||
+        (current.executionGeneration ?? 0) !==
+          (claimed.executionGeneration ?? 0) ||
+        current.lease?.sessionId !== sessionId ||
+        current.lease?.pid !== claimed.lease?.pid ||
+        current.lease?.hostname !== claimed.lease?.hostname ||
+        op?.operationId !== original.operationId ||
+        op.requestDigest !== original.requestDigest
+      )
+        return current;
+      if (
+        (op.externalRunId &&
+          mapping.runId &&
+          op.externalRunId !== mapping.runId) ||
+        (op.asyncDir && mapping.asyncDir && op.asyncDir !== mapping.asyncDir)
+      )
+        throw new Error(
+          'Legacy snapshot conflicts with a newer recorded native binding.',
+        );
+      return (
+        await this.registry.updateIfCurrent(
+          {
+            ...current,
+            [key]: {
+              ...op,
+              ...(mapping.runId
+                ? {
+                    externalRunId: mapping.runId,
+                    recovery: OPERATION_RECOVERY.OBSERVE,
+                  }
+                : {}),
+              ...(mapping.asyncDir ? { asyncDir: mapping.asyncDir } : {}),
+              ...(mapping.cancelRequested ? { stopRequested: true } : {}),
+              legacyImport: {
+                journalPath,
+                importedAt: Date.now(),
+                operation: mapping,
+              },
+            },
+          },
+          current.updatedAt,
+        )
+      ).run;
+    });
+    if (!result)
+      throw new Error(
+        'Controller is busy; retry the explicit snapshot import.',
+      );
+    return result;
+  }
+
   async resume(
     runId: string,
     sessionId: string,
@@ -1216,6 +1329,19 @@ export class PlanExecController {
     if ((run.nextAttemptAt ?? 0) > Date.now()) return run;
     if (run.isolationRecovery && run.isolationRecovery.state !== 'active')
       return this.continueIsolation(run);
+    if (
+      !run.activeOperation &&
+      run.failedOperation &&
+      !run.failedOperation.processTreeExited &&
+      !run.failedOperation.launchFenced
+    ) {
+      const restored = await this.registry.updateIfCurrent(
+        { ...run, activeOperation: run.failedOperation },
+        run.updatedAt,
+      );
+      if (!restored.applied) return restored.run;
+      run = restored.run;
+    }
     if (run.activeOperation) return this.observeActiveOperation(run);
 
     if (run.lanePreparation) return this.prepareLane(run);
@@ -1619,8 +1745,7 @@ export class PlanExecController {
     const outcome = parseGoalOutcome(output);
     if (
       outcome.kind === GOAL_OUTCOME.BLOCKED ||
-      (outcome.kind === GOAL_OUTCOME.CONTINUE &&
-        !isSuccessfulOperationState(state))
+      !isSuccessfulOperationState(state)
     )
       return this.pauseGoal(
         run,
@@ -2445,7 +2570,7 @@ export class PlanExecController {
           recovery: OPERATION_RECOVERY.REPLAY,
           expectedLifetime: lifetime,
           params,
-          requestDigest: bridgeRequestDigest(params),
+          requestDigest: executionRequestDigest(params),
         },
       },
       run.updatedAt,
@@ -2659,9 +2784,43 @@ export class PlanExecController {
     },
   ): Promise<PlanExecRun> {
     const lifetime = attemptExecutionLifetime(run, input.kind, input.taskId);
+    if (!(await this.native.available())) {
+      const reason =
+        'Native runtime unavailable; no dispatch occurred. Recovery will retry readiness.';
+      const task = input.taskId ? run.tasks?.[String(input.taskId)] : undefined;
+      if (task)
+        return (
+          await this.registry.updateIfCurrent(
+            {
+              ...run,
+              nextAttemptAt: 0,
+              needsAttention: true,
+              wakeReason: reason,
+              tasks: {
+                ...run.tasks,
+                [String(task.taskId)]: {
+                  ...task,
+                  state: 'waiting_external',
+                  reason,
+                  externalPrerequisite: {
+                    kind: 'runtime',
+                    source: 'provider',
+                    evidence: reason,
+                  },
+                  nextAttemptAt: Date.now() + run.config.retryDelayMs,
+                },
+              },
+            },
+            run.updatedAt,
+          )
+        ).run;
+      return input.kind === OPERATION_KIND.STATS
+        ? this.finishStats(run, reason)
+        : this.fail(run, reason);
+    }
     const operationId = input.operationId ?? randomUUID();
     const launchStartedAt = Date.now();
-    const model = run.recoveryModel ?? bridgeModel(run.config, input.kind);
+    const model = run.recoveryModel ?? nativeModel(run.config, input.kind);
     const runWithoutRecoveryModel = withoutRecoveryModel(run);
     const reviewedCommit =
       input.kind === OPERATION_KIND.REVIEW
@@ -2744,11 +2903,16 @@ export class PlanExecController {
       run.id,
       nativeBinding(required(intended.activeOperation)),
     );
-    const current = required(await this.registry.get(run.id));
+    let current = required(await this.registry.get(run.id));
     if (
       !sameOperationState(intended, current, required(intended.activeOperation))
     )
       return current;
+    if (observed.launchError)
+      current = await this.updateActiveOperation(current, operationId, {
+        lastLaunchError: observed.launchError.message,
+        lastLaunchErrorCode: observed.launchError.code,
+      });
     return observed.state === 'unknown'
       ? this.failUnknownLaunch(
           current,
@@ -2773,6 +2937,12 @@ export class PlanExecController {
         operation.service === OPERATION_SERVICE.NATIVE &&
         operation.native?.phase === 'prepared'
       ) {
+        if (!(await this.native.available()))
+          return this.fail(
+            run,
+            'Native runtime unavailable; prepared dispatch remains fenced until readiness.',
+            true,
+          );
         await this.native.spawn(run.id, nativeBinding(operation));
         return required(await this.registry.get(run.id));
       }
@@ -2826,7 +2996,7 @@ export class PlanExecController {
         !supportsExecution(capabilities, lifetime) ||
         !params ||
         !operation.requestDigest ||
-        operation.requestDigest !== bridgeRequestDigest(params) ||
+        operation.requestDigest !== executionRequestDigest(params) ||
         !text(params.prompt) ||
         !text(params.cwd) ||
         !isAbsolute(required(text(params.cwd))) ||
@@ -2957,6 +3127,11 @@ export class PlanExecController {
         {
           ...current,
           activeOperation: { ...current.activeOperation, ...patch },
+          ...(current.failedOperation?.operationId === operationId &&
+          current.failedOperation.requestDigest ===
+            current.activeOperation.requestDigest
+            ? { failedOperation: { ...current.activeOperation, ...patch } }
+            : {}),
         },
         current.updatedAt,
       );
@@ -3239,6 +3414,23 @@ export class PlanExecController {
     if (hasBoundNeverStarted(status.data, operation, run.id))
       return this.fenceRejectedLaunch(observed, operation, status.data);
     if (
+      !state &&
+      operation.service === OPERATION_SERVICE.BRIDGE &&
+      hasProcessExit(status.data, operation)
+    ) {
+      const retired = await this.updateActiveOperation(
+        observed,
+        operation.operationId,
+        { processTreeExited: true },
+      );
+      if (!sameOperationState(run, retired, operation)) return retired;
+      return this.recordObservationFailure(
+        retired,
+        required(retired.activeOperation),
+        'Legacy native retirement is proven, but successful result state/artifacts are unavailable. Preserve this identity and supply retained artifacts or an exact offline snapshot; no replacement is authorized by missing output.',
+      );
+    }
+    if (
       !state ||
       state === EXTERNAL_OPERATION_STATE.RUNNING ||
       state === EXTERNAL_OPERATION_STATE.STOPPING
@@ -3256,15 +3448,17 @@ export class PlanExecController {
       status.data,
     );
     if (!sameOperationState(run, observed, operation)) return observed;
-    operation = {
-      ...(observed.activeOperation ?? operation),
-      processTreeExited: true,
-      lastObservedState: state,
-    };
+    observed = await this.updateActiveOperation(
+      observed,
+      operation.operationId,
+      { processTreeExited: true, lastObservedState: state },
+    );
+    if (!sameOperationState(run, observed, operation)) return observed;
+    operation = required(observed.activeOperation);
     const terminalError =
       operation.terminationReason === 'execution_lifetime_expired'
         ? 'Explicit bounded execution lifetime expired; the checkpoint is preserved for automatic continuation.'
-        : bridgeTerminalError(status.data);
+        : workerTerminalError(status.data);
     if (operation.service === OPERATION_SERVICE.NATIVE) {
       const result = await this.native.result(run.id, nativeBinding(operation));
       const current = required(await this.registry.get(run.id));
@@ -3279,6 +3473,7 @@ export class PlanExecController {
           operation,
           state ?? 'failed',
           result.reason ?? terminalError,
+          result.failureOutput,
         );
       if (!result.result)
         return this.recordObservationFailure(
@@ -3805,6 +4000,23 @@ export class PlanExecController {
     retryTask = false,
     recoveryModel?: string,
   ): Promise<PlanExecRun> {
+    if (
+      !run.activeOperation &&
+      run.failedOperation &&
+      !run.failedOperation.processTreeExited &&
+      !run.failedOperation.launchFenced
+    ) {
+      return (
+        await this.registry.updateIfCurrent(
+          {
+            ...run,
+            status: RUN_STATUS.RUNNING,
+            activeOperation: run.failedOperation,
+          },
+          run.updatedAt,
+        )
+      ).run;
+    }
     const plan =
       isGoalRun(run) || run.stage === RUN_STAGE.ARCHIVE
         ? undefined
@@ -5298,6 +5510,7 @@ function nativeStatusReply(observed: NativeObservation): ServiceReply {
   return {
     success: true,
     data: {
+      ...observed.status,
       state:
         observed.workflowState === 'completed'
           ? 'complete'
@@ -5321,7 +5534,7 @@ function cancellationDeliveryError(message: string, upstreamCode?: string) {
   };
 }
 
-function bridgeTerminalError(
+function workerTerminalError(
   data: Record<string, unknown>,
 ): string | undefined {
   const statusText = text(data.text);
@@ -5668,7 +5881,7 @@ function withoutRoleModel(
   return copy;
 }
 
-function bridgeModel(
+function nativeModel(
   config: FrozenRunConfig,
   kind: ActiveOperation['kind'],
 ): string | undefined {

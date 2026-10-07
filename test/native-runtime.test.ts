@@ -1166,3 +1166,249 @@ test('native cwd is the canonical authorized execution target, including nested 
     'prepared',
   );
 });
+
+for (const wrong of ['runId', 'requestId', 'version'] as const) {
+  test(`native stop refuses mismatched ${wrong} delivery and retries only the same bound run`, async () => {
+    const f = await fixture();
+    f.setHandler((req) => {
+      if (req.method === 'stop') {
+        f.bus.emit(`subagents:rpc:v1:reply:${req.requestId}`, {
+          version: wrong === 'version' ? 2 : 1,
+          requestId: wrong === 'requestId' ? 'foreign' : req.requestId,
+          method: 'stop',
+          success: true,
+          data: {
+            runId: wrong === 'runId' ? 'foreign' : 'root',
+            state: 'stopping',
+          },
+        });
+      } else f.reply(req, { details: { workflowChildren: f.summary() } });
+    });
+    await f.client.spawn(f.run.id, f.binding);
+    await f.client.stop(f.run.id, f.binding);
+    await f.client.stop(f.run.id, f.binding);
+    const current = required(await f.registry.get(f.run.id));
+    expect(current.activeOperation?.stopDeliveredTo).toBeUndefined();
+    expect(current.activeOperation?.processTreeExited).toBeUndefined();
+    expect(current.activeOperation?.operationId).toBe(f.op.operationId);
+    expect(
+      f.requests
+        .filter((req) => req.method === 'stop')
+        .map((req) => req.params.id),
+    ).toEqual(['root', 'root']);
+    expect(f.requests.filter((req) => req.method === 'spawn')).toHaveLength(1);
+  });
+}
+
+test('schema requests use supported inline settlement but retain the unique bound output', async () => {
+  const f = await fixture();
+  const prepared = await f.client.prepare(f.run, {
+    operationId: 'schema',
+    kind: 'review',
+    agent: 'plan-exec-reviewer',
+    task: 'Review only',
+    outputSchema: { type: 'object' },
+  });
+  expect(prepared.native?.request.params.script).not.toContain('outputMode');
+  expect(prepared.native?.request.params.script).toContain(
+    JSON.stringify(required(prepared.native).outputPath),
+  );
+  expect(f.op.native?.request.params.script).toContain(
+    '"outputMode":"file-only"',
+  );
+});
+
+test('correlated facts update the same failed operation snapshot instead of resurrecting a lost launch', async () => {
+  const f = await fixture();
+  await f.client.spawn(f.run.id, f.binding);
+  await f.registry.updateLatest(f.run.id, (run) => ({
+    ...run,
+    failedOperation: required(run.activeOperation),
+  }));
+  f.setHandler((req) =>
+    f.reply(req, { details: { workflowChildren: f.summary() } }),
+  );
+  await f.client.operation(f.run.id, f.binding);
+  const current = required(await f.registry.get(f.run.id));
+  expect(current.failedOperation?.externalRunId).toBe('root');
+  expect(current.failedOperation?.native?.phase).toBe('bound');
+  expect(current.failedOperation?.requestDigest).toBe(
+    current.activeOperation?.requestDigest,
+  );
+  expect(f.requests.filter((req) => req.method === 'spawn')).toHaveLength(1);
+});
+
+test('native status inspection is read-only for prepared, unknown, bound and abandoned records', async () => {
+  const { nativeEvidenceProbe } = await import('../src/index.js');
+  const f = await fixture();
+  const probe = nativeEvidenceProbe(f.client);
+  let before = await readFile(f.registry.authorizationPath(f.run.id), 'utf8');
+  expect((await probe(f.run)).localPrepared).toBe(true);
+  expect(await readFile(f.registry.authorizationPath(f.run.id), 'utf8')).toBe(
+    before,
+  );
+  await f.client.spawn(f.run.id, f.binding);
+  let current = required(await f.registry.get(f.run.id));
+  before = await readFile(f.registry.authorizationPath(f.run.id), 'utf8');
+  expect((await probe(current)).operationBound).toBeUndefined();
+  expect(await readFile(f.registry.authorizationPath(f.run.id), 'utf8')).toBe(
+    before,
+  );
+  f.setHandler((req) =>
+    f.reply(req, { details: { workflowChildren: f.summary() } }),
+  );
+  expect((await probe(current)).operationBound).toBe(true);
+  expect(
+    (await f.registry.get(f.run.id))?.activeOperation?.externalRunId,
+  ).toBeUndefined();
+  expect(await readFile(f.registry.authorizationPath(f.run.id), 'utf8')).toBe(
+    before,
+  );
+  await f.client.operation(f.run.id, f.binding);
+  current = await f.registry.abandon(f.run.id, 'session');
+  before = await readFile(f.registry.authorizationPath(f.run.id), 'utf8');
+  await probe(current);
+  expect(await readFile(f.registry.authorizationPath(f.run.id), 'utf8')).toBe(
+    before,
+  );
+  f.setHandler((req) =>
+    f.reply(req, {
+      details: {
+        workflowChildren: { ...f.summary(), workflowRunId: 'foreign' },
+      },
+    }),
+  );
+  const seen = await f.client.inspect(f.run.id, f.binding);
+  expect(seen.proof).toBeUndefined();
+  expect(seen.state).toBe('unknown');
+  expect((await probe(current)).operationBound).toBeUndefined();
+  expect(await readFile(f.registry.authorizationPath(f.run.id), 'utf8')).toBe(
+    before,
+  );
+  expect((await f.registry.get(f.run.id))?.status).toBe('abandoned');
+});
+
+test('stale prepared inspection cannot reconcile a concurrently claimed dispatch', async () => {
+  const { execReconcile, nativeEvidenceProbe } = await import(
+    '../src/index.js'
+  );
+  const f = await fixture();
+  await f.registry.updateLatest(f.run.id, (run) => ({
+    ...run,
+    lease: { sessionId: 'dead', pid: 2147483647, heartbeatAt: 0 },
+  }));
+  const probe = nativeEvidenceProbe(f.client);
+  const report = await execReconcile(f.registry, async (run) => {
+    const evidence = await probe(run);
+    await f.registry.updateLatest(run.id, (current) => ({
+      ...current,
+      activeOperation: {
+        ...required(current.activeOperation),
+        native: {
+          ...required(current.activeOperation?.native),
+          phase: 'dispatching',
+        },
+      },
+    }));
+    return evidence;
+  });
+  expect(report).toMatch(/changed|reclaimed|nothing was reset/i);
+  const current = required(await f.registry.get(f.run.id));
+  expect(current.activeOperation?.native?.phase).toBe('dispatching');
+  expect(current.activeOperation?.launchFenced).toBeUndefined();
+  expect(current.activeOperation?.processTreeExited).toBeUndefined();
+  expect(f.requests).toHaveLength(0);
+});
+
+test('native resume preflight inspects an exact existing binding without another spawn', async () => {
+  const { nativeEvidenceProbe, reconcileForResume } = await import(
+    '../src/index.js'
+  );
+  const { PlanExecController } = await import('../src/controller.js');
+  const f = await fixture();
+  f.setHandler((req) =>
+    f.reply(req, { details: { workflowChildren: f.summary() } }),
+  );
+  await f.client.spawn(f.run.id, f.binding);
+  const dead = await f.registry.updateLatest(f.run.id, (run) => ({
+    ...run,
+    lease: { sessionId: 'session', pid: 2147483647, heartbeatAt: 0 },
+  }));
+  const reconciled = await reconcileForResume(
+    f.registry,
+    dead,
+    nativeEvidenceProbe(f.client),
+  );
+  expect(reconciled.run.activeOperation?.operationId).toBe(f.op.operationId);
+  const refuse = async () => {
+    throw new Error('No Git or Fusion work while a native child is live');
+  };
+  const controller = new PlanExecController(
+    f.registry,
+    f.client,
+    {
+      start: refuse,
+      status: refuse,
+      result: refuse,
+      adopt: refuse,
+      cancel: refuse,
+    },
+    refuse,
+  );
+  const resumed = await controller.resume(f.run.id, 'session');
+  expect(resumed.activeOperation?.externalRunId).toBe('root');
+  expect(f.requests.filter((req) => req.method === 'spawn')).toHaveLength(1);
+});
+
+test('known legacy retirement without retained result state is diagnosed, not accepted or relaunched', async () => {
+  const { PlanExecController } = await import('../src/controller.js');
+  const f = await fixture();
+  const op = {
+    operationId: 'historical-result',
+    service: 'bridge' as const,
+    kind: 'implementation' as const,
+    externalRunId: 'leaf',
+    requestDigest: 'original-digest',
+    taskId: 1,
+  };
+  const run = await f.registry.update({ ...f.run, activeOperation: op });
+  f.setHandler((req) =>
+    f.reply(req, {
+      details: {
+        lifecycleStatus: {
+          processTerminal: {
+            version: 1,
+            runId: 'leaf',
+            state: 'observed',
+            runnerProcessInstanceId: 'leaf-instance',
+            observedAt: Date.now(),
+            instances: [],
+          },
+        },
+      },
+    }),
+  );
+  const refuse = async () => {
+    throw new Error('Unknown legacy outcome cannot run workspace commands');
+  };
+  const controller = new PlanExecController(
+    f.registry,
+    f.client,
+    {
+      start: refuse,
+      status: refuse,
+      result: refuse,
+      adopt: refuse,
+      cancel: refuse,
+    },
+    refuse,
+  );
+  const observed = await controller.advance(run);
+  expect(observed.activeOperation?.operationId).toBe(op.operationId);
+  expect(observed.activeOperation?.processTreeExited).toBe(true);
+  expect(observed.activeOperation?.lastStatusError).toMatch(
+    /result state\/artifacts are unavailable/,
+  );
+  expect(observed.stage).toBe('implementation');
+  expect(f.requests.filter((req) => req.method === 'spawn')).toHaveLength(0);
+});

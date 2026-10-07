@@ -198,7 +198,7 @@ The progress strip reports state, accepted count and current action. Healthy
 working/complete is green; waiting/uncertain/stopping amber; failed red;
 paused/cancelled muted. Stop intent takes precedence over old task state.
 `/exec status` retains paths, usage, ownership and diagnostic evidence.
-Bridge advisory observations are display-only, not verified progress or exit.
+Native advisory observations are display-only, not verified progress or exit.
 An unpolled in-flight view keeps its execution label with an amber Snapshot
 qualifier and saved details, not current
 worker health. Live colors require this session's local controller and matching
@@ -247,7 +247,7 @@ true:
 - Pi reloaded, changed session, or handed off to another worktree;
 - `/exec status` reports an abandoned or ambiguous run;
 - the run is failed, paused, stopping, or owned by another session;
-- Bridge, Fusion, pi-subagents, or pi-tasks is missing or unavailable;
+- pi-subagents or an explicitly selected review backend is unavailable;
 - the plan structure changed or archive failed;
 - `/exec status` cannot find a known run or reports a corrupt record;
 - child output suggests `subagent resume` instead of plan-run recovery.
@@ -342,21 +342,28 @@ record, worktree, active-operation evidence, and approval or runtime fix needed.
 
 ## Prerequisites
 
-`pi-plan-exec` requires released installations of `pi-subagents` and
-`@alexeiled/pi-subagents-bridge`. Fusion and Revmux
-are optional explicit review backends; `@tintinweb/pi-tasks` is an optional
-projection cache. The strict controller requires explicit
-lifetime support and a healthy owned-process capability; released Bridge
-advertises best-effort descendant containment. Unknown APIs,
-process bindings, or retirement evidence remain fenced. Read [runtime
-contracts](../../docs/runtime-contracts.md) for the exact APIs, released pins,
-and dependency PR links.
+`pi-plan-exec` uses Pi 1.0.4 and unmodified pi-subagents 0.76.1. No Bridge,
+pi-tasks, cc-thingz or upstream-release prerequisite is needed. New work uses one
+keyed native workflow; request identity and unique output binding are persisted
+before dispatch. Cwd must match the authorized execution target. Unknown launch
+or retirement stays fenced, never replayed.
 
-The development checkout and CI use npm 12.0.2 with repository `.npmrc`
-`allow-git=root`. A packed consumer needs a project-local `allow-git=all` for
-transitive Git refs; never change global npm configuration. Run `/exec status`,
-restore the reported project-local dependency, restart Pi after a package
-upgrade, then return to the same run ID. `/reload` is for local source/config
-changes. Before upgrading to Bridge 0.5.5, stop Bridge-owning Pi processes and
-back up its journal; schema 7 cannot be reopened by older Bridge versions. Installing dependencies does not replace or complete the preserved
-run.
+The default required reviewer is the namespaced readonly `plan-exec-reviewer`,
+registered through public runtime-agent events. Configured frozen agents/models
+are honored. Typed review must bind the exact commit and contain schema-valid
+findings; missing, malformed or wrong-commit output cannot pass. Schema requests
+use supported inline settlement while retaining the caller-bound output file;
+marker requests keep file-only mode. Requested native maxTurns is unsupported,
+and unbounded workflow mode does not remove child defaults.
+
+Fusion and Revmux remain optional explicit backends with their own strict
+capability refusals and no automatic fallback. Read [runtime contracts](../../docs/runtime-contracts.md).
+Development uses npm 12.0.2 and released registry dependencies, not Git overrides.
+Restart after package upgrades; `/reload` is for local source/config changes.
+
+For an unbound historical operation, use only an explicitly supplied consistent
+offline schema-7 snapshot with `resume --legacy-journal /absolute/path/offline.sqlite`.
+No live journal is discovered or mutated. Original run/operation/digest, leases,
+stop generations and abandonment remain authoritative. Import is not proof of
+absence, retirement or replay permission. Known native IDs need no journal.
+See [recovery](references/recovery.md) before any action on an uncertain run.

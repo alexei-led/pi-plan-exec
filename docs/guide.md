@@ -16,40 +16,26 @@ contracts and component ownership.
 - These independently installed Pi packages, with the runtime capabilities
   described in [runtime contracts](runtime-contracts.md):
   - `pi-subagents`;
-  - optional `@tintinweb/pi-tasks` projection cache;
-  - `@alexeiled/pi-subagents-bridge`;
   - optional `@alexeiled/pi-fusion` when Fusion is selected as the review backend;
   - optional Revmux executable when Revmux is selected as the review backend;
   - `@alexeiled/pi-plan-exec`.
 
-The branch is validated against exact dependency feature commits recorded in
-the [active implementation plan](plans/2026-09-21-autonomous-execution.md),
-with linked dependency PRs in [runtime contracts](runtime-contracts.md). The
-pre-release setup uses npm 12.0.2 and project-local Git settings for transitive
-refs.
+The default backend targets unmodified pi-subagents 0.76.1 and Pi 1.0.4, with no
+upstream-release prerequisite. Development uses npm 12.0.2. Native's built-in
+`worker` and the extension's namespaced readonly `plan-exec-reviewer` work without
+cc-thingz. Explicit frozen agents/models are honored, never silently replaced.
 
-`pi-plan-exec` uses pi-subagents’ built-in `worker` and `reviewer` agents. It
-does not require cc-thingz agents.
-
-Strict autonomous execution
-requires the released `pi-subagents` runtime plus matching Bridge and Fusion
-ownership contracts, all installed from npm. Unsupported APIs and unknown
-ownership remain fenced. Local bootstrap
-and required checks use plan-exec's unbounded owned POSIX process-group runner.
-See [runtime contracts](runtime-contracts.md)
-for prerequisites, API boundaries, and linked dependency PRs.
+One public async workflow awaits one keyed `main` child. Cwd must match the
+current authorized execution target; immutable request identity is persisted
+before dispatch. Missing correlation or retirement remains fenced, never replayed.
+Local bootstrap/checks keep the owned POSIX runner. See
+[runtime contracts](runtime-contracts.md) for exact boundaries and limits.
 
 ## Install
 
-Install the released packages listed in
-[runtime contracts](runtime-contracts.md). pi-tasks is an optional projection
-cache. The setup commands below pin the exact released ranges; do not change
-global npm configuration.
-
-Restart Pi after upgrading installed packages. For Bridge 0.5.5, stop all
-Bridge-owning Pi processes and back up its journal before upgrade. Schema 7
-cannot be reopened by older Bridge versions. `/reload` is for local source/config
-changes, not an in-place package upgrade.
+Install pi-subagents 0.76.1 and this package as independent Pi packages. Bridge
+and pi-tasks are not dependencies. Restart after package upgrades; `/reload` is
+for local source/config changes, not mixed loaded package versions.
 
 The frozen run defaults are explicit: `{ "mode": "unbounded" }` execution
 lifetime, one required `subagent` reviewer, and an empty fallback list (`none`).
@@ -67,8 +53,7 @@ The selection is frozen into `run.json` when the run starts.
 }
 ```
 
-Production admission requires a healthy released runtime and Bridge with
-explicit lifetime support; see [runtime contracts](runtime-contracts.md).
+Production dispatch requires the public native runtime to be available; see [runtime contracts](runtime-contracts.md).
 
 Local bootstrap and required checks always use an unbounded, user-stoppable
 owned-process group. A run configured with bounded compatibility lifetime
@@ -83,6 +68,39 @@ native timer maximum and changes the continuation strategy. The frozen base
 remains unchanged. Heartbeats, silence, unknown results, wrapper exits,
 cancellation acknowledgements, and process-group snapshots do not count as
 progress or expiry.
+
+Native `workerMaxTurns`, `reviewerMaxTurns` and `statsMaxTurns` are requested
+settings only on 0.76.1 (`maxTurnsEnforced:false`). Unbounded workflow mode does
+not disable child defaults; bounded timeout is passed to root and child. Goal
+`maxTaskIterations` is a separate controller budget. Neither silence nor timeout
+text authorizes a duplicate writer.
+
+### Advanced legacy snapshot import
+
+Known recorded native IDs are observed without a journal. If a historical launch
+has no ID, supply a consistent offline schema-7 snapshot explicitly:
+
+```text
+/exec resume <full-run-id> --legacy-journal "/absolute/path/offline snapshot.sqlite"
+/goal resume <full-run-id> --legacy-journal /absolute/path/offline.sqlite
+```
+
+Use a closed/checkpointed database or a consistent SQLite snapshot with its WAL;
+never copy only the main file of a live WAL database. Nothing is auto-discovered,
+created, migrated or reset. The original run/operation/digest must match; imports
+preserve params, stop intent, leases and generations. Missing/mismatched/corrupt/
+busy snapshots stay fenced. A mapping/rejection/stop receipt is not retirement
+or replay permission, and abandoned runs cannot import or resume. Foreign native
+sessions do not gain control from a plan lease. Unresolved legacy isolation is
+refused because its old dispatcher cannot be fenced by a read-only import.
+
+Required native review is a typed commit-bound report from `plan-exec-reviewer`.
+Schema requests keep a unique owned output file but use default inline settlement
+(the released file-only guard can run before structured-output persistence).
+Missing, malformed and wrong-commit reports never pass review. Exact
+`settled-awaiting-resume` sole-child evidence can be recovered without relaunch;
+arbitrary failed-workflow output cannot. Early stops with unverified writer close
+retain reservations, including after force-stop/reload.
 
 ## Pursue a goal
 
@@ -100,7 +118,7 @@ commands) or supplied with `--check "<command>"`; they are the completion
 evidence.
 
 The controller runs one worker turn per iteration through the same owned
-Bridge/native runtime, registry, leases, stop fences, and recovery as `/exec`.
+native runtime, registry, leases, stop fences, and recovery as `/exec`.
 Each turn receives the goal, the previous outcome, the current check failure,
 and the commits made so far; it inspects the state, chooses and executes the
 next useful action, verifies it, and commits. A turn that ends with an ordinary
@@ -130,7 +148,7 @@ config; when it is reached the goal pauses and can be resumed.
 ```
 
 Goal runs live in the same registry and `/exec status` lists them; the project
-`pi-tasks` projection is skipped for goals, because a working list is optional
+There is no external task projection for goals or plans; the working list is optional
 and an empty list is not an error.
 
 ## Executable plan format
@@ -453,7 +471,7 @@ plain words and one safe next action.
 ### Cancellation and missing worktrees
 
 “Cancelling” means stop intent is saved, not that the worker exited.
-Bridge's `pending` delivery is retried against the same operation.
+Pending native stop delivery is retried against the same operation.
 A `delivered` stop receipt still needs separate retirement proof.
 The strip never lets a stale task's “running” state override cancellation.
 
@@ -489,8 +507,7 @@ absence of a signal as health. Every in-flight situation reads differently:
   wants to end the run.
 - `the worker is gone, so nothing is running` — checked at the moment status
   ran: a matching owned-process-tree terminal proof covers the bound external
-  run, or an authoritative never-started fence or durable `absent` lookup covers
-  an unbound launch. A missing directory or bridge record alone is inconclusive;
+  run, or an intact local prepared record proves no dispatch occurred. A missing/absent lookup never proves non-start. A missing directory or legacy journal row alone is inconclusive;
   `/exec resume` clears the worker only after decisive evidence and continues
   without starting a second one.
 - `the worker is gone, so the waived stage cannot finish` — the same evidence on
@@ -601,7 +618,7 @@ reconciled after restart.
 optional review or statistics stage is failed, paused, or already
 skip-pending. Required review and final verification cannot be skipped, including
 when the legacy `finalizeEnabled` option is false. If a
-Bridge, Fusion, or Revmux operation is tracked, the controller requests
+native, Fusion, or Revmux operation is tracked, the controller requests
 stop and remains `skip_pending` until the provider proves that operation is
 terminal. The skipped stage remains visible in status and projected tasks, its
 known findings remain unresolved, and final completion is
@@ -664,8 +681,7 @@ A run:
 
 1. Validates the Git repository and executable-plan contract.
 2. Asks for in-place execution or worktree isolation.
-3. Creates a durable global run record and may create an optional pi-tasks
-   projection.
+3. Creates the authoritative global run record and derives task summaries from it.
 4. Schedules dependency-ready implementation tasks with fresh `worker`
    subagents. Omitted dependencies preserve sequential plans; explicit empty
    dependencies allow independent work in a clean lane.
@@ -696,19 +712,22 @@ Every implementation, review, and fix operation has fresh subagent context.
 
 ## Review results
 
-Review stages return either:
+Native review calls `structured_output` with a schema-valid commit-bound report:
 
-```text
-NO_FINDINGS
+```json
+{
+  "schemaVersion": 1,
+  "reviewedCommit": "<exact full commit hash>",
+  "findings": [
+    {"severity":"MAJOR","summary":"Input validation is missing","evidence":"src/input.ts:17 accepts an empty value and throws.","suggestion":"Reject empty input at the boundary."}
+  ]
+}
 ```
 
-or structured findings:
-
-```text
-FINDING: MAJOR | Input validation is missing
-Evidence: src/input.ts:17 accepts an empty value and later throws.
-Fix: Reject empty input at the boundary.
-```
+`findings: []` is clean only with exact successful-child/retirement and Git
+candidate evidence. There is no verdict field or prose fallback. Historical
+artifacts and explicitly selected Fusion/Revmux retain their separate legacy
+finding/report decoders; they do not change the new native contract.
 
 Supported severities are `CRITICAL`, `MAJOR`, and `MINOR`. Fusion review
 requests the `plan-review-v1` output contract and consumes only Fusion's
@@ -733,22 +752,16 @@ Authoritative records live at:
 ~/.pi/plan-exec/runs/<run-id>/run.json
 ```
 
-They store stage, attempts, active Bridge/Fusion operation, worktree, branch,
-findings, force-skip audit records, and lease. Durable operation IDs and request digests let the controller reconcile an
-ambiguous or interrupted start without intentionally launching a second writer.
-A v2 `processTerminal` proof with `state: observed` is the only terminal process
-proof. Missing bridge memory, missing `asyncDir`, v1 `absent`, and unknown proof
-stay `recovery_required`/`unknown_launch`; they never start a duplicate. Registry
-compare-and-set updates and controller locks keep stale reload instances from
-overwriting cancellation, pause, or operation state.
+Records store stage, attempts, active/failed native identity, immutable request,
+worktree, branch, findings, stop/skip audit and lease. The keyed workflow's RPC
+UUID and structured root/child inventory recover an ambiguous start without
+replaying it. Exact published proof is checked against actual async child mode;
+missing identity, directories or journal rows never prove absence. Registry CAS
+and controller locks prevent stale instances overwriting pause/cancel/generations.
 
-Pi-subagents receives one top-level PlanExec external-run row and one
-background-work provider. Reload reads `run.json` and safely re-registers those
-owned records; native child rows are not duplicated. Pi-tasks is an optional,
-session-scoped, rebuildable UI cache. Owned tasks carry owner, run, key,
-revision, status, and projection version metadata. When present, its scope,
-path, and package version are checked. A cache repair failure is visible as
-degraded projection state while plan execution continues.
+Fleet receives one owned external-run row and a background-work provider. Native
+children are not duplicated. Task summaries derive from the registry; no external
+task cache, task file repair or degraded task-store state exists.
 
 Pause, cancellation, failure, and completion preserve the worktree for review.
 Cancellation retries transient provider failures without dropping the active
@@ -764,12 +777,11 @@ After Pi starts or reloads, the native controller restores unfinished runs when
 their lease is claimable. It never steals a live foreign lease or an explicit
 user pause. Pending native or local cleanup is restored and reconciled without
 resuming plan work. A tracked operation is reattached by its durable operation
-ID; an uncertain launch remains fenced until the provider proves absence or
-terminal ownership. The strip projects state, accepted count and current action
+ID; an uncertain launch remains fenced until exact retirement or local pre-dispatch non-start is proven. The strip projects state, accepted count and current action
 from `run.json`. `/exec status` retains dependency/retry waits, verified activity,
 usage, review backend and the active operation's persisted lifetime, including a
 grown budget. Missing lifetime evidence is reported as unknown. A broken
-pi-tasks/Fleet projection cannot block recovery. Projection writes coalesce one
+advisory Fleet publication cannot block recovery. Projection writes coalesce one
 in-flight update and one latest snapshot; a cold technical prerequisite does not
 discard an authorized start.
 
@@ -787,11 +799,11 @@ Safety limits:
   default, with an optional report child. Plan archival must succeed before the
   run becomes terminal.
 
-The strict path uses plan-exec's owned POSIX process group for local commands,
-Bridge/native workers, Fusion, and Revmux. The runtime, Bridge, and Fusion are
-released npm packages pinned by version. Unknown or unproven ownership remains
-fenced. Use [runtime contracts](runtime-contracts.md)
-for the exact prerequisites and dependency PR links.
+Local commands keep the owned POSIX process-group contract. Native model work
+uses released workflow/child proofs, without fabricated host-process containment.
+Fusion/Revmux retain explicit capability refusals and no implicit fallback.
+See [runtime contracts](runtime-contracts.md) for supported guarantees and safe
+limitations, including native stop proofs that remain unknown.
 
 For local setup, validation, and tag-driven releases, see
 [DEVELOPMENT.md](../DEVELOPMENT.md).

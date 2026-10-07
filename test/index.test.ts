@@ -29,7 +29,6 @@ import {
 import planExecExtension, {
   abandonedRunsNotice,
   abandonmentProbe,
-  bridgeRuntimeCompatible,
   type EvidenceProbe,
   execCleanup,
   execHelp,
@@ -41,8 +40,6 @@ import planExecExtension, {
   formatRunWidget,
   getExecArgumentCompletions,
   handleCommand,
-  hasBridgeOperationMethod,
-  hasBridgeWorkflowScriptSpawnCapability,
   isActionAllowed,
   isRecoverableFailure,
   isRemovableRun,
@@ -1164,78 +1161,6 @@ const durableTerminalProbe: EvidenceProbe = async (candidate) => {
       };
 };
 
-test('bridge runtime compatibility requires direct owned-agent recovery rather than workflow scripting', () => {
-  const v1 = {
-    protocolVersion: 1 as const,
-    healthy: true,
-    workflowScriptSpawn: true,
-    durableOperationLookup: false,
-  };
-  assert.equal(
-    bridgeRuntimeCompatible(
-      {
-        methods: ['ping', 'operation'],
-        capabilities: { workflowScriptSpawn: true },
-      },
-      v1,
-    ),
-    false,
-  );
-  assert.equal(
-    bridgeRuntimeCompatible(
-      {},
-      {
-        protocolVersion: 2,
-        healthy: true,
-        workflowScriptSpawn: false,
-        singleAgentSpawn: true,
-        prelaunchRejectionVersion: 1,
-        durableOperationLookup: true,
-        processTerminalProofVersion: 1,
-        executionLifetimeVersion: 1,
-        executionLifetimeModes: ['unbounded'],
-        processTreeOwnership: {
-          version: 1,
-          scope: 'owned-process-tree',
-          escapedDescendants: 'contained',
-        },
-      },
-    ),
-    true,
-  );
-  assert.equal(
-    bridgeRuntimeCompatible(
-      {
-        methods: ['ping', 'spawn'],
-        capabilities: { workflowScriptSpawn: true },
-      },
-      v1,
-    ),
-    false,
-  );
-  assert.equal(
-    hasBridgeOperationMethod({ methods: ['ping', 'operation'] }),
-    true,
-  );
-  assert.equal(hasBridgeOperationMethod({ methods: ['ping', 'spawn'] }), false);
-  assert.equal(hasBridgeOperationMethod({ methods: 'operation' }), false);
-  assert.equal(hasBridgeOperationMethod(undefined), false);
-
-  assert.equal(
-    hasBridgeWorkflowScriptSpawnCapability({
-      capabilities: { workflowScriptSpawn: true },
-    }),
-    true,
-  );
-  assert.equal(
-    hasBridgeWorkflowScriptSpawnCapability({
-      capabilities: { workflowScriptSpawn: false },
-    }),
-    false,
-  );
-  assert.equal(hasBridgeWorkflowScriptSpawnCapability(undefined), false);
-});
-
 test('exec command completions explain the command family', () => {
   const items = getExecArgumentCompletions('st');
   assert.deepEqual(
@@ -1335,10 +1260,7 @@ test('help and setup explain the installed command surface', () => {
   assert.match(execHelp(), /\/skill:exec-plan/);
   for (const alias of EXEC_ALIAS_ACTIONS)
     assert.doesNotMatch(execHelp(), new RegExp(`/exec ${alias}`), alias);
-  assert.match(
-    execSetup(),
-    /pi install -l npm:@alexeiled\/pi-subagents-bridge@\^0\.5\.5$/m,
-  );
+  assert.doesNotMatch(execSetup(), /pi-subagents-bridge/);
   assert.match(
     execSetup(),
     /pi install -l npm:@alexeiled\/pi-fusion@\^0\.9\.3$/m,
@@ -1348,12 +1270,9 @@ test('help and setup explain the installed command surface', () => {
   assert.doesNotMatch(execSetup(), /pi-tasks/);
 });
 
-test('setup installs the released bridge and fusion pins', () => {
+test('setup installs native and optional fusion without removed packages', () => {
   assert.match(execSetup(), /^pi install -l npm:pi-subagents@\^0\.76\.1$/m);
-  assert.match(
-    execSetup(),
-    /^pi install -l npm:@alexeiled\/pi-subagents-bridge@\^0\.5\.5$/m,
-  );
+  assert.doesNotMatch(execSetup(), /pi-subagents-bridge/);
   assert.match(
     execSetup(),
     /^pi install -l npm:@alexeiled\/pi-fusion@\^0\.9\.3$/m,
@@ -1672,9 +1591,15 @@ test('run status classifies recovery and gives one safe next action', () => {
   const unknown = formatRunStatus(unnamedWorker('running'), {
     leaseLive: true,
   });
-  assert.match(unknown, /recovery: cannot check on the worker right now/);
-  assert.match(unknown, /the tool never learned its name/);
-  assert.match(unknown, /\/exec status .* to look again later/);
+  assert.match(
+    unknown,
+    /recovery: (cannot check on the worker right now|legacy native identity unresolved)/,
+  );
+  assert.match(unknown, /Legacy launch identity is unresolved/);
+  assert.match(
+    unknown,
+    /--legacy-journal \/absolute\/path\/to\/snapshot.sqlite/,
+  );
 
   // The same operation on a settled run: its record already says the
   // controller stopped, and resume looks the operation up rather than
@@ -1698,21 +1623,18 @@ test('run status classifies recovery and gives one safe next action', () => {
     fencedStatus,
     /launch lookup: No correlated pre-launch rejection/,
   );
-  assert.match(fencedStatus, /Repeated resume cannot supply missing evidence/);
+  assert.match(fencedStatus, /no replay is authorized/);
   assert.doesNotMatch(fencedStatus, /next safe action:.*Run \/exec resume/);
 
   const rejectedStatus = formatRunStatus(fencedUnknown, {
     leaseLive: false,
     launchRejected: true,
   });
-  assert.match(
-    rejectedStatus,
-    /launch rejected before dispatch; cancellation fence required/,
-  );
-  assert.match(rejectedStatus, /next safe action: Run \/exec resume/);
+  assert.match(rejectedStatus, /legacy native identity unresolved/);
+  assert.match(rejectedStatus, /--legacy-journal/);
 
   const unknownSettled = formatRunStatus(unnamedWorker('failed'));
-  assert.match(unknownSettled, /recovery: stopped, and you can continue it/);
+  assert.match(unknownSettled, /recovery: legacy native identity unresolved/);
   assert.match(unknownSettled, /\/exec resume /);
   assert.doesNotMatch(unknownSettled, /cannot check on the worker/);
 
@@ -2130,11 +2052,17 @@ test('every recovery classification ends at a primary verb', () => {
 
   // Unobservable is a claim about a worker in flight. A settled run makes no
   // such claim, so an unnamed operation on one reads as the failure it is.
-  assert.equal(
+  assert.match(
     recoveryGuidance(unnamedInFlight).classification,
-    recoveryGuidance(unobservable).classification,
+    /legacy native identity unresolved/,
   );
-  assert.equal(
+  assert.match(recoveryGuidance(unnamedInFlight).command, /--legacy-journal/);
+  assert.match(recoveryGuidance(unobservable).classification, /cannot check/);
+  assert.match(
+    recoveryGuidance(unnamedOperation).classification,
+    /legacy native identity unresolved/,
+  );
+  assert.notEqual(
     recoveryGuidance(unnamedOperation).classification,
     recoveryGuidance(untrackedFailure).classification,
   );
@@ -2185,10 +2113,7 @@ test('resume output explains a required second plan-structure review', () => {
   assert.match(message, /run interactive \/exec resume/);
 
   const resumed = resumeResultMessage(run({ status: 'running' }));
-  assert.match(
-    resumed,
-    /already running; its tracked worker is being reconciled/,
-  );
+  assert.match(resumed, /--legacy-journal/);
 
   const reconciling = resumeResultMessage(
     run({
@@ -2200,10 +2125,7 @@ test('resume output explains a required second plan-structure review', () => {
       },
     }),
   );
-  assert.match(
-    reconciling,
-    /already running; its tracked worker is being reconciled/,
-  );
+  assert.match(reconciling, /--legacy-journal/);
   assert.doesNotMatch(resumed, /second resume/);
 });
 
@@ -3985,7 +3907,7 @@ const PREEMPTING_SHAPES: Array<[string, Partial<PlanExecRun>]> = [
   ['a stop was requested', { status: 'cancel_pending' }],
 ];
 
-test('decisive evidence outranks every claim that would say wait', async () => {
+test('exact retirement outranks wait claims but legacy absence stays inconclusive', async () => {
   for (const [label, overrides] of PREEMPTING_SHAPES) {
     const gone = abandonedRun(overrides);
     const registry = await seedRegistry([gone]);
@@ -4002,9 +3924,13 @@ test('decisive evidence outranks every claim that would say wait', async () => {
       guidance.classification,
       gone.activeOperation?.externalRunId
         ? /^the worker is gone/
-        : /pending launch can be checked/,
+        : /legacy native identity unresolved/,
       label,
     );
+    if (!gone.activeOperation?.externalRunId) {
+      assert.match(guidance.command, /--legacy-journal/);
+      assert.match(sweep, /ambiguous/);
+    }
     assert.doesNotMatch(
       guidance.action,
       /Do not resume|Do not start another|moves on by itself|until it reads cancelled|polling picks up/,
@@ -4027,7 +3953,7 @@ test('decisive evidence outranks every claim that would say wait', async () => {
 test('a live lease keeps every one of those claims exactly as it was', async () => {
   const waits = [
     /cannot check on the worker right now/,
-    /cannot check on the worker right now/,
+    /legacy native identity unresolved/,
     /waiting for the stage you waived to stop/,
     /waiting for the stop you asked for/,
   ];

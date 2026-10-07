@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { onTestFinished, type TestContext, test } from 'vitest';
-import { bridgeRequestDigest } from '../src/bridge.js';
+import { executionRequestDigest } from '../src/execution-contract.js';
 import type { RunCommand } from '../src/git.js';
 import { normalizeCheckOutput, parseGoalOutcome } from '../src/goal-loop.js';
 import {
@@ -23,8 +23,9 @@ import {
 } from '../src/index.js';
 import { LocalOperationFailedError } from '../src/local-operation.js';
 import { RunRegistry } from '../src/registry.js';
-import type { BridgeResult, PlanExecRun } from '../src/types.js';
+import type { PlanExecRun } from '../src/types.js';
 import { createControllerLocalExecutor } from './fixtures/controller-local-executor.js';
+import type { BridgeResult } from './fixtures/legacy-types.js';
 import { PlanExecController } from './fixtures/native-controller.js';
 
 const execute = promisify(execFile);
@@ -93,7 +94,7 @@ class GoalWorker {
       this.launches.push({ id, params });
     return ok({
       runId: id,
-      requestDigest: bridgeRequestDigest(params),
+      requestDigest: executionRequestDigest(params),
       effectiveExecutionLifetime: params.executionLifetime,
     });
   }
@@ -104,7 +105,7 @@ class GoalWorker {
         ? {
             state: 'found',
             runId: id,
-            requestDigest: bridgeRequestDigest(launch.params),
+            requestDigest: executionRequestDigest(launch.params),
             effectiveExecutionLifetime: launch.params.executionLifetime,
           }
         : { state: 'unknown' },
@@ -118,7 +119,7 @@ class GoalWorker {
         ? {
             processTerminalProof: observedWorkerProof(
               id,
-              bridgeRequestDigest(launch?.params ?? {}),
+              executionRequestDigest(launch?.params ?? {}),
             ),
           }
         : {}),
@@ -131,8 +132,8 @@ class GoalWorker {
   async adopt() {
     return ok({});
   }
-  async stop() {
-    return ok({ state: 'stopping' });
+  async stop(runId = this.launches.at(-1)?.id) {
+    return ok({ state: 'stopping', runId });
   }
 }
 const fusion = {
@@ -629,4 +630,20 @@ test('check-output normalization keeps real failure lines and replaces only timi
   assert.match(normalized, /duration_ms: <time>/);
   assert.match(normalized, /finished in <time>/);
   assert.match(normalized, /<addr>/);
+});
+
+test('a failed native child cannot complete a goal by printing GOAL_DONE', async (t) => {
+  const f = await fixture(t);
+  let run = await start(f);
+  run = await f.controller.tick(run.id, 'session');
+  await writeFile(join(f.root, 'done.txt'), 'done');
+  await f.git('add', 'done.txt');
+  await f.git('commit', '-m', 'candidate');
+  f.worker.state = 'failed';
+  f.worker.proof = true;
+  f.worker.output = '<<<RALPHEX:GOAL_DONE>>>';
+  run = await f.controller.tick(run.id, 'session');
+  assert.equal(run.status, 'paused');
+  assert.equal(run.stage, 'implementation');
+  assert.equal(f.worker.launches.length, 1);
 });

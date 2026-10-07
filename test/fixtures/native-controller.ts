@@ -1,14 +1,13 @@
 import type { ExtensionContext } from '@earendil-works/pi-coding-agent';
 import { readSubagentArtifact } from '../../src/artifact.js';
 import {
-  type BridgeOperationOwner,
-  bridgeRequestDigest,
-} from '../../src/bridge.js';
-import {
   PlanExecController as Controller,
   type NativeRuntime,
 } from '../../src/controller.js';
-import { hasTerminalOwnershipProof } from '../../src/execution-contract.js';
+import {
+  executionRequestDigest,
+  hasTerminalOwnershipProof,
+} from '../../src/execution-contract.js';
 import {
   type LegacyNativeBinding,
   type NativeObservation,
@@ -18,13 +17,11 @@ import {
 import type { RunRegistry } from '../../src/registry.js';
 import { required } from '../../src/required.js';
 import { parseReviewFindings } from '../../src/review.js';
-import type {
-  ActiveOperation,
-  BridgeResult,
-  PlanExecRun,
-} from '../../src/types.js';
+import type { ActiveOperation, PlanExecRun } from '../../src/types.js';
+import type { BridgeOperationOwner, BridgeResult } from './legacy-types.js';
 
 type FixtureWorker = {
+  capabilities?(): Promise<{ healthy: boolean }>;
   adopt?(id: string, dir?: string): Promise<BridgeResult>;
   spawn(
     id: string,
@@ -91,6 +88,10 @@ export function nativeFixture(
         await registry.updateIfCurrent(
           {
             ...latest,
+            ...(latest.failedOperation?.operationId === op.operationId &&
+            latest.failedOperation.requestDigest === op.requestDigest
+              ? { failedOperation: op }
+              : {}),
             activeOperation: {
               ...op,
               ...(latest.activeOperation.stopRequested !== undefined
@@ -109,11 +110,44 @@ export function nativeFixture(
   ): Promise<NativeObservation> {
     const { run, op } = await load(runId, binding);
     if (op.launchFenced) return { state: 'retired', operation: op };
-    if (!op.externalRunId)
+    if (!op.externalRunId) {
+      if (op.native?.phase === 'prepared')
+        return { state: 'prepared', operation: op };
+      const contract = contracts.get(op.operationId);
+      const lookup = await worker.operation(op.operationId, {
+        kind: 'pi-plan-exec',
+        runId,
+        key: op.operationId,
+        requestDigest: contract?.digest ?? binding.requestDigest,
+      });
+      if (
+        lookup.success &&
+        lookup.data.state === 'found' &&
+        lookup.data.requestDigest === contract?.digest &&
+        typeof lookup.data.runId === 'string'
+      ) {
+        await save(run, {
+          ...op,
+          externalRunId: lookup.data.runId,
+          native: {
+            ...required(op.native),
+            phase: 'bound',
+            childRunId: `${lookup.data.runId}-child`,
+          },
+        });
+        return observe(runId, binding);
+      }
       return {
-        state: op.native?.phase === 'prepared' ? 'prepared' : 'unknown',
+        state: 'unknown',
         operation: op,
+        reason: lookup.success
+          ? String(
+              lookup.data.text ??
+                'No exact fixture native correlation; replay fenced.',
+            )
+          : lookup.error.message,
       };
+    }
     const reply = await worker.status(op.externalRunId, op.asyncDir);
     if (!reply.success)
       return { state: 'unknown', operation: op, reason: reply.error.message };
@@ -152,6 +186,18 @@ export function nativeFixture(
         : {}),
     });
     return {
+      status: Object.fromEntries(
+        Object.entries(reply.data).filter(([key]) =>
+          [
+            'activity',
+            'totalTokens',
+            'totalCost',
+            'terminationReason',
+            'advisoryObservation',
+            'text',
+          ].includes(key),
+        ),
+      ),
       state: retired ? 'retired' : 'bound',
       operation,
       workflowState: state,
@@ -180,25 +226,48 @@ export function nativeFixture(
     }
     const observation = await observe(runId, binding);
     if (observation.state === 'retired') return observation;
-    if (op.externalRunId) await worker.stop(op.externalRunId, op.asyncDir);
-    return { ...observation, stopPending: true };
+    const current = observation.operation;
+    if (
+      !current.externalRunId ||
+      current.stopDeliveredTo === current.externalRunId
+    )
+      return { ...observation, stopPending: true };
+    const reply = await worker.stop(current.externalRunId, current.asyncDir);
+    const delivered =
+      reply.success &&
+      reply.data.state === 'stopping' &&
+      reply.data.runId === current.externalRunId;
+    const updated = { ...current };
+    if (delivered) {
+      updated.stopDeliveredTo = current.externalRunId;
+      delete updated.cancellationDeliveryError;
+    } else
+      updated.cancellationDeliveryError = {
+        message: reply.success
+          ? 'Malformed native stop reply.'
+          : reply.error.message,
+        observedAt: Date.now(),
+        ...(!reply.success && reply.error.code
+          ? { upstreamCode: reply.error.code }
+          : {}),
+      };
+    return {
+      ...observation,
+      operation: await save(run, updated),
+      stopPending: true,
+    };
   }
+
   async function legacy(runId: string, binding: LegacyNativeBinding) {
     const { op } = await load(runId, binding);
-    if (!op.externalRunId && !binding.requestDigest)
+    if (!op.externalRunId)
       return {
         operation: op,
         retired: false,
-        reason: 'Missing original legacy digest; launch remains fenced.',
+        reason:
+          'Legacy identity remains fenced; no replay is authorized. Import an exact offline snapshot.',
       };
-    const reply = op.externalRunId
-      ? await worker.status(op.externalRunId, op.asyncDir)
-      : await worker.operation(op.operationId, {
-          kind: 'pi-plan-exec',
-          runId,
-          key: op.operationId,
-          requestDigest: required(binding.requestDigest),
-        });
+    const reply = await worker.status(op.externalRunId, op.asyncDir);
     return {
       operation: op,
       retired:
@@ -222,6 +291,9 @@ export function nativeFixture(
     };
   }
   return {
+    async available() {
+      return (await worker.capabilities?.())?.healthy !== false;
+    },
     async prepare(run, input) {
       preparing = run;
       const op = await preparer.prepare(run, input);
@@ -240,7 +312,7 @@ export function nativeFixture(
       };
       contracts.set(op.operationId, {
         params,
-        digest: bridgeRequestDigest(params),
+        digest: executionRequestDigest(params),
       });
       return op;
     },
@@ -265,6 +337,15 @@ export function nativeFixture(
           state: 'unknown',
           operation: op,
           reason: reply.success ? 'No fixture run ID' : reply.error.message,
+          ...(!reply.success
+            ? {
+                launchError: {
+                  code:
+                    reply.error.upstreamCode ?? reply.error.code ?? 'transport',
+                  message: reply.error.message,
+                },
+              }
+            : {}),
         };
       const operation = await save(run, {
         ...op,
@@ -302,20 +383,34 @@ export function nativeFixture(
             successful: op.kind === 'review',
           },
         );
+        if (
+          !['complete', 'completed', 'done'].includes(
+            observation.workflowState ?? '',
+          )
+        )
+          return {
+            ...observation,
+            failureOutput: output,
+            reason: `Fixture child ended as ${observation.workflowState}.`,
+          };
         if (op.kind === 'review') {
-          const findings = parseReviewFindings(output).map(
-            ({ severity, summary, evidence, suggestion }) => ({
-              severity,
-              summary,
-              evidence,
-              suggestion,
-            }),
-          );
-          output = JSON.stringify({
-            schemaVersion: 1,
-            reviewedCommit: op.reviewedCommit,
-            findings,
-          });
+          try {
+            const findings = parseReviewFindings(output).map(
+              ({ severity, summary, evidence, suggestion }) => ({
+                severity,
+                summary,
+                evidence,
+                suggestion,
+              }),
+            );
+            output = JSON.stringify({
+              schemaVersion: 1,
+              reviewedCommit: op.reviewedCommit,
+              findings,
+            });
+          } catch {
+            /* Deliberately malformed fixture reports must reach semantic validation. */
+          }
         }
         return {
           ...observation,
@@ -355,9 +450,19 @@ export function nativeFixture(
         : { ...observed, reason: reply.error.message };
     },
     async stopLegacy(runId, binding) {
-      const { op } = await load(runId, binding);
-      if (op.externalRunId) await worker.stop(op.externalRunId, op.asyncDir);
-      return legacy(runId, binding);
+      const observed = await legacy(runId, binding);
+      if (observed.retired || !observed.operation.externalRunId)
+        return observed;
+      const reply = await worker.stop(
+        observed.operation.externalRunId,
+        observed.operation.asyncDir,
+      );
+      return {
+        ...observed,
+        reason: reply.success
+          ? 'Stop delivered; retirement remains unconfirmed.'
+          : reply.error.message,
+      };
     },
   };
 }

@@ -1,5 +1,4 @@
 import {
-  EXTERNAL_OPERATION_STATE,
   type ExecutionLifetime,
   type GoalState,
   MAX_EXECUTION_TIMEOUT_MS,
@@ -204,6 +203,9 @@ export interface AbandonmentEvidence {
   /** Exact owner-bound lookup permits observing the same child, never replacement. */
   operationBound?: boolean;
   processTerminalProof?: ProcessTerminalProof;
+  workflowTerminalProof?: import('./execution-contract.js').WorkflowTerminalProof;
+  /** Persisted prepared request, not provider absence or a mutable status hint. */
+  localPrepared?: boolean;
 }
 
 /** Exit proof permits result recovery; replay-safe absence permits only the same launch identity. */
@@ -215,27 +217,23 @@ export function classifyAbandonment(
   if (!isInFlightStatus(run.status) || !run.activeOperation)
     return ABANDONMENT.AMBIGUOUS;
   const terminalObserved =
-    evidence.processTerminalProof?.version === 1 &&
-    evidence.processTerminalProof.state === 'observed' &&
-    evidence.processTerminalProof.runId === run.activeOperation?.externalRunId;
-  const replaySafeAbsence =
-    !run.activeOperation.externalRunId &&
-    evidence.durableOperationLookup === true &&
-    evidence.replaySafe === true &&
-    evidence.bridgeState === EXTERNAL_OPERATION_STATE.ABSENT;
+    (evidence.processTerminalProof?.version === 1 &&
+      evidence.processTerminalProof.state === 'observed' &&
+      evidence.processTerminalProof.runId ===
+        run.activeOperation?.externalRunId) ||
+    (evidence.workflowTerminalProof?.state === 'observed' &&
+      evidence.workflowTerminalProof.runId ===
+        run.activeOperation?.externalRunId);
   const rejectedLaunch =
     !run.activeOperation.externalRunId &&
     evidence.durableOperationLookup === true &&
     evidence.bridgeState === 'not_started' &&
     evidence.launchRejected === true;
-  const boundOperation =
-    evidence.durableOperationLookup === true &&
-    evidence.bridgeState === EXTERNAL_OPERATION_STATE.FOUND &&
-    evidence.operationBound === true;
+  const boundOperation = evidence.operationBound === true;
   return terminalObserved ||
     (evidence.durableOperationLookup === true && evidence.neverStarted === true)
     ? ABANDONMENT.ABANDONED
-    : replaySafeAbsence || rejectedLaunch || boundOperation
+    : evidence.localPrepared === true || rejectedLaunch || boundOperation
       ? ABANDONMENT.RECONCILABLE
       : ABANDONMENT.AMBIGUOUS;
 }

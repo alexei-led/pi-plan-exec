@@ -1,6 +1,8 @@
 import { stat } from 'node:fs/promises';
+import { isAbsolute } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
-import type { ExecutionLifetime } from './types.js';
+import { parseExecutionLifetime } from './execution-contract.js';
+import type { ActiveOperation, ExecutionLifetime } from './types.js';
 
 export interface LegacyOperationBinding {
   operationId: string;
@@ -320,4 +322,156 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function diagnostic(error: unknown): string {
   return (error instanceof Error ? error.message : String(error)).slice(0, 500);
+}
+
+/** Validate persisted import identity using the same bounded row decoder. */
+export function validLegacyImport(
+  operation: ActiveOperation | undefined,
+  ownerRunId: string,
+): boolean {
+  const imported = operation?.legacyImport;
+  if (imported === undefined) return true;
+  if (
+    operation?.service !== 'bridge' ||
+    !operation.requestDigest ||
+    !isRecord(imported) ||
+    typeof imported.journalPath !== 'string' ||
+    !isAbsolute(imported.journalPath) ||
+    !timestamp(imported.importedAt) ||
+    !isRecord(imported.operation)
+  )
+    return false;
+  const value = imported.operation;
+  if (
+    JSON.stringify(value).length > MAX_ROW_BYTES ||
+    value.operationId !== operation.operationId ||
+    value.ownerRunId !== ownerRunId ||
+    value.requestDigest !== operation.requestDigest
+  )
+    return false;
+  try {
+    const parsed = parseMapping(
+      {
+        binding: value.binding,
+        run_id: value.runId ?? null,
+        async_dir: value.asyncDir ?? null,
+        error: value.error ?? null,
+        native_params: value.nativeParamsJson ?? null,
+        execution_lifetime: value.executionLifetime
+          ? JSON.stringify(value.executionLifetime)
+          : null,
+        native_correlated:
+          value.nativeCorrelated === true
+            ? 1
+            : value.nativeCorrelated === false
+              ? 0
+              : null,
+        cancel_requested:
+          value.cancelRequested === true
+            ? 1
+            : value.cancelRequested === false
+              ? 0
+              : null,
+        stop_receipt_state: value.stopReceiptState ?? null,
+        launch_rejection: value.launchRejection
+          ? JSON.stringify(value.launchRejection)
+          : null,
+        created_at: value.createdAt,
+        updated_at: value.updatedAt,
+      },
+      {
+        operationId: operation.operationId,
+        ownerRunId,
+        requestDigest: operation.requestDigest,
+      },
+    );
+    return Boolean(
+      parsed &&
+        (!parsed.runId || parsed.runId === operation.externalRunId) &&
+        parsed.rpcRequestId === value.rpcRequestId &&
+        JSON.stringify(parsed.nativeParams) ===
+          JSON.stringify(value.nativeParams),
+    );
+  } catch {
+    return false;
+  }
+}
+
+export function legacyImportGuidance(runId: string): string {
+  return `Legacy launch identity is unresolved; no replay is authorized. Supply a consistent offline schema-7 snapshot with /exec resume ${runId} --legacy-journal /absolute/path/to/snapshot.sqlite. Missing rows, receipts or directories are not non-start proof.`;
+}
+
+/** Validate new rejection receipts; legacy never-started fences retain their contract. */
+export function hasBoundNeverStarted(
+  data: Record<string, unknown>,
+  binding: { operationId: string; requestDigest?: string },
+  ownerRunId: string,
+): boolean {
+  if (
+    data.state === 'retired' ||
+    data.launchRetirement !== undefined ||
+    data.neverStarted !== true ||
+    data.operationId !== binding.operationId ||
+    !binding.requestDigest ||
+    data.requestDigest !== binding.requestDigest
+  )
+    return false;
+  const proof = data.launchRejection;
+  if (proof === undefined && data.state !== 'not_started') return true;
+  return (
+    isRecord(proof) &&
+    proof.version === 1 &&
+    proof.source === 'subagents-rpc' &&
+    typeof proof.requestId === 'string' &&
+    Boolean(proof.requestId.trim()) &&
+    proof.method === 'spawn' &&
+    proof.code === 'invalid_params' &&
+    typeof proof.message === 'string' &&
+    Boolean(proof.message.trim()) &&
+    proof.operationId === binding.operationId &&
+    proof.requestDigest === binding.requestDigest &&
+    proof.ownerRunId === ownerRunId &&
+    data.runId === undefined &&
+    data.replaySafe === false
+  );
+}
+
+/** An exact lookup can reattach a writer; it is not evidence that the writer exited. */
+export function hasBoundOperation(
+  data: unknown,
+  operation: {
+    operationId: string;
+    requestDigest?: string;
+    externalRunId?: string;
+    expectedLifetime?: ExecutionLifetime;
+    effectiveLifetime?: ExecutionLifetime;
+    params?: Record<string, unknown>;
+  },
+): boolean {
+  if (
+    !isRecord(data) ||
+    data.state !== 'found' ||
+    data.operationId !== operation.operationId ||
+    !operation.requestDigest ||
+    data.requestDigest !== operation.requestDigest ||
+    typeof data.runId !== 'string' ||
+    !data.runId.trim() ||
+    (operation.externalRunId !== undefined &&
+      data.runId !== operation.externalRunId) ||
+    data.launchRetirement !== undefined ||
+    data.neverStarted === true
+  )
+    return false;
+  const expected =
+    operation.expectedLifetime ??
+    parseExecutionLifetime(operation.params?.executionLifetime) ??
+    operation.effectiveLifetime;
+  const actual = parseExecutionLifetime(data.effectiveExecutionLifetime);
+  return (
+    expected !== undefined &&
+    actual !== undefined &&
+    expected.mode === actual.mode &&
+    (expected.mode === 'unbounded' ||
+      (actual.mode === 'bounded' && actual.timeoutMs === expected.timeoutMs))
+  );
 }

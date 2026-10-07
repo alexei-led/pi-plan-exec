@@ -14,16 +14,20 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { onTestFinished, test } from 'vitest';
-import { bridgeRequestDigest } from '../src/bridge.js';
+import { executionRequestDigest } from '../src/execution-contract.js';
 import type { RunCommand } from '../src/git.js';
 import { formatRunStatus, formatRunWidget } from '../src/index.js';
 import { prepareIsolationDirectory } from '../src/isolation.js';
 import { runCommands } from '../src/lanes.js';
+import { nativeOperationDigest } from '../src/operation-safety.js';
 import { parsePlan } from '../src/plan.js';
 import { RunRegistry } from '../src/registry.js';
 import { required } from '../src/required.js';
 import { DEFAULT_FROZEN_RUN_CONFIG } from '../src/types.js';
-import { PlanExecController } from './fixtures/native-controller.js';
+import {
+  nativeFixture,
+  PlanExecController,
+} from './fixtures/native-controller.js';
 
 const execute = promisify(execFile);
 const command: RunCommand = async (program, args, cwd) => {
@@ -72,7 +76,7 @@ async function fixture(
     executionLifetime: { mode: 'unbounded' },
   };
   const registry = new RunRegistry(join(root, 'runs'));
-  const run = await registry.create({
+  let run = await registry.create({
     schemaVersion: 1,
     repositoryRoot: old,
     worktreeCwd: old,
@@ -104,7 +108,7 @@ async function fixture(
       kind: 'implementation',
       taskId: 1,
       params,
-      requestDigest: bridgeRequestDigest(params),
+      requestDigest: executionRequestDigest(params),
       expectedLifetime: { mode: 'unbounded' },
       recovery: 'recovery_required',
       lastObservedState: 'unknown_launch',
@@ -138,7 +142,7 @@ async function fixture(
       return ok({
         operationId,
         runId: 'new-worker',
-        requestDigest: bridgeRequestDigest(params),
+        requestDigest: executionRequestDigest(params),
         effectiveExecutionLifetime: { mode: 'unbounded' },
       });
     },
@@ -162,6 +166,22 @@ async function fixture(
     adopt: async () => ok({ state: 'running' }),
     stop: async () => ok({ state: 'stopping' }),
   };
+  const operation = await nativeFixture(registry, bridge).prepare(run, {
+    operationId: 'legacy-op',
+    kind: 'implementation',
+    taskId: 1,
+    agent: 'worker',
+    task: 'Local characterization',
+  });
+  run = await registry.update({
+    ...run,
+    activeOperation: {
+      ...operation,
+      native: { ...required(operation.native), phase: 'dispatching' },
+      lastObservedState: 'unknown_launch',
+      recovery: 'recovery_required',
+    },
+  });
   const makeController = (localCommands = runCommands, observe = command) =>
     new PlanExecController(
       registry,
@@ -214,7 +234,7 @@ test('force abandonment preserves isolated recovery lineage and every quarantine
   assert.equal(f.spawns(), 0);
 });
 
-test('explicit isolation preserves legacy uncertainty and creates one independent same-run writer', async () => {
+test('explicit isolation preserves native uncertainty and creates one independent same-run writer', async () => {
   const f = await fixture();
   const target = join(f.root, 'new');
   const isolated = await f.controller.recoverIsolated(
@@ -270,7 +290,7 @@ test('explicit isolation preserves legacy uncertainty and creates one independen
     f.controller.resume(f.run.id, 'owner'),
   ]);
   assert.equal(f.spawns(), 1);
-  assert.equal(f.fences(), 1);
+  assert.equal(f.fences(), 0);
 });
 
 test('rendering isolated recovery never writes task files to either checkout', async () => {
@@ -562,9 +582,11 @@ test('a crash during private marker preparation never exposes an unowned target'
 test('a genuine unborn target left after init can resume its original preparation', async () => {
   const f = await fixture();
   const target = join(f.root, 'new');
-  const cancel = f.bridge.cancelOperation;
-  f.bridge.cancelOperation = async () => {
-    throw new Error('interrupt before clone');
+  const update = f.registry.updateIfCurrent.bind(f.registry);
+  f.registry.updateIfCurrent = async (...args) => {
+    if (args[0].quarantinedExecutions?.some((entry) => entry.dispatchFenced))
+      throw new Error('interrupt before clone');
+    return update(...args);
   };
   await assert.rejects(
     f.controller.recoverIsolated(f.run.id, 'owner', target, true),
@@ -573,7 +595,7 @@ test('a genuine unborn target left after init can resume its original preparatio
   const pending = required(await f.registry.get(f.run.id));
   await prepareIsolationDirectory(required(pending.isolationRecovery));
   await execute('git', ['init', '--initial-branch', 'main'], { cwd: target });
-  f.bridge.cancelOperation = cancel;
+  f.registry.updateIfCurrent = update;
   const recovered = await f.controller.recoverIsolated(
     f.run.id,
     'owner',
@@ -587,9 +609,12 @@ test('a genuine unborn target left after init can resume its original preparatio
 test('a lost quarantine fence reply resumes the same pending target without a second lineage entry', async () => {
   const f = await fixture();
   const target = join(f.root, 'new');
-  const cancel = f.bridge.cancelOperation;
-  f.bridge.cancelOperation = async () => {
-    throw new Error('lost fence reply');
+  const update = f.registry.updateIfCurrent.bind(f.registry);
+  f.registry.updateIfCurrent = async (...args) => {
+    const result = await update(...args);
+    if (args[0].quarantinedExecutions?.some((entry) => entry.dispatchFenced))
+      throw new Error('lost fence reply');
+    return result;
   };
   await assert.rejects(
     f.controller.recoverIsolated(f.run.id, 'owner', target, true),
@@ -598,7 +623,7 @@ test('a lost quarantine fence reply resumes the same pending target without a se
   const pending = required(await f.registry.get(f.run.id));
   assert.equal(pending.quarantinedExecutions?.length, 1);
   assert.equal(pending.activeOperation, undefined);
-  f.bridge.cancelOperation = cancel;
+  f.registry.updateIfCurrent = update;
   const recovered = await f
     .makeController()
     .recoverIsolated(f.run.id, 'owner', target, true);
@@ -647,7 +672,7 @@ test('failed bootstrap pauses and explicit reapply can retry after the prerequis
   );
   assert.equal(recovered.isolationRecovery?.state, 'active');
   assert.equal(recovered.status, 'paused');
-  assert.equal(f.fences(), 1);
+  assert.equal(f.fences(), 0);
 });
 
 test('retrying an interrupted clone never resets new commits in its pending target', async () => {
@@ -762,7 +787,7 @@ test('restart after cloned checkout reuses the same target and rejects old-gener
     .recoverIsolated(f.run.id, 'owner', target, true);
   assert.equal(restarted.isolationRecovery?.id, ticket);
   assert.equal(restarted.isolationRecovery?.state, 'active');
-  assert.equal(f.fences(), 1);
+  assert.equal(f.fences(), 0);
   const stale = await f.registry.updateIfCurrent(
     { ...f.run, tasks: {} },
     restarted.updatedAt,
@@ -852,7 +877,14 @@ test('mid-plan isolation retains accepted checkboxes and keeps quarantine reserv
   const current = required(await f.registry.get(f.run.id));
   await f.registry.update({
     ...current,
-    activeOperation: { ...required(current.activeOperation), taskId: 2 },
+    activeOperation: {
+      ...required(current.activeOperation),
+      taskId: 2,
+      requestDigest: nativeOperationDigest({
+        ...required(current.activeOperation),
+        taskId: 2,
+      }),
+    },
     tasks: {
       '1': {
         taskId: 1,

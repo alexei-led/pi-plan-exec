@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -33,7 +33,7 @@ const freshHostPhaseScript = [
   "import { readFile, writeFile } from 'node:fs/promises';",
   "import { join } from 'node:path';",
   `import { createNativeRuntimeHost } from ${JSON.stringify(nativeHostFixtureUrl)};`,
-  'const [phase, sandbox, sessionId] = process.argv.slice(1);',
+  'const [phase, sandbox, sessionId, shape] = process.argv.slice(2);',
   "const originPath = join(sandbox, 'u2-origin.json');",
   "const reportPath = join(sandbox, 'u2-recovery.json');",
   'function isRecord(value) { return value !== null && typeof value === "object" && !Array.isArray(value); }',
@@ -43,7 +43,7 @@ const freshHostPhaseScript = [
   '  if (!object) return found;',
   '  for (const [key, entry] of Object.entries(object)) {',
   '    if (key === "text") continue;',
-  '    if (["id", "runId", "requestId", "toolCallId", "sessionId"].includes(key) && typeof entry === "string") found.push({ path: path + "." + key, key, value: entry });',
+  '    if (["id", "runId", "workflowRunId", "parentToolCallId", "requestId", "toolCallId", "sessionId"].includes(key) && typeof entry === "string") found.push({ path: path + "." + key, key, value: entry });',
   '    identityFields(entry, path + "." + key, found);',
   '  }',
   '  return found;',
@@ -53,9 +53,9 @@ const freshHostPhaseScript = [
   '  const data = isRecord(envelope.data) ? envelope.data : undefined;',
   '  const details = isRecord(data && data.details) ? data.details : undefined;',
   '  const lifecycle = isRecord(details && details.lifecycleStatus) ? details.lifecycleStatus : undefined;',
-  '  const proof = isRecord(lifecycle && lifecycle.processTerminal) ? lifecycle.processTerminal : undefined;',
+  '  const proof = isRecord(details && details.workflowTerminalProof) ? details.workflowTerminalProof : isRecord(lifecycle && lifecycle.processTerminal) ? lifecycle.processTerminal : undefined;',
   '  const error = isRecord(envelope.error) ? envelope.error : undefined;',
-  '  return { delivered: result.delivered, success: envelope.success === true, error: error ? { code: error.code, message: error.message } : undefined, processTerminal: proof ? { state: proof.state, runId: proof.runId, runnerProcessInstanceId: proof.runnerProcessInstanceId } : undefined, structuredIdentityFields: identityFields(data, "data") };',
+  '  return { delivered: result.delivered, success: envelope.success === true, error: error ? { code: error.code, message: error.message } : undefined, processTerminal: proof ? { state: proof.state, runId: proof.runId, runnerProcessInstanceId: proof.runnerProcessInstanceId, children: proof.children } : undefined, structuredIdentityFields: identityFields(data, "data") };',
   '}',
   'async function waitForProof(host, runId, timeoutMs) {',
   '  const deadline = Date.now() + timeoutMs;',
@@ -77,9 +77,9 @@ const freshHostPhaseScript = [
   '  if (phase === "origin") {',
   '    const starts = [];',
   '    host.events.on("subagent:async-started", event => { if (isRecord(event)) starts.push(event); });',
-  '    const launched = await host.rpc("spawn", { agent: "worker", task: "Complete the deterministic native U2 fixture.", cwd: host.repository, context: "fresh", worktree: false, timeoutMs: 15000 }, { dropReply: true, timeoutMs: 15000 });',
+  '    const params = { agent: "worker", task: "Complete the deterministic native U2 fixture.", cwd: host.repository, context: "fresh", worktree: false, mission: false, acceptance: false, timeoutMs: 15000 }; const launched = await host.rpc("spawn", shape === "workflow" ? { script: "return await runs.run(" + JSON.stringify("main") + ", " + JSON.stringify(params) + ");", cwd: host.repository, worktree: false, mission: false, acceptance: false, timeoutMs: 15000 } : params, { dropReply: true, timeoutMs: 15000 });',
   '    assert.equal(launched.delivered, false, "spawn reply is dropped from the caller");',
-  '    const started = starts.find(event => event.agent === "worker");',
+  '    const started = starts.find(event => shape === "workflow" ? event.mode === "workflow" : event.agent === "worker");',
   '    assert.ok(started && typeof started.id === "string", "native run identity was observed independently by the fixture");',
   '    assert.equal(started.sessionId, sessionId);',
   '    assert.equal(Object.hasOwn(started, "requestId"), false);',
@@ -124,19 +124,15 @@ async function runFreshHostPhase(
   sandbox,
   sessionId,
   timeoutMs = 75_000,
+  shape = 'direct',
 ) {
   const { spawn } = await import('node:child_process');
+  const scriptPath = join(sandbox, 'host-phase.mjs');
+  await writeFile(scriptPath, freshHostPhaseScript);
   return new Promise((resolve, reject) => {
     const child = spawn(
       process.execPath,
-      [
-        '--input-type=module',
-        '-e',
-        freshHostPhaseScript,
-        phase,
-        sandbox,
-        sessionId,
-      ],
+      [scriptPath, phase, sandbox, sessionId, shape],
       {
         cwd: process.cwd(),
         env: {
@@ -195,11 +191,13 @@ async function runFreshHostPhase(
 function structuredBindingFields(view, candidateId, runId) {
   const fields = view?.structuredIdentityFields ?? [];
   const runFields = fields.filter(
-    (field) => field.key === 'runId' && field.value === runId,
+    (field) =>
+      ['runId', 'workflowRunId'].includes(field.key) && field.value === runId,
   );
   const bindingFields = fields.filter(
     (field) =>
       (field.key === 'toolCallId' ||
+        field.key === 'parentToolCallId' ||
         field.key === 'requestId' ||
         field.key === 'id') &&
       field.value === candidateId,
@@ -544,5 +542,45 @@ test('released public RPC launches direct worker/reviewer leaves and preserves e
       if (passed) await rm(sandbox, { recursive: true, force: true });
       else console.error(`Retained native recovery sandbox: ${sandbox}`);
     }
+  }
+});
+
+test('selected keyed workflow recovers exact request correlation across fresh OS hosts without redispatch', {
+  timeout: 180000,
+}, async () => {
+  const sandbox = await mkdtemp(join(tmpdir(), 'native-workflow-restart-'));
+  const sessionId = `native-workflow-${randomUUID()}`;
+  let passed = false;
+  try {
+    await runFreshHostPhase('origin', sandbox, sessionId, 75000, 'workflow');
+    const origin = JSON.parse(
+      await readFile(join(sandbox, 'u2-origin.json'), 'utf8'),
+    );
+    await runFreshHostPhase('reattach', sandbox, sessionId, 75000, 'workflow');
+    const recovered = JSON.parse(
+      await readFile(join(sandbox, 'u2-recovery.json'), 'utf8'),
+    );
+    assert.equal(recovered.rpcSpawnAlias.success, true);
+    assert.equal(
+      recovered.nativeStatusArtifact.toolCallId,
+      `rpc-spawn-${origin.requestId}`,
+    );
+    assert.equal(
+      structuredBindingFields(
+        recovered.rpcSpawnAlias,
+        `rpc-spawn-${origin.requestId}`,
+        origin.nativeRunId,
+      ),
+      true,
+    );
+    assert.equal(recovered.knownRunStatus.processTerminal?.state, 'observed');
+    assert.equal(recovered.knownRunStatus.processTerminal?.children.length, 1);
+    assert.equal(recovered.sideEffects, 1);
+    assert.equal(recovered.head, origin.head);
+    assert.deepEqual(recovered.childPids, [origin.childPid]);
+    passed = true;
+  } finally {
+    if (passed) await rm(sandbox, { recursive: true, force: true });
+    else console.error(`Unresolved recovery fixture retained: ${sandbox}`);
   }
 });

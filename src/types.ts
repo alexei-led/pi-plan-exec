@@ -295,6 +295,12 @@ export interface NativeOperationMetadata {
 }
 
 export interface ActiveOperation {
+  /** Explicit read-only schema-7 snapshot import; never dispatch authority. */
+  legacyImport?: {
+    journalPath: string;
+    importedAt: number;
+    operation: import('./legacy-operation.js').LegacyOperationMapping;
+  };
   native?: NativeOperationMetadata;
   operationId: string;
   executionGeneration?: number;
@@ -587,10 +593,3 @@ export interface PlanExecRun {
   error?: string;
   unresolvedFindings: ReviewFinding[];
 }
-
-export type BridgeResult =
-  | { success: true; data: Record<string, unknown> }
-  | {
-      success: false;
-      error: { code?: string; upstreamCode?: string; message: string };
-    };

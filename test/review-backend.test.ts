@@ -4,7 +4,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { onTestFinished, type TestContext, test } from 'vitest';
-import { hasTerminalOwnershipProof } from '../src/bridge.js';
+import { hasTerminalOwnershipProof } from '../src/execution-contract.js';
 import {
   parseRevmuxReport,
   RevmuxReviewClient,

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import {
   PROCESS_TERMINAL_STATE,
   type ProcessTerminalProof,
@@ -329,4 +330,35 @@ export function parseExecutionLifetime(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+export function executionRequestDigest(
+  params: Record<string, unknown>,
+): string {
+  const { cwd, ...spawnParams } = params;
+  const payload = {
+    ...(typeof cwd === 'string' ? { cwd } : {}),
+    params: spawnParams,
+  };
+  return `sha256:${createHash('sha256')
+    .update(canonicalJson(payload))
+    .digest('hex')}`;
+}
+
+function canonicalJson(value: unknown): string {
+  return JSON.stringify(canonicalValue(value));
+}
+
+function canonicalValue(value: unknown): unknown {
+  if (Array.isArray(value))
+    return value.map((item) =>
+      item === undefined ? null : canonicalValue(item),
+    );
+  if (!isRecord(value)) return value;
+  return Object.fromEntries(
+    Object.keys(value)
+      .sort()
+      .filter((key) => value[key] !== undefined)
+      .map((key) => [key, canonicalValue(value[key])]),
+  );
 }

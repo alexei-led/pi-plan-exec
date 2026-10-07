@@ -1091,7 +1091,7 @@ test('abandonment needs a dead lease, an in-flight claim, and a gone operation',
       expected: 'ambiguous',
     },
     {
-      name: 'explicit replay safety permits reconciliation without proving exit',
+      name: 'legacy replay hints cannot turn absence into evidence',
       run: subject({
         activeOperation: {
           operationId: 'operation-1',
@@ -1105,7 +1105,7 @@ test('abandonment needs a dead lease, an in-flight claim, and a gone operation',
         durableOperationLookup: true,
         replaySafe: true,
       },
-      expected: 'reconcilable',
+      expected: 'ambiguous',
     },
     {
       name: 'live lease outranks every other signal',

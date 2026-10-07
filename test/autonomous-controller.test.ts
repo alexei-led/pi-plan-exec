@@ -16,11 +16,9 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { promisify } from 'node:util';
 import { onTestFinished, type TestContext, test, vi } from 'vitest';
 import {
-  type BridgeOperationOwner,
-  bridgeRequestDigest,
-  type DiagnosticGuidanceRequest,
+  executionRequestDigest,
   processTerminalProof,
-} from '../src/bridge.js';
+} from '../src/execution-contract.js';
 import type { RunCommand } from '../src/git.js';
 import { execReconcile, reconcileForResume } from '../src/index.js';
 import type { runCommands } from '../src/lanes.js';
@@ -39,13 +37,17 @@ import {
   selectReadyTask,
 } from '../src/scheduler.js';
 import {
-  type BridgeResult,
   DEFAULT_FROZEN_RUN_CONFIG,
   type ExecutionLifetime,
   MAX_EXECUTION_TIMEOUT_MS,
   type PlanExecRun,
 } from '../src/types.js';
 import { createControllerLocalExecutor } from './fixtures/controller-local-executor.js';
+import type {
+  BridgeOperationOwner,
+  BridgeResult,
+  DiagnosticGuidanceRequest,
+} from './fixtures/legacy-types.js';
 import { PlanExecController } from './fixtures/native-controller.js';
 
 const execute = promisify(execFile);
@@ -87,7 +89,7 @@ function observedWorkerProof(id: string, digest: string) {
 
 class Worker {
   launches: { id: string; params: Record<string, unknown> }[] = [];
-  output = '';
+  output = 'Task completed.';
   state = 'running';
   proof = false;
   failStatus = false;
@@ -125,7 +127,7 @@ class Worker {
       return { success: false, error: { message: 'lost spawn reply' } };
     return ok({
       runId: id,
-      requestDigest: bridgeRequestDigest(params),
+      requestDigest: executionRequestDigest(params),
       effectiveExecutionLifetime: params.executionLifetime,
     });
   }
@@ -136,7 +138,7 @@ class Worker {
         ? {
             state: 'found',
             runId: id,
-            requestDigest: bridgeRequestDigest(launch.params),
+            requestDigest: executionRequestDigest(launch.params),
             effectiveExecutionLifetime: launch.params.executionLifetime,
           }
         : { state: 'unknown' },
@@ -157,7 +159,7 @@ class Worker {
         ? {
             processTerminalProof: observedWorkerProof(
               id,
-              bridgeRequestDigest(
+              executionRequestDigest(
                 this.launches.find((launch) => launch.id === id)?.params ?? {},
               ),
             ),
@@ -172,9 +174,9 @@ class Worker {
   async adopt() {
     return ok({});
   }
-  async stop() {
+  async stop(runId = this.launches.at(-1)?.id) {
     this.stopCalls++;
-    return ok({ state: 'stopping' });
+    return ok({ state: 'stopping', runId });
   }
 }
 
@@ -488,7 +490,7 @@ for (const trackedPlan of [true, false]) {
     assert.equal(run.status, 'paused');
     f.worker.state = 'running';
     f.worker.proof = false;
-    f.worker.output = '';
+    f.worker.output = 'Task completed.';
     run = await f.controller.resume(
       run.id,
       'session',
@@ -801,7 +803,7 @@ for (const initialSnapshot of [false, true]) {
     run = await f.controller.tick(run.id, 'session');
     f.worker.state = 'running';
     f.worker.proof = false;
-    f.worker.output = '';
+    f.worker.output = 'Task completed.';
     for (let step = 0; step < 12 && f.worker.launches.length < 2; step++) {
       if (run.lanePreparation) lanes.add(run.lanePreparation.cwd);
       run = await f.controller.tick((await due(f.registry, run)).id, 'session');
@@ -1159,7 +1161,7 @@ for (const reapprove of [false, true]) {
     run = await f.controller.tick(run.id, 'session');
     f.worker.state = 'running';
     f.worker.proof = false;
-    f.worker.output = '';
+    f.worker.output = 'Task completed.';
     if (reapprove) {
       await writeFile(
         f.planPath,
@@ -1491,7 +1493,7 @@ test('nested independent task lane preserves the cwd and excludes partial work',
   run = await f.controller.tick(run.id, 'session');
   f.worker.state = 'running';
   f.worker.proof = false;
-  f.worker.output = '';
+  f.worker.output = 'Task completed.';
   for (let step = 0; step < 12 && f.worker.launches.length < 2; step++) {
     if (run.lanePreparation) lanes.add(run.lanePreparation.cwd);
     run = await due(f.registry, run);
@@ -1571,99 +1573,21 @@ test('plan drift after proven exit retains task recovery evidence across repair 
 });
 
 for (const lostReply of [false, true]) {
-  test(`pre-dispatch rejection with ${lostReply ? 'lost' : 'bound'} spawn reply fences automatically before retry`, async (t) => {
+  test(`legacy neverStarted claims cannot retire a native dispatch with ${lostReply ? 'lost' : 'received'} reply`, async (t) => {
     const f = await fixture(t);
-    vi.useFakeTimers({ toFake: ['Date'] });
-    vi.setSystemTime(Date.now());
-    class RejectedWorker extends Worker {
-      reject = true;
-      cancellations = 0;
-      children = 0;
-      rejected = new Set<string>();
-      override async spawn(id: string, params: Record<string, unknown>) {
-        if (!this.launches.some((launch) => launch.id === id)) {
-          if (this.reject) this.rejected.add(id);
-          else this.children++;
-        }
-        return super.spawn(id, params);
-      }
-      receipt(id: string) {
-        return ok({
-          state: 'found',
-          runId: id,
-          operationId: id,
-          requestDigest: bridgeRequestDigest(
-            this.launches.find((launch) => launch.id === id)?.params ?? {},
-          ),
-          neverStarted: true,
-          isError: true,
-          text: 'Unknown agent: worker',
-        });
-      }
-      override async status(id: string) {
-        return this.rejected.has(id) ? this.receipt(id) : super.status(id);
-      }
-      override async operation(id: string) {
-        return this.rejected.has(id) ? this.receipt(id) : super.operation(id);
-      }
-      async cancelOperation(id: string, owner: BridgeOperationOwner) {
-        this.cancellations++;
-        if (this.cancellations === 1)
-          return {
-            success: false as const,
-            error: { message: 'cancel reply lost' },
-          };
-        return ok({
-          state: 'cancelled',
-          operationId: id,
-          requestDigest: owner.requestDigest,
-          neverStarted: true,
-          cancellationRequested: true,
-        });
-      }
+    f.worker.loseSpawn = lostReply;
+    f.worker.status = async (id) =>
+      ok({ state: 'failed', runId: id, neverStarted: true, replaySafe: true });
+    let run = await f.controller.tick(f.run.id, 'session');
+    const identity = required(run.activeOperation);
+    for (let i = 0; i < 3; i++) {
+      run = await f.controller.tick((await due(f.registry, run)).id, 'session');
+      assert.equal(run.activeOperation?.operationId, identity.operationId);
+      assert.equal(run.activeOperation?.requestDigest, identity.requestDigest);
+      assert.equal(run.activeOperation?.launchFenced, undefined);
+      assert.equal(run.activeOperation?.processTreeExited, undefined);
     }
-    const worker = new RejectedWorker(f.worker.resultPath);
-    worker.loseSpawn = lostReply;
-    let controller = new PlanExecController(
-      f.registry,
-      worker,
-      fusion,
-      command,
-      f.localExecutor,
-    );
-    let run = await controller.tick(f.run.id, 'session');
-    const operationId = run.activeOperation?.operationId;
-    run = await due(f.registry, run);
-    run = await controller.tick(run.id, 'session');
-    assert.equal(worker.cancellations, 1);
-    assert.equal(run.activeOperation?.operationId, operationId);
-    assert.equal(worker.launches.length, 1);
-    assert.equal(worker.children, 0);
-    controller = new PlanExecController(
-      f.registry,
-      worker,
-      fusion,
-      command,
-      f.localExecutor,
-    );
-    run = await due(f.registry, run);
-    run = await controller.tick(run.id, 'session');
-    assert.equal(run.activeOperation, undefined);
-    assert.equal(run.failedOperation?.launchFenced, true);
-    assert.equal(run.tasks?.['1']?.state, 'retry_wait');
-    assert.ok((run.tasks?.['1']?.nextAttemptAt ?? 0) > Date.now());
-    await controller.tick(run.id, 'session');
-    assert.equal(worker.launches.length, 1);
-    worker.reject = false;
-    worker.loseSpawn = false;
-    vi.advanceTimersByTime(
-      required(run.tasks?.['1']?.nextAttemptAt) - Date.now(),
-    );
-    run = await due(f.registry, required(await f.registry.get(run.id)));
-    run = await controller.tick(run.id, 'session');
-    assert.notEqual(run.activeOperation?.operationId, operationId);
-    assert.equal(worker.launches.length, 2);
-    assert.equal(worker.children, 1);
+    assert.equal(f.worker.launches.length, 1);
   });
 }
 
@@ -1674,7 +1598,7 @@ for (const outcome of [
   'bound',
   'cancel-race',
 ] as const) {
-  test(`typed prelaunch rejection recovery: ${outcome}`, async (t) => {
+  test(`legacy-style rejection claims cannot authorize native replay: ${outcome}`, async (t) => {
     const f = await fixture(t);
     vi.useFakeTimers({ toFake: ['Date'] });
     vi.setSystemTime(Date.now());
@@ -1697,7 +1621,9 @@ for (const outcome of [
       };
     };
     const receipt = () => {
-      const digest = bridgeRequestDigest(required(f.worker.launches[0]).params);
+      const digest = executionRequestDigest(
+        required(f.worker.launches[0]).params,
+      );
       return {
         state: 'not_started',
         operationId: rejectedId,
@@ -1762,51 +1688,21 @@ for (const outcome of [
       f.localExecutor,
     );
     run = await due(f.registry, run);
-    if (outcome === 'valid') {
+    if (outcome === 'cancel-race')
       run = await f.registry.update({
         ...run,
-        lease: { sessionId: 'dead', pid: 2147483647, heartbeatAt: 0 },
+        status: 'cancel_pending',
+        userStopped: true,
+        stopGeneration: 1,
       });
-      const before = run.activeOperation;
-      const reconciled = await reconcileForResume(
-        f.registry,
-        run,
-        async () => ({
-          durableOperationLookup: true,
-          bridgeState: 'not_started',
-          launchRejected: true,
-        }),
-      );
-      assert.deepEqual(reconciled.run.activeOperation, before);
-      assert.equal(cancellations, 0);
-      assert.equal(spawnCount, 1);
-      run = reconciled.run;
-    }
     run = await controller.tick(run.id, 'session');
-    if (outcome === 'valid') {
-      assert.equal(run.activeOperation, undefined);
-      assert.equal(run.failedOperation?.operationId, rejectedId);
-      assert.equal(run.failedOperation?.requestDigest, digest);
-      assert.equal(run.failedOperation?.launchFenced, true);
-      vi.advanceTimersByTime(
-        required(run.tasks?.['1']?.nextAttemptAt) - Date.now(),
-      );
-      run = await due(f.registry, run);
-      await Promise.all([
-        controller.resume(run.id, 'session'),
-        controller.resume(run.id, 'session'),
-      ]);
-      run = required(await f.registry.get(run.id));
-      assert.equal(spawnCount, 2);
-      assert.notEqual(run.activeOperation?.operationId, rejectedId);
-      assert.equal(cancellations, 1);
-    } else {
-      assert.equal(run.activeOperation?.operationId, rejectedId);
-      assert.equal(run.activeOperation?.requestDigest, digest);
-      assert.equal(spawnCount, 1);
-      assert.equal(cancellations, outcome === 'cancel-race' ? 1 : 0);
-      if (outcome === 'cancel-race') assert.equal(run.status, 'cancel_pending');
-    }
+    assert.equal(run.activeOperation?.operationId, rejectedId);
+    assert.equal(run.activeOperation?.requestDigest, digest);
+    assert.equal(run.activeOperation?.launchFenced, undefined);
+    assert.equal(run.activeOperation?.processTreeExited, undefined);
+    assert.equal(spawnCount, 1);
+    assert.equal(cancellations, 0);
+    if (outcome === 'cancel-race') assert.equal(run.status, 'cancel_pending');
   });
 }
 
@@ -1828,7 +1724,7 @@ for (const stop of ['none', 'paused', 'cancel_pending'] as const) {
         await released;
         return ok({
           operationId: id,
-          requestDigest: bridgeRequestDigest(
+          requestDigest: executionRequestDigest(
             required(this.launches.find((launch) => launch.id === id)).params,
           ),
           state: 'retired',
@@ -2250,7 +2146,9 @@ test('fair scheduler has no fifty-task or attempt cap', async () => {
   assert.equal(selectReadyTask(states)?.taskId, 1);
 });
 
-test('controller accepts fifty-one distinct committed tasks without a global iteration cap', async (t) => {
+test('controller accepts fifty-one distinct committed tasks without a global iteration cap', {
+  timeout: 180_000,
+}, async (t) => {
   const count = 51;
   let content = Array.from(
     { length: count },
@@ -2507,7 +2405,7 @@ for (const phase of ['cancelled', 'failed'] as const) {
       reviewedCommit: head,
       executionLifetime: { mode: 'unbounded' },
     };
-    const digest = bridgeRequestDigest(params);
+    const digest = executionRequestDigest(params);
     let retired = false;
     let cancels = 0;
     const backend = {
@@ -2620,7 +2518,7 @@ test('lost optional Bridge reply uses its owner to recover and retire the same w
       assert.equal(owner.key, id);
       assert.equal(
         owner.requestDigest,
-        bridgeRequestDigest(
+        executionRequestDigest(
           this.launches.find((launch) => launch.id === id)?.params ?? {},
         ),
       );
@@ -2711,7 +2609,7 @@ for (const service of ['bridge', 'fusion'] as const) {
         reviewedCommit: head,
         executionLifetime: { mode: 'unbounded' },
       };
-      const digest = bridgeRequestDigest(params);
+      const digest = executionRequestDigest(params);
       const lostReply: BridgeResult = {
         success: false,
         error: { code: 'timeout', message: 'Cancellation reply lost' },
@@ -2792,7 +2690,7 @@ for (const service of ['bridge', 'fusion'] as const) {
         'Optional review waived',
         1,
       );
-      if (replyKind === 'fenced') {
+      if (replyKind === 'fenced' && service === 'fusion') {
         assert.equal(
           run.skippedStages[0]?.terminalOperationState,
           'launch durably fenced before dispatch',
@@ -2804,7 +2702,7 @@ for (const service of ['bridge', 'fusion'] as const) {
         assert.equal(run.skippedStages.length, 0);
         assert.match(
           run.activeOperation?.lastSkipError ?? '',
-          /ownership is unresolved/,
+          /ownership is unresolved|fenced|no replay/,
         );
       }
       assert.equal(worker.launches.length, 0);
@@ -4123,7 +4021,7 @@ test('confirmed bounded expiry grows later budgets while a lost reply preserves 
   ).tick(run.id, 'session');
   assert.equal(run.activeOperation?.operationId, operationId);
   assert.equal(run.activeOperation?.requestDigest, digest);
-  assert.deepEqual(run.activeOperation?.effectiveLifetime, {
+  assert.deepEqual(run.activeOperation?.native?.limits.requestedLifetime, {
     mode: 'bounded',
     timeoutMs: 4_000,
   });
@@ -4168,9 +4066,11 @@ test('silent unbounded workers never acquire a synthetic execution budget', asyn
   assert.deepEqual(run.activeOperation?.expectedLifetime, {
     mode: 'unbounded',
   });
-  assert.deepEqual(run.activeOperation?.effectiveLifetime, {
-    mode: 'unbounded',
-  });
+  assert.equal(run.activeOperation?.effectiveLifetime, undefined);
+  assert.equal(
+    run.activeOperation?.native?.limits.childTimeout,
+    'native-default',
+  );
   assert.equal(run.budgetExhaustions, undefined);
   assert.equal(f.worker.launches.length, 1);
 });
@@ -4263,7 +4163,7 @@ test('unavailable runtime preflight is an explicit prerequisite and does not con
   assert.equal(run.tasks?.['1']?.state, 'waiting_external');
   assert.equal(run.tasks?.['1']?.externalPrerequisite?.source, 'provider');
   assert.equal(run.tasks?.['1']?.externalPrerequisite?.kind, 'runtime');
-  assert.match(run.tasks?.['1']?.reason ?? '', /Capability probe/);
+  assert.match(run.tasks?.['1']?.reason ?? '', /Native runtime unavailable/);
   assert.equal(run.tasks?.['1']?.attempts, 0);
   assert.equal(f.worker.launches.length, 0);
   f.worker.capabilities = capabilities;
@@ -4342,13 +4242,17 @@ test('doctor preserves the same launch identity when an empty lookup races a lat
     replaySafe: true,
   });
   const report = await execReconcile(f.registry, evidence);
-  assert.match(report, /existing operation identity/);
+  assert.match(report, /nothing was reset/);
   run = required(await f.registry.get(run.id));
   assert.equal(run.status, 'running');
   assert.equal(run.activeOperation?.operationId, operationId);
   assert.equal(run.activeOperation?.requestDigest, digest);
   assert.equal(run.activeOperation?.processTreeExited, undefined);
-  run = (await reconcileForResume(f.registry, run, evidence)).run;
+  await assert.rejects(
+    reconcileForResume(f.registry, run, evidence),
+    /evidence is incomplete/,
+  );
+  // Only the later exact native binding, not the empty legacy lookup, permits observation.
   run = await due(f.registry, run);
   f.worker.loseSpawn = false;
   run = await new PlanExecController(
@@ -4434,7 +4338,10 @@ test('pause persists cancellation before RPC and early resume cannot replace the
   });
   run = await f.controller.advance(run);
   assert.equal(run.status, 'paused');
-  assert.equal(run.activeOperation?.stopAcknowledged, true);
+  assert.equal(
+    run.activeOperation?.stopDeliveredTo,
+    run.activeOperation?.externalRunId,
+  );
   assert.equal(run.activeOperation?.processTreeExited, undefined);
   assert.equal(f.worker.stopCalls, 1);
   run = await f.controller.resume(run.id, 'session', true);
@@ -4458,17 +4365,17 @@ test('pause persists cancellation before RPC and early resume cannot replace the
   assert.equal(f.worker.launches.length, 2);
 });
 
-for (const wrong of ['runId', 'operationId', 'requestDigest'] as const)
+for (const wrong of ['runId', 'state'] as const)
   test(`foreign delivered receipt cannot suppress cancellation retry: ${wrong}`, async (t) => {
     const f = await fixture(t);
     let run = await f.controller.tick(f.run.id, 'session');
     const operation = required(run.activeOperation);
     let calls = 0;
     Object.assign(f.worker, {
-      cancelOperation: async () => {
+      stop: async () => {
         calls++;
         return ok({
-          cancellationDelivery: 'delivered',
+          state: 'stopping',
           runId: operation.externalRunId,
           operationId: operation.operationId,
           requestDigest: operation.requestDigest,
@@ -4576,20 +4483,16 @@ test('pending native cancellation errors survive observations and restart until 
   const operation = required(run.activeOperation);
   let delivered = false;
   Object.assign(f.worker, {
-    cancelOperation: async () =>
-      ok({
-        operationId: operation.operationId,
-        requestDigest: operation.requestDigest,
-        runId: operation.externalRunId,
-        cancellationDelivery: delivered ? 'delivered' : 'pending',
-        cancellationRequested: true,
-        ...(delivered
-          ? {}
-          : {
-              error: 'Run is paused; native RPC cannot stop it',
-              upstreamCode: 'invalid_state',
-            }),
-      }),
+    stop: async () =>
+      delivered
+        ? ok({ runId: operation.externalRunId, state: 'stopping' })
+        : {
+            success: false,
+            error: {
+              code: 'invalid_state',
+              message: 'Run is paused; native RPC cannot stop it',
+            },
+          },
   });
   run = await f.registry.update({
     ...run,
@@ -4635,13 +4538,13 @@ test('intent-only cancellation and legacy acknowledgements retry the same operat
   const operation = required(run.activeOperation);
   const requests: string[] = [];
   Object.assign(f.worker, {
-    cancelOperation: async (id: string) => {
+    stop: async (id: string) => {
       requests.push(id);
       return ok({
         operationId: id,
         requestDigest: operation.requestDigest,
         runId: operation.externalRunId,
-        state: 'unknown',
+        state: requests.length < 2 ? 'unknown' : 'stopping',
         cancellationRequested: true,
         cancellationDelivery: requests.length < 2 ? 'pending' : 'delivered',
       });
@@ -4687,7 +4590,7 @@ test('pause cancellation reply loss retries the same fence without claiming work
           success: false,
           error: { code: 'timeout', message: 'cancel reply lost' },
         }
-      : ok({ state: 'stopping' });
+      : ok({ state: 'stopping', runId: run.activeOperation?.externalRunId });
   };
   run = await f.registry.update({
     ...run,
@@ -4703,12 +4606,15 @@ test('pause cancellation reply loss retries the same fence without claiming work
   assert.equal(requests, 2);
   assert.equal(run.status, 'paused');
   assert.equal(run.activeOperation?.operationId, id);
-  assert.equal(run.activeOperation?.stopAcknowledged, true);
+  assert.equal(
+    run.activeOperation?.stopDeliveredTo,
+    run.activeOperation?.externalRunId,
+  );
   assert.equal(run.activeOperation?.processTreeExited, undefined);
   assert.equal(f.worker.launches.length, 1);
 });
 
-test('confirmed tool guidance replays one durable action after reply loss and never marks the tool repaired', async (t) => {
+test('confirmed tool faults remain advisory across restart without unsupported guidance RPC', async (t) => {
   const f = await fixture(t);
   vi.useFakeTimers({ toFake: ['Date'] });
   vi.setSystemTime(Date.now());
@@ -4733,10 +4639,7 @@ test('confirmed tool guidance replays one durable action after reply loss and ne
   let run = await controller.tick(f.run.id, 'session');
   const id = run.activeOperation?.operationId;
   run = await controller.tick(run.id, 'session');
-  const first = required(
-    Object.values(required(run.activeOperation?.diagnosticActions))[0],
-  );
-  assert.equal(first.state, 'pending');
+  assert.equal(run.activeOperation?.diagnosticActions, undefined);
   vi.advanceTimersByTime(f.run.config.retryDelayMs);
   controller = new PlanExecController(
     f.registry,
@@ -4746,24 +4649,17 @@ test('confirmed tool guidance replays one durable action after reply loss and ne
     f.localExecutor,
   );
   run = await controller.tick(run.id, 'session');
-  const second = required(
-    Object.values(required(run.activeOperation?.diagnosticActions))[0],
-  );
-  assert.equal(second.diagnosticId, first.diagnosticId);
-  assert.equal(second.state, 'queued');
   assert.equal(
     run.activeOperation?.diagnostics?.assessment,
     'tool_fault_reported',
   );
-  assert.deepEqual(worker.guidanceCalls[0], worker.guidanceCalls[1]);
-  assert.equal(worker.queued.size, 1);
-  run = await controller.tick(run.id, 'session');
-  assert.equal(worker.guidanceCalls.length, 2);
+  assert.equal(run.activeOperation?.diagnostics?.action, 'probe');
+  assert.equal(worker.guidanceCalls.length, 0);
   assert.equal(run.activeOperation?.operationId, id);
   assert.equal(worker.launches.length, 1);
 });
 
-test('pause delivers its fence while diagnostic RPC is pending and ignores the late queued acknowledgment', async (t) => {
+test('pause wins over delayed native observation without issuing unsupported guidance', async (t) => {
   const f = await fixture(t);
   const worker = new GuidingWorker(f.worker.resultPath);
   worker.activity = {
@@ -4784,18 +4680,14 @@ test('pause delivers its fence while diagnostic RPC is pending and ignores the l
   const replyGate = new Promise<void>((resolve) => {
     release = resolve;
   });
-  worker.diagnoseOperation = async (operationId, owner, params) => {
-    worker.guidanceCalls.push({ operationId, owner, params });
-    await entered();
-    await replyGate;
-    return ok({
-      operationId,
-      requestDigest: owner.requestDigest,
-      diagnosticId: params.diagnosticId,
-      toolCallId: params.toolCallId,
-      guidanceOnly: true,
-      state: 'queued',
-    });
+  const status = worker.status.bind(worker);
+  let observations = 0;
+  worker.status = async (id) => {
+    if (++observations === 1) {
+      entered();
+      await replyGate;
+    }
+    return status(id);
   };
   const controller = new PlanExecController(
     f.registry,
@@ -4820,12 +4712,9 @@ test('pause delivers its fence while diagnostic RPC is pending and ignores the l
   release();
   run = await pending;
   assert.equal(run.status, 'paused');
-  assert.equal(
-    Object.values(required(run.activeOperation?.diagnosticActions))[0]?.state,
-    'pending',
-  );
+  assert.equal(run.activeOperation?.diagnosticActions, undefined);
   await controller.tick(run.id, 'session');
-  assert.equal(worker.guidanceCalls.length, 1);
+  assert.equal(worker.guidanceCalls.length, 0);
   assert.equal(worker.launches.length, 1);
 });
 

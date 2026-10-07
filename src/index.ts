@@ -11,7 +11,6 @@ import {
 } from '@earendil-works/pi-coding-agent';
 import type { AutocompleteItem } from '@earendil-works/pi-tui';
 import { parseAdvisoryObservation } from './advisory-observation.js';
-import { type BridgeCapabilities, supportsOwnedProcessTree } from './bridge.js';
 import {
   isDetachedWorkflowFailure,
   isExternalManualBlocker,
@@ -22,8 +21,13 @@ import {
   TASK_RETRY_OPTION,
   taskRetryRequiredMessage,
 } from './controller.js';
+import {
+  processTerminalProof,
+  workflowTerminalProof,
+} from './execution-contract.js';
 import { FusionClient } from './fusion.js';
 import { isPathWithin } from './git.js';
+import { legacyImportGuidance } from './legacy-operation.js';
 import {
   ABANDONMENT,
   type Abandonment,
@@ -174,10 +178,7 @@ function sourceInstallCommand(packageName: string): string {
 }
 
 function requiredSetupCommands(): string[] {
-  return [
-    sourceInstallCommand('pi-subagents'),
-    sourceInstallCommand('@alexeiled/pi-subagents-bridge'),
-  ];
+  return [sourceInstallCommand('pi-subagents')];
 }
 
 /** Primary verbs only: a retired name still dispatches, but is never taught. */
@@ -406,18 +407,7 @@ export default function planExecExtension(pi: ExtensionAPI): void {
     runCommand,
   );
 
-  // Diagnostic inspection must not adopt a session or authorize legacy replay.
-  const doctorProbe = abandonmentProbe(async (_operationId, run) => {
-    const op = run.activeOperation;
-    if (!op?.requestDigest) return undefined;
-    const observation = await native.observeLegacy(run.id, {
-      operationId: op.operationId,
-      requestDigest: op.requestDigest,
-    });
-    return observation.data
-      ? String(observation.data.state ?? 'unknown')
-      : undefined;
-  });
+  const doctorProbe = nativeEvidenceProbe(native);
 
   const activeControllers = new Map<string, ReturnType<typeof setInterval>>();
   const inFlightControllers = new Map<string, Promise<PlanExecRun>>();
@@ -1051,43 +1041,6 @@ export function runtimeIntegrationProblem(
     : 'pi-subagents >=0.60.0 external-runs/background-work APIs unavailable';
 }
 
-export function bridgeRuntimeCompatible(
-  _pingData: unknown,
-  capabilities: BridgeCapabilities,
-): boolean {
-  if (!capabilities.healthy || capabilities.singleAgentSpawn !== true)
-    return false;
-  if (capabilities.protocolVersion === 2)
-    return (
-      capabilities.prelaunchRejectionVersion === 1 &&
-      capabilities.durableOperationLookup &&
-      capabilities.processTerminalProofVersion === 1 &&
-      capabilities.executionLifetimeVersion === 1 &&
-      (capabilities.executionLifetimeModes?.length ?? 0) > 0 &&
-      supportsOwnedProcessTree(capabilities)
-    );
-  return false;
-}
-
-export function hasBridgeOperationMethod(data: unknown): boolean {
-  if (typeof data !== 'object' || data === null || !('methods' in data))
-    return false;
-  const methods = data.methods;
-  return Array.isArray(methods) && methods.includes('operation');
-}
-
-export function hasBridgeWorkflowScriptSpawnCapability(data: unknown): boolean {
-  if (typeof data !== 'object' || data === null || !('capabilities' in data))
-    return false;
-  const capabilities = data.capabilities;
-  return (
-    typeof capabilities === 'object' &&
-    capabilities !== null &&
-    'workflowScriptSpawn' in capabilities &&
-    capabilities.workflowScriptSpawn === true
-  );
-}
-
 export function missingRuntimeTools(available: string[]): string[] {
   const registered = new Set(available);
   return Object.entries(REQUIRED_RUNTIME_TOOLS)
@@ -1293,6 +1246,14 @@ export function recoveryGuidance(
       command: stageWaiverCommand(run),
     };
   }
+  const legacy = run.activeOperation ?? run.failedOperation;
+  if (legacy?.service === OPERATION_SERVICE.BRIDGE && !legacy.externalRunId)
+    return {
+      classification:
+        'legacy native identity unresolved; replacement work is fenced',
+      action: legacyImportGuidance(run.id),
+      command: `${resume} --legacy-journal /absolute/path/to/snapshot.sqlite`,
+    };
   if (evidence?.launchRejected === true)
     return {
       classification:
@@ -1313,7 +1274,7 @@ export function recoveryGuidance(
   )
     return {
       classification: 'recovery required: worker launch outcome is unknown',
-      action: `Inspect the launch error and lookup diagnostic, and repair Bridge/runtime compatibility if needed. Recovery requires identity-bound pre-launch rejection, durable absence, or terminal ownership proof; missing IDs, elapsed time, and old error text are not proof. Run ${status} after evidence or runtime support changes. Repeated resume cannot supply missing evidence; do not start replacement work in the old target.${run.stage === RUN_STAGE.IMPLEMENTATION && run.activeOperation?.service === OPERATION_SERVICE.BRIDGE ? ` If the operator approves a different local-files-only target, preview /exec recover-isolated ${run.id} <absolute-new-checkout>; the old writer remains quarantined, not retired.` : ''}`,
+      action: `Inspect the launch error and lookup diagnostic, and repair native runtime availability if needed. Recovery requires an intact local prepared operation or exact terminal ownership proof; missing IDs, elapsed time, and old error text are not proof. Run ${status} after evidence or runtime support changes. Repeated resume cannot supply missing evidence; do not start replacement work in the old target.${run.stage === RUN_STAGE.IMPLEMENTATION && run.activeOperation?.service === OPERATION_SERVICE.NATIVE ? ` If the operator approves a different local-files-only target, preview /exec recover-isolated ${run.id} <absolute-new-checkout>; the old writer remains quarantined, not retired.` : ''}`,
       command: status,
     };
   // In-flight only. A settled run's own record says the controller stopped, and
@@ -2151,6 +2112,80 @@ export interface AbandonmentSweep {
  * no evidence rather than a false verdict, and a run whose lease names another
  * host yields none at all — see `isLocalRun`.
  */
+export function nativeEvidenceProbe(
+  client: Pick<NativeRuntimeClient, 'inspect' | 'observeLegacy'>,
+): EvidenceProbe {
+  return async (run) => {
+    const operation = run.activeOperation;
+    if (!operation || !isLocalRun(run)) return {};
+    const disk = operation.asyncDir
+      ? await pathExists(operation.asyncDir)
+      : undefined;
+    const base = disk === undefined ? {} : { asyncDirPresent: disk };
+    try {
+      if (
+        operation.service === OPERATION_SERVICE.NATIVE &&
+        operation.requestDigest
+      ) {
+        const seen = await client.inspect(run.id, {
+          operationId: operation.operationId,
+          requestDigest: operation.requestDigest,
+        });
+        return {
+          ...base,
+          ...(seen.state === 'prepared' ||
+          seen.operation.native?.retirement === 'local-not-started'
+            ? { localPrepared: true }
+            : {}),
+          ...(seen.state !== 'unknown' && seen.operation.externalRunId
+            ? { operationBound: true }
+            : {}),
+          ...(seen.proof ? { workflowTerminalProof: seen.proof } : {}),
+        };
+      }
+      if (operation.service !== OPERATION_SERVICE.BRIDGE) return base;
+      const seen = await client.observeLegacy(run.id, {
+        operationId: operation.operationId,
+        ...(operation.requestDigest
+          ? { requestDigest: operation.requestDigest }
+          : {}),
+      });
+      const caller = operation.requestDigest
+        ? {
+            operationId: operation.operationId,
+            requestDigest: operation.requestDigest,
+          }
+        : undefined;
+      const process =
+        seen.retired && operation.externalRunId
+          ? processTerminalProof(
+              seen.data?.processTerminalProof,
+              operation.externalRunId,
+              caller,
+            )
+          : undefined;
+      const workflow =
+        seen.retired && operation.externalRunId
+          ? workflowTerminalProof(
+              seen.data?.workflowTerminalProof,
+              operation.externalRunId,
+              caller,
+            )
+          : undefined;
+      return {
+        ...base,
+        ...(seen.data && operation.externalRunId
+          ? { operationBound: true }
+          : {}),
+        ...(process ? { processTerminalProof: process } : {}),
+        ...(workflow ? { workflowTerminalProof: workflow } : {}),
+      };
+    } catch {
+      return base;
+    }
+  };
+}
+
 export function abandonmentProbe(
   lookupOperationState?: (
     operationId: string,
@@ -2516,9 +2551,12 @@ async function reconcileRun(
     return { skipped: RECONCILE_SKIP.STOP_REQUESTED };
   const reason = reconcileReason(diagnosis, actor);
   const terminalObserved =
-    diagnosis.evidence.processTerminalProof?.state === 'observed' &&
-    diagnosis.evidence.processTerminalProof.runId ===
-      diagnosis.run.activeOperation?.externalRunId;
+    (diagnosis.evidence.processTerminalProof?.state === 'observed' &&
+      diagnosis.evidence.processTerminalProof.runId ===
+        diagnosis.run.activeOperation?.externalRunId) ||
+    (diagnosis.evidence.workflowTerminalProof?.state === 'observed' &&
+      diagnosis.evidence.workflowTerminalProof.runId ===
+        diagnosis.run.activeOperation?.externalRunId);
   const reconciled = await registry.updateIfCurrent(
     {
       ...diagnosis.run,
@@ -2695,6 +2733,8 @@ function overdueText(diagnosis: ObservedRun): string {
 function operationEvidence(diagnosis: ObservedRun): string {
   const operation = diagnosis.run.activeOperation;
   if (!operation) return 'no operation is tracked';
+  if (diagnosis.evidence.localPrepared)
+    return 'the persisted native request is prepared and has not been dispatched';
   if (diagnosis.evidence.operationBound)
     return 'the provider identified the exact bound child; it can be reattached without launching a replacement';
   if (diagnosis.evidence.neverStarted)
@@ -2703,7 +2743,7 @@ function operationEvidence(diagnosis: ObservedRun): string {
     diagnosis.evidence.replaySafe &&
     diagnosis.evidence.bridgeState === EXTERNAL_OPERATION_STATE.ABSENT
   )
-    return 'the provider permits only same-ID replay; no worker-exit claim was made';
+    return 'legacy absence is inconclusive; neither replay nor worker exit is authorized';
   if (diagnosis.evidence.asyncDirPresent === false)
     return 'its operation directory is gone from disk';
   if (diagnosis.evidence.bridgeState === EXTERNAL_OPERATION_STATE.ABSENT)
@@ -2860,7 +2900,10 @@ export async function handleCommand(
     runtimeProblems,
     doctorProbe,
   } = dependencies;
-  const [subcommand, ...rest] = args.split(/\s+/).filter(Boolean);
+  const words = /^(?:resume|adopt)\b/.test(args.trim())
+    ? (args.match(/"[^"]*"|'[^']*'|\S+/g) ?? [])
+    : args.split(/\s+/).filter(Boolean);
+  const [subcommand, ...rest] = words;
   if (subcommand === EXEC_ACTION.HELP) return execHelp();
   if (subcommand === ISOLATION_ACTION)
     return recoverIsolatedCommand(args, ctx, dependencies);
@@ -3217,6 +3260,21 @@ async function resumeRun(
   const sessionId = ctx.sessionManager.getSessionId();
   await checkRuntime();
   if (dependencies.isSessionClosed?.()) return undefined;
+  if (options.legacyJournal) {
+    const expectedStopGeneration = resolved.stopGeneration ?? 0;
+    resolved = await mutateCommand(dependencies, () =>
+      controller.importLegacyJournal(
+        resolved.id,
+        sessionId,
+        required(options.legacyJournal),
+        resolved.stopGeneration ?? 0,
+      ),
+    );
+    const superseded = supersededCommandMessage(resolved, dependencies);
+    if (superseded) return superseded;
+    if ((resolved.stopGeneration ?? 0) !== expectedStopGeneration)
+      return `Run ${resolved.id} changed during snapshot import; the newer stop intent was preserved. Use /exec status ${resolved.id}.`;
+  }
   // Before anything else touches the run, so the rest of resume works from a
   // state it has evidence for.
   const recovered = await reconcileForResume(
@@ -3762,6 +3820,7 @@ type ResumeOptions = {
   retryTask: boolean;
   sameMachine: boolean;
   model: string | undefined;
+  legacyJournal?: string;
 };
 type ResumeArguments = ResumeOptions & { selector: string | undefined };
 
@@ -3786,7 +3845,19 @@ export function parseResumeOptions(args: string[]): ResumeOptions {
     if (arg === '--adopt-current-branch') options.adoptCurrentBranch = true;
     else if (arg === TASK_RETRY_OPTION) options.retryTask = true;
     else if (arg === SAME_MACHINE_OPTION) options.sameMachine = true;
-    else if (arg === RECOVERY_MODEL_OPTION) {
+    else if (arg === '--legacy-journal') {
+      let path = args[++index];
+      const quote = path?.[0];
+      if (path && (quote === '"' || quote === "'")) {
+        while (!path.endsWith(quote) && index + 1 < args.length)
+          path += ` ${args[++index]}`;
+        if (!path.endsWith(quote) || path.length < 3) throw resumeUsageError();
+        path = path.slice(1, -1);
+      }
+      if (!path || !isAbsolute(path) || options.legacyJournal)
+        throw resumeUsageError();
+      options.legacyJournal = path;
+    } else if (arg === RECOVERY_MODEL_OPTION) {
       const model = args[index + 1];
       if (!model || model.startsWith('--')) throw resumeUsageError();
       options.model = model;
@@ -3798,7 +3869,7 @@ export function parseResumeOptions(args: string[]): ResumeOptions {
 
 function resumeUsageError(): Error {
   return new Error(
-    `Usage: /exec resume [full-run-id] [--adopt-current-branch] [${TASK_RETRY_OPTION}] [${SAME_MACHINE_OPTION}] [${RECOVERY_MODEL_OPTION} current|provider/model]`,
+    `Usage: /exec resume [full-run-id] [--adopt-current-branch] [${TASK_RETRY_OPTION}] [${SAME_MACHINE_OPTION}] [${RECOVERY_MODEL_OPTION} current|provider/model] [--legacy-journal /absolute/path/to/snapshot.sqlite]`,
   );
 }
 
@@ -3809,6 +3880,12 @@ function skipUsageError(): Error {
 }
 
 export function resumeResultMessage(run: PlanExecRun): string {
+  if (
+    run.status !== RUN_STATUS.ABANDONED &&
+    run.activeOperation?.service === OPERATION_SERVICE.BRIDGE &&
+    !run.activeOperation.externalRunId
+  )
+    return legacyImportGuidance(run.id);
   if (needsPlanStructureReview(run))
     return [
       `Run ${shortRunId(run.id)} paused for plan-structure review: ${run.status} (${run.stage}).`,
@@ -4162,7 +4239,7 @@ export function execHelp(): string {
     '/exec [plan-path]       Start a plan (bare /exec opens the plan picker).',
     '/exec --worktree <path> <plan-path>  Execute a plan in an existing registered worktree.',
     '/exec status [run-id]   No run ID: every run grouped by what it needs, with any missing package and one next command per run. With a run ID: that run in detail.',
-    `/exec resume [run-id] [${RECOVERY_MODEL_OPTION} current|provider/model]`,
+    `/exec resume [run-id] [${RECOVERY_MODEL_OPTION} current|provider/model] [--legacy-journal /absolute/path/to/snapshot.sqlite]`,
     '/exec recover-isolated <full-run-id> <absolute-new-checkout> [--apply] — explicit local-files-only target change; old writer stays unknown',
     "                        Continue a stuck run: take over a dead session's lease while retaining the existing operation and saved result. Explicit pauses require resume; automatic task retries preserve their checkpoints.",
     '/exec ui on|off         Toggle the display without changing execution.',
@@ -4180,7 +4257,7 @@ export function execHelp(): string {
     '- Use --worktree when the plan and branch already exist in a registered worktree; the existing branch and unrelated changes are preserved.',
     '- /exec status reports a missing package with the exact install commands, and diagnoses every run that claims a worker.',
     '- The footer shows live stage and worker progress.',
-    '- /exec resume preserves the stage and worktree, and reconciles a known Bridge operation before retrying it.',
+    '- /exec resume preserves the stage and worktree, and observes the exact native operation without replaying an uncertain launch.',
     '- /exec resume never starts a second worker: a run whose worker cannot be proven gone is reported, not reset.',
     `- ${RECOVERY_MODEL_OPTION} is an advanced one-recovery-launch override; normal resume uses this Pi session model after a model/provider failure.`,
     '- /exec status spells out the /exec skip command, run ID filled in, for a stage that is blocked; skip keeps its reason and its confirm.',

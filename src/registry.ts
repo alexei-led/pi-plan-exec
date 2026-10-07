@@ -13,6 +13,7 @@ import { homedir, hostname } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { parseOperationActivity } from './diagnostics.js';
 import { worktreeIdentity } from './git.js';
+import { validLegacyImport } from './legacy-operation.js';
 import { isSkippableStage, isTerminalStatus } from './lifecycle.js';
 import { hasActiveLocalOperations } from './local-operation.js';
 import { validNativeOperation } from './operation-safety.js';
@@ -1220,7 +1221,11 @@ function isAutonomousState(run: PlanExecRun): boolean {
     )
       return false;
   for (const operation of [run.activeOperation, run.failedOperation]) {
-    if (!validNativeOperation(operation, run.id)) return false;
+    if (
+      !validNativeOperation(operation, run.id) ||
+      !validLegacyImport(operation, run.id)
+    )
+      return false;
     const commit = operation?.reviewedCommit;
     if (
       commit !== undefined &&

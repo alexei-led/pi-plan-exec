@@ -1,269 +1,200 @@
-# Autonomous runtime contracts
+# Runtime contracts
 
-A run is admitted only when the selected runtime advertises explicit lifetime
-support and ownership of every operation-owned descendant. The development
-baseline uses Pi `1.0.4`, `pi-subagents@0.76.1`,
-`@alexeiled/pi-subagents-bridge@0.5.5`, and `@alexeiled/pi-fusion@0.9.3`.
-The default subagent backend needs no Git pins. The optional Revmux contract
-still depends on an unmerged upstream change; it is not a released backend.
-See the [upstream audit](upstream-audit.md) for release evidence and limits.
+## Released baseline and ownership
 
-## Owned-process runner
+The default backend uses **unmodified pi-subagents 0.76.1** and Pi 1.0.4
+(`^1.0.4`). It does not require an upstream patch, Bridge, pi-tasks, or cc-thingz.
+Install pi-subagents and this package as independent Pi packages. Restart Pi
+after package upgrades; `/reload` is for local source/config changes.
 
-Local checks, bootstrap commands, and the Revmux adapter run through
-`src/owned-process.ts`, a POSIX process-group runner owned by plan-exec:
+Status/doctor use a read-only native inspection seam: it shares exact identity and
+proof validation but never binds, persists, claims, dispatches or controls a run.
+Later reconciliation revalidates the scanned operation/generation under CAS; stale
+prepared evidence cannot fence a concurrently claimed dispatch.
 
-- `prepareOwnedProcess(request)` returns an immutable operation binding;
-- `launchOwnedProcess(request)` starts the prepared operation as a detached
-  process group and records the leader pid, start identity, host ID, and boot ID;
-- `observeOwnedProcess(operationDirectory)` reports `pending`, `running`,
-  `retired`, `never-started`, or `unknown`;
-- `cancelOwnedProcess(operationDirectory, { deadlineMs, cancelled })` sends
-  `SIGTERM` to the group, escalates to `SIGKILL`, and returns the observation;
-- `requestOwnedProcessCancellation(operationDirectory)` sends `SIGTERM` without
-  waiting.
+The controller owns task/goal policy, Git acceptance, frozen checks and review.
+`RunRegistry` is the only operation ledger for new work. Fleet and the progress
+view are advisory; `run.tasks` supplies task summaries. Old task-projection
+session attribution is recognized read-only, not rebuilt into another store.
 
-The request binds `operationDirectory`, immutable `argv`, `cwd`, captured `env`,
-and `lifetime: { kind: "unbounded" }` or `{ kind: "bounded", timeoutMs }`. The
-binding includes operation ID, request digest, host ID, and boot ID. Retirement
-proofs are `{ kind: "process-group-retired" }` for a dead group or
-`{ kind: "never-started" }` for an operation that never reached a launch record;
-both must match the binding. Malformed, changed, or host/boot-mismatched
-operations stay fenced.
+## One native launch protocol
 
-Liveness is ps-based: the recorded leader pid is checked with a zero signal and
-its `ps -o lstart=` identity. A child that calls `setsid` or double-forks out of
-the group escapes containment; that is the documented best-effort ceiling, and
-the same ceiling the released runtime carries. The supported platform is any
-POSIX host (Darwin or Linux).
+Each operation is one public async `subagents:rpc:v1` script awaiting
+`runs.run("main", {...})`. Do not set child `async:true`: that returns a receipt
+instead of the awaited result. The released runtime normally executes this
+awaited child in a detached process. Actual `steps[].async`, not omitted input
+or a mock, determines the required retirement proof.
 
-Signal paths (`cancel`, cooperative cancellation, and the bounded-lifetime
-timer) first prove the binding still belongs to this host and boot, that no
-retirement was already persisted, and, when a start identity was recorded, that
-the leader pid was not reused. Retirement is persisted once observed and
-short-circuits every later signal. A successful launch keeps `launching.json`
-as the durable launch lock, so a concurrent launcher observes instead of
-spawning a second group. With no launch record and no `launch-failed.json`, an
-unresolved claim is `pending` while fresh and fenced as `unknown` once stale;
-it is never reported as `never-started`. A failed spawn records
-`launch-failed.json` and releases the claim: local operations relaunch on the
-next attempt, while the Revmux adapter reports `unknown` until the review is
-cancelled.
+Before dispatch the controller persists:
 
-## Released runtime and Bridge dependency
+- operation ID, kind, task/review iteration and reviewed commit;
+- controller session UUID, native session identity (`getSessionFile() ??
+  getSessionId()`), execution/stop generations and immutable request digest;
+- a distinct native RPC UUID and exact request;
+- unique absolute run-owned output binding and requested limits.
 
-Bridge v2 requires `singleAgentSpawn: true`, explicit lifetime support, durable
-operation lookup, terminal-proof support, and
-`processTreeOwnership: { scope: "owned-process-tree", escapedDescendants:
-"best-effort" }`.
+The requested cwd must canonically equal the authoritative `run.worktreeCwd`,
+including a selected nested/task lane. Dispatch rechecks the current registry
+target and authority; an arbitrary absolute override is not permission.
 
-The released `pi-subagents` runtime executes an async agent task as a
-**persistent workflow host**: the parent run publishes no writer-exit proof.
-Since 0.71.0, its targeted status includes `details.workflowTerminalProof`
-only after dispatch closes and each async child has observed exit evidence or
-a recorded `not-started` failure. Bridge 0.5.0 validates and forwards that
-native proof; it no longer reconstructs one from child events or sidecar files.
-Absent, pending, unknown, or malformed proofs cannot release ownership. A
-closed terminal workflow without a native proof field yields an upgrade/status
-artifact diagnostic rather than a claim that its process tree exited.
+Phases are `prepared -> dispatching -> bound -> retired`. CAS claims dispatch
+before emit. An intact prepared record proves no request was emitted; a
+`dispatching`/unknown operation is **never replayed**. Native readiness failure
+before preparation is an explicit retryable prerequisite, not a consumed child
+attempt. A lost reply is recovered using `status` with exact
+`rpc-spawn-<persisted-uuid>` correlation and validated `workflowChildren`.
+Correlated completion events may retain the binding before temporary indexes
+expire; they are not retirement or acceptance proof. No prompt/path/time guesses
+or scans of unrelated native runs are used. Missing/expired correlation stays
+fenced, even across repeated resume.
 
-Fusion 0.9.3 supports ordinary panels and judges with this native runtime, but
-plan-exec's strict Fusion review path requires durable native operations and
-contained process-tree ownership not established by this runtime upgrade. Selecting
-`reviewBackend: "fusion"` fails when the review stage launches, after
-implementation has run; the default subagent review backend remains available.
-Fusion's standalone panel and judge still work on the released stack.
+Native session authority is not transferred by a plan-exec lease takeover.
+Another session can inspect supported evidence but cannot impersonate the
+original native session to stop/resume a child.
 
-## Lifetime and recovery
+## Retirement, stop and abandonment
 
-The frozen run policy is either `{ "mode": "unbounded" }` or
-`{ "mode": "bounded", "timeoutMs": <positive integer> }`. Local verification
-and bootstrap commands use an unbounded owned-process operation and remain
-user-stoppable, even when the run's model/review policy selects bounded mode.
-For native model work, bridge unbounded mode omits the outer workflow deadline,
-but the native runtime may still apply a default timeout to its child. This
-integration does not guarantee end-to-end unbounded execution.
+Published workflow proof must bind the exact root and complete closed child
+inventory. An actual async `main` requires its one exact nonempty child process
+proof. A recorded synchronous child uses the runtime's corresponding published
+workflow proof; an empty roster alone proves nothing. A no-child failed workflow
+may retire dispatch, but cannot complete a task or pass review.
 
-For Bridge, native review, Fusion, and Revmux operations, bounded mode is an
-explicit compatibility timeout. The controller only treats
-`terminationReason: "execution_lifetime_expired"` plus full retirement proof as
-a confirmed expiry and recent verified model/tool progress as evidence for a
-continuation. It persists that fact and doubles the next bounded budget, up to
-the native timer maximum, while changing the continuation strategy. The frozen
-base policy is unchanged. A heartbeat, silence, unknown result, wrapper exit,
-cancellation acknowledgement, or process-group snapshot never counts as
-progress or expiry.
+Observe retirement before stop. Stop delivery, stopped/paused wrapper text,
+a missing directory, elapsed time and a dead PID are not retirement proof.
+Queued/paused/reloaded workflows can refuse public stop; intent and delivery
+errors remain recorded and observation/delivery can retry against the same ID.
 
-Control RPC deadlines remain finite. A lost reply does not establish whether a
-child started or stopped. Lookup, replay, adoption, and cancellation retain the
-same operation ID and immutable digest across restart.
+`/exec stop <id>` requests final cancellation; `/exec pause <id>` is resumable.
+`/exec stop <id> --force` durably backs up and abandons the run **before**
+best-effort native control. Abandonment ends management, not necessarily worker
+ownership. Ordinary writes, automatic recovery and UI restoration cannot revive
+it. Only the registry's narrow exact-retirement path can release its reservation.
+Controller/record lock ordering, final fsynced archive and quiescence precede
+cleanup; worktrees and provider storage are not deleted by management cleanup.
 
-Recovery records preserve ownership as well as lifetime. Ordinary native resume
-cannot downgrade an owned run to the legacy launcher. Continuation uses a fresh
-correlated owned operation after predecessor retirement. Owner-bound Bridge
-lookup and cancellation use v2 even before a new client negotiates capabilities.
+An early native stop can publish `writer-close-unverified` even when a runner
+close is recorded. This is a safe limitation of 0.76.1, not an excuse to infer
+exit. The run remains abandoned and its target reserved. The packed consumer
+smoke verifies no restart takeover and retains its isolated evidence in this
+case rather than deleting unknown ownership.
 
-## Pre-launch rejection recovery
+## Output and required review
 
-Admission requires Bridge's `prelaunchRejection: { version: 1 }` capability,
-available from 0.5.3. A `not_started` receipt must carry `neverStarted: true`,
-`replaySafe: false`, and a validated `launchRejection` bound to the operation
-ID, request digest and plan owner. Its source is `subagents-rpc`, method
-`spawn`, code `invalid_params`, with an exact correlated request ID and
-message. Plan-exec still requests cancellation before retiring that identity.
+New output comes only from the unique caller-bound path and exact native
+root/child/key/request identity. The controller copies validated output and
+proof to `native/<request-uuid>/controller-result.json` under the owning run,
+with an authorized record-lock check before writing/accepting it. Missing,
+symlinked, oversized or contradictory artifacts never mean success. Bound
+failure text may carry worker/goal blocker diagnostics; it cannot turn a failed
+child into a successful task, goal or review.
 
-The original error code, upstream code and message are retained separately from
-subsequent lookup diagnostics. Legacy journal rows lacking a correlated receipt
-remain unknown. pi-subagents 0.76.1 has no authoritative durable operation lookup
-API for retrospective absence proof. No timeout, old log string, or missing ID
-authorizes replacement work. See [recovery](../skills/exec-plan/references/recovery.md).
+The default reviewer and optional statistics role is `plan-exec-reviewer`,
+registered through public runtime-agent events on session start and disposed on
+shutdown. It has only `read`, `grep`, `find` and `ls`; no model is pinned. Explicit
+frozen agent/model choices retain their meaning and are never silently replaced.
 
-Bridge 0.5.4 persists the native RPC request UUID before dispatch and recovers
-only an exact retained native tool-call binding or durable completion binding.
-No UUID is inferred from task text, paths or timestamps. An unbound legacy row
-without retained evidence stays unknown under ordinary resume.
+Required native review submits `structured_output` with:
 
-Explicit `recover-isolated` is a different operator-approved contract: it closes
-old-generation acceptance/redispatch, retains quarantined lineage and creates an
-independent checkout from the accepted commit and checked plan. It does not
-claim old-worker death. Local implementation tasks only; no shared Git metadata,
-object alternates, hardlinked working data or remotes. The new target is paused
-until resume. Old partial work is inventoried, not silently imported, and the
-quarantined target keeps its reservation. See the recovery reference above.
+```json
+{"schemaVersion":1,"reviewedCommit":"<exact full commit>","findings":[]}
+```
 
-## Stop delivery and advisory observations
+Findings require uppercase `CRITICAL|MAJOR|MINOR`, summary, concrete evidence and
+suggestion. There is no redundant verdict. Empty findings is clean only after
+runtime success/retirement and independent Git/candidate verification. Unknown
+fields, malformed/missing reports and wrong commits fail closed.
 
-Bridge 0.5.5 advertises `cancellationDelivery: true`. An owner-bound cancel reply
-can report `pending` (intent saved) or `delivered` (exact native stop receipt).
-Plan-exec retries pending delivery on the same operation. It suppresses delivery
-only for a receipt bound to that operation/digest/native run, a never-started
-fence, or retirement proof. Legacy `stopAcknowledged` alone cannot suppress a
-Bridge retry. Correlated pending-delivery errors and upstream codes are stored
-separately from observation errors and remain visible through successful polls
-and restart. Delivery, launch fencing or observed retirement clears them.
-Fusion's separate cancellation contract is unchanged.
+**Released output settlement:** worker/marker operations retain `file-only`
+output. Requests with `outputSchema` keep the exact absolute `output` path but
+omit `outputMode`, using supported default inline settlement. On 0.76.1 a real
+read-only `structured_output`-only turn with `file-only` can fail its required-file
+guard before persistence. Default inline settlement persists the schema value at
+the bound path without granting write tools or changing launch backend. The
+normal-loader tarball smoke covers clean/findings reports and refusal of
+malformed, missing and wrong-commit reports.
 
-Native pi-subagents 0.76.1 RPC still refuses paused/queued whole-run stops,
-despite its model-facing tool fix. Bridge preserves that error and pending intent.
-There is no tool/CLI fallback or fabricated cancellation success.
+The specific `settled-awaiting-resume` case is supported: a sole successful child
+settled after supervisor detachment, but the JavaScript wrapper stopped before
+returning its value. Recovery requires its exact receipt, complete child
+identity, retirement proof and bound output. It does not restart that worker or
+reviewer merely because the wrapper failed. Arbitrary failed-workflow prose is
+not a fallback result; missing settlement evidence stays fenced.
 
-Bridge's version-1 `advisoryObservation` carries bounded exact-root activity
-from the native snapshot, with omission flags. It is stored separately from
-verified progress, usage, expiry and retirement evidence. Stale, foreign,
-future-dated or malformed observations are discarded. No guessed child identity,
-cost or ETA is inferred.
+## Honest limits
 
-Bridge schema 7 stores stop receipts. Stop Bridge-owning Pi processes and back up
-the journal before upgrade; older Bridge cannot reopen it. Restart after package
-upgrades. Reload only local source/config. Unknown legacy launches remain unknown.
+`executionLifetime` is a frozen **request**: `{ "mode": "unbounded" }` or
+`{ "mode": "bounded", "timeoutMs": <positive integer> }`. Bounded timeout is
+passed to both workflow and child. Unbounded omits the workflow deadline; it
+does not remove native child defaults. Requested and observed limits are stored
+separately. Legacy `workerMaxTurns`, `reviewerMaxTurns` and `statsMaxTurns` remain
+recorded requested settings, but native RPC 0.76.1 does not enforce them
+(`maxTurnsEnforced:false`). Goal `maxTaskIterations` is a separate controller
+iteration budget, not a native child turn guarantee.
 
-## Final operator abandonment
+Only explicit structured bounded-expiry evidence plus retirement and useful
+progress can grow a later bounded request. Tool timeout prose, silence and
+advisory activity cannot do so. No wall-clock or PID heuristic authorizes a new
+writer. Native proofs do not invent containment of arbitrary escaped descendants.
 
-`/exec stop <id> --force` writes terminal `abandoned` before calling providers.
-It revokes controller authorization, not external process ownership. Cancellation
-delivery and retirement proof remain separate. Unknown operations keep their
-immutable identity and checkout reservation, but no automatic recovery or display
-is restored. Ordinary registry CAS writes cannot change an abandoned record.
-Only exact-operation validated retirement can release its reservation for registry
-cleanup. The pre-stop and final records are archived outside the active listing.
-No worker PID guessing, global package mutation, journal reset or worktree
-deletion is part of this action. See [recovery](../skills/exec-plan/references/recovery.md#permanent-force-stop).
+Local bootstrap, checks and Git mutations keep plan-exec's owned POSIX
+process-group runner, unbounded user-stoppable lifetime, exact local binding,
+start identity, generation fencing and durable writer-exit proof. Escaped
+process-group descendants remain a documented best-effort limitation. Native
+workflow lifetime does not impose a timer on those local commands.
 
-## Caller, native, and process identities
+## Explicit legacy snapshot import
 
-These identity namespaces are separate and must never be equated:
+Existing Bridge records are data, never a live fallback. Already-recorded exact
+native IDs can be observed without a journal. For an unbound legacy operation:
 
-- the plan-exec caller digest covers the controller request and is sent through
-  the provider owner/caller binding;
-- the native operation has its own operation ID and native request digest;
-- the owned-process binding has operation ID, request digest, host ID, and boot
-  ID, and its retirement proof must match that binding.
+```text
+/exec resume <full-run-id> --legacy-journal /absolute/path/to/offline.sqlite
+/goal resume <full-run-id> --legacy-journal "/absolute/path/with spaces/offline.sqlite"
+```
 
-The owner DTO is `{ kind: "pi-plan-exec", runId, key, requestDigest }`; the
-request digest is the canonical digest of `{ cwd, params }`. A native
-workflow proof binds the parent run to the attested writer-exit proofs of its
-children; the direct native process-terminal proof, when the runtime publishes
-one, takes precedence.
+Supply a **consistent offline schema-7 snapshot**, preferably a closed,
+checkpointed database, or a consistent SQLite snapshot including its WAL. Do
+not copy only the main file of a live WAL database. No journal is discovered,
+created, migrated, copied or reset by this extension; it never opens a default
+live journal. SQLite is opened lazily read-only with bounded row size/lock wait;
+SQLite can manage WAL/SHM sidecars, so this is not a filesystem-wide immutability
+claim for arbitrary live databases.
 
-## Review backends
+Import requires the original plan run ID, operation ID and request digest.
+Fresh CAS preserves newer stop/generation/lease changes and refuses abandoned
+runs. It retains validated binding, RPC correlation, rejection and cancellation
+evidence without rewriting the original params/digest. Mapping is not retirement,
+non-start or replay authority. Missing, mismatched, corrupt, busy or unsupported
+snapshots preserve the original identity and fence work. Stop still requires the
+exact original native session; delivery receipts never release ownership.
 
-The default review backend is one required Bridge/subagent reviewer with
-`reviewFallback: []`. Fusion and Revmux are explicit backend selections, not
-implicit safety fallbacks.
+Native isolated recovery can fence its old generation locally and retain the
+quarantined checkout. An unresolved legacy dispatcher cannot be fenced by this
+read-only importer, so isolated recovery refuses before mutating its target.
 
-Fusion uses a structured panel graph with one judge and the
-`plan-review-v1` caller-output contract. Strict early-agreement profiles are
-currently unsupported and must be rejected before dispatch; they cannot be
-treated as equivalent to the structured panel-plus-judge path. Fusion start,
-lookup, result, and cancellation preserve the caller digest and operation ID.
-Shared project admission serializes concurrent starts across Pi processes.
-Writers must use the updated protocol; conflicting unknown legacy snapshots
-remain visible and fenced rather than being discarded or replaced by age.
+## Explicit alternative review backends
 
-Revmux must support the explicit `--execution-lifetime=unbounded|bounded`
-selection from [Revmux commit 988904f](https://github.com/umputun/revmux/pull/35/commits/988904f30da351e76c29d5779c6833a6bf890b51).
-That commit belongs to open PR #35, not released v0.2.6. The adapter must reject
-a binary without the required capabilities. It wraps a compatible binary in
-the outer owned-process group. Revmux's
-internal process-group proof is narrower and cannot satisfy the full ownership
-contract by itself. Its report remains invalid unless source coverage, agent
-health, findings, and unresolved questions all validate.
+Fusion and Revmux remain explicit choices with empty default fallback lists.
+They must attest their existing lifetime, durable lookup and owned-process
+proof contracts. Fusion 0.9.3 does not satisfy this strict controller contract;
+Revmux requires the documented lifecycle adapter. Neither is silently replaced
+with native review when selected. An unknown start never permits fallback over
+an uncertain writer. Source-named backend tests retain capability refusals.
 
-## Local commands and task prerequisites
+## Verification boundaries
 
-Local required checks and bootstrap execute sequentially through the same
-owned-process runner. They use immutable environment/argv, durable command
-grants, the run's authorization and stop generation, and a process-group
-retirement proof before success or failure is accepted. A missing result after
-confirmed retirement is a confirmed command failure and may retry; malformed
-identity or unknown retirement remains fenced. Controller Git commands route
-through owned workspace commands with injected environment cleared at the
-boundary; observations disable fsmonitor and optional index writes. The local
-active-operation index keeps cancellation, cleanup, and exclusivity fenced until
-process retirement is proven. The run registry itself uses an OS `flock` on a
-compiled helper, not the process-group runner.
+- `npm test`: domain, registry/CAS, native transport/proof/result, legacy SQLite
+  import, UI and command tests; both Vitest and node:test run.
+- `npm run test:runtime-smoke`: real released detached workers with deterministic
+  scripted sessions, required review/fix/checks and captured evidence.
+- `npm run test:native-recovery`: new OS hosts, exact workflow correlation and
+  nonempty child proof; direct-leaf missing correlation remains a negative case.
+- `npm run test:packed-consumer`: actual tarball in an isolated install with only
+  Pi, native subagents and this package; normal ambient loading, localhost model,
+  default readonly reviewer, plan/goal, lost reply, rejection, stop/restart and no
+  child command registration or lease takeover. Neither removed package resolves.
+- `npm run pack:dry`: runtime-only tarball and host peer declarations.
 
-When a worker reports `<<<RALPHEX:TASK_FAILED>>>`, only an observed
-`Prerequisite: credentials|permission|missing_executable|runtime` together with
-an `Evidence:` line creates `waiting_external`. That state preserves the task,
-records the evidence, and schedules an automatic wake. Generic blocker prose,
-silence, elapsed time, or a guessed prerequisite remains ordinary recovery and
-does not create an external-wait classification.
-
-Native status, the Pi widget, pi-tasks, and Fleet are advisory projections of
-`run.json`. Projection failure cannot block admission, recovery, or restart
-ownership decisions. Fleet cache admission failure cannot remove active background
-work tracking. Native Fleet/background-work identity is the transcript path
-(`getSessionFile() ?? getSessionId()`), not the UUID retained by leases and task
-projection rows. Terminal Fleet rows are bounded to twenty per integration instance.
-A no-session Pi host has no durable pi-tasks projection file.
-
-`npm run test:runtime-smoke` is the declared host-boundary smoke check. Its
-model turns are scripted; a passing smoke run is not a live-LLM guarantee. It
-runs on any POSIX host, and its scripted worker is executed by a detached
-released-runtime runner. The run completes only when Bridge forwards native
-`details.workflowTerminalProof` from pi-subagents. The main full
-gate covers the controller, Bridge RPC, owned-process runner, required review,
-promotion, and archive.
-
-## Source and review tracking
-
-- Current integration: [pi-plan-exec #9](https://github.com/alexei-led/pi-plan-exec/pull/9).
-- Revmux adapter evidence: [revmux #35](https://github.com/umputun/revmux/pull/35).
-- Fusion compatibility: [pi-fusion #14](https://github.com/alexei-led/pi-fusion/pull/14).
-- Native proof forwarding: [pi-subagents-bridge #5](https://github.com/alexei-led/pi-subagents-bridge/pull/5),
-  replacing the synthesis introduced by
-  [pi-subagents-bridge #4](https://github.com/alexei-led/pi-subagents-bridge/pull/4).
-
-The dependency pins are:
-
-- native `pi-subagents`: released `^0.76.1`;
-- Bridge: `@alexeiled/pi-subagents-bridge@^0.5.5`;
-- Fusion: released `@alexeiled/pi-fusion@^0.9.3`;
-- Revmux: unreleased `988904f30da351e76c29d5779c6833a6bf890b51` (PR #35);
-- Pi SDK: `^1.0.4`, validated at `1.0.4`;
-- optional pi-tasks projection: `>=0.9.0 <0.10.0`, session scope only.
-
-These are dependency evidence, not a claim that the full production pipeline is
-complete. The implementation remains a release candidate; no production support
-claim follows from host smoke checks or dependency test results alone.
+These checks do not claim live-model reliability or repair an unavailable native
+identity/proof. The executable plan and independent review own final acceptance.

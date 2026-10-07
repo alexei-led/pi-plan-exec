@@ -147,10 +147,18 @@ test('background recovery keeps ticking through UI failure and pending Fleet pub
     await events.get('session_shutdown')?.({}, context);
   });
   await events.get('session_start')?.({}, context);
-  async function waitFor(predicate: () => Promise<boolean>): Promise<void> {
-    for (let attempt = 0; attempt < 500; attempt++) {
+  async function waitFor(
+    predicate: () => Promise<boolean>,
+    keepPolling = false,
+  ): Promise<void> {
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline) {
       if (await predicate()) return;
-      await new Promise<void>((resolve) => setImmediate(resolve));
+      // A previous async tick may still hold the controller lock when an
+      // interval fires. Simulate later polls rather than assuming that one
+      // coalesced callback performs cancellation immediately under I/O load.
+      if (keepPolling) await vi.advanceTimersByTimeAsync(1_000);
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
     }
     assert.fail('Controller did not settle');
   }
@@ -176,6 +184,7 @@ test('background recovery keeps ticking through UI failure and pending Fleet pub
   await vi.advanceTimersByTimeAsync(1_000);
   await waitFor(
     async () => (await registry.get(run.id))?.status === RUN_STATUS.CANCELLED,
+    true,
   );
   await waitFor(async () =>
     published.some((current) => current.status === RUN_STATUS.CANCELLED),

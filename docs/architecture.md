@@ -1,458 +1,177 @@
 # pi-plan-exec Architecture
 
-<!-- markdownlint-disable MD013 -->
+`PlanExecController` owns domain policy, not a second workflow engine. It keeps
+one writer per execution target, fresh model context per operation, deterministic
+task eligibility, accepted/reviewed commits and deliberate recovery. New work
+uses unmodified pi-subagents 0.76.1 through public native RPC. See
+[runtime contracts](runtime-contracts.md) for evidence and safe limitations.
 
-`pi-plan-exec` is a deterministic controller around existing Pi extensions. It
-owns plan-specific policy, durable transitions, automatic recovery, commit
-acceptance, and provider reconciliation, not model execution or another extension's task UI.
+## Boundaries
 
-The strict autonomous path
-requires the released `pi-subagents` runtime and matching Bridge, Fusion, and
-Revmux ownership contracts. Released pins and
-installed-runtime smoke evidence are available;
-unsupported APIs and unknown ownership remain fenced. Local bootstrap and
-required checks use plan-exec's unbounded owned process group. See [runtime
-contracts](runtime-contracts.md) for API boundaries, prerequisites, and links.
-
-## Design goals
-
-- deterministic stage order and automatic recovery without a global retry cap;
-- one child at a time, with one writer per execution lane;
-- fresh model context for every implementation, review, and fix operation;
-- crash-safe replay without duplicate writer starts;
-- cross-session recovery and adoption;
-- explicit dependency scheduling, accepted commit ancestry, and frozen checks;
-- existing Pi extensions remain the owners of their domains.
-
-## Component ownership
-
-| Component | Owns |
+| Module | Owned responsibility |
 | --- | --- |
-| `pi-plan-exec` | Plan parsing, Git safety, stages, scheduled recovery, leases, accepted commits, frozen checks, lanes, prompts, findings, archival |
-| `pi-subagents-bridge` | Versioned execution RPC, `cwd` forwarding, spawn idempotency, durable operation lookup, native process-terminal proof, run observation, result normalization, stop/adopt |
-| `pi-subagents` | Fresh child sessions, built-in `worker`/`reviewer`, model execution, artifacts, lifecycle, external-run/background-work visibility registries |
-| `pi-fusion` | Explicitly selected panel, judge, profiles, machine-readable Fusion RPC, validated caller output, persistent operation identity |
-| `pi-tasks` | Task file format, locking, dependencies, session widget |
+| `src/index.ts` | `/exec` and `/goal`, session lifecycle, one polling loop, readonly view, parent-only activation |
+| `src/controller.ts` | Task/goal stages, operation preparation/observation, checks, review, acceptance, retry, stop and archive |
+| `src/registry.ts` | Authoritative run ledger, CAS, leases, reservations, stable locks, fsynced abandonment backup/archive |
+| `src/registry-lock.ts` | OS `flock` locks at stable never-unlinked paths |
+| `src/native-runtime.ts` | Public RPC correlation, immutable request dispatch, exact observation/control, native result binding |
+| `src/operation-safety.ts` | Native request digest, metadata validation, distinct dispatch and late-binding predicates |
+| `src/execution-contract.ts` | Pure lifetime, request digest and published retirement-proof validation |
+| `src/legacy-operation.ts` | Bounded lazy read-only schema-7 snapshot lookup and imported-evidence validation |
+| `src/native-reviewer.ts` | Namespaced readonly role registration through public runtime-agent events |
+| `src/artifact.ts`, `src/review.ts` | Explicit native result contracts, commit-bound typed review; separate legacy decoding |
+| `src/task-summary.ts` | Pure summaries derived from `run.tasks`, no external task store |
+| `src/runtime-integration.ts`, `src/run-view.ts` | Advisory Fleet/background-work and session-local presentation |
+| `src/plan.ts`, `src/scheduler.ts` | Markdown/task identity, approved plan structure, dependencies and wake selection |
+| `src/goal-loop.ts` | Goal marker protocol, committed check evidence, stall/iteration policy |
+| `src/lanes.ts`, `src/git.ts`, `src/isolation.ts` | Frozen commands, worktree identity, selective checkpoints, lanes and quarantine |
+| `src/local-operation.ts`, `src/owned-process.ts` | Local command intent, process-group ownership, cancellation and retirement |
+| `src/fusion.ts`, `src/review-backend.ts` | Explicit alternative backends with independent capability refusals |
+| `src/progress.ts` | Applied-transition-only progress history |
 
-The bridge and Fusion APIs are event-based, versioned RPC contracts. The
-controller does not import their runtime internals. Fusion review starts request
-`outputContract: "plan-review-v1"`; terminal approval uses only validated
-top-level `callerOutput.output` and fails closed when it is absent. An ambiguous
-Fusion start retains the same operation ID and does not fall back over an
-unknown child.
-
-The exception is the pi-tasks projection adapter. Pi-tasks has no cross-extension
-CRUD RPC, so `task-projection.ts` uses the shipped `TaskStore` contract. The
-adapter validates the methods it needs before writing. Pi-tasks is never the
-controller's authoritative state.
-
-## Data flow
-
-`/goal` runs on the same controller and registry as `/exec`. A goal run is a run
-record with a `goal` payload instead of a plan: no plan file, task DAG, or
-checkbox contract. The controller loops one owned worker turn per iteration in
-place on the current branch; the turn's committed work is accepted only after
-the required checks pass, followed by the same review and final-verification
-pipeline `/exec` uses. Goal progress, the turn budget, and blockers live in the
-same durable record, so restart, stop fences, and recovery behave exactly as for
-a plan run.
+There is no Bridge client/RPC server, new launch journal or pi-tasks adapter.
+The production package imports no private native runtime modules. Fixture-only
+runtime seams are pinned and distinguished from the packed normal-loader gate.
 
 ```mermaid
 flowchart LR
-    goal["/goal goal text"] --> command[Pi command]
-    user["/exec plan.md"] --> command[Pi command]
-    command --> controller[plan-exec controller]
-    controller --> registry["global run registry"]
-    controller --> projection[pi-tasks projection]
-    controller --> bridge[pi-subagents-bridge direct owned single-agent RPC]
-    bridge --> agents["owned pi-subagents worker / reviewer"]
-    controller --> fusion[selected Fusion or Revmux backend]
-    fusion --> panel[structured panel and single judge]
-    agents --> worktree[Git execution worktree]
-    panel --> controller
-    worktree --> plan[plan checkboxes]
-    plan --> controller
-    controller --> lanes[accepted baseline + prepared task lanes]
-    lanes --> worktree
+    commands["/exec or /goal"] --> controller
+    controller --> registry["RunRegistry: operation ledger and reservations"]
+    controller --> native["public native RPC: one keyed main workflow"]
+    native --> child["fresh worker / readonly reviewer"]
+    child --> files["authorized checkout and unique bound output"]
+    files --> controller
+    controller --> checks["owned local checks and Git acceptance"]
+    controller --> views["advisory Fleet / progress view"]
+    controller --> alternatives["explicit Fusion / Revmux only"]
 ```
 
-The controller re-reads the plan after implementation. A child saying “done” is
-not completion evidence; committed checked plan items are — and for a goal run,
-passing required checks on committed work are. Omitted task
-dependencies preserve legacy sequential ordering, while `dependsOn: []` marks
-an independent task. For an incomplete task, a leading
-`<<<RALPHEX:TASK_FAILED>>>` records the blocker and schedules automatic
-recovery while keeping the run owned. It does not create a global pause or
-terminal retry cap. Candidate acceptance requires ancestry from the accepted
-commit, the frozen required checks, and a clean worktree with no uncommitted or
-untracked non-ignored files. Failed partial work stays in its lane; independent
-work starts from a prepared clean lane at the last accepted commit. Concurrent
-stop/cancel changes take precedence over a late output lookup.
-When a retry observes an advanced accepted head, the controller creates a fresh
-lane from that head and carries forward only the selective recovery checkpoint;
-an old candidate is never reverified against a newer baseline.
+## Durable operation protocol
 
-Only a worker `TASK_FAILED` response with an observed
-`Prerequisite: credentials|permission|missing_executable|runtime` and an
-`Evidence:` line creates `waiting_external`; the controller records the
-evidence and schedules an automatic wake. Generic blocker text does not infer
-an external prerequisite.
+Records live at `~/.pi/plan-exec/runs/<run-id>/run.json`. Registry-wide,
+controller and record locks have stable paths. CAS writes use atomic rename and
+monotonic revisions; unrelated metadata must not erase stop intent or reset a
+terminal retention anchor. Controller-to-record lock ordering is preserved.
+Never hold the record lock across provider RPC.
 
-For isolated runs, `outputTarget` records the original worktree, branch, initial
-head, plan path, and progress path. After every task is accepted and the candidate
-passes required review and verification, the controller validates the accepted
-plan and fast-forwards that output branch from a known
-accepted ancestor only when its current head and worktree are safe. The
-promotion is durable (`pending`/`complete`), preserves user changes, and moves
-the run back to the output target after required review and verification, before
-archive. The final reviewed fast-forward is guarded against overwriting ignored
-or preserved user files.
+Preparation freezes logical operation/kind/task/review/candidate, cwd, request,
+RPC UUID, controller session UUID, native runtime identity, output path and
+requested limits. Input cwd must canonically match the current authorized
+`run.worktreeCwd`, including nested/task lanes. Dispatch revalidates it against
+fresh authority rather than permitting any absolute override.
 
-## Source modules
+`prepared -> dispatching -> bound -> retired`: dispatch CAS precedes emission.
+Only an intact prepared record or exact retirement permits another authorized
+attempt. Unknown dispatch never emits another spawn. Targeted status uses
+`rpc-spawn-<uuid>` and verifies both `workflowChildren.parentToolCallId` and its
+root ID. Completion events can retain a fast binding but cannot replace proof.
+Facts for the same active/failed operation are synchronized, so an older failed
+snapshot cannot resurrect an already-retired attempt after lost-reply recovery.
 
-| Module | Responsibility |
-| --- | --- |
-| `src/index.ts` | `/exec` and `/goal` commands, interactive selection, background controller loop |
-| `src/run-view.ts` | Width/theme-aware progress strip and branch-local presentation preferences |
-| `src/advisory-observation.ts` | Exact-native-run display telemetry validation, separate from execution evidence |
-| `src/runtime-integration.ts` | Optional native Fleet/background-work projection and generation-safe ownership |
-| `src/goal-loop.ts` | Goal prompt and outcome protocol, goal hash, stall and sample limits |
-| `src/controller.ts` | State transitions, operation launch/observation, automatic recovery, cancellation, acceptance |
-| `src/config.ts` | Run configuration parsing and frozen lifetime/review policy |
-| `src/types.ts` | Run, stage, operation, finding, and frozen configuration contracts |
-| `src/registry.ts` | Locked atomic run persistence, migration, leases, liveness, removal |
-| `src/registry-lock.ts` | Kernel `flock` binding for stable, never-unlinked registry lock files |
-| `src/lifecycle.ts` | Stage order and status classification predicates shared by command and controller |
-| `src/plan.ts` | Strict Markdown plan parser and structure hash |
-| `src/scheduler.ts` | Dependency reconciliation, ready-task selection, and wake scheduling |
-| `src/lanes.ts` | Frozen required checks/bootstrap resolution and local-operation dispatch |
-| `src/local-operation.ts` | Durable local command intent, authorization fence, and owned-process command execution |
-| `src/owned-process.ts` | POSIX process-group runner: binding, detached launch, ps-based liveness, cancellation, writer-exit retirement proof |
-| `src/git.ts` | Repository, branch, dirty-state, common-dir, and worktree safety |
-| `src/bridge.ts` | Typed v1/v2 bridge client, capability negotiation, request digests, and proof validation |
-| `src/fusion.ts` | Typed client for `fusion:rpc:v1` |
-| `src/review-backend.ts` | Explicit Revmux backend, report validation, and capability admission |
-| `src/task-projection.ts` | Rebuildable, owned pi-tasks cache with scope/version checks and degraded-state reporting |
-| `src/artifact.ts` | Subagent output/result fallback extraction |
-| `src/review.ts` | Structured finding parsing and severity decisions |
-| `src/progress.ts` | `.ralphex/progress/` execution log |
+The awaited `main` normally runs detached. Its recorded `async:true` requires
+one exact child proof in the published closed workflow roster. Recorded
+synchronous mode is handled explicitly; empty arrays alone are not retirement.
+A failed no-child workflow cannot provide task success. Missing/expired
+correlation stays fenced with a useful diagnosis, not a guessed identity.
 
-## Authoritative state
+Status/doctor use `NativeRuntimeClient.inspect`, sharing validation without any
+registry writes or native control. Exact binding is identity, not retirement;
+unknown/absent/refused observations stay inconclusive. Explicit reconciliation
+uses the scanned revision under CAS, so inspection cannot authorize a stale
+release or replay.
 
-Run records live at:
+## Domain acceptance stays controller-owned
 
-```text
-~/.pi/plan-exec/runs/<run-id>/run.json
-```
+The plan parser freezes task structure separately from checkbox completion.
+Omitted `dependsOn` preserves sequential order; `dependsOn: []` makes a task
+independent. The scheduler never treats unchecked prerequisites as accepted.
+A failed partial task retains its lane; independent work can start in a clean
+lane at the accepted baseline, excluding unaccepted and ignored user content.
+When the baseline advances, recovery creates a fresh lane with a selective
+checkpoint rather than revalidating an old candidate against a new baseline.
 
-Writes use compare-and-set updates under OS `flock` locks plus temporary-file
-rename. Lock files live at stable paths — the registry-wide lock at
-`<runs>/registry.lock` and the per-run controller and record locks under
-`<runs>/.locks/` — and are never
-unlinked, so a lock's lifetime is the open file description's lifetime: a dead
-owner releases it when the OS closes the descriptor. Controller transitions
-use a per-run lock; stale reload instances cannot
-blindly overwrite newer pause, cancellation, or operation state. Each record
-includes:
+A task is accepted only after a successful exact child, committed checked plan
+items, accepted/checkpoint ancestry, frozen required checks and a clean tree.
+An output marker is not Git evidence. Bound `TASK_FAILED` diagnostics can record
+an observed external prerequisite and schedule bounded backoff; generic prose
+cannot infer credentials or permission failure. Failed-child output is diagnostic
+only. Local commands retain durable authorization and owned-process retirement.
 
-- repository, worktree, branch, and plan structure hash;
-- status and current stage;
-- dependency-aware task states, attempts, lane paths, candidate and accepted commits;
-- stage attempt counters and scheduled next wake;
-- original output target and promotion state when isolated lanes are used;
-- active operation ID, external run ID, parameters, and result location;
-- frozen execution lifetime, required checks, bootstrap commands, review backend,
-  fallback policy, and optional statistics setting;
-- review and unresolved findings;
-- pending and completed force-skip audit records;
-- explicit execution-branch rebindings;
-- frozen role/model limits;
-- session lease with pid, hostname, and heartbeat;
-- the last worker signal digest parsed from the provider status text;
-- cumulative reported usage and verified activity timestamps;
-- deterministic statistics summary, or an explicitly requested optional report;
-- retirement and reconciliation stamps.
+`/goal` uses the same controller without a task DAG or plan file. A goal marker
+requires a successful turn, committed work and the frozen checks; failed turns
+cannot pass by printing `GOAL_DONE`. Only implementation turns consume the goal
+iteration budget. Test deletion/weakening and uncommitted changes remain final
+acceptance blockers. Review/fix and final verification use the same gates.
 
-`lease.hostname`, `retiredAt`, `reconciledAt`, and `activeOperation.workerSignal`
-are all optional. `schemaVersion` stays at `1`: records written before those
-fields existed still parse, and `assertRun` validates none of them.
+Required review is one readonly `plan-exec-reviewer` by default, with no implicit
+backend fallback. Configured frozen agents/models are honored. The typed report
+binds the exact candidate commit; all findings require severity, summary,
+evidence and suggestion. The controller verifies HEAD again before accepting
+review. Schema failure, missing output and wrong commits never become a clean
+review. Optional statistics cannot waive mandatory checks or review.
 
-### Lease liveness
+New artifacts are unique under the owning run. Validated result/proof copies
+are written via the existing authorized record-lock seam before acceptance.
+Structured requests omit file-only mode to avoid 0.76.1's premature required-file
+guard on structured-output-only completion; the runtime still persists the exact
+bound JSON. Marker operations keep file-only mode. The specific successful
+sole-child `settled-awaiting-resume` receipt can be consumed after wrapper
+failure; missing or inconsistent evidence is fenced, not a fresh worker launch.
 
-A stored lease is a claim, not evidence. For an ordinary liveness check,
-`isLeaseLive` treats a lease with no hostname (the legacy record shape) as live
-only while its heartbeat is fresh. A lease naming another host is always live;
-its heartbeat is not evidence that this machine can safely take it over. A
-lease naming this host is live while its recorded pid is running; a dead local
-pid makes it stale immediately. Passing a session ID to `isLeaseLive` is an
-explicit same-session observation and returns live for that session, but
-`takeoverRefusal` also requires the current process pid and local hostname to
-match before allowing that process to reclaim the lease.
+After all tasks, review and checks succeed, `outputTarget` guards promotion back
+to the original branch: known accepted ancestor, clean target and no ignored or
+preserved file overwrite. Promotion and plan archival are durable local
+operations. Progress is logged only after the matching state transition applies.
 
-`claim` stamps the host once and `heartbeat` never re-stamps it, so the name is
-frozen for the run's whole life while `os.hostname()` moves with the network.
-The whole name identifies the machine, case-folded: `foo.local` and `foo.lan`
-are as foreign to each other as `foo` and `bar`. Only the first label would be
-cheaper, but corporate DNS gives `build.a.example` and `build.b.example` the
-same one, and a registry on a shared or NFS home shows both machines' runs — so
-that reduction reads a live remote worker as a dead local one and resets the run
-under it. A name that is not exactly this one is treated as another machine, and
-the renamed machine that reduction was meant to help is recovered by the
-operator instead, with `--same-machine` below.
+## Stop, sessions and retention
 
-A session may claim a run when no lease exists, the current process is the
-recorded local owner, or the prior lease is not live by the rules above. A dead
-local pid therefore frees the run at once instead of after the heartbeat
-window. A matching session string from a different process is not enough to
-take over. The lease controls cross-session ownership; compare-and-set updates
-and the per-run controller lock serialize same-session reload instances.
+Stop intent and delivery are separate from retirement. Pause is resumable;
+ordinary stop is final cancellation. Cancellation can bind a late identity but
+cannot consume a result, advance review or erase a newer stop generation.
+Provider refusal or timeout retries the same operation, never another worker.
 
-Claiming is not the only consumer: the same predicate answers whether a run is
-safe to remove, and it is one third of the abandonment conjunction, so ownership,
-cleanup, and diagnosis cannot disagree about who holds a run.
+Force-stop durably backs up, abandons and revokes ordinary mutation before
+best-effort native stop. It ends management even if ownership remains unknown.
+No polling, session reload, result callback or UI preference may revive it.
+Only exact retirement through the registry's narrow abandoned-operation path
+can release reservations. Final archive fsync and controller-lock quiescence
+precede registry cleanup; workspace and provider storage are not deleted.
 
-### Retirement and cleanup
+A native early stop may leave `writer-close-unverified`. That target remains
+reserved. Neither stopped text nor runner PID disappearance is a substitute
+proof. Local process groups similarly retain their documented escaped-descendant
+limits rather than inventing stronger containment.
 
-Terminal state is retired, not accumulated, in three steps:
+Lease UUID/host/pid, display owner attribution and native session file identity
+are different concepts. A lease takeover never grants another native session's
+control authority. A foreign-host lease requires explicit same-machine handling
+or recovery on its host. The native runner's `PI_SUBAGENT_CHILD=1` makes the
+extension inert before registration or registry access, while leaving unrelated
+ambient extensions available for provider/MCP functionality.
 
-1. A successful completion or cancellation write stamps `retiredAt`. Later writes
-   preserve it; older final records without a stamp retain their previous
-   `updatedAt` as the retention anchor on their next write.
-2. `/exec status` hides terminal runs 24 hours after their last update, counting
-   the hidden rows in a footer that names `--all` and `/exec cleanup`. The listing
-   filter keys on terminal status plus `updatedAt`: a just-archived run is news for
-   a day whatever its stamp says.
-3. `RunRegistry.remove` deletes the run directory. `removalRefusal` gates it on
-   the same two facts the `/exec cleanup` preview shows, so the preview can never
-   promise a removal the registry would reject: a non-terminal run is refused, and
-   so is a run held by a live lease. Both are decided under the run's own lock,
-   with the record read inside it — deciding first and locking afterwards would let
-   a concurrent claim revive the run into the window before the delete. The
-   controller lock is taken first, in the order every controller takes it: a
-   `/exec resume` holds it from before its claim until the recovery ends, and a
-   removal that ignored it would delete the record mid-recovery. A removal that
-   cannot take it refuses rather than waits.
-   `/exec cleanup` selects `completed`, `completed_with_findings`, and `cancelled`
-   runs that finished more than 7 days ago, measured from `retiredAt` where the
-   record carries one and from `updatedAt` otherwise, so a lease release does not
-   restart the clock; `failed` is excluded unless `--include-failed` is passed,
-   because the registry entry is what `/exec resume` needs. Naming one full run ID
-   bypasses the retention window and the exclusion, never the refusal. Each removal
-   is reported separately: one refusal cannot hide the deletions around it.
+## Read-only legacy recovery
 
-Removal deletes the registry entry only. Worktrees, branches, and
-`.ralphex/progress/` logs are never touched, so a deleted record costs the ability
-to resume or inspect that run and nothing else. A `run.json` the registry cannot
-parse is removable too: `list` drops it, so removal is the only action that
-applies. Only a parse failure counts as corrupt — an I/O or permission error is
-rethrown rather than answered with a recursive delete.
+Known historical native IDs can be observed without a journal. An unbound record
+requires explicit `resume --legacy-journal /absolute/path/to/offline.sqlite`.
+The snapshot must be schema 7 and SQLite-consistent; the importer checks original
+run/operation/digest and fresh CAS, retaining binding/rejection/cancel evidence
+without rewriting original intent. Absence, a receipt or a mapping is not
+non-start/retirement/replay authority. No default live journal is opened, migrated
+or reset. Abandoned records cannot import or resume.
 
-### Abandonment
+Native isolated recovery can fence its old registry generation and preserve the
+quarantined original target while preparing a separate checkout. Read-only legacy
+import cannot revoke a historical dispatch service, so unresolved legacy
+isolation refuses before filesystem mutation. Unknown active, failed and
+quarantined identities continue reserving their targets.
 
-A run is `abandoned` only on the full conjunction: an in-flight status, a lease
-that is not live, and either a matching owned-tree `processTerminal` proof with
-`state: observed`, an authoritative never-started fence, or a v2 healthy durable
-lookup that proves an unbound operation is absent. Missing bridge memory, a
-missing `asyncDir`, v1 `absent`, and `pending`/`unknown` proof are inconclusive.
-They are reported as `recovery_required`/`unknown_launch` and never trigger a
-duplicate worker. Reconciliation records the evidence without clearing or
-replacing the operation, candidate, or saved result identity, stamps
-`reconciledAt`, appends the reason to the progress log, and leaves
-`taskAttempts` untouched — the worker never ran. Recovery is then the ordinary
-`/exec resume` path.
+## Validation
 
-One function maps a run and its evidence to a verdict and exactly one next
-command. The sweep row, the settled row, the detail view, and the refusal the
-resume gate raises all render that one result, so no two of them can name
-different commands for the same record. The command is always one the sentence
-beside it names first, and always one the run will accept. `/exec status` is
-named only where the next read can differ — something is polling, or an
-operation is left to probe. Where nothing polls, the command has to move the
-run: a takeover for a dead owner, `/exec stop` for a worker that cannot be
-proven gone, `/exec stop` again for a stop nothing will land, and the waiver
-again for a pending waiver nothing will finish. Naming a re-read there would
-loop the reader on a record nothing updates.
-
-Every evidence-driven decision reads the same three inputs at the moment it is
-made: the lease, the operation directory on disk, and the bridge. Nothing about
-liveness is persisted, because the record is only refreshed while its owning
-session polls — the instant that stops being true is the instant the question
-matters. Evidence measured here is also discarded for a run whose lease names
-another host: its directory and its bridge are on that machine, and an absence
-observed locally would be an absence of the wrong thing. Any rename at all is
-treated as a foreign host until the operator supplies `/exec resume <id> --same-machine`;
-the flag asserts that the frozen name was this machine, creates a temporary local
-view for the probe and abandonment decision, and changes nothing in
-the durable lease. A worker still writing here keeps the run live; decisive
-local evidence permits the normal reset and claim, which stamps the current
-host. `/exec doctor --reconcile` has no equivalent because a registry-wide host
-assertion would speak for every run at once.
-
-One writer performs every reset, so both callers inherit its exclusions.
-A `cancel_pending` run is never reconciled however dead its worker: changing
-its recovery state would erase the stop the operator asked for, and the next
-resume could restart plan work instead of finishing the cancellation. `/exec resume <id>` reconciles the
-single run it recovers; the registry-wide sweep behind `/exec doctor
---reconcile` is dispatched as a write command and is unreachable from any read.
-
-## Crash safety
-
-External starts follow this order:
-
-1. Generate a durable operation ID and canonical request digest.
-2. Persist operation intent, replay parameters, digest, and `mission: false`.
-3. Admit the selected runtime only when it advertises the frozen explicit
-   lifetime and a healthy owned-process capability. Native, Bridge, Fusion, and
-   Revmux paths use the boundary they own; missing public APIs, unsupported
-   capabilities, or unknown ownership fail closed before spawn. Once a
-   compatible Bridge exists, call it with the v2 owner DTO; v1 recovery fails
-   closed when it cannot prove a launch outcome.
-4. Persist the returned external run ID.
-
-The plan-exec caller digest, provider/native operation digest, and owned-process
-binding digest are separate namespaces. Terminal evidence must bind all required
-layers to the same operation; no caller digest is accepted as a process
-retirement proof.
-Local checks and bootstrap use the owned process group directly with an
-unbounded lifetime, durable grants, and user stop generation.
-
-Each plan run is also exposed as exactly one `pi-subagents` external-runs row and
-one background-work provider. Native registrations use `getSessionFile() ??
-getSessionId()`, matching pi-subagents. Durable leases and pi-tasks rows retain
-the session UUID; these are distinct identity namespaces.
-Reload reconciliation uses `run.json`, replaces
-only this extension's registrations, and never creates native child rows.
-Pi-tasks remains an optional rebuildable cache: owned tasks carry the plan
-owner, run ID, key, revision, status, and projection version. When present, its
-scope, path, and package version are checked. A failed repair records visible
-degraded projection state while the controller continues.
-
-Startup restores an unfinished run when its lease is claimable, preserving an
-explicit user pause and refusing a live foreign lease. The native strip shows
-state, accepted count and current action. `/exec status` retains waits, verified
-activity, usage, review backend and the active operation's persisted lifetime.
-Presentation preferences follow the active transcript branch and refresh on
-`session_tree` without changing execution. In-flight display defaults to an
-amber snapshot. Live colors require a local polling controller, matching lease
-session/PID/host, and no outstanding polling error. That view context never
-changes durable authority. Hide is separate from cancellation. These are
-projections of `run.json`; optional pi-tasks/Fleet visibility cannot gate
-controller recovery. Projection writes coalesce one in-flight update plus the
-latest pending snapshot, and a cold technical prerequisite cannot discard an
-authorized start. Statistics default to a deterministic usage/task summary; an
-optional report child is enabled only by frozen `statsEnabled`.
-
-If Pi stops between steps 2 and 4, or a start reply times out or is malformed,
-recovery reconciles the same operation ID. The Bridge reports an operation as
-`found`, `pending`, `unknown`, or `absent`; plan-exec only attaches `found`
-work or a terminal ownership proof and refuses a blind replay for every other
-uncertain outcome. Fusion and Revmux retry their persisted operation ID; an
-unavailable or ambiguous launch remains recoverable under that operation ID.
-Fallback is explicit and defaults to none. Active foreign-session runs are
-observed rather than replaced.
-
-## Stage pipeline
-
-The controller uses these stages:
-
-1. `resolve`
-2. `project_tasks`
-3. `branch`
-4. `progress`
-5. `implementation`
-6. `comprehensive_review`
-7. `smells_review`
-8. `fusion_review`
-9. `critical_review`
-10. `finalize`
-11. `stats`
-12. `archive`
-13. `complete`
-
-Isolation is selected before the durable run is created. `isolation` remains in
-the schema for migration and explicit transition handling.
-
-Implementation repeatedly selects ready tasks, preserving dependencies and
-accepted commit ancestry. Omitted dependencies retain sequential behavior;
-explicit empty dependencies are independent. The default configuration enables
-one required `subagent` reviewer with `reviewFallback: []` (`none`). Fusion and
-Revmux are explicit backend selections under the same review lifecycle. Review
-stage names remain in the schema for compatibility with older run records, but
-the selected backend controls the active review path. CRITICAL and MAJOR
-findings remain unmet and schedule recovery. MINOR-only advisory findings may
-be recorded as unresolved while the reviewed commit advances, producing
-`completed_with_findings`; an explicit waiver has the same terminal status and
-is audited.
-
-## Cancellation, pause, and force-skip
-
-`/exec stop` requests final cancellation without a dialog. `/exec pause` is
-resumable; both are usable without UI.
-
-- `pause` cancels the current attempt, waits for native or local cleanup proof,
-  and preserves the stage, checkpoint, progress, and resumability.
-- `stop` (legacy alias `cancel`) requests Bridge, Fusion, Revmux, or local-operation stop when
-  possible, keeps polling through `cancel_pending`, retries provider errors
-  without discarding operation state, and ends at `cancelled` only after the
-  operation is terminal.
-- Both preserve the execution worktree.
-- `stop <id> --force` durably writes terminal `abandoned` under the record lock,
-  revoking controller writes before best-effort cancellation. It does not wait
-  for an unresponsive provider to decide management state. Unknown operations
-  retain their identity and checkout reservation; all abandoned records remain
-  reserved until cleanup acquires the controller lock and proves eligibility.
-  Short direct archive mutations also hold the record lock and recheck stop
-  authorization. Backups and the final marker sync file data and directory
-  entries before active artifacts can be removed. No worktree deletion or
-  process-retirement claim follows from abandonment.
-- Read-only display refreshes remove abandoned runs from observing sessions;
-  this path cannot claim a lease or start execution.
-- A branch rebind verifies the same repository, requires no active operation, and
-  is recorded explicitly before resuming. Interactive `resume` asks for it when
-  the run's error is an execution-branch mismatch and nothing is tracked;
-  `--adopt-current-branch` answers the same question for a caller with no human.
-- `skip` is an interactive, auditable waiver for optional review
-  and statistics only. Required review and final verification cannot be
-  skipped. It first persists `skip_pending`, then stops and terminally
-  reconciles any tracked operation before clearing it and advancing exactly one
-  stage. Skipped stages retain current findings as unresolved and cause
-  `completed_with_findings`; implementation and archive are never skippable.
-
-The background loop serializes ticks per run. It temporarily hides active tools
-from the main agent so projected pi-tasks rows are not interpreted as a second
-execution queue.
-
-## Trust boundaries
-
-Untrusted boundaries are validated at entry:
-
-- Markdown plans use a small heading-and-checkbox grammar; unsupported prose and
-  table content is not inferred as executable work.
-- Registry run IDs must be UUID-shaped before path construction.
-- Stored run records are schema-checked and migrated.
-- Bridge/Fusion replies are parsed from `unknown`.
-- Fusion review requires validated top-level `callerOutput` for
-  `plan-review-v1`; `run.report` is not an approval fallback.
-- Revmux reports require complete source coverage, non-degraded agents, and no
-  unresolved questions.
-- Reviewer output must be `NO_FINDINGS` or structured findings.
-- Runtime admission requires explicit lifetime support and a healthy
-  `scope: "owned-process-tree"` capability; released Bridge advertises
-  `escapedDescendants: "best-effort"`. Unknown process binding or retirement
-  evidence fails closed. Local checks and
-  bootstrap use the owned POSIX process group with unbounded user-stoppable
-  lifetime, and detached descendants that leave the group are best-effort.
-- Git common-directory and branch checks protect writer stages.
-- Controller Git writes for worktree creation, task checkpoints, output
-  promotion, and archive use durable owned commands with workspace-safe
-  environment injection. Observations disable fsmonitor and optional index
-  writes so Git state cannot be silently synthesized by a cache.
-- `src/types.ts` defines persisted run/status/stage/operation contracts.
-  TypeScript validates their shapes; Biome enforces the configured code rules.
-
-## Further design record
-
-The implementation originated from the detailed design in
-[`plans/2026-07-12-pi-plan-exec-design.md`](plans/2026-07-12-pi-plan-exec-design.md).
-That historical document predates autonomous recovery. This file describes the
-current module boundaries and runtime contracts.
+Source-named tests preserve domain, CAS, generations, leases, force-stop and
+retention behavior. `test:runtime-smoke` exercises real detached native execution;
+`test:native-recovery` checks correlation across new OS hosts and preserves the
+negative direct-leaf case. `test:packed-consumer` installs a real tarball with
+neither removed package present and uses normal ambient loading plus a localhost
+scripted model. It proves default reviewer registration, typed clean/findings and
+rejection, lost replies, stop/restart, child inertness and no lease takeover.
+These are runtime/control guarantees, not claims about live model reliability.

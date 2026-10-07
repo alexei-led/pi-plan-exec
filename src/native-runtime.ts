@@ -7,6 +7,7 @@ import {
   type WorkflowTerminalProof,
   workflowTerminalProof,
 } from './execution-contract.js';
+import { legacyImportGuidance } from './legacy-operation.js';
 import {
   nativeBindingAllowed,
   nativeDispatchAllowed,
@@ -50,10 +51,14 @@ export interface NativeObservation {
   state: 'prepared' | 'unknown' | 'bound' | 'retired';
   operation: ActiveOperation;
   reason?: string;
+  launchError?: { code: string; message: string };
   workflowState?: string;
   proof?: WorkflowTerminalProof;
   stopPending?: boolean;
   successfulChild?: boolean;
+  /** Bound diagnostic text from a retired failed child; never successful output. */
+  failureOutput?: string;
+  status?: Record<string, unknown>;
   /** Only exact, terminal, caller-bound output is returned here. */
   result?: {
     runId: string;
@@ -207,7 +212,9 @@ export class NativeRuntimeClient {
       mission: false,
       acceptance: false,
       output: outputPath,
-      outputMode: 'file-only',
+      // 0.76.1 settles structured_output before file-only persistence. Default
+      // inline settlement still persists the schema value at this bound path.
+      ...(input.outputSchema ? {} : { outputMode: 'file-only' }),
       ...timeout,
       ...(input.model ? { model: input.model } : {}),
       ...(input.outputSchema ? { outputSchema: input.outputSchema } : {}),
@@ -317,6 +324,7 @@ export class NativeRuntimeClient {
           ? fresh.operation
           : (await this.load(runId, binding)).operation,
         reason: `${reply.code}: ${reply.message}`,
+        launchError: { code: reply.code, message: reply.message },
       };
     return this.observeData(runId, binding, reply.data);
   }
@@ -347,6 +355,27 @@ export class NativeRuntimeClient {
       runId,
       binding,
       `rpc-spawn-${required(operation.native).request.requestId}`,
+    );
+  }
+
+  /** Read-only inspection for status/doctor. Facts are returned, never persisted. */
+  async inspect(
+    runId: string,
+    binding: NativeOperationBinding,
+  ): Promise<NativeObservation> {
+    const current = required(await this.registry.get(runId));
+    const abandoned = current.status === 'abandoned';
+    const { operation } = await this.load(runId, binding, false, abandoned);
+    if (operation.native?.phase === 'prepared')
+      return { state: 'prepared', operation };
+    if (operation.native?.retirement === 'local-not-started')
+      return { state: 'retired', operation };
+    return this.observeTarget(
+      runId,
+      binding,
+      operation.externalRunId ??
+        `rpc-spawn-${required(operation.native).request.requestId}`,
+      abandoned ? true : 'inspect',
     );
   }
 
@@ -390,15 +419,33 @@ export class NativeRuntimeClient {
         status.steps.length !== 1 ||
         !record(status.steps[0]) ||
         status.steps[0].runId !== op.native.childRunId ||
-        status.steps[0].workflowKey !== 'main' ||
-        status.steps[0].status !== 'completed' ||
-        status.steps[0].error ||
-        status.steps[0].stopped ||
-        status.steps[0].interrupted
+        status.steps[0].workflowKey !== 'main'
       )
         throw new Error(
           'Native result source identity or successful child mismatch.',
         );
+      if (
+        status.steps[0].status !== 'completed' ||
+        status.steps[0].error ||
+        status.steps[0].stopped ||
+        status.steps[0].interrupted
+      ) {
+        let failureOutput: string | undefined;
+        try {
+          await this.checkOutputPath(runId, op, true);
+          failureOutput = await readFile(op.native.outputPath, 'utf8');
+        } catch {
+          /* Missing diagnostic artifacts cannot prove success. */
+        }
+        return {
+          ...observed,
+          ...(failureOutput ? { failureOutput } : {}),
+          reason:
+            typeof status.steps[0].error === 'string'
+              ? status.steps[0].error
+              : 'Native child did not succeed.',
+        };
+      }
       successfulChild = true;
       let child: Record<string, unknown>;
       if (
@@ -574,7 +621,7 @@ export class NativeRuntimeClient {
       return {
         operation,
         retired: false,
-        reason: `Legacy launch is unbound; explicit schema-7 snapshot import is required. No replay is authorized.`,
+        reason: legacyImportGuidance(runId),
       };
     const reply = await this.call('status', { id: operation.externalRunId });
     if (!reply.success)
@@ -589,6 +636,17 @@ export class NativeRuntimeClient {
     const summary = record(details.workflowChildren)
       ? details.workflowChildren
       : undefined;
+    const rpcRequestId = operation.legacyImport?.operation.rpcRequestId;
+    if (
+      summary &&
+      rpcRequestId &&
+      summary.parentToolCallId !== `rpc-spawn-${rpcRequestId}`
+    )
+      return {
+        operation,
+        retired: false,
+        reason: 'Imported legacy RPC correlation mismatch.',
+      };
     let source: Record<string, unknown> | undefined;
     const asyncDir =
       operation.asyncDir ??
@@ -783,18 +841,19 @@ export class NativeRuntimeClient {
     runId: string,
     binding: NativeOperationBinding,
     id: string,
-    abandoned = false,
+    abandoned: boolean | 'inspect' = false,
   ): Promise<NativeObservation> {
     const reply = await this.call('status', { id });
     if (!reply.success)
       return {
         state: 'unknown',
-        operation: (await this.load(runId, binding, false, abandoned))
+        operation: (await this.load(runId, binding, false, abandoned === true))
           .operation,
         reason: reply.message,
       };
-    const operation = (await this.load(runId, binding, false, abandoned))
-      .operation;
+    const operation = (
+      await this.load(runId, binding, false, abandoned === true)
+    ).operation;
     const alias = `rpc-spawn-${required(operation.native).request.requestId}`;
     return this.observeData(
       runId,
@@ -810,9 +869,14 @@ export class NativeRuntimeClient {
     binding: NativeOperationBinding,
     data: Record<string, unknown>,
     targetId?: string,
-    abandoned = false,
+    abandoned: boolean | 'inspect' = false,
   ): Promise<NativeObservation> {
-    const { operation } = await this.load(runId, binding, false, abandoned);
+    const { operation } = await this.load(
+      runId,
+      binding,
+      false,
+      abandoned === true,
+    );
     const meta = required(operation.native);
     const details = data.details;
     const identity = record(details)
@@ -970,9 +1034,25 @@ export class NativeRuntimeClient {
       },
     });
     const updated = abandoned
-      ? update((await this.load(runId, binding, false, true)).operation)
+      ? update(
+          (await this.load(runId, binding, false, abandoned === true))
+            .operation,
+        )
       : await this.mutate(runId, binding, update);
+    const status: Record<string, unknown> = {};
+    for (const key of [
+      'activity',
+      'totalTokens',
+      'totalCost',
+      'terminationReason',
+      'advisoryObservation',
+    ]) {
+      const value = sourceStatus?.[key] ?? details[key];
+      if (value !== undefined) status[key] = value;
+    }
+    if (typeof data.text === 'string') status.text = data.text;
     return {
+      status,
       state: updated.native?.phase === 'retired' ? 'retired' : 'bound',
       operation: updated,
       workflowState: identity.state,
@@ -1050,8 +1130,17 @@ export class NativeRuntimeClient {
     for (let attempt = 0; attempt < 5; attempt++) {
       const { run, operation } = await this.load(runId, binding);
       const key = run.activeOperation ? 'activeOperation' : 'failedOperation';
+      const next = apply(operation);
       const written = await this.registry.updateIfCurrent(
-        { ...run, [key]: apply(operation) },
+        {
+          ...run,
+          [key]: next,
+          ...(key === 'activeOperation' &&
+          run.failedOperation?.operationId === operation.operationId &&
+          run.failedOperation.requestDigest === operation.requestDigest
+            ? { failedOperation: next }
+            : {}),
+        },
         run.updatedAt,
       );
       if (written.applied) return required(written.run[key]);

@@ -81,7 +81,7 @@ test('recovery fails closed when a bound worker has only missing-directory or ab
   );
 });
 
-test('durable absence is ambiguous unless it explicitly permits same-identity reconciliation', () => {
+test('legacy absence stays ambiguous even with a replay-safe hint', () => {
   const run = inFlight({
     activeOperation: {
       operationId: 'operation-1',
@@ -105,7 +105,7 @@ test('durable absence is ambiguous unless it explicitly permits same-identity re
       durableOperationLookup: true,
       replaySafe: true,
     }),
-    'reconcilable',
+    'ambiguous',
   );
 });
 
