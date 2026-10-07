@@ -6541,7 +6541,8 @@ export function modelRecoveryOperation(
       ) ||
       op.stopRequested ||
       (op.executionGeneration ?? 0) !== (run.executionGeneration ?? 0) ||
-      (op.stopGeneration ?? 0) !== (run.stopGeneration ?? 0) ||
+      // Retirement survives a pause; resume separately fences its current stop epoch.
+      (op.stopGeneration ?? 0) > (run.stopGeneration ?? 0) ||
       !isModelProviderFailureText(op.terminalError)
     )
       continue;

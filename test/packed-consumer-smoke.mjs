@@ -954,6 +954,47 @@ import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8')
         assert.equal(failed.failedOperation?.native?.phase, 'retired');
         if (!mode.startsWith('goal'))
           assert.equal(failed.tasks['1'].state, 'waiting_external');
+        if (mode === 'http401') {
+          const failureBeforePause = structuredClone(failed.failedOperation);
+          host.send({
+            id: 'provider-pause',
+            type: 'prompt',
+            message: `/exec pause ${run.id}`,
+          });
+          const paused = await waitFor(async () => {
+            const value = await json(join(runs, run.id, 'run.json'));
+            return value?.status === 'paused' && value.userStopped && value;
+          }, 'pause proven provider failure');
+          assert.ok(
+            (paused.stopGeneration ?? 0) > (failed.stopGeneration ?? 0),
+          );
+          for (const field of [
+            'operationId',
+            'requestDigest',
+            'executionGeneration',
+            'stopGeneration',
+            'externalRunId',
+            'processTreeExited',
+          ])
+            assert.deepEqual(
+              paused.failedOperation?.[field],
+              failureBeforePause?.[field],
+            );
+          assert.deepEqual(
+            paused.failedOperation?.native?.request,
+            failureBeforePause?.native?.request,
+          );
+          assert.deepEqual(
+            paused.failedOperation?.native?.terminalProof,
+            failureBeforePause?.native?.terminalProof,
+          );
+          if (!mode.startsWith('goal'))
+            assert.deepEqual(
+              paused.tasks['1'].providerFailure,
+              failed.tasks['1'].providerFailure,
+            );
+          assert.equal(paused.recoveryModel, undefined);
+        }
         host.send({
           id: 'provider-override',
           type: 'prompt',

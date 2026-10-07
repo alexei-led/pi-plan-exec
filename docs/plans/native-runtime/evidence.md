@@ -428,3 +428,23 @@ above. Independent review of the parent delta plus the approved S29 correction,
 and parent-owned marker/release reconciliation, are still required. Linux remains
 waived, not passed. No child release, version bump, push or main/global/live
 mutation was performed.
+
+## Post-pause recovery recheck
+
+The final bounded review of9cf009e accepted the capture-error and repeated-import
+checks but found one blocker: an ordinary pause invalidated already-retired
+provider evidence by requiring equal stop generations. The evidence predicate
+now rejects future stop generations, not historical ones. Explicit resume still
+checks its current stop generation under the existing lock/CAS path; the saved
+failure/request/proof is not rewritten.
+
+The existing concurrent-stop test first reproduced the rejected later resume.
+It now verifies that the racing stop wins, then a separate explicit resume emits
+exactly one new attempt at the current stop generation, with unchanged failure
+evidence and config. Future-generation, active/unknown, stale execution and
+cross-task refusal tests remain. Four focused provider tests plus check passed.
+The actual packed HTTP401 plan now pauses before explicit --model recovery and
+completes; HTTP404 direct recovery and goal HTTP401/current-model recovery also
+pass. Volatile observation timestamps are not treated as immutable proof.
+Independent recheck remains the final blocker before parent checklist closure
+and version/release preparation.

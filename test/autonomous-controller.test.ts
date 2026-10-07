@@ -4963,6 +4963,7 @@ test('native provider failure holds only its task and explicit recovery uses one
   const f = await fixture(t);
   let run = await f.registry.update({
     ...f.run,
+    stopGeneration: 1,
     config: { ...f.run.config, workerModel: 'fixture/bad' },
   });
   run = await f.controller.tick(run.id, 'session');
@@ -4994,7 +4995,7 @@ test('native provider failure holds only its task and explicit recovery uses one
     { ...run, status: 'abandoned' as const },
     { ...run, activeOperation: original },
     { ...run, executionGeneration: (run.executionGeneration ?? 0) + 1 },
-    { ...run, stopGeneration: (run.stopGeneration ?? 0) + 1 },
+    { ...run, stopGeneration: (run.stopGeneration ?? 0) - 1 },
     {
       ...run,
       failedOperation: {
@@ -5097,8 +5098,9 @@ test('stop generation winning provider recovery CAS cannot launch or retain an o
   });
   run = await f.controller.tick(run.id, 'session');
   const update = f.registry.updateIfCurrent.bind(f.registry);
-  vi.spyOn(f.registry, 'updateIfCurrent').mockImplementation(
-    async (...args) => {
+  const updateSpy = vi
+    .spyOn(f.registry, 'updateIfCurrent')
+    .mockImplementation(async (...args) => {
       if (args[0].recoveryModel) {
         const current = required(await f.registry.get(run.id));
         await update(
@@ -5112,8 +5114,7 @@ test('stop generation winning provider recovery CAS cannot launch or retain an o
         );
       }
       return update(...args);
-    },
-  );
+    });
   const stopped = await f.controller.resume(
     run.id,
     'session',
@@ -5126,6 +5127,29 @@ test('stop generation winning provider recovery CAS cannot launch or retain an o
   assert.equal(stopped.userStopped, true);
   assert.equal(stopped.recoveryModel, undefined);
   assert.equal(f.worker.launches.length, 1);
+  const retiredFailure = structuredClone(stopped.failedOperation);
+  updateSpy.mockRestore();
+  f.worker.state = 'running';
+  f.worker.proof = false;
+  const resumed = await f.controller.resume(
+    run.id,
+    'session',
+    true,
+    undefined,
+    false,
+    'fixture/override',
+    stopped.stopGeneration,
+  );
+  assert.equal(f.worker.launches.length, 2);
+  assert.equal(f.worker.launches[1]?.params.model, 'fixture/override');
+  assert.notEqual(
+    resumed.activeOperation?.operationId,
+    retiredFailure?.operationId,
+  );
+  assert.equal(resumed.activeOperation?.stopGeneration, stopped.stopGeneration);
+  assert.deepEqual(resumed.failedOperation, retiredFailure);
+  assert.deepEqual(resumed.config, stopped.config);
+  assert.equal(resumed.recoveryModel, undefined);
 });
 
 test('two independent provider failures retain separate proof and recover B then A without model leakage', async (t) => {
