@@ -11,6 +11,9 @@ permissions:
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
+defaults:
+  run:
+    shell: bash # Explicit bash makes GitHub use -eo pipefail, including tee pipelines.
 jobs:
   verify:
     name: Verify
@@ -20,6 +23,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0 # The frozen 1.8.0 rollback regression reads its exact source commit.
           persist-credentials: false
       - name: Setup Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -29,10 +33,68 @@ jobs:
       - name: Install dependencies
         run: npm exec --yes --package=npm@12.0.2 -- npm ci --ignore-scripts
       - name: Lint
-        run: npm run lint
+        run: npm exec --yes --package=npm@12.0.2 -- npm run lint
       - name: Typecheck
-        run: npm run check
+        run: npm exec --yes --package=npm@12.0.2 -- npm run check
       - name: Test
-        run: npm test
+        run: npm exec --yes --package=npm@12.0.2 -- npm test
       - name: Package dry run
-        run: npm run pack:dry
+        run: npm exec --yes --package=npm@12.0.2 -- npm run pack:dry
+
+  native-verification:
+    name: Native ${{ matrix.gate }} (Linux)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        gate: [contracts, runtime, recovery, packed]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.15.0
+          cache: npm
+      - name: Install declared dependencies
+        run: npm exec --yes --package=npm@12.0.2 -- npm ci --ignore-scripts
+      - name: Verify native boundary
+        env:
+          NATIVE_GATE: ${{ matrix.gate }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/native-evidence/fixtures"
+          export TMPDIR="$RUNNER_TEMP/native-evidence/fixtures/"
+          case "$NATIVE_GATE" in
+            contracts) npm exec --yes --package=npm@12.0.2 -- npm run test:native-contracts 2>&1 | tee "$RUNNER_TEMP/native-evidence/contracts.log" ;;
+            runtime) npm exec --yes --package=npm@12.0.2 -- npm run test:runtime-smoke 2>&1 | tee "$RUNNER_TEMP/native-evidence/runtime.log" ;;
+            recovery)
+              npm exec --yes --package=npm@12.0.2 -- npm run test:native-recovery 2>&1 | tee "$RUNNER_TEMP/native-evidence/recovery.log"
+              npm exec --yes --package=npm@12.0.2 -- npm run test:parent-death 2>&1 | tee "$RUNNER_TEMP/native-evidence/parent-death.log"
+              ;;
+            packed) npm exec --yes --package=npm@12.0.2 -- npm run test:packed-consumer 2>&1 | tee "$RUNNER_TEMP/native-evidence/packed.log" ;;
+            *) echo 'Unknown native verification gate' >&2; exit 2 ;;
+          esac
+      - name: Collect retained fixture diagnostics
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/native-evidence"
+          if [ -d "$RUNNER_TEMP/native-evidence/fixtures" ]; then
+            find "$RUNNER_TEMP/native-evidence/fixtures" \( -type d \( -name node_modules -o -name .git \) -prune \) -o \( -type f \( -name status.json -o -name process-terminal.json -o -name origin.json -o -name recovery.json -o -name run.json -o -name before.json -o -name '*barrier.json' -o -name 'loads.jsonl' -o -name 'spawns.jsonl' \) -print0 \) | tar --null -T - -czf "$RUNNER_TEMP/native-evidence/retained-state.tgz"
+          fi
+      - name: Retain native gate logs and safe-uncertainty diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-${{ matrix.gate }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/native-evidence/*.log
+            ${{ runner.temp }}/native-evidence/retained-state.tgz
+          if-no-files-found: warn
+          retention-days: 7

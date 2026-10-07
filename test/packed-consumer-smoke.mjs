@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { existsSync } from 'node:fs';
 import {
@@ -14,7 +15,7 @@ import {
 import http from 'node:http';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import test from 'node:test';
 import { promisify } from 'node:util';
 
@@ -40,8 +41,8 @@ async function json(path) {
   }
 }
 
-test('packed normal loader: native plan/goal/review, lost reply, force stop/restart and inert ambient children', {
-  timeout: 360000,
+test('packed normal loader: native execution, recovery, readonly controls, supervisor reload and pinned-executor cutover', {
+  timeout: 600000,
 }, async () => {
   const sandbox = await realpath(
     await mkdtemp(join(tmpdir(), 'plan-exec-consumer-')),
@@ -72,12 +73,16 @@ test('packed normal loader: native plan/goal/review, lost reply, force stop/rest
   let mode = 'plan';
   let hold = false;
   const calls = [];
+  let supervisorReply = false;
+  let releaseSupervisorChild = false;
+  let supervisorReturned = false;
+  let readonlyRefusal = false;
   const server = http.createServer((req, res) => {
     let body = '';
     req.on('data', (chunk) => {
       body += chunk;
     });
-    req.on('end', () => {
+    req.on('end', async () => {
       try {
         const input = JSON.parse(body);
         const tools = (input.tools ?? []).map((tool) => tool.function?.name);
@@ -88,12 +93,55 @@ test('packed normal loader: native plan/goal/review, lost reply, force stop/rest
             message.role === 'tool' &&
             String(message.tool_call_id).startsWith('fixture-write'),
         );
-        calls.push({ mode, reviewer, worker, wrote });
+        calls.push({ mode, reviewer, worker, wrote, tools, at: Date.now() });
+        if (reviewer) {
+          assert.ok(
+            !tools.includes('bash') &&
+              !tools.includes('write') &&
+              !tools.includes('edit'),
+            'Readonly reviewer effective tool set',
+          );
+          assert.ok(
+            tools.includes('structured_output'),
+            'Required schema tool is actually available',
+          );
+        }
+        const contactCalled = input.messages.some(
+          (message) =>
+            message.role === 'tool' &&
+            String(message.tool_call_id).startsWith('fixture-contact'),
+        );
+        if (mode === 'supervisor' && worker && contactCalled) {
+          assert.match(body, /FINAL_PROBE_S25_REPLY/);
+          supervisorReturned = true;
+          while (!releaseSupervisorChild && !res.destroyed)
+            await new Promise((resolve) => setTimeout(resolve, 20));
+          if (res.destroyed) return;
+        }
+        const forbiddenCalled = input.messages.some(
+          (message) =>
+            message.role === 'tool' &&
+            String(message.tool_call_id).startsWith('fixture-forbidden'),
+        );
+        if (mode === 'tool-ceiling' && reviewer && forbiddenCalled) {
+          assert.match(
+            body,
+            /not found|not available|not allowed|unknown tool/i,
+          );
+          readonlyRefusal = true;
+        }
         if (hold && worker && !wrote) {
           res.on('close', () => {});
           return;
         }
-        const command = `node -e 'const fs=require("node:fs");fs.writeFileSync("result.txt","done\\n");if(fs.existsSync("plan.md"))fs.writeFileSync("plan.md",fs.readFileSync("plan.md","utf8").replace("[ ]","[x]"));' && git add result.txt plan.md && git -c commit.gpgSign=false commit -m 'Deliver fixture'`;
+        let command = `node -e 'const fs=require("node:fs");fs.writeFileSync("result.txt","done\\n");if(fs.existsSync("plan.md"))fs.writeFileSync("plan.md",fs.readFileSync("plan.md","utf8").replace("[ ]","[x]"));' && git add result.txt plan.md && git -c commit.gpgSign=false commit -m 'Deliver fixture'`;
+        if (mode === 'cutover')
+          command =
+            'npm exec --yes --package=npm@12.0.2 -- npm uninstall --ignore-scripts @alexeiled/pi-subagents-bridge @tintinweb/pi-tasks && ' +
+            command.replace(
+              'git add result.txt plan.md',
+              'git add result.txt plan.md package.json package-lock.json',
+            );
         const commit = /Review exactly commit ([a-f0-9]{40})/.exec(body)?.[1];
         if (reviewer)
           assert.ok(commit, 'Reviewer must be bound to a full commit');
@@ -123,8 +171,54 @@ test('packed normal loader: native plan/goal/review, lost reply, force stop/rest
         );
         const fixing = body.includes('sole worker fixing review findings');
         const fixCommand = `node -e 'require("node:fs").writeFileSync("review-fixed.txt","reviewed\\n")' && git add review-fixed.txt && git -c commit.gpgSign=false commit -m 'Fix review metadata'`;
+        let toolId;
+        let special;
+        if (mode === 'supervisor' && worker && !contactCalled) {
+          special = {
+            name: 'contact_supervisor',
+            arguments: JSON.stringify({
+              reason: 'need_decision',
+              message:
+                'FINAL_PROBE_S25: wait for the retained reply before doing any work.',
+            }),
+          };
+          toolId = 'fixture-contact';
+        } else if (
+          mode === 'supervisor' &&
+          !worker &&
+          !reviewer &&
+          supervisorReply &&
+          !input.messages.some(
+            (message) =>
+              message.role === 'tool' &&
+              message.tool_call_id === 'fixture-supervisor-reply',
+          )
+        ) {
+          const request = await json(join(sandbox, 'supervisor-request.json'));
+          assert.ok(request?.requestId);
+          special = {
+            name: 'subagent_supervisor',
+            arguments: JSON.stringify({
+              action: 'reply',
+              replyTo: request.requestId,
+              message:
+                'FINAL_PROBE_S25_REPLY: proceed once on the original child.',
+            }),
+          };
+          toolId = 'fixture-supervisor-reply';
+        } else if (mode === 'tool-ceiling' && reviewer && !forbiddenCalled) {
+          special = {
+            name: 'write',
+            arguments: JSON.stringify({
+              path: join(sandbox, mode, 'forbidden-review-write'),
+              content: 'must not execute',
+            }),
+          };
+          toolId = 'fixture-forbidden';
+        }
         const toolCall =
-          reviewer &&
+          special ??
+          (reviewer &&
           mode !== 'missing' &&
           !(mode === 'malformed' && reviewCalled)
             ? {
@@ -138,14 +232,14 @@ test('packed normal loader: native plan/goal/review, lost reply, force stop/rest
                     command: fixing ? fixCommand : command,
                   }),
                 }
-              : undefined;
+              : undefined);
         const delta = toolCall
           ? {
               role: 'assistant',
               tool_calls: [
                 {
                   index: 0,
-                  id: reviewer ? 'fixture-review' : 'fixture-write',
+                  id: toolId ?? (reviewer ? 'fixture-review' : 'fixture-write'),
                   type: 'function',
                   function: toolCall,
                 },
@@ -236,6 +330,7 @@ test('packed normal loader: native plan/goal/review, lost reply, force stop/rest
     const require = createRequire(join(consumer, 'package.json'));
     const installed = join(consumer, 'node_modules/@alexeiled/pi-plan-exec');
     for (const name of removed) {
+      assert.equal(existsSync(join(consumer, 'node_modules', name)), false);
       assert.throws(() => require.resolve(name));
       assert.throws(() =>
         createRequire(join(installed, 'src/index.ts')).resolve(name),
@@ -254,9 +349,12 @@ EventEmitter.prototype.emit=function(name,value,...rest){if(process.env.PI_SUBAG
     const observer = join(sandbox, 'observer.mjs');
     await writeFile(
       observer,
-      `import{appendFileSync,existsSync,readFileSync,readdirSync,unlinkSync,writeFileSync}from'node:fs';import{join}from'node:path';
+      `import { registerSubagentCapabilityCeiling } from ${JSON.stringify(require.resolve('pi-subagents/capability-ceiling'))};
+import{appendFileSync,existsSync,readFileSync,readdirSync,unlinkSync,writeFileSync}from'node:fs';import{join}from'node:path';
 export default function(pi){
  const root=${JSON.stringify(sandbox)},home=${JSON.stringify(home)};
+ if(process.env.PI_SUBAGENT_CHILD!=='1'){pi.events.on('pi-intercom:detach-request',value=>writeFileSync(join(root,'supervisor-request.json'),JSON.stringify(value)));pi.events.on('pi-intercom:detach-response',value=>writeFileSync(join(root,'supervisor-detach.json'),JSON.stringify(value)));}
+ pi.on('session_start',(_event,ctx)=>{if(process.env.PI_SUBAGENT_CHILD!=='1'&&ctx.cwd.endsWith('/schema-ceiling'))registerSubagentCapabilityCeiling({sessionId:ctx.sessionManager.getSessionId(),source:'final-probe',ceiling:{allowedTools:['read','grep','find','ls']}});});
  pi.on('session_start',(_event,ctx)=>{const dir=join(home,'.pi','plan-exec','runs');const leases=existsSync(dir)?readdirSync(dir).filter(id=>!id.startsWith('.')).flatMap(id=>{try{const r=JSON.parse(readFileSync(join(dir,id,'run.json'),'utf8'));return r.lease?[{id,pid:r.lease.pid,sessionId:r.lease.sessionId}]:[];}catch{return[];}}):[];appendFileSync(join(root,'loads.jsonl'),JSON.stringify({pid:process.pid,child:process.env.PI_SUBAGENT_CHILD==='1',commands:pi.getCommands().map(c=>c.name),sessionId:ctx.sessionManager.getSessionId(),sessionFile:ctx.sessionManager.getSessionFile(),leases})+'\\n');});
 }`,
     );
@@ -295,6 +393,17 @@ export default function(pi){
       consumer,
       'node_modules/@earendil-works/pi-coding-agent/dist/cli.js',
     );
+    async function executorFingerprint() {
+      const hash = createHash('sha256');
+      for (const file of (await readdir(join(installed, 'src'))).sort()) {
+        hash.update(file).update(await readFile(join(installed, 'src', file)));
+      }
+      return hash.digest('hex');
+    }
+    const executorHash = await executorFingerprint();
+    const executorTarballHash = createHash('sha256')
+      .update(await readFile(tarball))
+      .digest('hex');
     const runs = join(home, '.pi/plan-exec/runs');
     async function listRuns() {
       try {
@@ -370,7 +479,7 @@ export default function(pi){
         },
       };
     }
-    for (mode of [
+    const scenarios = process.env.PLAN_EXEC_PACKED_SCENARIOS?.split(',') ?? [
       'plan',
       'goal',
       'findings',
@@ -378,7 +487,14 @@ export default function(pi){
       'malformed',
       'missing',
       'stop',
-    ]) {
+      'tool-ceiling',
+      'missing-agent',
+      'schema-ceiling',
+      'deadline',
+      'supervisor',
+      'cutover',
+    ];
+    for (mode of scenarios) {
       const cwd = join(sandbox, mode);
       await mkdir(join(cwd, '.pi'), { recursive: true });
       const git = (args) => execute('git', args, { cwd, env });
@@ -393,8 +509,57 @@ export default function(pi){
       );
       await writeFile(
         join(cwd, 'check.mjs'),
-        `import assert from 'node:assert/strict';import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8'),'done\\n');`,
+        `import assert from 'node:assert/strict';
+import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8'),'done\\n');`,
       );
+      await writeFile(join(cwd, '.gitignore'), 'node_modules/\n');
+      if (mode === 'schema-ceiling') {
+        await writeFile(join(cwd, 'result.txt'), 'done\n');
+        await writeFile(
+          join(cwd, 'plan.md'),
+          '### Task 1: Deliver fixture\n- [x] Deliver fixture\n',
+        );
+      }
+      if (mode === 'cutover') {
+        await writeFile(
+          join(cwd, 'package.json'),
+          JSON.stringify({
+            name: 'disposable-migration-target',
+            private: true,
+            version: '0.0.0',
+          }),
+        );
+        await execute(
+          'npm',
+          [
+            'exec',
+            '--yes',
+            '--package=npm@12.0.2',
+            '--',
+            'npm',
+            'install',
+            '--ignore-scripts',
+            '--no-audit',
+            '--no-fund',
+            '@alexeiled/pi-subagents-bridge@0.5.5',
+            '@tintinweb/pi-tasks@0.9.0',
+          ],
+          { cwd, env, timeout: 120000, maxBuffer: 2000000 },
+        );
+        for (const [name, version] of [
+          [removed[0], '0.5.5'],
+          [removed[1], '0.9.0'],
+        ])
+          assert.equal(
+            (await json(join(cwd, 'node_modules', name, 'package.json')))
+              .version,
+            version,
+          );
+        await writeFile(
+          join(cwd, 'check.mjs'),
+          `import assert from 'node:assert/strict';import{readFileSync}from'node:fs';import{createRequire}from'node:module';const r=createRequire(import.meta.url);assert.equal(readFileSync('result.txt','utf8'),'done\\n');for(const name of ${JSON.stringify(removed)})assert.throws(()=>r.resolve(name));`,
+        );
+      }
       await writeFile(
         join(cwd, '.pi/plan-exec.json'),
         JSON.stringify({
@@ -402,10 +567,23 @@ export default function(pi){
           reviewRequired: true,
           finalizeEnabled: false,
           statsEnabled: false,
-          retryDelayMs: 100,
+          retryDelayMs: [
+            'deadline',
+            'missing-agent',
+            'schema-ceiling',
+            'supervisor',
+          ].includes(mode)
+            ? 30000
+            : 100,
+          ...(mode === 'missing-agent'
+            ? { workerAgent: 'intentionally-missing-configured-agent' }
+            : {}),
           workerModel: 'localfixture/fixture',
           reviewerModel: 'localfixture/fixture',
-          executionLifetime: { mode: 'bounded', timeoutMs: 60000 },
+          executionLifetime: {
+            mode: 'bounded',
+            timeoutMs: mode === 'deadline' ? 8000 : 60000,
+          },
           requiredChecks: [[process.execPath, 'check.mjs']],
         }),
       );
@@ -416,7 +594,10 @@ export default function(pi){
       host = await launch(cwd, session);
       if (mode === 'plan' || mode === 'stop')
         await writeFile(join(sandbox, 'drop-next'), 'drop');
-      hold = mode === 'stop';
+      hold = mode === 'stop' || mode === 'deadline';
+      supervisorReply = false;
+      releaseSupervisorChild = false;
+      supervisorReturned = false;
       host.send({
         id: 'start',
         type: 'prompt',
@@ -429,7 +610,260 @@ export default function(pi){
         async () => (await listRuns()).find((r) => r.repositoryRoot === cwd),
         `create ${mode}`,
       );
-      if (['wrong-commit', 'malformed', 'missing'].includes(mode)) {
+      if (['missing-agent', 'deadline'].includes(mode)) {
+        const failed = await waitFor(
+          async () => {
+            const current = await json(join(runs, run.id, 'run.json'));
+            const op = current?.activeOperation ?? current?.failedOperation;
+            const status = op?.asyncDir
+              ? await json(join(op.asyncDir, 'status.json'))
+              : undefined;
+            return (
+              status &&
+              ['failed', 'stopped'].includes(status.state) && {
+                current,
+                op,
+                status,
+              }
+            );
+          },
+          `actual native refusal/expiry: ${mode}`,
+          45000,
+        );
+        assert.notEqual(failed.current.status, 'completed');
+        if (mode === 'deadline') {
+          assert.ok(
+            calls.some(
+              (call) => call.mode === mode && call.worker && !call.wrote,
+            ),
+            'Deadline fired after the real model request started',
+          );
+          assert.match(
+            JSON.stringify(failed.status),
+            /timeout|timed.out|deadline/i,
+          );
+          assert.equal(failed.status.timeoutMs, 8000);
+          assert.equal(existsSync(join(cwd, 'result.txt')), false);
+          const step = failed.status.steps.find(
+            (value) => value.workflowKey === 'main',
+          );
+          assert.ok(step?.runId);
+          const child = await waitFor(
+            async () => {
+              const status = await json(
+                join(dirname(failed.op.asyncDir), step.runId, 'status.json'),
+              );
+              return (
+                status &&
+                !['running', 'queued'].includes(status.state) &&
+                status.processTerminal &&
+                status
+              );
+            },
+            'bounded child expiry and published process evidence',
+            20000,
+          );
+          assert.equal(child.timeoutMs, 8000);
+          assert.match(JSON.stringify(child), /timeout|timed.out|deadline/i);
+          assert.equal(child.processTerminal.runId, step.runId);
+          const proof = await waitFor(
+            async () => {
+              const value = await json(
+                join(
+                  dirname(failed.op.asyncDir),
+                  step.runId,
+                  'process-terminal.json',
+                ),
+              );
+              return (
+                value && ['observed', 'unknown'].includes(value.state) && value
+              );
+            },
+            'published deadline retirement disposition',
+            10000,
+          );
+          assert.equal(proof.runId, step.runId);
+          assert.equal(
+            proof.runnerProcessInstanceId,
+            child.processTerminal.runnerProcessInstanceId,
+          );
+          console.log(
+            JSON.stringify({
+              scenario: 'S28 child expiry',
+              state: child.state,
+              error: child.error,
+              timeoutMs: child.timeoutMs,
+              proof,
+            }),
+          );
+        } else {
+          assert.equal(
+            calls.some(
+              (call) => call.mode === mode && (call.worker || call.reviewer),
+            ),
+            false,
+            'Admission refusal occurred before model work',
+          );
+          assert.match(
+            JSON.stringify(failed.status),
+            mode === 'missing-agent'
+              ? /unknown agent|not found|missing/i
+              : /structured_output|ceiling|required tool/i,
+          );
+        }
+        console.log(
+          JSON.stringify({
+            scenario: mode,
+            state: failed.status.state,
+            error: failed.status.error,
+            steps: failed.status.steps,
+            operationId: failed.op.operationId,
+          }),
+        );
+        host.send({
+          id: 'refused-stop',
+          type: 'prompt',
+          message: `/exec stop ${run.id} --force`,
+        });
+        await waitFor(async () => {
+          const current =
+            (await json(join(runs, run.id, 'run.json'))) ??
+            (await json(join(runs, '.abandoned', run.id, 'run.json')));
+          return current?.status === 'abandoned' && current;
+        }, 'end refused/expired fixture');
+        retainUnknownOwnership = true; // Keep raw proof/expiry evidence, including unknown retirement.
+      } else if (mode === 'supervisor') {
+        const request = await waitFor(
+          () => json(join(sandbox, 'supervisor-request.json')),
+          'real contact_supervisor request',
+        );
+        const tracked = await waitFor(async () => {
+          const current = await json(join(runs, run.id, 'run.json'));
+          return current?.activeOperation?.asyncDir && current;
+        }, 'supervisor root binding');
+        const originalOp = tracked.activeOperation;
+        const waiting = await json(join(originalOp.asyncDir, 'status.json'));
+        const childId = request.runId;
+        const childPath = join(
+          dirname(originalOp.asyncDir),
+          childId,
+          'status.json',
+        );
+        const originalChild = await waitFor(
+          () => json(childPath),
+          'supervisor child status',
+        );
+        assert.ok(originalChild.steps[0].sessionFile);
+        const notices = host.output.length;
+        host.send({
+          id: 'supervisor-detach',
+          type: 'prompt',
+          message: `/subagents-detach ${childId}`,
+        });
+        const detachOutcome = await waitFor(
+          () =>
+            host.output
+              .slice(notices)
+              .find(
+                (value) =>
+                  typeof value.message === 'string' &&
+                  /detach|foreground/i.test(value.message),
+              ),
+          'actual detach command outcome',
+          15000,
+        );
+        supervisorReply = true;
+        host.send({
+          id: 'supervisor-answer',
+          type: 'prompt',
+          message: 'Reply to the retained fixture supervisor request now.',
+        });
+        await waitFor(
+          () => supervisorReturned,
+          'actual supervisor reply returned to original child',
+        );
+        const detachment = await json(join(sandbox, 'supervisor-detach.json'));
+        await host.close();
+        host = undefined;
+        host = await launch(cwd, session);
+        releaseSupervisorChild = true;
+        const settled = await waitFor(
+          async () => {
+            const child = await json(childPath);
+            return (
+              child && !['running', 'queued'].includes(child.state) && child
+            );
+          },
+          'same child settles after reload',
+          45000,
+        );
+        assert.equal(settled.runId, childId);
+        assert.equal(
+          settled.steps[0].sessionFile,
+          originalChild.steps[0].sessionFile,
+        );
+        const launches = (await readFile(join(sandbox, 'spawns.jsonl'), 'utf8'))
+          .trim()
+          .split('\n')
+          .map(JSON.parse);
+        const owned = launches.filter(
+          (value) =>
+            value.pid === tracked.lease.pid || value.pid === host.child.pid,
+        );
+        assert.equal(
+          owned.length,
+          1,
+          'Supervisor continuation never launches a replacement worker',
+        );
+        host.send({
+          id: 'pause-supervisor',
+          type: 'prompt',
+          message: `/exec pause ${run.id}`,
+        });
+        const paused = await waitFor(async () => {
+          const current = await json(join(runs, run.id, 'run.json'));
+          return current?.status === 'paused' && current.userStopped && current;
+        }, 'explicit pause wins');
+        await new Promise((r) => setTimeout(r, 1200));
+        assert.equal(
+          (await json(join(runs, run.id, 'run.json'))).status,
+          'paused',
+        );
+        assert.equal(
+          paused.activeOperation?.operationId ??
+            paused.failedOperation?.operationId,
+          originalOp.operationId,
+        );
+        assert.equal(
+          (await git(['log', '--format=%s'])).stdout
+            .split('\n')
+            .filter((line) => line === 'Deliver fixture').length,
+          1,
+        );
+        const retainedOp = paused.activeOperation ?? paused.failedOperation;
+        if (retainedOp.native?.phase !== 'retired') {
+          assert.notEqual(retainedOp.processTreeExited, true);
+          assert.notEqual(paused.tasks?.['1']?.state, 'accepted');
+        }
+        console.log(
+          JSON.stringify({
+            scenario: 'S25',
+            controllerPhase: retainedOp.native?.phase,
+            controllerProof: retainedOp.native?.terminalProof,
+            sideEffects: 1,
+            request,
+            detachment,
+            detachOutcome: detachOutcome.message,
+            waitingState: waiting?.state,
+            childRunId: childId,
+            childSession: settled.steps[0].sessionFile,
+            childState: settled.state,
+            nativeProof: settled.processTerminal,
+            paused: true,
+          }),
+        );
+        retainUnknownOwnership = true;
+      } else if (['wrong-commit', 'malformed', 'missing'].includes(mode)) {
         const rejected = await waitFor(
           async () => {
             const current = await json(join(runs, run.id, 'run.json'));
@@ -472,10 +906,65 @@ export default function(pi){
         );
         assert.equal(completed.reviewFindings.length, 0);
         assert.equal(completed.config.reviewerAgent, 'plan-exec-reviewer');
+        if (mode === 'schema-ceiling')
+          console.log(
+            JSON.stringify({
+              scenario: 'S33 schema ceiling',
+              internalProtocolTool: 'structured_output',
+              effectiveToolSets: calls
+                .filter((call) => call.mode === mode && call.reviewer)
+                .map((call) => call.tools),
+            }),
+          );
+        if (mode === 'tool-ceiling') {
+          assert.equal(readonlyRefusal, true);
+          assert.equal(existsSync(join(cwd, 'forbidden-review-write')), false);
+          console.log(
+            JSON.stringify({
+              scenario: 'S34 readonly refusal',
+              mutationAttemptRefused: readonlyRefusal,
+              effectiveTools: calls.find(
+                (call) => call.mode === mode && call.reviewer,
+              )?.tools,
+              sentinelExists: false,
+            }),
+          );
+        }
+        if (mode === 'cutover') {
+          assert.equal(await executorFingerprint(), executorHash);
+          for (const name of removed) {
+            assert.equal(existsSync(join(cwd, 'node_modules', name)), false);
+            assert.throws(() =>
+              createRequire(join(cwd, 'package.json')).resolve(name),
+            );
+          }
+          assert.equal(completed.archiveOperation?.phase, 'retired');
+          assert.ok(
+            completed.archiveOperation.destination.includes('completed'),
+          );
+          assert.ok(
+            await readFile(completed.archiveOperation.destination, 'utf8'),
+          );
+          assert.match(
+            (await git(['log', '-1', '--format=%s'])).stdout,
+            /archive/,
+          );
+          console.log(
+            JSON.stringify({
+              scenario: 'S54',
+              executorHash,
+              executorTarballHash,
+              executor: installed,
+              target: cwd,
+              state: completed.status,
+              archive: completed.archiveOperation.destination,
+            }),
+          );
+        }
         const evidenceDirs = await readdir(join(runs, run.id, 'native'));
         assert.equal(
           evidenceDirs.length,
-          mode === 'findings' ? 4 : 2,
+          mode === 'findings' ? 4 : mode === 'schema-ceiling' ? 1 : 2,
           'Only the required worker/review/fix operations, including lost-reply recovery',
         );
         for (const id of evidenceDirs) {
@@ -589,7 +1078,19 @@ export default function(pi){
       .map(JSON.parse);
     const children = loads.filter((value) => value.child);
     assert.ok(
-      children.length >= 4,
+      children.length >=
+        scenarios.reduce(
+          (sum, value) =>
+            sum +
+            (value === 'missing-agent' || value === 'stop'
+              ? 0
+              : ['schema-ceiling', 'deadline', 'supervisor'].includes(value)
+                ? 1
+                : value === 'findings'
+                  ? 4
+                  : 2),
+          0,
+        ),
       'Real ambient child extension loading occurred',
     );
     for (const child of children) {
@@ -603,10 +1104,17 @@ export default function(pi){
         'Children never take parent leases',
       );
     }
-    assert.ok(await json(join(sandbox, 'dropped.json')));
-    assert.ok(
-      calls.some((call) => call.worker) && calls.some((call) => call.reviewer),
-    );
+    if (scenarios.includes('plan') || scenarios.includes('stop'))
+      assert.ok(await json(join(sandbox, 'dropped.json')));
+    if (
+      scenarios.some((value) =>
+        ['plan', 'goal', 'findings', 'cutover', 'tool-ceiling'].includes(value),
+      )
+    )
+      assert.ok(
+        calls.some((call) => call.worker) &&
+          calls.some((call) => call.reviewer),
+      );
     complete = true;
   } finally {
     await host?.close();

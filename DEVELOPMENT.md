@@ -33,13 +33,16 @@ npm run check
 npm test
 npm run test:runtime-smoke
 npm run test:native-recovery
+npm run test:parent-death
 npm run test:packed-consumer
 npm run pack:dry
 ```
 
 `npm run check` runs Biome and `tsc`; `npm run lint` and `npm run format` are
-available for focused runs. `npm run test:all` is the local gate used by CI and
-the release workflow.
+available for focused runs. `npm run test:all` runs all local unit/native/recovery/parent-death/packed gates
+and packaging checks. CI also runs bounded Ubuntu native gate jobs and retains
+logs plus unresolved fixture metadata. Linux CI results are distinct from local
+Darwin results; wiring a job is not evidence that it ran.
 `npm run pack:dry` rejects private host SDK/TUI/TypeBox dependencies and checks
 the final npm tarball against a runtime-only allowlist. Host packages stay peers,
 never runtime copies: Pi core uses `^1.0.4`; the other host aliases use `"*"`.
@@ -140,3 +143,25 @@ setup; do not add an npm token to GitHub secrets.
 
 After trusted publishing is configured, future releases must go through pushed
 version tags. Do not run local `npm publish` again.
+
+
+## Rollback preflight
+
+Never point an older executor directly at a registry containing native data.
+The frozen 1.8.0 parser accepts the extra native service data; its reservation
+check can still block a competing owner, but that is not format rejection.
+Its explicit cleanup can delete native terminal artifacts or unreadable owner
+records. `test/rollback-preflight.test.ts` demonstrates those actual paths using
+unmodified source pinned to `bc5fb6ef800b6e88f3edeef542869bbd84a9ed3a` in a disposable fixture.
+
+Before any supported rollback, quiesce writers and use the new read-only check
+against an explicitly selected registry/consistent backup:
+
+```bash
+npm run check:rollback -- --registry /absolute/registry-directory
+```
+
+It refuses native records, retained native artifact directories, terminal and
+abandonment history, unreadable JSON, symlinks and incomplete inspection. It never
+opens a default live registry or deletes evidence to make rollback pass. Running
+old code directly bypasses this check and remains unsafe.

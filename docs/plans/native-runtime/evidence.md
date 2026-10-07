@@ -1,207 +1,171 @@
-# Native runtime contract evidence
+# Native runtime verification evidence
 
-## Scope and state
+## Current candidate and authority
 
-This is a partial Task 1 characterization, not a native-runtime cutover. The branch now includes the other lane's merged 1.8.0 force-stop implementation; this lane's own changes remain plan, tests and evidence. Three checkpoints are checked in the plan, but Task 1 is incomplete and no U1–U4 cutover claim is made. The upstream fixes and their validation are recorded below.
+This supersedes the earlier partial-characterization narrative (retained in Git
+history). The candidate now uses unmodified released `pi-subagents@0.76.1` through
+one keyed public workflow. Production Bridge/pi-tasks transport/dependencies are
+removed; the readonly legacy snapshot reader remains. Pi is `1.0.4`, Node
+`24.15.0`, npm `12.0.2`; package version remains `1.8.0`. No upstream patch,
+global/live executor upgrade, paid API, push, release or PR dispatch is part of
+this verification.
 
-Worktree branch: `plan/native-runtime-safety-kernel`. Initial characterization baseline commit: `581c22a923daa32e72f05324c2b18c4fe3a64159`.
+The reviewed implementation checkpoint is `c6d3d231a54c18c47d1a8c70ce47290e436e4a4b`.
+Its recorded full gate was **725 Vitest + 143 node:test = 868**, not the historical
+591/594/626 counts. The final verification slice adds the rollback regression,
+actual parent-death barrier and expanded deterministic packed-consumer probes.
+Its fresh full unit run is **728 Vitest + 143 node:test = 871**, all passing;
+standalone gates additionally cover 3 runtime, 5 recovery, 1 parent-death and
+1 packed-consumer test (13 packed modes). The authoritative **final-probes.json** handoff and external bundle manifest
+record the final commit, fresh gate counts, exact log paths and SHA-256 hashes.
+No independent reviewer acceptance or executable-plan checkbox completion is
+claimed here; those remain parent-owned.
 
-Installed versions: npm `12.0.2`, pi-subagents `0.76.1`, Bridge `0.5.5`, Pi `1.0.4`. The test-only factory seam verifies pi-subagents `0.76.1` before importing its private source modules. `npm ci` reported one high-severity audit finding; it was not triaged or changed.
+## Reproduce and inspect results
 
-## Parent-verified baseline
+From this worktree (all runtime fixtures isolate HOME, registry, sessions, Git
+repositories and deterministic local models):
 
-The unchanged baseline ran in the separate `test/native-runtime-baseline` checkout; logs are under its `.pi/native-runtime-baseline/`. `npm test` passed (591 Vitest and 140 node tests); `npm run test:runtime-smoke`, `npm run check`, and `npm run pack:dry` passed. After the review fixes, the parent also ran the full suite and existing runtime smoke in the implementation worktree; see Parent verification below. The pre-change source/test sizes recorded in this worktree were `src/bridge.ts` 790 lines, `src/task-projection.ts` 582 lines, `test/bridge.test.ts` 835 lines, and `test/autonomous-runtime-smoke.mjs` 592 lines.
+```bash
+npm exec --yes --package=npm@12.0.2 -- npm run test:all
+npm exec --yes --package=npm@12.0.2 -- npm run test:native-contracts
+actionlint .github/workflows/ci.yml
+zizmor --offline .github/workflows/ci.yml
+git diff --check
+```
 
-## Characterization added
+`test:all` includes check, the full Vitest and node:test suites, runtime smoke,
+native recovery, real parent-death, packed consumer and pack:dry. The focused
+contract command is a reusable subset, not extra duplicated scenarios. The
+external bundle includes the actual full-candidate and follow-up diffs produced
+with `--no-ext-diff --no-textconv`, final gate logs and clean-index proof.
 
-- `test/native-runtime-contract.test.ts`: `fixture setup restores process state and disposes partial native registrations`; `released public RPC characterizes rejection, stop parity, ownership, and missing proof`.
-- `test/runtime-boundaries.test.ts`: `native boundary guard rejects private native imports and accepts public subpaths`.
-- `test/native-recovery-smoke.mjs`: `released public status correlation after a fresh OS host process`; `released public RPC launches direct worker/reviewer leaves and preserves exact run proof identity`. It uses the existing deterministic scripted-session fixture and the real detached runner; its test-only private imports are version-bound in `test/fixtures/native-runtime-host.ts`.
+**Linux: NOT RUN locally.** No Docker daemon is available and no VM/service or
+remote workaround was provisioned. `.github/workflows/ci.yml` now wires four
+bounded Ubuntu native jobs (contracts/runtime/recovery/packed) with pinned
+Node/npm, full-history checkout for the frozen regression, pipeline failure
+propagation and retained logs/fixture diagnostics. Successful actionlint/zizmor
+is configuration evidence only, not CI execution. Cross-platform confidence and
+live-model reliability are not newly established.
 
-The probes exercise public RPC request/reply envelopes, direct worker and reviewer launches, run/proof identity, pre-dispatch `async:false` rejection with zero child side effects, stop-session ownership, and refusal to seal a paused run without process proof. The setup regression injects a failure after RPC registration and verifies environment/home restoration, listener disposal, and factory reset.
+## New observed host facts and limitations
 
-## Observed limits
+- **S23:** SIGKILL is delivered to the known spawned parent ChildProcess after a
+  child-written launch barrier. The same child PID/session heartbeat advances
+  after parent death. A fresh host observes the original operation without
+  dispatch; one side effect is recorded. Native parent-observed retirement is
+  missing, so the operation remains bound/reserved. OS exit is recorded for the
+  exact fixture child; it is not substituted for native retirement proof.
+- **S25:** the real local model calls `contact_supervisor`, waits, and receives a
+  real `subagent_supervisor` reply. The released async workflow's explicit
+  `/subagents-detach` call returns **No active foreground run found**. After
+  reply, the parent reloads while that same child is held; releasing it produces
+  one commit from the same child/session, with no replacement. User pause wins.
+  Child completion without matching retirement keeps controller state bound;
+  neither successful foreground detach nor proof-backed controller acceptance
+  is fabricated. Pending-question reply recovery *after* parent replacement is
+  not demonstrated by this probe.
+- **S28:** an 8000ms bound expires while the real local-model request is held.
+  Both workflow and child publish timeout failures; the live parent publishes
+  exact observed runner-instance close proof. This is enforcement evidence, not
+  a captured launch option. Controller budget-growth tests remain separately
+  labelled C.
+- **S33/S34:** a readonly reviewer actually attempts `write`; native tool lookup
+  rejects it and no sentinel is created. Required structured output still
+  settles. A registered readonly capability ceiling does not add caller
+  mutation tools; `structured_output` (and supervisor protocol tooling) is
+  package-owned internal protocol, explicitly permitted by 0.76.1. A configured
+  nonexistent agent fails before model work. Lazy-skill denial is not separately
+  exercised. Tool restrictions are not an OS sandbox; `maxTurns` is unsupported
+  and native child defaults are not an end-to-end-unbounded guarantee.
+- **S53 correction, approved by supervisor:** frozen 1.8.0 does **not** reject
+  native-format schema-1 records. The test byte-compares extracted registry
+  source to `bc5fb6ef800b6e88f3edeef542869bbd84a9ed3a`, invokes that exact code,
+  demonstrates reservation refusal separately from parse acceptance, and then
+  demonstrates actual unsafe old cleanup of terminal native artifacts and,
+  separately, corrupt ownership. No schema change conceals this result.
+  `src/rollback-preflight.mjs --registry /absolute/directory` is readonly and
+  blocks all retained native records/history/artifacts, malformed/unreadable
+  data, symlinks and inspection limits. Quiesce writers first. Direct old-version
+  execution bypasses the supported preflight and remains unsafe.
+- **S54:** a separately installed tarball executor (hashed tarball + complete
+  `src` fingerprint) runs against a different target Git repository with the
+  actual pinned old dependencies. The native worker removes both from that
+  target only. The same unchanged executor completes checks, required typed
+  review, the removal commit and final archive commit. Neither old package is
+  resolvable/present in the final target or executor package root.
 
-- **U1, reproduced only on seeded status fixtures:** RPC `stop` returns `invalid_state` for `queued` and `paused`; the existing tool route accepts queued stop, and for paused runs persists the stop request but refuses to seal without exact terminal proof. The test is a route characterization, not proof from queued/paused live detached children or target-contract success. Sources: `node_modules/pi-subagents/src/extension/rpc.js:441-548`; `node_modules/pi-subagents/src/runs/foreground/async-stop-action.js:121-185`.
-- **U2, confirmed limitation in pi-subagents 0.76.1 public status after a real host-process restart:** a fresh Node host dropped the direct worker spawn reply, waited for exact observed runner proof, and persisted only the originating session/request IDs plus separate test-harness ground truth. A second Node host used the same isolated HOME/temp roots/session and reattached without reinitializing Git. For request `ec88942a-bb36-41a2-9387-86a18f33b32f`, both the raw ID and `rpc-spawn-ec88942a-bb36-41a2-9387-86a18f33b32f` returned `success:false`, `error.code: execution_failed`; each message ended `Async run not found. Provide id or dir.` (raw target: `Status target: run ec88942a-bb36-41a2-9387-86a18f33b32f`; alias target: `Status target: run rpc-spawn-ec88942a-bb36-41a2-9387-86a18f33b32f`; both also included `Spawn budget: unlimited` and `Active async capacity: 0/unlimited used`). The separate native status artifact for run `a326cc44-8b4c-4f65-976d-58a6f3237508` had matching session `native-u2-65fce788-4998-457a-be37-9ee47add3165`, `state: complete`, `toolCallId: null`, and `processTerminal: { state: observed, runId: a326cc44-8b4c-4f65-976d-58a6f3237508, runnerProcessInstanceId: f9e77d46-12cd-41e0-8368-fd48c01ee71f }`. Untargeted/Fleet public status replies had no structured identity fields. Exact native run-ID status still returned that proof; host PIDs `57832` and `58383` differed; the worker side-effect count remained one. These RPC not-found messages are not non-start proof. Sources: `node_modules/pi-subagents/src/extension/rpc.js:343-347,582-610`; `node_modules/pi-subagents/src/runs/foreground/subagent-executor.js:3033,6997-7000`; `node_modules/pi-subagents/src/runs/background/run-id-resolver.js:42-58,130-146`; public contract `node_modules/pi-subagents/docs/extension-api.md:96-127` and `node_modules/pi-subagents/docs/observability.md:229-255`. Candidate for parent/upstream decision: preserve the existing RPC request/tool-call identity with the direct async run and expose exact session-scoped structured correlation; keep ambiguous, stale, and not-found outcomes non-authoritative. No upstream code/API was changed.
-- **U3, partial:** the paused fixture proves refusal when terminal proof is absent. No parent SIGKILL/runner-survival test was run. The published observability contract says proof is observed only after the live parent observes runner close and any session lease is free; missing observation remains unknown (`node_modules/pi-subagents/docs/observability.md:249-255`).
-- **U4, partial:** direct RPC receipts report requested context, timeout, tool budget and launch digest; the real scripted leaf records its worker/reviewer cwd and separate runner PID. The direct leaf accepts an extra `executionLifetime` input but the scripted runtime records no effective lifetime value. This does not establish control enforcement. Public docs list `timeoutMs`, `toolTimeoutMs`, and `toolBudget` (`node_modules/pi-subagents/docs/tool-reference.md:97-100`), but output schema, output binding, actual timeout/tool-limit enforcement, and turn-limit behavior remain unverified. Do not infer enforcement from echoed request/receipt fields.
+Unknown proof deliberately retains fixture artifacts/reservations; a delivered
+stop, fixture disposal, process-not-found result or child-success prose never
+manufactures retirement. Baseline high-severity dependency advisory remains
+unfixed; no unrelated audit upgrade was performed.
 
-## Commands and results
+## Exact S01–S56 scenario map
 
-- `npm exec --yes --package=npm@12.0.2 -- npm ci` — passed; this worktree installed its own dependencies.
-- `npm exec --yes --package=npm@12.0.2 -- npm --version` — passed; `12.0.2`.
-- `node -p "JSON.stringify({piSubagents:require('./node_modules/pi-subagents/package.json').version, bridge:require('./node_modules/@alexeiled/pi-subagents-bridge/package.json').version, pi:require('./node_modules/@earendil-works/pi-coding-agent/package.json').version})"` — passed; `0.76.1`, `0.5.5`, `1.0.4`.
-- `npm exec -- vitest run test/native-runtime-contract.test.ts test/runtime-boundaries.test.ts` — passed; 2 files, 3 tests.
-- `node --test test/native-recovery-smoke.mjs` — passed 4 tests. The new U2 case uses two fresh Node host processes; both ID queries fail while exact native-run status returns observed proof and the side-effect count remains one.
-- `npm run check` — passed after fixing the new fixture typing. It emitted four non-failing informational suggestions in untouched `src/registry-lock.ts`, `test/index.test.ts`, and `test/review-backend.test.ts`.
-- `git diff --check` — passed for the tracked U2 delta. No source changes outside the declared test/evidence scope.
+P = pure/table; C = controller/client with real temp registry/Git and controlled
+external boundary; H = actual released Pi/public RPC/native runner with local
+model; X = separate processes/fault barriers. PASS is scoped to the named tests
+and stated layers, not every conceivable timing or all platforms. Historical
+Bridge/Fusion words in old test titles name preserved controlled-boundary tests,
+not a restored production Bridge launcher. Template titles are the exact source
+names of parameterized tests. Packed entries additionally identify their mode.
+The table explicitly leaves genuine host-level gaps/unsupported guarantees open.
 
-The first check run before the bounded recovery failed on the new fixture's TypeScript issues; those diagnostics were corrected and the final `npm run check` passed. The parent subsequently ran `npm test` and `npm run test:runtime-smoke` here after the review fixes. `npm run pack:dry` has only the unchanged separate-checkout baseline result so far.
-
-## Parent verification after review
-
-The parent reproduced a native module-cache leak: following failed setup in sandbox A, a second host in sandbox B still used A's cached async/results roots. Root-isolation assertions failed before the fix. The setup-failure probe now runs in a fresh Node process with a minimal environment, leaving the main test's native module imports isolated to its own sandbox. Its regression checks both async/results roots.
-
-A second red test showed that the import guard missed side-effect imports and require calls. The scanner now covers those literal forms as well as named and dynamic imports. This remains a literal-import guard, not whole-program data-flow analysis.
-
-Smoke failure cleanup now attempts bounded stop and proof observation only for known fixture run IDs. Stop delivery alone leaves the run unresolved; already-proven runners are never signalled again. Failed sandboxes stay retained. The fixture's dispose method is not retirement evidence.
-
-Parent commands after these fixes:
-
-- Focused Vitest probes — 2 files, 3 tests passed; both root-leak and scanner regressions failed before their fixes.
-- `node --test test/native-recovery-smoke.mjs` — 3 tests passed.
-- `npm run check` — passed, with the same four informational baseline suggestions.
-- `npm test` — 594 Vitest and 140 node tests passed; complete log: `.pi/native-runtime-parent/npm-test.log`.
-- `npm run test:runtime-smoke` — 2 tests passed; complete log: `.pi/native-runtime-parent/runtime-smoke.log`.
-
-After the U2 delta, the writer reran the focused Vitest probes, native smoke (4 tests) and check successfully. The parent independently reran the native smoke: 4 tests passed, with the same missing direct-RPC correlation and a single worker side effect across two fresh hosts. Full output, including exact request/run/process identities: `.pi/native-runtime-parent/u2-smoke.log`. The full suite was not repeated after this delta; its 594/140 result above applies to the preceding checkpoint.
-
-These checks accept only the current partial characterization, not Task 1 or an upstream fix.
-
-## Upstream fixes (PR open, unreleased)
-
-The operator first approved local fixes, then requested one combined PR.
-Published [pi-subagents PR #2717](https://github.com/nicobailon/pi-subagents/pull/2717)
-from `alexei-led:fix/rpc-async-recovery`, head
-`2328b1d22f047fa281f7ce30668f684166f43084`. The PR was verified open with CI
-in progress. No merge, tag, release or global package upgrade was performed. The refreshed upstream base
-was `5da808168c097ea0d56616644773efe0f6f87938`; no open PR already covered the
-two fixes when checked.
-
-Separate pi-subagents branches:
-
-- `fix/rpc-stop-parity`, commit `37601c5a`: reuse the tool's existing stop
-  delivery and proof-backed paused sealing policy in RPC. Keep the successful
-  `stopping` acknowledgement separate from lifecycle/retirement proof.
-- `fix/rpc-direct-correlation`, commit `00147dba`: retain the existing
-  tool-call ID through direct async launch, runner status rewrites and terminal
-  result. Reuse the existing indexed alias resolver and existing structured
-  runId/toolCallId fields. No new RPC method, scan, journal or idempotency claim.
-
-Independent read-only reviews found no confirmed code defects in the inspected
-seams. The parent checked complete diffs and added the public contract wording.
-The stop review did not locate this downstream evidence file in the upstream
-checkout; its code review and the parent's reproduction cover different evidence.
-
-Combined branch `integration/native-rpc-fixes` contains cherry-picks
-`089b8ce3` and `2328b1d2`. Component and integration worktrees were clean
-after their commits. They remain separate from both repositories' main checkouts.
-
-Validation on the combined tree:
-
-- `npm run typecheck` passed.
-- First `npm run test:all` stopped in unit tests: 3,813 passed, 11 failed,
-  17 skipped. Failures included macOS socket-path length, noncanonical
-  /var versus /private/var paths, path truncation and a short fixture deadline.
-- With `TMPDIR=/private/tmp` and `--test-concurrency=4`, all 99 cases in the
-  initially failing groups passed unchanged. No assertions were disabled.
-- The complete unit suite under those settings had 3,823 passed, one failed
-  and 17 skipped. The remaining `global-npm-root` timeout test attempted to
-  read its PID file after its 500ms deadline had expired before file creation.
-  Its isolated seven-test file then passed. That concurrent run was not clean.
-  The complete unit suite was subsequently run with the same canonical temp
-  root and `--test-concurrency=1`: 3,824 passed, zero failed, 17 skipped.
-  No source, assertions or skip rules were changed to obtain this result.
-- The complete integration suite under the same canonical temp/concurrency
-  settings passed: 1,168 passed, zero failed, seven skipped.
-- Integration fixtures still logged the existing missing
-  `(deps.parentWake ?? deps.pi).sendMessage` callback warning. No unrelated
-  notification implementation change was made.
-- `npm run build:pkg` and local tarball creation passed. The tarball retains
-  the package's 0.76.1 version string but is an unreleased development artifact,
-  not evidence that published 0.76.1 contains these fixes.
-- Extension API documentation links and Git whitespace checks passed.
-- The baseline npm audit warning remains untriaged and unchanged.
-
-Exact combined-tree commands and logs are under the upstream integration
-worktree's `tmp/native-rpc-integration/`: `typecheck.log`, `test-all.log`,
-`environment-repro.log`, `unit-canonical.log`, `global-npm-repro.log`,
-`unit-serial.log`, `integration-canonical.log`, `build-package.log` and `pack.json`.
-Unit/integration retries used the repository's existing Node test loaders and
-complete file inventories, with only TMPDIR and test concurrency changed.
-
-Published-runtime cutover remains blocked. These local candidates do not
-authorize relaxing unknown-launch fences or pinning an unreleased build as
-released compatibility.
-
-## Merge coordination with force-stop / 1.8.0
-
-Both parent sessions confirmed this order and ownership:
-
-1. The `feat/exec-force-stop-ux` lane owns its feature PR integration and the
-   operator-authorized 1.8.0 tag/release. This migration lane does not merge to
-   pi-plan-exec main, tag, or bump its version.
-2. Force-stop landed first in [PR #11](https://github.com/alexei-led/pi-plan-exec/pull/11),
-   immutable merge `bc5fb6ef800b6e88f3edeef542869bbd84a9ed3a`. GitHub confirmed
-   the merged state and matching feature head. Its owner retained release authority.
-   Release [v1.8.0](https://github.com/alexei-led/pi-plan-exec/releases/tag/v1.8.0)
-   is published; the parent independently checked the release target and peeled
-   tag both resolve to that exact merge SHA. The release owner reported successful
-   provenance publication and tarball verification. No global upgrade was performed here.
-3. This lane merged that exact SHA without rewriting history, producing
-   `a410e22b548a08809958dd9695f7f4a47c85d0e9`. The merge was clean. Plan baseline
-   and compatibility requirements now reflect 1.8.0; headings, dependencies,
-   checkbox text and completed checkpoints remain unchanged.
-4. A future migration-to-main merge needs renewed coordination. Task 1 remains
-   partial and upstream PR #2717 is not a released runtime prerequisite yet.
-
-Early conflict check: the common base is `757b6a3`. A read-only
-`git merge-tree --write-tree b77674b 4bb0a6e` produced a clean merge tree.
-The migration branch changes six plan/evidence/native-test files; the force-stop
-branch changes twenty files, with no path overlap. This is not a real merge or
-a final compatibility claim. That earlier check preceded the final safety fixes. The read-only merge-tree
-check was repeated against `c7bbc1f` and the final `bc5fb6e` before the actual
-clean merge; no conflicted files or manual resolutions were required.
-
-Semantic requirements to preserve after refresh:
-
-- Terminal operator `abandoned` is a durable management decision, not proof of
-  worker retirement; no automatic restore, resume or default UI resurrection.
-- Ordinary CAS writes cannot revive an abandoned run. Native replay/dispatch
-  must recheck stop and execution generations after asynchronous admission.
-- Preserve unknown active and failed operation identity plus every quarantined
-  target. All abandoned checkouts stay reserved until controller-lock quiescence
-  and cleanup eligibility are proven.
-- Sync the backup/final abandonment marker before cleanup or provider calls.
-  Flush the final archive inside the removal lock before deleting active state.
-- Cancellation remains exact-operation best effort. Delivery, abandonment and
-  process-retirement proof stay separate; missing evidence never frees a writer.
-- Older registry cleanup must not operate on new abandoned record shapes.
-
-Combined-tree verification completed on `a410e22b`:
-
-- `npm run check` passed (same four non-failing baseline suggestions).
-- `npm test` passed: 626 Vitest tests in 33 files and 143 node lifecycle/UI tests.
-  This includes force-stop, controller, registry, lifecycle, isolation,
-  run-view/runtime-integration and the native contract fixtures.
-- `npm run test:runtime-smoke` passed: two tests.
-- `node --test test/native-recovery-smoke.mjs` passed: four tests.
-- `npm run pack:dry` passed.
-
-Logs: `.pi/native-runtime-parent/force-stop-merge/`. Package/lock changes from
-1.7.1 to 1.8.0 only change the root version, so existing checkout-local locked
-dependencies were reused. No global install, live registry, other worktree,
-main checkout, tag or release was changed by this integration.
-
-These checks establish that the current characterization branch coexists with
-1.8.0. The native safety-kernel migration is not implemented, so its future
-abandonment compatibility still requires the planned tests.
-
-## Operator revision: do not wait for upstream
-
-The operator explicitly requested completing the remaining migration even if
-upstream PR #2717 is never merged. The selected baseline is now one keyed public
-native workflow per operation on unmodified 0.76.1, with caller-owned operation
-state and bound outputs. Direct-leaf optimization is deferred rather than adding
-conditional backends. Missing identity/proof remains fenced; upstream fixes are
-optional improvements, not installation/cutover prerequisites.
-
-See [execution contract](execution-contract.md) for the component boundaries.
-This approved revision changes the prior direct-leaf/release-gated plan text;
-completed evidence checkpoints are retained. No active /exec controller is used
-for this operator-managed implementation.
-
-## Remaining Task 1 work
-
-Still required: exercise queued/paused stop parity against real native states; run the parent-death fault barrier; verify direct-leaf control enforcement (including structured output and actual timeout/turn limits); exercise a fresh Pi normal-loader host; and complete the S01–S56 scenario mapping. U1/U2 are published together in upstream PR #2717, but are not merged or released. A supported released native contract remains a cutover prerequisite. No upstream release or global install was performed. Force-stop/command-UX PR #11 is merged into this branch and its 1.8.0 abandonment/reservation/no-autorestore contract is incorporated into the plan. Preserve that contract in Tasks 2–5; those production tasks have not started.
+| ID | Local result / actual layer | Concrete test(s) | Scope / unresolved limitation |
+| --- | --- | --- | --- |
+| S01 | PASS C/H | `test/controller.test.ts` — **existing linked worktree execution keeps its branch and plan**<br>`test/controller.test.ts` — **in-place execution on the default branch keeps that branch**<br>`test/autonomous-controller.test.ts` — **nested execution keeps the worker cwd with plan in ${planDirectory}**<br>`test/git.test.ts` — **plans execution worktree paths without running Git before durable intent exists**<br>`test/packed-consumer-smoke.mjs` — **packed normal loader: native execution, recovery, readonly controls, supervisor reload and pinned-executor cutover** | C covers worktree/nested variants; H packed `plan` uses in-place target. |
+| S02 | PASS C/H | `test/autonomous-goal.test.ts` — **a goal continues after an intermediate answer and completes when checks pass**<br>`test/packed-consumer-smoke.mjs` — **packed normal loader: native execution, recovery, readonly controls, supervisor reload and pinned-executor cutover** | H packed `goal`; durable checks and review/archive remain mandatory. |
+| S03 | PASS C | `test/autonomous-goal.test.ts` — **a goal that claims done with failing checks continues instead of completing**<br>`test/autonomous-goal.test.ts` — **goal completion pauses when the diff deletes tests**<br>`test/autonomous-goal.test.ts` — **three turns without progress pause the goal and launch nothing further**<br>`test/autonomous-goal.test.ts` — **a goal paused for its turn budget grants more turns on explicit resume**<br>`test/autonomous-goal.test.ts` — **a failed native child cannot complete a goal by printing GOAL_DONE** | False completion, test deletion, no-progress/turn budgets and explicit resume are controller probes. |
+| S04 | PASS C | `test/autonomous-controller.test.ts` — **nested independent task lane preserves the cwd and excludes partial work**<br>`test/autonomous-controller.test.ts` — **external prerequisite A preserves its lane while B completes and C waits until automatic recovery** | Real temp Git lanes; unknown original writer is not reclassified dead. |
+| S05 | PASS C/X | `test/registry-lock.test.ts` — **two crash recoverers admit only one run while the first pauses before publication**<br>`test/registry-lock.test.ts` — **cross-process compare-and-set applies exactly one shared revision**<br>`test/registry.test.ts` — **concurrent starts through different path aliases admit exactly one run**<br>`test/controller.test.ts` — **same-session concurrent resumes launch one operation** | Kernel lock cross-process admission plus lease/CAS races. |
+| S06 | PASS C/H | `test/index.test.ts` — **native ambient child startup is inert before any registration or runtime access**<br>`test/packed-consumer-smoke.mjs` — **packed normal loader: native execution, recovery, readonly controls, supervisor reload and pinned-executor cutover** | Packed loader checks actual ambient children, command registrations, Fleet/provider registration and lease writes. |
+| S07 | PASS C | `test/native-runtime.test.ts` — **stop before emit retires locally without launch; foreign control and abandoned writes denied**<br>`test/controller.test.ts` — **force stop wins while native readiness is pending without dispatch** | Authorization checked before emitting the public request. |
+| S08 | PASS C | `test/native-runtime.test.ts` — **double spawn CAS-claims once and freezes body before emit**<br>`test/native-runtime.test.ts` — **stop before emit retires locally without launch; foreign control and abandoned writes denied** | Durable prepared/CAS barrier; no physical SIGKILL at this pre-emit point. |
+| S09 | PASS C | `test/native-runtime.test.ts` — **lost response discovers only exact structured correlation; unknown is never absence or replay**<br>`test/native-runtime.test.ts` — **malformed replies and unknown lookups never authorize a second spawn**<br>`test/native-runtime.test.ts` — **unbound recovery targets only its persisted request alias, never snapshot candidates** | Dispatching/unknown is never re-emitted after a missing reply, including unbound exact-alias inspection. |
+| S10 | PASS C/H/X | `test/native-runtime.test.ts` — **correlated completion retains binding after lost reply without replay or late abandoned writes**<br>`test/native-recovery-smoke.mjs` — **selected keyed workflow recovers exact request correlation across fresh OS hosts without redispatch**<br>`test/packed-consumer-smoke.mjs` — **packed normal loader: native execution, recovery, readonly controls, supervisor reload and pinned-executor cutover** | Packed `plan` drops actual spawn reply; fresh-process keyed workflow probe observes one effect. |
+| S11 | PASS C/H | `test/native-runtime.test.ts` — **abandoned lost spawn resolves its exact alias and stops without ordinary binding writes**<br>`test/packed-consumer-smoke.mjs` — **packed normal loader: native execution, recovery, readonly controls, supervisor reload and pinned-executor cutover** | Packed `stop` drops reply and checks absent external ID before abandonment, then exact alias stop. |
+| S12 | PASS C | `test/native-runtime.test.ts` — **abandoned exact alias ${outcome} remains unknown with no stop or replay**<br>`test/native-runtime.test.ts` — **imported alias ${outcome} cannot establish a legacy binding**<br>`test/native-runtime.test.ts` — **malformed replies and unknown lookups never authorize a second spawn** | Foreign/ambiguous/not-found correlation remains unknown; retained only through validated authority. |
+| S13 | PASS C/H | `test/native-runtime.test.ts` — **no-child failed workflow can retire but never supply task success**<br>`test/native-runtime-contract.test.ts` — **released public RPC characterizes rejection, stop parity, ownership, and missing proof**<br>`test/packed-consumer-smoke.mjs` — **packed normal loader: native execution, recovery, readonly controls, supervisor reload and pinned-executor cutover** | No-child failure is not success; real missing configured agent refuses before model work. |
+| S14 | PASS C | `test/controller.test.ts` — **stale completed observation preserves a newer cancellation request**<br>`test/native-runtime.test.ts` — **late response binds after stop without overwriting stop intent; queued rejection is retryable**<br>`test/native-runtime.test.ts` — **native controller force-stop abandons before provider calls and cannot revive** | Stale observation cannot erase cancellation; abandoned ordinary writes forbidden. |
+| S15 | PASS C/H | `test/autonomous-controller.test.ts` — **pause persists cancellation before RPC and early resume cannot replace the live attempt**<br>`test/native-runtime.test.ts` — **native controller pause observes exact retirement without accepting output or relaunching**<br>`test/packed-consumer-smoke.mjs` — **packed normal loader: native execution, recovery, readonly controls, supervisor reload and pinned-executor cutover** | Explicit pause retains operation; H packed `supervisor` holds final user pause. |
+| S16 | PASS C | `test/autonomous-controller.test.ts` — **pending native cancellation errors survive observations and restart until delivered**<br>`test/autonomous-controller.test.ts` — **pause cancellation reply loss retries the same fence without claiming worker exit**<br>`test/native-runtime.test.ts` — **native stop refuses mismatched ${wrong} delivery and retries only the same bound run** | Persisted stop intent retries exact bound identity; a lost acknowledgement is not death. |
+| S17 | PASS C; LIMIT H | `test/native-runtime-contract.test.ts` — **released public RPC characterizes rejection, stop parity, ownership, and missing proof**<br>`test/autonomous-controller.test.ts` — **pending native cancellation errors survive observations and restart until delivered** | Seeded real-public-RPC queued/paused refusal characterization plus C pending-stop handling. Live queued/paused RPC parity is not claimed. |
+| S18 | PASS P/C/H | `test/execution-contract.test.ts` — **process terminal proof accepts only complete observed upstream receipts**<br>`test/native-runtime.test.ts` — **wrong root, child identity and malformed published proof cannot retire ownership**<br>`test/native-recovery-smoke.mjs` — **failure cleanup leaves unproven runners unresolved after stop delivery**<br>`test/packed-consumer-smoke.mjs` — **packed normal loader: native execution, recovery, readonly controls, supervisor reload and pinned-executor cutover** | Exact public proof only; packed `stop` and parent-death preserve uncertainty. |
+| S19 | PASS C/H | `test/force-stop.test.ts` — **backup failure leaves management state unchanged**<br>`test/force-stop.test.ts` — **failed final backup never deletes the abandoned active record**<br>`test/force-stop.test.ts` — **force abandonment ends management without inventing retirement or freeing an unknown checkout**<br>`test/packed-consumer-smoke.mjs` — **packed normal loader: native execution, recovery, readonly controls, supervisor reload and pinned-executor cutover** | Backup/final-marker fault tests and actual lost-reply force-stop. No cleanup merely from stop delivery. |
+| S20 | PASS C | `test/autonomous-controller.test.ts` — **late successful worker after stop cannot accept its candidate**<br>`test/controller.test.ts` — **force stop fences a pending archive observation and holds the checkout until tick retirement**<br>`test/index.test.ts` — **force stop refreshes a foreign observer and suppresses late completion (stale=${staleCompletion})** | Late success/stop race cannot accept candidate or revive final management state. |
+| S21 | PASS C | `test/native-runtime.test.ts` — **lost native reply retirement binds only through the abandoned retirement seam**<br>`test/native-runtime.test.ts` — **abandoned lost spawn resolves its exact alias and stops without ordinary binding writes**<br>`test/force-stop.test.ts` — **eligible cleanup archives then removes only the exact registry directory** | Post-abandonment discovery is readonly; exact retirement uses its single authorized seam. |
+| S22 | PASS C/H | `test/native-runtime.test.ts` — **native resume preflight inspects an exact existing binding without another spawn**<br>`test/autonomous-controller.test.ts` — **paused runs observe a tracked child without accepting it or dispatching a replacement**<br>`test/packed-consumer-smoke.mjs` — **packed normal loader: native execution, recovery, readonly controls, supervisor reload and pinned-executor cutover** | Reload cannot duplicate or implicitly resume explicit pause/abandonment. |
+| S23 | PASS H/X SAFE UNCERTAINTY | `test/native-parent-death-smoke.mjs` — **S23 SIGKILL after native launch barrier leaves one surviving child and no recovery redispatch** | Actual parent SIGKILL, same live child heartbeat, release, fresh host, one side effect and zero recovery spawns; missing parent-observed proof leaves operation bound. |
+| S24 | PASS C/H/X | `test/native-recovery-smoke.mjs` — **selected keyed workflow recovers exact request correlation across fresh OS hosts without redispatch**<br>`test/autonomous-controller.test.ts` — **restart after candidate commit verifies it without another implementation worker**<br>`test/native-runtime.test.ts` — **cancellation recovery binds a lost launch but cannot consume a successful review or revive the run** | Fresh-host lost reply plus retained result/review candidate checks. H/X does not emulate arbitrary filesystem power loss. |
+| S25 | PASS C/H SAFE UNCERTAINTY; DETACH LIMIT | `test/packed-consumer-smoke.mjs` — **packed normal loader: native execution, recovery, readonly controls, supervisor reload and pinned-executor cutover**<br>`test/controller.test.ts` — **resume consumes a settled detached stats child without launching a replacement**<br>`test/index.test.ts` — **generic paused operation guidance does not invent a supervisor request**<br>`test/index.test.ts` — **user-pause intent precedes generic recovery advice: ${error}** | Packed `supervisor`: actual contact_supervisor wait/reply, explicit foreground-detach refusal, same child/session after host reload, one effect/no replacement, pause wins. Controller remains bound; no validated settled acceptance. Reload before answering a pending question is not proven. |
+| S26 | PASS P/C | `test/registry.test.ts` — **a dead local pid frees the lease without waiting out the heartbeat**<br>`test/registry.test.ts` — **matching session text does not authorize takeover from a live remote owner**<br>`test/index.test.ts` — **--same-machine verifies local proof before taking a foreign lease**<br>`test/native-runtime.test.ts` — **native session authority is separate from the controller UUID and immutable** | Lease recovery and immutable native authority are distinct. No fabricated foreign-host takeover. |
+| S27 | PASS P/C; HONEST LIMIT | `test/autonomous-controller.test.ts` — **silent unbounded workers never acquire a synthetic execution budget**<br>`test/native-runtime.test.ts` — **prepare records unsupported limits honestly and freezes configured agent/model into awaited child**<br>`test/lifecycle.test.ts` — **legacy unknown operation lifetime is not synthesized from a changed frozen base** | No synthesized unbounded/turn guarantee. Native child defaults remain native defaults. |
+| S28 | PASS C/H | `test/packed-consumer-smoke.mjs` — **packed normal loader: native execution, recovery, readonly controls, supervisor reload and pinned-executor cutover**<br>`test/autonomous-controller.test.ts` — **confirmed bounded expiry grows later budgets while a lost reply preserves the exact request**<br>`test/autonomous-controller.test.ts` — **bounded compatibility stops growing at the supported timer maximum without ending recovery**<br>`test/autonomous-controller.test.ts` — **ordinary tool timeout text cannot grow a bounded session budget** | Packed `deadline`: blocked real local-model request, actual root and child 8000ms expiry, exact observed runner-instance close proof. Budget growth/cap are C tests, not inferred from runtime prose. |
+| S29 | PASS C | `test/autonomous-controller.test.ts` — **unavailable runtime preflight is an explicit prerequisite and does not consume a worker attempt**<br>`test/autonomous-controller.test.ts` — **structured tool diagnosis preserves the session and schedules probes without unsupported repair**<br>`test/autonomous-controller.test.ts` — **doctor preserves the same launch identity when an empty lookup races a late spawn** | Capability/prerequisite failures keep identity without silent repair, replay or unsupported guidance. |
+| S30 | PASS C | `test/autonomous-controller.test.ts` — **diagnostic capability does not trigger guidance or cancellation for a silent healthy tool**<br>`test/autonomous-controller.test.ts` — **status uncertainty beyond diagnostic burst preserves one writer and automatic wake**<br>`test/autonomous-controller.test.ts` — **advisory observations cannot become verified progress or retirement** | Healthy silence is not death; diagnostic budget alone cannot stop or replace writer. |
+| S31 | PASS P/C/H | `test/review.test.ts` — **native reports bind clean, blocking and minor findings to the candidate commit**<br>`test/review.test.ts` — **native reports reject wrong commits, malformed findings and contradictory fields**<br>`test/autonomous-controller.test.ts` — **minor-only required review records advisory findings without an endless fixer**<br>`test/packed-consumer-smoke.mjs` — **packed normal loader: native execution, recovery, readonly controls, supervisor reload and pinned-executor cutover** | Packed plan/goal/findings/wrong-commit/malformed cases; minor terminal behavior is C. Schema acceptance still binds exact Git candidate. |
+| S32 | PASS P/H | `test/artifact.test.ts` — **native bound files never infer fallback output for missing, truncated or excessive reports**<br>`test/artifact.test.ts` — **recovers a settled detached workflow after its result was archived**<br>`test/native-runtime.test.ts` — **native result requires consistent bound JSON: ${scenario}**<br>`test/packed-consumer-smoke.mjs` — **packed normal loader: native execution, recovery, readonly controls, supervisor reload and pinned-executor cutover** | Packed missing bound file fails acceptance; artifact tests exercise truncated/deleted/archived evidence. Contradictory parsed JSON is never masked by envelope. |
+| S33 | PASS H NAMED CASES | `test/packed-consumer-smoke.mjs` — **packed normal loader: native execution, recovery, readonly controls, supervisor reload and pinned-executor cutover** | Packed `tool-ceiling`, `schema-ceiling`, `missing-agent`: mutation tool actually rejected, internal structured_output remains permitted by released contract without widening caller tools, unknown configured agent fails pre-model. Lazy-skill denial is not separately probed; no claim that package-owned schema tool must be denied. |
+| S34 | PASS C/H; HONEST LIMIT | `test/packed-consumer-smoke.mjs` — **packed normal loader: native execution, recovery, readonly controls, supervisor reload and pinned-executor cutover**<br>`test/native-runtime.test.ts` — **prepare records unsupported limits honestly and freezes configured agent/model into awaited child** | Actual readonly/schema/model behavior and 8s expiry, not only request echoes. maxTurns unsupported; native child defaults prevent an end-to-end-unbounded claim; tool filtering is not an OS sandbox. |
+| S35 | PASS C/X | `test/local-operation.test.ts` — **controller death leaves one command that a new controller adopts**<br>`test/local-operation.test.ts` — **batch monitor death cancels surviving descendants before a fresh retry**<br>`test/local-operation.test.ts` — **stop retires the owned process group and fences later commands**<br>`test/autonomous-controller.test.ts` — **bootstrap changes identity only after proven failure and does not consume task attempts** | Existing owned-process implementation unchanged; real local monitor/controller-death and cancellation probes. |
+| S36 | PASS C | `test/autonomous-controller.test.ts` — **untracked source cannot be smuggled into an accepted candidate**<br>`test/autonomous-controller.test.ts` — **candidate verification failure is recoverable and never accepts checkbox-only work**<br>`test/controller.test.ts` — **explicit recovery can adopt the verified current execution branch**<br>`test/controller.test.ts` — **branch adoption rejects a run with an active child** | Real Git checks reject dirty/checkbox-only candidates and require explicit branch adoption. |
+| S37 | PASS C/X/H | `test/owned-git.test.ts` — **owned post-merge survives controller death and promotes the same accepted candidate**<br>`test/autonomous-controller.test.ts` — **accepted internal-lane work fast-forwards the original output branch without erasing dirty files**<br>`test/controller.test.ts` — **archive recovery completes after a committed plan move without committing again**<br>`test/controller.test.ts` — **archive retry preserves a partially staged move and unrelated changes**<br>`test/packed-consumer-smoke.mjs` — **packed normal loader: native execution, recovery, readonly controls, supervisor reload and pinned-executor cutover** | Owned Git survives parent death; archive recovery preserves user changes; packed cutover reaches actual archive commit. |
+| S38 | PASS C | `test/autonomous-controller.test.ts` — **optional statistics failure needs exit proof but cannot block mandatory completion afterward**<br>`test/autonomous-controller.test.ts` — **required review cannot be waived by explicit skip**<br>`test/controller.test.ts` — **a force-skipped stage makes terminal completion honest** | Stats degrade only after proof; required review cannot be waived; legacy explicit skip preserves findings. |
+| S39 | PASS C/X | `test/controller.test.ts` — **Fusion replay preserves the operation identity without unsafe fallback**<br>`test/review-backend.test.ts` — **a reviewer without explicit execution-lifetime support is rejected before launching**<br>`test/review-backend.test.ts` — **controlled Revmux review survives client restart and replays exactly one operation**<br>`test/autonomous-controller.test.ts` — **unknown review lookup does not replay or launch a configured fallback** | Explicit adapters retain their existing capability/owned-command contracts; no installed external-provider/live-model compatibility claim. |
+| S40 | PASS P/C/H | `test/pi-rpc-smoke.test.ts` — **real Pi RPC registers exec and renders isolated status without model dispatch**<br>`test/index.test.ts` — **display controls persist independently of stopped run state**<br>`test/index.test.ts` — **force stop stays dismissed through late updates, branch navigation, and a fresh session**<br>`test/index.test.ts` — **unpolled ${owner} run stays an amber snapshot on startup and explicit show** | Real no-session status host; display state is separate from lease/management and force-stop reservations. |
+| S41 | PASS C/H | `test/runtime-integration.test.ts` — **Fleet admission failure cannot hide active background work or leak completion**<br>`test/runtime-integration.test.ts` — **late running snapshots cannot re-add terminal work to the provider**<br>`test/runtime-integration.test.ts` — **terminal Fleet retention is bounded without dropping active work**<br>`test/ui-controller-integration.test.ts` — **background recovery keeps ticking through UI failure and pending Fleet publication**<br>`test/packed-consumer-smoke.mjs` — **packed normal loader: native execution, recovery, readonly controls, supervisor reload and pinned-executor cutover** | Fleet failure/stale-generation behavior is controlled C; packed real loader sees one parent provider and inert children. |
+| S42 | PASS P/C | `test/legacy-import.test.ts` — **legacy snapshot import preserves original intent, cancellation and read-only source bytes**<br>`test/native-runtime.test.ts` — **imported dispatch alias resolves read-only and controller CAS binds original intent**<br>`test/native-runtime.test.ts` — **known legacy retirement without retained result state is diagnosed, not accepted or relaunched**<br>`test/index.test.ts` — **legacy terminal history is visible without rewriting registry or task files**<br>`test/force-stop.test.ts` — **ordinary cleanup enforces the final abandonment archive after an interrupted force-stop** | Readonly legacy import/binding and abandonment history; no live legacy journal was opened. Full old live workflow settlement is not newly demonstrated by a model-host probe. |
+| S43 | PASS C | `test/legacy-operation.test.ts` — **legacy-operation reports exclusive lock unavailable within bounded wait**<br>`test/legacy-operation.test.ts` — **legacy-operation reads committed WAL rows and does not observe uncommitted updates**<br>`test/legacy-operation.test.ts` — **legacy-operation refuses schema ${version} without migration**<br>`test/legacy-operation.test.ts` — **legacy-operation does not initialize an existing empty file** | Disposable SQLite fixtures only; pinned schema 7 readonly access and real lock/WAL cases. |
+| S44 | PASS C | `test/force-stop.test.ts` — **backup failure leaves management state unchanged**<br>`test/force-stop.test.ts` — **failed final backup never deletes the abandoned active record**<br>`test/force-stop.test.ts` — **ordinary cleanup enforces the final abandonment archive after an interrupted force-stop**<br>`test/legacy-import.test.ts` — **fresh CAS import preserves newer stop intent instead of overwriting a concurrent cancellation**<br>`test/legacy-import.test.ts` — **invalid import preserves a preexisting legitimate lease byte for byte** | Injected backup/final archive and import CAS races; no physical power-loss durability claim. |
+| S45 | PARTIAL C/X; H DUAL-RUNTIME NOT RUN | `test/registry.test.ts` — **unreadable ownership records fail closed during exclusive creation**<br>`test/registry-lock.test.ts` — **two crash recoverers admit only one run while the first pauses before publication**<br>`test/rollback-preflight.test.ts` — **S53 frozen 1.8.0 accepts native records, guards reservations, but old cleanup deletes native history and unreadable ownership** | Reservation/admission seams covered; simultaneously active old and new extension runtimes not hosted together. S53 disproves old native-format rejection, so supported rollback/cutover requires quiescence and preflight, not direct old execution. |
+| S46 | PASS C/X | `test/registry.test.ts` — **remove decides refusal under the lock, not before it**<br>`test/registry.test.ts` — **corrupt run cleanup preserves the independent local ownership fence**<br>`test/force-stop.test.ts` — **force abandonment revokes the current controller even while its tick lock is held**<br>`test/controller.test.ts` — **force stop fences a pending archive observation and holds the checkout until tick retirement**<br>`test/registry-lock.test.ts` — **removing a run preserves the lock inodes seen by waiting writers** | Removal/refusal under lock and final archive preserve independent ownership; stale views cannot revive abandonment. |
+| S47 | PASS C | `test/isolation.test.ts` — **explicit isolation preserves native uncertainty and creates one independent same-run writer**<br>`test/isolation.test.ts` — **force abandonment preserves isolated recovery lineage and every quarantined reservation**<br>`test/isolation.test.ts` — **restart after cloned checkout reuses the same target and rejects old-generation state** | Separate real repository and generation fences; old execution remains quarantined/unknown. |
+| S48 | PASS H | `test/packed-consumer-smoke.mjs` — **packed normal loader: native execution, recovery, readonly controls, supervisor reload and pinned-executor cutover**<br>`test/pack.test.ts` — **package manifest ships only plan-exec resources, needs no runtime dependency, and requires native peers without removed packages** | Packed absent dependencies; `cutover` begins with real old packages installed in target but unused by separately installed executor, then removes them. Foreign task/projection sentinels unchanged throughout. |
+| S49 | PASS P/C/H | `test/native-runtime.test.ts` — **malformed replies and unknown lookups never authorize a second spawn**<br>`test/native-runtime.test.ts` — **disposal settles pending RPC without permitting replay and removes listeners**<br>`test/native-runtime-contract.test.ts` — **released public RPC characterizes rejection, stop parity, ownership, and missing proof**<br>`test/packed-consumer-smoke.mjs` — **packed normal loader: native execution, recovery, readonly controls, supervisor reload and pinned-executor cutover** | Malformed/foreign replies and disposal tested against fake boundary; pinned public RPC real-route characterization plus normal loader. |
+| S50 | PASS P/H/X; LIMITED CONTAINMENT | `test/execution-contract.test.ts` — **process terminal proof accepts only complete observed upstream receipts**<br>`test/native-runtime.test.ts` — **actual async child classification requires its exact nonempty proof roster**<br>`test/native-recovery-smoke.mjs` — **released public RPC launches direct worker/reviewer leaves and preserves exact run proof identity**<br>`test/local-operation.test.ts` — **a restarted stop discovers and retires local descendants after both monitors die** | Native exact writer/runner proof, not arbitrary escaped-descendant containment. Existing local owned-process backend remains separate. |
+| S51 | PASS C/H | `test/native-runtime.test.ts` — **registry rejects changed native request/digest and ownership**<br>`test/autonomous-controller.test.ts` — **cumulative native usage is counted once across repeated status polls**<br>`test/autonomous-controller.test.ts` — **final checks get a fresh persisted identity after proven nonzero exit**<br>`test/packed-consumer-smoke.mjs` — **packed normal loader: native execution, recovery, readonly controls, supervisor reload and pinned-executor cutover** | C frozen request/digest and usage accounting; packed `findings` has distinct initial/fix/review operation directories and re-review. |
+| S52 | PASS P/C | `test/git.test.ts` — **accepts a symlink alias of a registered worktree with a newline in its path**<br>`test/native-runtime.test.ts` — **native cwd is the canonical authorized execution target, including nested lanes**<br>`test/native-runtime.test.ts` — **caller-bound output rejects symlinks before any dispatch**<br>`test/native-runtime.test.ts` — **prepare refuses an aliased output parent without creating files outside the run** | Canonical aliases are separate from output-source symlinks. No filename-based output identity. |
+| S53 | PASS CORRECTED NEGATIVE REGRESSION; OLD REJECTION DISPROVEN | `test/rollback-preflight.test.ts` — **S53 frozen 1.8.0 accepts native records, guards reservations, but old cleanup deletes native history and unreadable ownership**<br>`test/rollback-preflight.test.ts` — **rollback preflight refuses non-directory roots, symlinks and unreadable inspection without writes**<br>`test/rollback-preflight.test.ts` — **rollback preflight refuses a non-regular JSON source without opening it** | Frozen bc5fb6e source accepts native schema-1 record, refuses competing owner/active removal, but deletes terminal native history and corrupt ownership. New readonly explicit-directory preflight blocks native records/history/artifacts and incomplete inspection; direct old execution bypasses it and is unsafe. |
+| S54 | PASS H | `test/packed-consumer-smoke.mjs` — **packed normal loader: native execution, recovery, readonly controls, supervisor reload and pinned-executor cutover** | Packed `cutover`: executor tarball and full src fingerprint independently pinned; target starts with actual old packages; real native worker uninstalls both and commits lock/manifest; same unchanged executor reviews, checks and commits archive. |
+| S55 | PASS P/H + DOC INSPECTION | `test/pack.test.ts` — **package manifest ships only plan-exec resources, needs no runtime dependency, and requires native peers without removed packages**<br>`test/index.test.ts` — **setup installs native and optional fusion without removed packages**<br>`test/index.test.ts` — **the exec-plan skill documents exactly the subcommands /exec implements**<br>`test/packed-consumer-smoke.mjs` — **packed normal loader: native execution, recovery, readonly controls, supervisor reload and pinned-executor cutover** | Manifest and real packed loader exclude old packages; setup/help updated; historical references intentionally retained. No release/version bump. |
+| S56 | LOCAL GATES; LINUX NOT RUN | `test/runtime-boundaries.test.ts` — **native boundary guard rejects private native imports and accepts public subpaths**<br>`test/packed-consumer-smoke.mjs` — **packed normal loader: native execution, recovery, readonly controls, supervisor reload and pinned-executor cutover** | Complete test:all is the local gate. Bounded Ubuntu contracts/runtime/recovery/packed jobs retain logs/state; workflow lint is not a Linux runtime result. Independent review and final plan acceptance belong to parent. |

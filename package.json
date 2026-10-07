@@ -44,9 +44,12 @@
     "format:check": "biome format .",
     "pack:dry": "node scripts/check-pack.mjs",
     "publish:dry": "npm publish --dry-run",
-    "test:all": "npm run check && npm test && npm run pack:dry",
+    "test:all": "npm run check && npm test && npm run test:runtime-smoke && npm run test:native-recovery && npm run test:parent-death && npm run test:packed-consumer && npm run pack:dry",
     "test:native-recovery": "node --test test/native-recovery-smoke.mjs",
-    "test:packed-consumer": "node --test test/packed-consumer-smoke.mjs"
+    "test:packed-consumer": "node --test test/packed-consumer-smoke.mjs",
+    "test:parent-death": "node --test test/native-parent-death-smoke.mjs",
+    "test:native-contracts": "vitest run test/native-runtime-contract.test.ts test/native-runtime.test.ts test/operation-safety.test.ts test/rollback-preflight.test.ts",
+    "check:rollback": "node src/rollback-preflight.mjs"
   },
   "pi": {
     "extensions": [

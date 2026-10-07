@@ -126,6 +126,7 @@ export type NativeRuntimeHostOptions = {
   sessionId?: string;
   sessionFile?: string;
   nativeController?: 'plan' | 'goal' | 'fix';
+  holdChild?: boolean;
 };
 
 export function nativeFixtureFactoryModulePath(): string | undefined {
@@ -212,6 +213,7 @@ export async function createNativeRuntimeHost(
     process.env.PI_CODING_AGENT_DIR = agentDirectory;
     process.env.PI_SUBAGENTS_TEMP_ROOT = nativeTempRoot;
     process.env.PI_AUTONOMOUS_SMOKE_CALLS = callsPath;
+    if (options.holdChild) process.env.PI_NATIVE_HOLD_DIRECTORY = sandbox;
     if (options.nativeController)
       process.env.PI_NATIVE_CONTROLLER_SMOKE = options.nativeController;
     process.env.GIT_CONFIG_GLOBAL = '/dev/null';

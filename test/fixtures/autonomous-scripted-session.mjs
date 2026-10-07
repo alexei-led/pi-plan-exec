@@ -60,6 +60,22 @@ export default function scriptedSessions() {
           return () => listeners.delete(listener);
         },
         async prompt() {
+          const holdDirectory = process.env.PI_NATIVE_HOLD_DIRECTORY;
+          if (holdDirectory) {
+            let tick = 0;
+            while (!existsSync(join(holdDirectory, 'release-child'))) {
+              writeFileSync(
+                join(holdDirectory, 'child-barrier.json'),
+                JSON.stringify({
+                  pid: process.pid,
+                  sessionId,
+                  sessionFile,
+                  tick: ++tick,
+                }),
+              );
+              await new Promise((resolve) => setTimeout(resolve, 20));
+            }
+          }
           const agent = launch.runtime.agent;
           assert.ok(
             agent === 'worker' ||
