@@ -76,6 +76,7 @@ test('packed normal loader: native execution, recovery, readonly controls, super
   let supervisorReply = false;
   let releaseSupervisorChild = false;
   let supervisorReturned = false;
+  let supervisorReplyOutcome;
   let readonlyRefusal = false;
   const server = http.createServer((req, res) => {
     let body = '';
@@ -111,9 +112,16 @@ test('packed normal loader: native execution, recovery, readonly controls, super
             message.role === 'tool' &&
             String(message.tool_call_id).startsWith('fixture-contact'),
         );
+        if (mode === 'supervisor' && !worker && !reviewer) {
+          const reply = input.messages.find(
+            (message) =>
+              message.role === 'tool' &&
+              message.tool_call_id === 'fixture-supervisor-reply',
+          );
+          if (reply) supervisorReplyOutcome = JSON.stringify(reply);
+        }
         if (mode === 'supervisor' && worker && contactCalled) {
-          assert.match(body, /FINAL_PROBE_S25_REPLY/);
-          supervisorReturned = true;
+          supervisorReturned = body.includes('FINAL_PROBE_S25_REPLY');
           while (!releaseSupervisorChild && !res.destroyed)
             await new Promise((resolve) => setTimeout(resolve, 20));
           if (res.destroyed) return;
@@ -225,7 +233,9 @@ test('packed normal loader: native execution, recovery, readonly controls, super
                 name: 'structured_output',
                 arguments: JSON.stringify({ value: report }),
               }
-            : worker && !wrote
+            : worker &&
+                !wrote &&
+                !(mode === 'supervisor' && contactCalled && !supervisorReturned)
               ? {
                   name: 'bash',
                   arguments: JSON.stringify({
@@ -349,12 +359,14 @@ EventEmitter.prototype.emit=function(name,value,...rest){if(process.env.PI_SUBAG
     const observer = join(sandbox, 'observer.mjs');
     await writeFile(
       observer,
-      `import { registerSubagentCapabilityCeiling } from ${JSON.stringify(require.resolve('pi-subagents/capability-ceiling'))};
+      `import { registerSubagentCapabilityCeiling, resolveCurrentSubagentCapabilityCeiling } from ${JSON.stringify(require.resolve('pi-subagents/capability-ceiling'))};
+import { resolveSubagentLaunchContract } from ${JSON.stringify(require.resolve('pi-subagents/preflight'))};
 import{appendFileSync,existsSync,readFileSync,readdirSync,unlinkSync,writeFileSync}from'node:fs';import{join}from'node:path';
 export default function(pi){
  const root=${JSON.stringify(sandbox)},home=${JSON.stringify(home)};
  if(process.env.PI_SUBAGENT_CHILD!=='1'){pi.events.on('pi-intercom:detach-request',value=>writeFileSync(join(root,'supervisor-request.json'),JSON.stringify(value)));pi.events.on('pi-intercom:detach-response',value=>writeFileSync(join(root,'supervisor-detach.json'),JSON.stringify(value)));}
- pi.on('session_start',(_event,ctx)=>{if(process.env.PI_SUBAGENT_CHILD!=='1'&&ctx.cwd.endsWith('/schema-ceiling'))registerSubagentCapabilityCeiling({sessionId:ctx.sessionManager.getSessionId(),source:'final-probe',ceiling:{allowedTools:['read','grep','find','ls']}});});
+ pi.on('session_start',(_event,ctx)=>{if(process.env.PI_SUBAGENT_CHILD!=='1'&&ctx.cwd.endsWith('/schema-ceiling'))registerSubagentCapabilityCeiling({sessionId:ctx.sessionManager.getSessionFile()??ctx.sessionManager.getSessionId(),source:'final-probe',ceiling:{allowedTools:['read','grep','find','ls']}});});
+ pi.on('session_start',async(_event,ctx)=>{if(process.env.PI_SUBAGENT_CHILD!=='1'&&['/missing-skill','/lazy-skill'].some(name=>ctx.cwd.endsWith(name))){if(ctx.cwd.endsWith('/lazy-skill'))registerSubagentCapabilityCeiling({sessionId:ctx.sessionManager.getSessionFile()??ctx.sessionManager.getSessionId(),source:'skill-probe',ceiling:{allowedTools:['grep','find','ls']}});const result=await resolveSubagentLaunchContract({agent:'skill-probe',task:'Skill admission probe',cwd:ctx.cwd,context:'fresh',sessionRoot:join(root,'skill-preflight'),parentSessionId:ctx.sessionManager.getSessionId(),capabilityCeiling:resolveCurrentSubagentCapabilityCeiling(ctx.sessionManager.getSessionFile()??ctx.sessionManager.getSessionId()),availableModels:ctx.modelRegistry.getAvailable(),runtimeSnapshotHost:pi});writeFileSync(join(ctx.cwd,'..',ctx.cwd.endsWith('/lazy-skill')?'lazy-skill-preflight.json':'missing-skill-preflight.json'),JSON.stringify(result));}});
  pi.on('session_start',(_event,ctx)=>{const dir=join(home,'.pi','plan-exec','runs');const leases=existsSync(dir)?readdirSync(dir).filter(id=>!id.startsWith('.')).flatMap(id=>{try{const r=JSON.parse(readFileSync(join(dir,id,'run.json'),'utf8'));return r.lease?[{id,pid:r.lease.pid,sessionId:r.lease.sessionId}]:[];}catch{return[];}}):[];appendFileSync(join(root,'loads.jsonl'),JSON.stringify({pid:process.pid,child:process.env.PI_SUBAGENT_CHILD==='1',commands:pi.getCommands().map(c=>c.name),sessionId:ctx.sessionManager.getSessionId(),sessionFile:ctx.sessionManager.getSessionFile(),leases})+'\\n');});
 }`,
     );
@@ -490,6 +502,8 @@ export default function(pi){
       'tool-ceiling',
       'missing-agent',
       'schema-ceiling',
+      'missing-skill',
+      'lazy-skill',
       'deadline',
       'supervisor',
       'cutover',
@@ -513,6 +527,22 @@ export default function(pi){
 import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8'),'done\\n');`,
       );
       await writeFile(join(cwd, '.gitignore'), 'node_modules/\n');
+      if (['missing-skill', 'lazy-skill'].includes(mode)) {
+        await mkdir(join(cwd, '.pi/agents'), { recursive: true });
+        await writeFile(
+          join(cwd, '.pi/agents/skill-probe.md'),
+          '---\nname: skill-probe\ndescription: Deterministic skill admission probe\ntools: bash, read\ninheritSkills: false\nskills: fixture-private-skill\n---\nYou are `worker`. Deliver the fixture exactly once.\n',
+        );
+        if (mode === 'lazy-skill') {
+          await mkdir(join(cwd, '.pi/skills/fixture-private-skill'), {
+            recursive: true,
+          });
+          await writeFile(
+            join(cwd, '.pi/skills/fixture-private-skill/SKILL.md'),
+            '---\nname: fixture-private-skill\ndescription: Fixture lazy skill requiring read\n---\nInspect this file before work.\n',
+          );
+        }
+      }
       if (mode === 'schema-ceiling') {
         await writeFile(join(cwd, 'result.txt'), 'done\n');
         await writeFile(
@@ -570,6 +600,7 @@ import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8')
           retryDelayMs: [
             'deadline',
             'missing-agent',
+            'lazy-skill',
             'schema-ceiling',
             'supervisor',
           ].includes(mode)
@@ -577,6 +608,9 @@ import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8')
             : 100,
           ...(mode === 'missing-agent'
             ? { workerAgent: 'intentionally-missing-configured-agent' }
+            : {}),
+          ...(['missing-skill', 'lazy-skill'].includes(mode)
+            ? { workerAgent: 'skill-probe' }
             : {}),
           workerModel: 'localfixture/fixture',
           reviewerModel: 'localfixture/fixture',
@@ -598,6 +632,7 @@ import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8')
       supervisorReply = false;
       releaseSupervisorChild = false;
       supervisorReturned = false;
+      supervisorReplyOutcome = undefined;
       host.send({
         id: 'start',
         type: 'prompt',
@@ -610,7 +645,7 @@ import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8')
         async () => (await listRuns()).find((r) => r.repositoryRoot === cwd),
         `create ${mode}`,
       );
-      if (['missing-agent', 'deadline'].includes(mode)) {
+      if (['missing-agent', 'lazy-skill', 'deadline'].includes(mode)) {
         const failed = await waitFor(
           async () => {
             const current = await json(join(runs, run.id, 'run.json'));
@@ -631,6 +666,16 @@ import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8')
           45000,
         );
         assert.notEqual(failed.current.status, 'completed');
+        if (mode === 'lazy-skill') {
+          const preflight = await json(
+            join(sandbox, 'lazy-skill-preflight.json'),
+          );
+          assert.equal(preflight?.code, 'denied_required_tool');
+          assert.match(
+            JSON.stringify(failed.status),
+            /excludes required tool 'read' for lazy skill loading/,
+          );
+        }
         if (mode === 'deadline') {
           assert.ok(
             calls.some(
@@ -772,6 +817,17 @@ import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8')
           'actual detach command outcome',
           15000,
         );
+        assert.equal(supervisorReturned, false);
+        assert.equal(
+          calls.filter((call) => call.mode === mode && call.worker).length,
+          1,
+          'No contact_supervisor result has reached the waiting child before replacement',
+        );
+        assert.equal(existsSync(join(cwd, 'result.txt')), false);
+        // Replace the actual host while the original question is still unanswered.
+        await host.close();
+        host = undefined;
+        host = await launch(cwd, session);
         supervisorReply = true;
         host.send({
           id: 'supervisor-answer',
@@ -779,13 +835,15 @@ import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8')
           message: 'Reply to the retained fixture supervisor request now.',
         });
         await waitFor(
+          () => supervisorReplyOutcome,
+          'public reply outcome after pending-question reload',
+        );
+        assert.match(supervisorReplyOutcome, /Replied to supervisor request/);
+        await waitFor(
           () => supervisorReturned,
-          'actual supervisor reply returned to original child',
+          'reply reaches original waiting child',
         );
         const detachment = await json(join(sandbox, 'supervisor-detach.json'));
-        await host.close();
-        host = undefined;
-        host = await launch(cwd, session);
         releaseSupervisorChild = true;
         const settled = await waitFor(
           async () => {
@@ -794,8 +852,8 @@ import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8')
               child && !['running', 'queued'].includes(child.state) && child
             );
           },
-          'same child settles after reload',
-          45000,
+          'same child settles or reaches its original deadline after reload',
+          70000,
         );
         assert.equal(settled.runId, childId);
         assert.equal(
@@ -851,6 +909,8 @@ import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8')
             controllerPhase: retainedOp.native?.phase,
             controllerProof: retainedOp.native?.terminalProof,
             sideEffects: 1,
+            replacedWhilePending: true,
+            supervisorReplyOutcome,
             request,
             detachment,
             detachOutcome: detachOutcome.message,
@@ -906,6 +966,23 @@ import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8')
         );
         assert.equal(completed.reviewFindings.length, 0);
         assert.equal(completed.config.reviewerAgent, 'plan-exec-reviewer');
+        if (mode === 'missing-skill') {
+          const preflight = await json(
+            join(sandbox, 'missing-skill-preflight.json'),
+          );
+          assert.equal(preflight?.code, 'missing_skill');
+          assert.ok(calls.some((call) => call.mode === mode && call.worker));
+          console.log(
+            JSON.stringify({
+              scenario: 'S33 missing skill',
+              preflight,
+              actualExecution: completed.status,
+              effectiveTools: calls.find(
+                (call) => call.mode === mode && call.worker,
+              )?.tools,
+            }),
+          );
+        }
         if (mode === 'schema-ceiling')
           console.log(
             JSON.stringify({
@@ -1082,7 +1159,7 @@ import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8')
         scenarios.reduce(
           (sum, value) =>
             sum +
-            (value === 'missing-agent' || value === 'stop'
+            (['missing-agent', 'lazy-skill', 'stop'].includes(value)
               ? 0
               : ['schema-ceiling', 'deadline', 'supervisor'].includes(value)
                 ? 1

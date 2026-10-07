@@ -1,6 +1,6 @@
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { expect, onTestFinished, test, vi } from 'vitest';
 import { PlanExecController } from '../src/controller.js';
 import { parseResumeArguments } from '../src/index.js';
@@ -303,4 +303,36 @@ test('invalid import preserves a preexisting legitimate lease byte for byte', as
   expect(await readFile(f.registry.authorizationPath(f.run.id))).toEqual(
     before,
   );
+});
+
+test('legacy import publication EACCES preserves registry and SQLite bytes and retries the same identity', async () => {
+  const f = await fixture();
+  await writeLegacyJournal(f.snapshot, f.binding);
+  const record = f.registry.authorizationPath(f.run.id);
+  const before = await readFile(record);
+  const snapshot = await readFile(f.snapshot);
+  await chmod(dirname(record), 0o555);
+  try {
+    await expect(
+      f.controller.importLegacyJournal(f.run.id, 'owner', f.snapshot),
+    ).rejects.toMatchObject({ code: 'EACCES' });
+  } finally {
+    await chmod(dirname(record), 0o755);
+  }
+  expect(await readFile(record)).toEqual(before);
+  expect(await readFile(f.snapshot)).toEqual(snapshot);
+  expect(f.calls).toEqual([]);
+  const imported = await f.controller.importLegacyJournal(
+    f.run.id,
+    'owner',
+    f.snapshot,
+  );
+  expect(imported.activeOperation?.operationId).toBe(f.binding.operationId);
+  expect(imported.activeOperation?.requestDigest).toBe(f.binding.requestDigest);
+  expect(imported.activeOperation?.params).toEqual(
+    f.run.activeOperation?.params,
+  );
+  expect(imported.lease).toBeUndefined();
+  expect(await readFile(f.snapshot)).toEqual(snapshot);
+  expect(f.calls).toEqual([]);
 });

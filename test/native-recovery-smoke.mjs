@@ -584,3 +584,160 @@ test('selected keyed workflow recovers exact request correlation across fresh OS
     else console.error(`Unresolved recovery fixture retained: ${sandbox}`);
   }
 });
+
+test('S42/S45 real old Bridge workflow excludes a new controller and imports exact settlement after quiescence', {
+  timeout: 150000,
+}, async () => {
+  const { execFile, spawn } = await import('node:child_process');
+  const { once } = await import('node:events');
+  const { mkdir, realpath } = await import('node:fs/promises');
+  const { promisify } = await import('node:util');
+  const { fileURLToPath } = await import('node:url');
+  const execute = promisify(execFile);
+  const sandbox = await realpath(
+    await mkdtemp(join(tmpdir(), 'native-legacy-hosts-')),
+  );
+  async function readJson(path) {
+    try {
+      return JSON.parse(await readFile(path, 'utf8'));
+    } catch {
+      return undefined;
+    }
+  }
+  async function until(fn, label) {
+    const end = Date.now() + 65000;
+    while (Date.now() < end) {
+      const result = await fn();
+      if (result) return result;
+      await delay(30);
+    }
+    throw new Error(`Timed out: ${label}`);
+  }
+  await mkdir(join(sandbox, 'frozen'));
+  await mkdir(join(sandbox, 'bridge'));
+  await mkdir(join(sandbox, 'npm-home'));
+  const packageEnv = {
+    PATH: process.env.PATH,
+    HOME: join(sandbox, 'npm-home'),
+    npm_config_userconfig: join(sandbox, 'npm-home/user.npmrc'),
+    npm_config_globalconfig: join(sandbox, 'npm-home/global.npmrc'),
+    npm_config_cache: join(sandbox, 'npm-cache'),
+    npm_config_registry: 'https://registry.npmjs.org',
+  };
+  const baseline = 'bc5fb6ef800b6e88f3edeef542869bbd84a9ed3a';
+  await execute('git', [
+    'archive',
+    '--format=tar',
+    `--output=${join(sandbox, 'old.tar')}`,
+    baseline,
+    'src',
+  ]);
+  await execute('tar', [
+    '-xf',
+    join(sandbox, 'old.tar'),
+    '-C',
+    join(sandbox, 'frozen'),
+  ]);
+  for (const file of ['controller.ts', 'registry.ts', 'bridge.ts'])
+    assert.equal(
+      await readFile(join(sandbox, 'frozen/src', file), 'utf8'),
+      (
+        await execute('git', ['show', `${baseline}:src/${file}`], {
+          maxBuffer: 2000000,
+        })
+      ).stdout,
+    );
+  const packed = await execute(
+    'npm',
+    [
+      'exec',
+      '--yes',
+      '--package=npm@12.0.2',
+      '--',
+      'npm',
+      'pack',
+      '@alexeiled/pi-subagents-bridge@0.5.5',
+      '--json',
+      '--ignore-scripts',
+      '--pack-destination',
+      join(sandbox, 'bridge'),
+    ],
+    { env: packageEnv, timeout: 60000, maxBuffer: 2000000 },
+  );
+  const packing = JSON.parse(packed.stdout);
+  const manifest = Array.isArray(packing)
+    ? packing[0]
+    : Object.values(packing)[0];
+  await writeFile(
+    join(sandbox, 'bridge-package.json'),
+    JSON.stringify(manifest),
+  );
+  await execute('tar', [
+    '-xf',
+    join(sandbox, 'bridge', manifest.filename),
+    '-C',
+    join(sandbox, 'bridge'),
+  ]);
+  const script = new URL('./fixtures/legacy-runtime-host.mjs', import.meta.url);
+  const child = spawn(
+    process.execPath,
+    [fileURLToPath(script), 'origin', sandbox],
+    { stdio: ['ignore', 'ignore', 'pipe'] },
+  );
+  let errors = '';
+  child.stderr.on('data', (chunk) => {
+    errors += chunk;
+  });
+  const closed = once(child, 'close');
+  let origin;
+  try {
+    origin = await until(async () => {
+      if (child.exitCode !== null) throw new Error(errors);
+      return readJson(join(sandbox, 'origin.json'));
+    }, 'old process owns active workflow');
+    await execute(
+      process.execPath,
+      [fileURLToPath(script), 'admission', sandbox],
+      { timeout: 30000, maxBuffer: 2000000 },
+    );
+    const admission = await readJson(join(sandbox, 'admission.json'));
+    assert.equal(admission.refused, true);
+    assert.equal(admission.spawns, 0);
+    assert.notEqual(admission.hostPid, origin.hostPid);
+    await writeFile(join(sandbox, 'quiesce.json'), '{}');
+    await until(async () => {
+      if (child.exitCode !== null) throw new Error(errors);
+      return readJson(join(sandbox, 'quiescent.json'));
+    }, 'explicit old-controller quiescence and settlement');
+    await execute(
+      process.execPath,
+      [fileURLToPath(script), 'recover', sandbox],
+      { timeout: 30000, maxBuffer: 2000000 },
+    );
+    const recovered = await readJson(join(sandbox, 'recovery.json'));
+    assert.equal(recovered.rootId, origin.rootId);
+    assert.equal(recovered.spawns, 0);
+    assert.equal(recovered.sideEffects, 1);
+    assert.equal(recovered.retired, true);
+    console.log(
+      JSON.stringify({ scenario: 'S42/S45', admission, recovered, sandbox }),
+    );
+    await writeFile(join(sandbox, 'finish.json'), '{}');
+    assert.equal((await closed)[0], 0, errors);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null)
+      child.kill('SIGTERM');
+    await writeFile(join(sandbox, 'host/release-child'), 'fixture cleanup');
+    if (origin?.child?.pid)
+      await until(() => {
+        try {
+          process.kill(origin.child.pid, 0);
+          return false;
+        } catch (error) {
+          if (error.code === 'ESRCH') return true;
+          throw error;
+        }
+      }, 'known legacy child OS cleanup, not retirement proof');
+    console.log(`Retained real legacy-host evidence: ${sandbox}; ${errors}`);
+  }
+});

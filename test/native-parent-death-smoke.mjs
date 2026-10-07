@@ -1,7 +1,14 @@
 import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import {
+  chmod,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import test from 'node:test';
@@ -103,3 +110,97 @@ test('S23 SIGKILL after native launch barrier leaves one surviving child and no 
     }
   }
 });
+
+for (const [scenario, barrier, name] of [
+  [
+    'S08',
+    'prepared',
+    'S08 fresh controller recovers the real prepared filesystem barrier without duplicate launch',
+  ],
+  [
+    'S09',
+    'dispatch',
+    'S09 fresh controller recovers the real dispatch filesystem barrier without duplicate launch',
+  ],
+  [
+    'S11',
+    'binding',
+    'S11 fresh controller recovers the real binding filesystem barrier without duplicate launch',
+  ],
+]) {
+  test(name, {
+    timeout: 100000,
+  }, async () => {
+    const sandbox = await realpath(
+      await mkdtemp(join(tmpdir(), `native-${barrier}-`)),
+    );
+    const script = resolve('test/fixtures/native-crash-host.mjs');
+    const parent = spawn(
+      process.execPath,
+      [script, 'origin', sandbox, barrier],
+      { stdio: ['ignore', 'ignore', 'pipe'] },
+    );
+    let errors = '';
+    parent.stderr.on('data', (value) => {
+      errors += value;
+    });
+    const closed = once(parent, 'close');
+    let origin;
+    try {
+      origin = await waitFor(async () => {
+        if (parent.exitCode !== null) throw new Error(errors);
+        return json(join(sandbox, 'origin.json'));
+      }, 'durable filesystem barrier');
+      assert.equal(origin.hostPid, parent.pid);
+      assert.equal(origin.spawns, barrier === 'binding' ? 1 : 0);
+      const before = await json(join(origin.registryDirectory, 'run.json'));
+      assert.equal(
+        before.activeOperation.native.phase,
+        barrier === 'prepared' ? 'prepared' : 'dispatching',
+      );
+      assert.equal(before.activeOperation.externalRunId, undefined);
+      if (barrier === 'binding') {
+        assert.equal(origin.failure.code, 'EACCES');
+        assert.equal(origin.successfulReply.success, true);
+        await waitFor(
+          () => json(join(sandbox, 'child-barrier.json')),
+          'launched original child',
+        );
+      }
+      assert.equal(parent.kill('SIGKILL'), true);
+      assert.equal((await closed)[1], 'SIGKILL');
+      await chmod(origin.registryDirectory, 0o755);
+      await execute(process.execPath, [script, 'recover', sandbox, barrier], {
+        timeout: 70000,
+        maxBuffer: 2000000,
+      });
+      const recovered = await json(join(sandbox, 'recovery.json'));
+      assert.notEqual(recovered.hostPid, origin.hostPid);
+      assert.equal(recovered.controllerTicks, 3);
+      assert.equal(recovered.spawns, barrier === 'prepared' ? 1 : 0);
+      assert.equal(recovered.sideEffects, barrier === 'dispatch' ? 0 : 1);
+      if (origin.rootId && recovered.operation.externalRunId)
+        assert.equal(recovered.operation.externalRunId, origin.rootId);
+      console.log(
+        JSON.stringify({
+          scenario,
+          barrier,
+          originalRoot: origin.rootId,
+          recoveredRoot: recovered.operation.externalRunId,
+          phase: recovered.operation.native.phase,
+          spawns: recovered.spawns,
+          sideEffects: recovered.sideEffects,
+          sandbox,
+        }),
+      );
+    } finally {
+      if (parent.exitCode === null && parent.signalCode === null)
+        parent.kill('SIGKILL');
+      if (origin) await chmod(origin.registryDirectory, 0o755);
+      await writeFile(join(sandbox, 'release-child'), 'fixture cleanup');
+      console.log(
+        `Retained filesystem-barrier evidence: ${sandbox}; ${errors}`,
+      );
+    }
+  });
+}
