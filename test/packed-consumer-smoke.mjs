@@ -9,6 +9,7 @@ import {
   readdir,
   readFile,
   realpath,
+  rename,
   rm,
   writeFile,
 } from 'node:fs/promises';
@@ -94,7 +95,15 @@ test('packed normal loader: native execution, recovery, readonly controls, super
             message.role === 'tool' &&
             String(message.tool_call_id).startsWith('fixture-write'),
         );
-        calls.push({ mode, reviewer, worker, wrote, tools, at: Date.now() });
+        calls.push({
+          mode,
+          reviewer,
+          worker,
+          wrote,
+          tools,
+          model: input.model,
+          at: Date.now(),
+        });
         if (reviewer) {
           assert.ok(
             !tools.includes('bash') &&
@@ -267,7 +276,7 @@ test('packed normal loader: native execution, recovery, readonly controls, super
           id: 'local-fixture',
           object: 'chat.completion.chunk',
           created: 1,
-          model: 'fixture',
+          model: input.model,
         };
         res.writeHead(200, { 'Content-Type': 'text/event-stream' });
         res.write(
@@ -378,14 +387,12 @@ export default function(pi){
             api: 'openai-completions',
             apiKey: 'local-only',
             baseUrl: `http://127.0.0.1:${server.address().port}/v1`,
-            models: [
-              {
-                id: 'fixture',
-                reasoning: false,
-                contextWindow: 128000,
-                maxTokens: 2048,
-              },
-            ],
+            models: ['fixture', 'scoped-fixture'].map((id) => ({
+              id,
+              reasoning: false,
+              contextWindow: 128000,
+              maxTokens: 2048,
+            })),
           },
         },
       }),
@@ -436,7 +443,16 @@ export default function(pi){
     async function launch(cwd, session) {
       const child = spawn(
         process.execPath,
-        [cli, '--mode', 'rpc', '--session', session],
+        [
+          cli,
+          '--mode',
+          'rpc',
+          '--session',
+          session,
+          ...(mode === 'valid-skill'
+            ? ['--models', 'localfixture/fixture,localfixture/scoped-fixture']
+            : []),
+        ],
         { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] },
       );
       const output = [];
@@ -492,6 +508,7 @@ export default function(pi){
       };
     }
     const scenarios = process.env.PLAN_EXEC_PACKED_SCENARIOS?.split(',') ?? [
+      'no-peer',
       'plan',
       'goal',
       'findings',
@@ -502,7 +519,9 @@ export default function(pi){
       'tool-ceiling',
       'missing-agent',
       'schema-ceiling',
+      'owned-collision',
       'missing-skill',
+      'valid-skill',
       'lazy-skill',
       'deadline',
       'supervisor',
@@ -527,13 +546,13 @@ export default function(pi){
 import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8'),'done\\n');`,
       );
       await writeFile(join(cwd, '.gitignore'), 'node_modules/\n');
-      if (['missing-skill', 'lazy-skill'].includes(mode)) {
+      if (['missing-skill', 'valid-skill', 'lazy-skill'].includes(mode)) {
         await mkdir(join(cwd, '.pi/agents'), { recursive: true });
         await writeFile(
           join(cwd, '.pi/agents/skill-probe.md'),
           '---\nname: skill-probe\ndescription: Deterministic skill admission probe\ntools: bash, read\ninheritSkills: false\nskills: fixture-private-skill\n---\nYou are `worker`. Deliver the fixture exactly once.\n',
         );
-        if (mode === 'lazy-skill') {
+        if (mode !== 'missing-skill') {
           await mkdir(join(cwd, '.pi/skills/fixture-private-skill'), {
             recursive: true,
           });
@@ -543,7 +562,23 @@ import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8')
           );
         }
       }
-      if (mode === 'schema-ceiling') {
+      if (mode === 'valid-skill')
+        await writeFile(
+          join(cwd, '.pi/settings.json'),
+          JSON.stringify({
+            subagents: {
+              modelScope: { enforce: true, strict: true, allow: ['scoped'] },
+            },
+          }),
+        );
+      if (mode === 'owned-collision') {
+        await mkdir(join(cwd, '.pi/agents'), { recursive: true });
+        await writeFile(
+          join(cwd, '.pi/agents/plan-exec-reviewer.md'),
+          '---\nname: plan-exec-reviewer\ndescription: Unacceptable configured substitute\ntools: read\n---\nDo not substitute this definition.\n',
+        );
+      }
+      if (mode === 'schema-ceiling' || mode === 'owned-collision') {
         await writeFile(join(cwd, 'result.txt'), 'done\n');
         await writeFile(
           join(cwd, 'plan.md'),
@@ -609,11 +644,15 @@ import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8')
           ...(mode === 'missing-agent'
             ? { workerAgent: 'intentionally-missing-configured-agent' }
             : {}),
-          ...(['missing-skill', 'lazy-skill'].includes(mode)
+          ...(['missing-skill', 'valid-skill', 'lazy-skill'].includes(mode)
             ? { workerAgent: 'skill-probe' }
             : {}),
-          workerModel: 'localfixture/fixture',
-          reviewerModel: 'localfixture/fixture',
+          workerModel:
+            mode === 'valid-skill'
+              ? 'localfixture/scoped-fixture'
+              : 'localfixture/fixture',
+          reviewerModel:
+            mode === 'valid-skill' ? 'inherit' : 'localfixture/fixture',
           executionLifetime: {
             mode: 'bounded',
             timeoutMs: mode === 'deadline' ? 8000 : 60000,
@@ -625,6 +664,68 @@ import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8')
       await git(['commit', '-m', 'Fixture baseline']);
       await git(['checkout', '-b', 'feature']);
       const session = join(sandbox, `${mode}-session.jsonl`);
+      if (mode === 'no-peer') {
+        const settingsPath = join(agent, 'settings.json');
+        const settings = await readFile(settingsPath, 'utf8');
+        const hidden = join(sandbox, 'temporarily-absent-native-peer');
+        await rename(native, hidden);
+        try {
+          await writeFile(
+            settingsPath,
+            JSON.stringify({
+              ...JSON.parse(settings),
+              packages: [installed],
+              extensions: [],
+            }),
+          );
+          host = await launch(cwd, session);
+          host.send({
+            id: 'no-peer-start',
+            type: 'prompt',
+            message: `/exec --worktree ${cwd} plan.md`,
+          });
+          const held = await waitFor(async () => {
+            const run = (await listRuns()).find(
+              (run) => run.repositoryRoot === cwd,
+            );
+            return run?.tasks?.['1']?.state === 'waiting_external' && run;
+          }, 'bounded optional-peer prerequisite');
+          assert.equal(
+            calls.some((call) => call.mode === mode),
+            false,
+          );
+          assert.equal(held.tasks['1'].attempts, 0);
+          assert.equal(held.activeOperation, undefined);
+          assert.match(held.tasks['1'].reason, /Native runtime unavailable/);
+          console.log(
+            JSON.stringify({
+              scenario: 'optional peer absent',
+              commandsRegistered: true,
+              prerequisite: held.tasks['1'].externalPrerequisite,
+              modelCalls: 0,
+            }),
+          );
+          host.send({
+            id: 'no-peer-stop',
+            type: 'prompt',
+            message: `/exec stop ${held.id} --force`,
+          });
+          await waitFor(
+            async () =>
+              (
+                (await json(join(runs, '.abandoned', held.id, 'run.json'))) ??
+                (await json(join(runs, held.id, 'run.json')))
+              )?.status === 'abandoned',
+            'stop peer-absent fixture',
+          );
+        } finally {
+          await host?.close();
+          host = undefined;
+          await rename(hidden, native);
+          await writeFile(settingsPath, settings);
+        }
+        continue;
+      }
       host = await launch(cwd, session);
       if (mode === 'plan' || mode === 'stop')
         await writeFile(join(sandbox, 'drop-next'), 'drop');
@@ -645,7 +746,75 @@ import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8')
         async () => (await listRuns()).find((r) => r.repositoryRoot === cwd),
         `create ${mode}`,
       );
-      if (['missing-agent', 'lazy-skill', 'deadline'].includes(mode)) {
+      if (
+        [
+          'missing-agent',
+          'missing-skill',
+          'lazy-skill',
+          'owned-collision',
+        ].includes(mode)
+      ) {
+        const refused = await waitFor(async () => {
+          assert.equal(
+            calls.some(
+              (call) => call.mode === mode && (call.worker || call.reviewer),
+            ),
+            false,
+            'Application admission must refuse before model work',
+          );
+          const current = await json(join(runs, run.id, 'run.json'));
+          return (
+            current?.error?.includes('Native launch admission refused') &&
+            current
+          );
+        }, `application admission refusal: ${mode}`);
+        assert.match(
+          refused.error,
+          mode === 'missing-agent'
+            ? /missing_agent/
+            : mode === 'missing-skill'
+              ? /missing_skill/
+              : mode === 'owned-collision'
+                ? /owned_reviewer_collision/
+                : /denied_required_tool/,
+        );
+        assert.match(refused.error, /Correct.*resume/i);
+        assert.equal(refused.activeOperation?.native?.phase, 'prepared');
+        assert.equal(refused.activeOperation.externalRunId, undefined);
+        assert.notEqual(refused.activeOperation.processTreeExited, true);
+        const launches = existsSync(join(sandbox, 'spawns.jsonl'))
+          ? (await readFile(join(sandbox, 'spawns.jsonl'), 'utf8'))
+              .trim()
+              .split('\n')
+              .map(JSON.parse)
+          : [];
+        assert.equal(
+          launches.filter((value) => value.pid === host.child.pid).length,
+          0,
+          'No native spawn emitted on admission refusal',
+        );
+        console.log(
+          JSON.stringify({
+            scenario: 'S33 application admission',
+            mode,
+            error: refused.error,
+            phase: refused.activeOperation.native.phase,
+            spawns: 0,
+            modelCalls: 0,
+          }),
+        );
+        host.send({
+          id: 'admission-stop',
+          type: 'prompt',
+          message: `/exec stop ${run.id} --force`,
+        });
+        await waitFor(async () => {
+          const current =
+            (await json(join(runs, run.id, 'run.json'))) ??
+            (await json(join(runs, '.abandoned', run.id, 'run.json')));
+          return current?.status === 'abandoned';
+        }, 'retire undispatched refused fixture');
+      } else if (mode === 'deadline') {
         const failed = await waitFor(
           async () => {
             const current = await json(join(runs, run.id, 'run.json'));
@@ -666,96 +835,70 @@ import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8')
           45000,
         );
         assert.notEqual(failed.current.status, 'completed');
-        if (mode === 'lazy-skill') {
-          const preflight = await json(
-            join(sandbox, 'lazy-skill-preflight.json'),
-          );
-          assert.equal(preflight?.code, 'denied_required_tool');
-          assert.match(
-            JSON.stringify(failed.status),
-            /excludes required tool 'read' for lazy skill loading/,
-          );
-        }
-        if (mode === 'deadline') {
-          assert.ok(
-            calls.some(
-              (call) => call.mode === mode && call.worker && !call.wrote,
-            ),
-            'Deadline fired after the real model request started',
-          );
-          assert.match(
-            JSON.stringify(failed.status),
-            /timeout|timed.out|deadline/i,
-          );
-          assert.equal(failed.status.timeoutMs, 8000);
-          assert.equal(existsSync(join(cwd, 'result.txt')), false);
-          const step = failed.status.steps.find(
-            (value) => value.workflowKey === 'main',
-          );
-          assert.ok(step?.runId);
-          const child = await waitFor(
-            async () => {
-              const status = await json(
-                join(dirname(failed.op.asyncDir), step.runId, 'status.json'),
-              );
-              return (
-                status &&
-                !['running', 'queued'].includes(status.state) &&
-                status.processTerminal &&
-                status
-              );
-            },
-            'bounded child expiry and published process evidence',
-            20000,
-          );
-          assert.equal(child.timeoutMs, 8000);
-          assert.match(JSON.stringify(child), /timeout|timed.out|deadline/i);
-          assert.equal(child.processTerminal.runId, step.runId);
-          const proof = await waitFor(
-            async () => {
-              const value = await json(
-                join(
-                  dirname(failed.op.asyncDir),
-                  step.runId,
-                  'process-terminal.json',
-                ),
-              );
-              return (
-                value && ['observed', 'unknown'].includes(value.state) && value
-              );
-            },
-            'published deadline retirement disposition',
-            10000,
-          );
-          assert.equal(proof.runId, step.runId);
-          assert.equal(
-            proof.runnerProcessInstanceId,
-            child.processTerminal.runnerProcessInstanceId,
-          );
-          console.log(
-            JSON.stringify({
-              scenario: 'S28 child expiry',
-              state: child.state,
-              error: child.error,
-              timeoutMs: child.timeoutMs,
-              proof,
-            }),
-          );
-        } else {
-          assert.equal(
-            calls.some(
-              (call) => call.mode === mode && (call.worker || call.reviewer),
-            ),
-            false,
-            'Admission refusal occurred before model work',
-          );
-          assert.match(
-            JSON.stringify(failed.status),
-            mode === 'missing-agent'
-              ? /unknown agent|not found|missing/i
-              : /structured_output|ceiling|required tool/i,
-          );
-        }
+        assert.ok(
+          calls.some(
+            (call) => call.mode === mode && call.worker && !call.wrote,
+          ),
+          'Deadline fired after the real model request started',
+        );
+        assert.match(
+          JSON.stringify(failed.status),
+          /timeout|timed.out|deadline/i,
+        );
+        assert.equal(failed.status.timeoutMs, 8000);
+        assert.equal(existsSync(join(cwd, 'result.txt')), false);
+        const step = failed.status.steps.find(
+          (value) => value.workflowKey === 'main',
+        );
+        assert.ok(step?.runId);
+        const child = await waitFor(
+          async () => {
+            const status = await json(
+              join(dirname(failed.op.asyncDir), step.runId, 'status.json'),
+            );
+            return (
+              status &&
+              !['running', 'queued'].includes(status.state) &&
+              status.processTerminal &&
+              status
+            );
+          },
+          'bounded child expiry and published process evidence',
+          20000,
+        );
+        assert.equal(child.timeoutMs, 8000);
+        assert.match(JSON.stringify(child), /timeout|timed.out|deadline/i);
+        assert.equal(child.processTerminal.runId, step.runId);
+        const proof = await waitFor(
+          async () => {
+            const value = await json(
+              join(
+                dirname(failed.op.asyncDir),
+                step.runId,
+                'process-terminal.json',
+              ),
+            );
+            return (
+              value && ['observed', 'unknown'].includes(value.state) && value
+            );
+          },
+          'published deadline retirement disposition',
+          10000,
+        );
+        assert.equal(proof.runId, step.runId);
+        assert.equal(
+          proof.runnerProcessInstanceId,
+          child.processTerminal.runnerProcessInstanceId,
+        );
+        console.log(
+          JSON.stringify({
+            scenario: 'S28 child expiry',
+            state: child.state,
+            error: child.error,
+            timeoutMs: child.timeoutMs,
+            proof,
+          }),
+        );
         console.log(
           JSON.stringify({
             scenario: mode,
@@ -966,20 +1109,28 @@ import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8')
         );
         assert.equal(completed.reviewFindings.length, 0);
         assert.equal(completed.config.reviewerAgent, 'plan-exec-reviewer');
-        if (mode === 'missing-skill') {
-          const preflight = await json(
-            join(sandbox, 'missing-skill-preflight.json'),
+        if (mode === 'valid-skill') {
+          assert.ok(
+            calls.some(
+              (call) =>
+                call.mode === mode &&
+                call.worker &&
+                call.model === 'scoped-fixture',
+            ),
           );
-          assert.equal(preflight?.code, 'missing_skill');
-          assert.ok(calls.some((call) => call.mode === mode && call.worker));
+          assert.ok(
+            calls.some(
+              (call) =>
+                call.mode === mode && call.reviewer && call.model === 'fixture',
+            ),
+          );
           console.log(
             JSON.stringify({
-              scenario: 'S33 missing skill',
-              preflight,
-              actualExecution: completed.status,
-              effectiveTools: calls.find(
-                (call) => call.mode === mode && call.worker,
-              )?.tools,
+              scenario: 'S33 valid selected skill',
+              scope: 'scoped',
+              workerModel: 'scoped-fixture',
+              reviewerModel: 'inherit',
+              status: completed.status,
             }),
           );
         }
@@ -1149,9 +1300,14 @@ import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8')
       await host.close();
       host = undefined;
     }
-    const loads = (await readFile(join(sandbox, 'loads.jsonl'), 'utf8'))
+    const loads = (
+      existsSync(join(sandbox, 'loads.jsonl'))
+        ? await readFile(join(sandbox, 'loads.jsonl'), 'utf8')
+        : ''
+    )
       .trim()
       .split('\n')
+      .filter(Boolean)
       .map(JSON.parse);
     const children = loads.filter((value) => value.child);
     assert.ok(
@@ -1159,7 +1315,14 @@ import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8')
         scenarios.reduce(
           (sum, value) =>
             sum +
-            (['missing-agent', 'lazy-skill', 'stop'].includes(value)
+            ([
+              'no-peer',
+              'missing-agent',
+              'missing-skill',
+              'lazy-skill',
+              'owned-collision',
+              'stop',
+            ].includes(value)
               ? 0
               : ['schema-ceiling', 'deadline', 'supervisor'].includes(value)
                 ? 1

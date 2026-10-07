@@ -48,6 +48,40 @@ expire; they are not retirement or acceptance proof. No prompt/path/time guesses
 or scans of unrelated native runs are used. Missing/expired correlation stays
 fenced, even across repeated resume.
 
+### Application admission before dispatch
+
+A still-`prepared` operation is validated through the public
+`pi-subagents/preflight` `resolveSubagentLaunchContract` API before its dispatch
+CAS or spawn emission. Validation uses the exact saved fresh-child literal
+(agent/task/model/cwd/output/schema), current available and scoped models,
+parent model/session, native capability ceiling and the real Pi host for built-in
+MCP snapshots. Public imports are lazy: a missing optional peer does not prevent
+extension startup and retains the existing bounded runtime prerequisite behavior.
+Missing selected skills, missing configured agents and denied required tools
+refuse with an actionable diagnostic and zero native dispatch. Fix the selected
+configuration and resume; the prepared request is not rewritten. Upstream 0.76.1
+execution alone treats missing selected skills as warnings; plan-exec now gates
+that case itself with the public validator.
+
+Validation is not dispatch, authoritative non-start, retirement or acceptance
+proof. It creates no separate store. Session/ownership and cancellation checks
+are repeated after the await, the original revision gates dispatch CAS, and
+already-dispatched/unknown operations never re-enter admission or replay.
+
+**Narrow 0.76.1 runtime-role exception:** public preflight discovers configured
+agent files, not runtime registrations, even with `runtimeSnapshotHost`. Our
+fixed `plan-exec-reviewer` reviewer/stats role explicitly declares `skills: []`,
+`inheritSkills: false`, readonly tools and no model override. Only that exact
+role, with this extension's successful undisposed registration on the current
+event bus, may proceed past the validator's plain unknown-agent discovery result.
+Registration liveness is rechecked after admission and immediately before emit.
+Unavailable/disposed registration and configured collisions refuse; a name match
+alone is insufficient. Invalid configuration, missing skills, denied tools,
+model/scope errors and other returned failures are never exempted. This is not a
+claim that preflight validated the invisible runtime definition: actual native
+execution retains model/tool/schema/collision enforcement. No agent files,
+private imports, arbitrary runtime-agent allowlist or user bypass are introduced.
+
 Native session authority is not transferred by a plan-exec lease takeover.
 Another session can inspect supported evidence but cannot impersonate the
 original native session to stop/resume a child.

@@ -3,12 +3,14 @@ import { lstat, mkdir, readFile, realpath } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import type { ExtensionContext } from '@earendil-works/pi-coding-agent';
+import type { SubagentLaunchContractInput } from 'pi-subagents/preflight';
 import {
   hasTerminalOwnershipProof,
   type WorkflowTerminalProof,
   workflowTerminalProof,
 } from './execution-contract.js';
 import { legacyImportGuidance } from './legacy-operation.js';
+import { hasNativeReviewerRegistration } from './native-reviewer.js';
 import {
   correlatedWorkflowIdentity,
   nativeBindingAllowed,
@@ -27,6 +29,7 @@ import type {
   OperationKind,
   PlanExecRun,
 } from './types.js';
+import { NATIVE_REVIEWER_AGENT } from './types.js';
 
 export type { NativeOperationMetadata } from './types.js';
 
@@ -102,7 +105,12 @@ export class NativeRuntimeClient {
     private readonly events: EventBus,
     private readonly registry: RunRegistry,
     private readonly getContext: () => ExtensionContext,
-    private readonly options: { rpcTimeoutMs?: number } = {},
+    private readonly options: {
+      rpcTimeoutMs?: number;
+      runtimeSnapshotHost?: SubagentLaunchContractInput['runtimeSnapshotHost'] & {
+        getSessionName?(): string | undefined;
+      };
+    } = {},
   ) {
     this.unsubscribeCompletion = events.on(
       'subagent:async-complete',
@@ -269,6 +277,99 @@ export class NativeRuntimeClient {
     return operation;
   }
 
+  private async validateAdmission(
+    operation: ActiveOperation,
+  ): Promise<() => void> {
+    const meta = required(operation.native);
+    const script = meta.request.params.script;
+    const prefix = 'return await runs.run("main", ';
+    // Decode only the fixed JSON literal this adapter durably prepared. Never
+    // re-resolve or rewrite the request from mutable controller configuration.
+    if (
+      typeof script !== 'string' ||
+      !script.startsWith(prefix) ||
+      !script.endsWith(');')
+    )
+      throw new Error(
+        'Native launch admission cannot validate this prepared workflow. Restore its original request before resume.',
+      );
+    const child = JSON.parse(
+      script.slice(prefix.length, -2),
+    ) as SubagentLaunchContractInput;
+    if (
+      child.context !== 'fresh' ||
+      child.cwd !== meta.request.params.cwd ||
+      child.output !== meta.outputPath
+    )
+      throw new Error(
+        'Native launch admission does not match the prepared child binding.',
+      );
+    // Optional peers must not prevent extension startup. Resolve public APIs
+    // only for an authorized, still-prepared operation, never during lookup.
+    const [preflight, ceilings, intercom] = await Promise.all([
+      import('pi-subagents/preflight'),
+      import('pi-subagents/capability-ceiling'),
+      import('pi-subagents/intercom-bridge'),
+    ]).catch((error: unknown) => {
+      throw new Error(
+        `Native launch admission unavailable: ${error instanceof Error ? error.message : String(error)}. Restore the supported pi-subagents peer and resume.`,
+      );
+    });
+    const ctx = this.getContext();
+    const ceiling = ceilings.resolveCurrentSubagentCapabilityCeiling(
+      this.nativeSessionId(),
+    );
+    const ownedReviewer = child.agent === NATIVE_REVIEWER_AGENT;
+    const requireOwnedReviewer = () => {
+      if (ownedReviewer && !hasNativeReviewerRegistration(this.events))
+        throw new Error(
+          'Native launch admission refused (owned_reviewer_unavailable): Register the package-owned readonly reviewer in the current runtime, then resume.',
+        );
+    };
+    requireOwnedReviewer();
+    const result = await preflight.resolveSubagentLaunchContract({
+      ...child,
+      availableModels: ctx.modelRegistry.getAvailable(),
+      scopedModelIds: (ctx.scopedModels ?? []).map(
+        ({ model }) => `${model.provider}/${model.id}`,
+      ),
+      ...(ctx.model
+        ? { parentModel: { provider: ctx.model.provider, id: ctx.model.id } }
+        : {}),
+      parentSessionFile: ctx.sessionManager.getSessionFile() ?? null,
+      parentSessionId: this.nativeSessionId(),
+      ...(ceiling ? { capabilityCeiling: ceiling } : {}),
+      ...(this.options.runtimeSnapshotHost
+        ? { runtimeSnapshotHost: this.options.runtimeSnapshotHost }
+        : {}),
+      orchestratorTarget: intercom.resolveIntercomSessionTarget(
+        this.options.runtimeSnapshotHost?.getSessionName?.(),
+        ctx.sessionManager.getSessionId(),
+      ),
+    });
+    requireOwnedReviewer();
+    // 0.76.1 preflight discovers configured files, not runtime registrations.
+    // Only our live, fixed no-skills role may use that exact discovery exception;
+    // native execution still enforces its model, tools, schema and collisions.
+    if (
+      ownedReviewer &&
+      !result.ok &&
+      result.code === 'missing_agent' &&
+      result.diagnostics.length === 0 &&
+      result.message.startsWith(`Unknown agent: ${NATIVE_REVIEWER_AGENT}\n`)
+    )
+      return requireOwnedReviewer;
+    if (!result.ok)
+      throw new Error(
+        `Native launch admission refused (${result.code}): ${result.message}. Correct the selected agent/skills/model/tool configuration, then resume. No spawn was emitted; the prepared request is unchanged.`,
+      );
+    if (ownedReviewer)
+      throw new Error(
+        'Native launch admission refused (owned_reviewer_collision): A configured agent resolves to the package-owned reviewer name. Correct the collision, then resume; no substitute will be dispatched.',
+      );
+    return requireOwnedReviewer;
+  }
+
   async spawn(
     runId: string,
     binding: NativeOperationBinding,
@@ -284,6 +385,11 @@ export class NativeRuntimeClient {
       };
     await this.checkExecutionTarget(run, operation);
     await this.checkOutputPath(runId, operation);
+    const requireAdmission = await this.validateAdmission(operation);
+    // Admission is asynchronous validation, not dispatch or non-start evidence.
+    // The original revision still gates the claim; recheck session authority too.
+    await this.load(runId, binding, true);
+    requireAdmission();
     const claimed = await this.registry.updateIfCurrent(
       {
         ...run,
@@ -313,6 +419,7 @@ export class NativeRuntimeClient {
         reason: 'Disposed before dispatch; operation remains fenced.',
       };
     const reply = await this.rpc(operation.native.request, () => {
+      requireAdmission();
       if (
         this.sessionId() !== operation.native?.ownerSessionId ||
         this.nativeSessionId() !== operation.native?.nativeSessionId

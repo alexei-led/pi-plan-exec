@@ -388,7 +388,7 @@ export default function planExecExtension(pi: ExtensionAPI): void {
     pi.events,
     defaultRegistry,
     () => required(currentContext),
-    { rpcTimeoutMs: RUNTIME_TIMEOUT_MS },
+    { rpcTimeoutMs: RUNTIME_TIMEOUT_MS, runtimeSnapshotHost: pi },
   );
   const fusion = new FusionClient(pi.events);
   const runCommand = async (command: string, args: string[], cwd: string) => {

@@ -33,6 +33,20 @@ The scoped D1–D9 architecture sweep found no blocking defect (one low-severity
 RPC-plumbing duplication note remains). Final scenario acceptance is still
 partial: passing local gates do not waive the explicitly unrun cases below.
 
+## Missing-skill admission follow-up
+
+This bounded follow-up starts from `dcc1ede19c6e001017bdb21da90c9902ec544eba`.
+The required missing-skill refusal was observed red before production changes.
+The application gate and explicitly approved fixed-owned-role discovery exception
+are described below and in `docs/runtime-contracts.md`. Normal-loader scenarios
+now number 18. One settled-tree broad gate passed: **750 Vitest + 143 node:test =
+893**, plus 3 runtime, 6 recovery, 4 parent-death/barrier and 1 packed-consumer test
+(18 modes), zero failures/skips. Check/TypeScript passed with seven informational
+diagnostics; pack:dry contains 41 files. The **missing-skill-admission.json**
+handoff and external actual-diff bundle record red/green logs and the exact commit.
+Independent review of this new production admission change remains required;
+plan markers and exact scenario IDs remain parent-owned and unchanged.
+
 ## Reproduce and inspect results
 
 From this worktree (all runtime fixtures isolate HOME, registry, sessions, Git
@@ -91,22 +105,26 @@ live-model reliability are not newly established.
   exact observed runner-instance close proof. This is enforcement evidence, not
   a captured launch option. Controller budget-growth tests remain separately
   labelled C.
-- **S33/S34:** a readonly reviewer actually attempts `write`; native tool lookup
-  rejects it and no sentinel is created. Required structured output settles
-  under the effective readonly ceiling. The initial lazy-skill probe exposed a
-  test-harness defect: the ceiling used the controller-style UUID rather than
-  native's saved-session-file identity. The fixture now registers the actual
-  native identity and passes the resolved ceiling explicitly to public preflight.
-  Under that ceiling, an existing lazy skill requiring `read` is refused by real
-  execution before model work, without widening tools. A missing selected skill
-  produces `missing_skill` in the public preflight, but actual execution continues
-  and completes, matching released `docs/agents.md` (missing skills are warnings).
-  Therefore automatic missing-skill execution refusal is **unsupported**, not an
-  application guarantee. The fixture uses existing agent frontmatter only; no
-  new application knob or filesystem-denial claim. `structured_output` is a
-  package-owned internal protocol tool, while `contact_supervisor` is filtered
-  by the effective readonly ceiling. Tool filtering is not an OS sandbox;
-  `maxTurns` and end-to-end-unbounded child lifetime remain unsupported.
+- **S33/S34 application admission:** the packed missing-skill test first failed
+  on real model execution. The native adapter now validates its saved fresh child
+  through the lazy public preflight API before dispatch CAS. Missing selected
+  skill, missing agent and denied lazy read remain `prepared`, with actionable
+  refusal and zero native spawns/model calls. A valid selected skill executes
+  under an enforced `scoped` policy using a non-parent worker model; required
+  review uses `inherit` and still completes. A physically absent optional peer
+  permits normal-loader startup and the existing zero-attempt runtime prerequisite.
+  Readonly tool refusal and structured_output-only settlement remain covered.
+- **Owned-role discovery exception:** the first guarded valid-skill run exposed
+  the public API's inability to discover runtime-registered `plan-exec-reviewer`.
+  With supervisor approval, only our successfully registered, undisposed, exact
+  readonly reviewer/stats role (`skills: []`, `inheritSkills: false`, no model
+  override) can pass the plain unknown-agent result. Its registration is checked
+  again after the await and before emit. Configured collision/invalid definition,
+  any other missing agent and every other preflight failure refuse. Native still
+  enforces this role's model/tools/schema: preflight does not see or validate its
+  definition. The exception uses the existing registration lifecycle, not agent
+  files, private discovery, a policy framework or a user toggle. Upstream's raw
+  missing-skill warning behavior is distinct from application admission.
 - **S42/S45:** one isolated host loads byte-checked frozen 1.8.0 controller,
   registry and BridgeClient source from `bc5fb6e`, plus the actual published
   `@alexeiled/pi-subagents-bridge@0.5.5` package. Its real historical workflow
@@ -194,7 +212,7 @@ The table explicitly leaves genuine host-level gaps/unsupported guarantees open.
 | S30 | Credentials/permission/executable/runtime prerequisite | PASS C | `test/autonomous-controller.test.ts` — **unavailable runtime preflight is an explicit prerequisite and does not consume a worker attempt**<br>`test/autonomous-controller.test.ts` — **structured tool diagnosis preserves the session and schedules probes without unsupported repair**<br>`test/autonomous-controller.test.ts` — **doctor preserves the same launch identity when an empty lookup races a late spawn**<br>`test/autonomous-controller.test.ts` — **nested independent task lane preserves the cwd and excludes partial work**<br>`test/autonomous-controller.test.ts` — **external prerequisite A preserves its lane while B completes and C waits until automatic recovery** | Capability/prerequisite failures keep identity without silent repair, replay or unsupported guidance. Independent B progresses while external prerequisite A remains safely reserved. |
 | S31 | Typed review clean/blocking/minor/malformed/wrong candidate | PASS P/C/H | `test/review.test.ts` — **native reports bind clean, blocking and minor findings to the candidate commit**<br>`test/review.test.ts` — **native reports reject wrong commits, malformed findings and contradictory fields**<br>`test/autonomous-controller.test.ts` — **minor-only required review records advisory findings without an endless fixer**<br>`test/packed-consumer-smoke.mjs` — **packed normal loader: native execution, recovery, readonly controls, supervisor reload and pinned-executor cutover** | Packed plan/goal/findings/wrong-commit/malformed cases; minor terminal behavior is C. Schema acceptance still binds exact Git candidate. |
 | S32 | Missing/truncated output, deleted temporary result, retained archive | PASS P/H | `test/artifact.test.ts` — **native bound files never infer fallback output for missing, truncated or excessive reports**<br>`test/artifact.test.ts` — **recovers a settled detached workflow after its result was archived**<br>`test/native-runtime.test.ts` — **native result requires consistent bound JSON: ${scenario}**<br>`test/packed-consumer-smoke.mjs` — **packed normal loader: native execution, recovery, readonly controls, supervisor reload and pinned-executor cutover** | Packed missing bound file fails acceptance; artifact tests exercise truncated/deleted/archived evidence. Contradictory parsed JSON is never masked by envelope. |
-| S33 | Output schema/tool ceiling conflict, missing agent/skill | PASS H CHARACTERIZATION; MISSING-SKILL REFUSAL UNSUPPORTED | `test/packed-consumer-smoke.mjs` — **packed normal loader: native execution, recovery, readonly controls, supervisor reload and pinned-executor cutover** | Actual missing-agent and denied-lazy-read refusals occur before model work. Correct native-session ceiling retains internal schema tool without caller-tool widening. Missing selected skill fails public preflight but actual execution completes as documented; no mandatory skill/filesystem-denial guarantee is invented. |
+| S33 | Output schema/tool ceiling conflict, missing agent/skill | PASS C/H APPLICATION ADMISSION | `test/packed-consumer-smoke.mjs` — **packed normal loader: native execution, recovery, readonly controls, supervisor reload and pinned-executor cutover**<br>`test/native-runtime.test.ts` — **public admission ${reason} preserves prepared intent without dispatch or retirement**<br>`test/native-runtime.test.ts` — **owned no-skills reviewer admission ${state} never creates a generic runtime-agent bypass**<br>`test/native-runtime.test.ts` — **async admission rechecks ${race} before claiming dispatch**<br>`test/native-runtime.test.ts` — **owned reviewer disposal after dispatch claim still prevents the synchronous spawn emit** | Packed missing-skill/missing-agent/lazy-skill refuse before any spawn/model work; valid selected skill and scoped/inherited models execute with required review. Owned runtime-role discovery exception is registration-scoped and no-skills only; configured collision refuses. Validation never supplies retirement/non-start authority or mutates dispatched requests. |
 | S34 | Native controls and unsupported legacy knobs | PASS C/H; HONEST LIMIT | `test/packed-consumer-smoke.mjs` — **packed normal loader: native execution, recovery, readonly controls, supervisor reload and pinned-executor cutover**<br>`test/native-runtime.test.ts` — **prepare records unsupported limits honestly and freezes configured agent/model into awaited child** | Actual readonly/schema/model behavior and 8s expiry, not only request echoes. maxTurns unsupported; native child defaults prevent an end-to-end-unbounded claim; tool filtering is not an OS sandbox. |
 | S35 | Local required check/bootstrap interrupted or orphaned | PASS C/X | `test/local-operation.test.ts` — **controller death leaves one command that a new controller adopts**<br>`test/local-operation.test.ts` — **batch monitor death cancels surviving descendants before a fresh retry**<br>`test/local-operation.test.ts` — **stop retires the owned process group and fences later commands**<br>`test/autonomous-controller.test.ts` — **bootstrap changes identity only after proven failure and does not consume task attempts** | Existing owned-process implementation unchanged; real local monitor/controller-death and cancellation probes. |
 | S36 | Dirty/untracked candidate, wrong ancestry, changed branch | PASS C | `test/autonomous-controller.test.ts` — **untracked source cannot be smuggled into an accepted candidate**<br>`test/autonomous-controller.test.ts` — **candidate verification failure is recoverable and never accepts checkbox-only work**<br>`test/controller.test.ts` — **explicit recovery can adopt the verified current execution branch**<br>`test/controller.test.ts` — **branch adoption rejects a run with an active child** | Real Git checks reject dirty/checkbox-only candidates and require explicit branch adoption. |

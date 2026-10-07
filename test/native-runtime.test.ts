@@ -11,13 +11,38 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { ExtensionContext } from '@earendil-works/pi-coding-agent';
-import { expect, onTestFinished, test } from 'vitest';
+import { beforeEach, expect, onTestFinished, test, vi } from 'vitest';
+import { registerNativeReviewer } from '../src/native-reviewer.js';
 import { NativeRuntimeClient } from '../src/native-runtime.js';
 import { RunRegistry } from '../src/registry.js';
 import { required } from '../src/required.js';
 import type { EventBus } from '../src/rpc.js';
 import { DEFAULT_FROZEN_RUN_CONFIG } from '../src/types.js';
 import { createNativeRuntimeHost } from './fixtures/native-runtime-host.js';
+
+// These are controlled-boundary adapter tests; packed consumers exercise the
+// unmocked public preflight with real agents/models/skills and normal loading.
+const admission = vi.hoisted(() =>
+  vi.fn<
+    typeof import('pi-subagents/preflight')['resolveSubagentLaunchContract']
+  >(),
+);
+vi.mock('pi-subagents/preflight', () => ({
+  resolveSubagentLaunchContract: admission,
+}));
+vi.mock('pi-subagents/capability-ceiling', () => ({
+  resolveCurrentSubagentCapabilityCeiling: () => undefined,
+}));
+vi.mock('pi-subagents/intercom-bridge', () => ({
+  resolveIntercomSessionTarget: () => 'fixture-supervisor',
+}));
+beforeEach(() => {
+  admission
+    .mockReset()
+    .mockResolvedValue({ ok: true, contract: {} } as Awaited<
+      ReturnType<typeof admission>
+    >);
+});
 
 class Bus implements EventBus {
   listeners = new Map<string, Set<(value: unknown) => void>>();
@@ -47,11 +72,13 @@ async function fixture(sessionFile?: string) {
   let session = 'session';
   const context = () =>
     ({
+      modelRegistry: { getAvailable: () => [] },
+      scopedModels: [],
       sessionManager: {
         getSessionId: () => session,
         getSessionFile: () => sessionFile,
       },
-    }) as ExtensionContext;
+    }) as unknown as ExtensionContext;
   const bus = new Bus();
   const client = new NativeRuntimeClient(bus, registry, context, {
     rpcTimeoutMs: 30,
@@ -124,11 +151,15 @@ async function fixture(sessionFile?: string) {
     requests,
     reply,
     summary,
+    context,
     setHandler(fn: typeof handler) {
       handler = fn;
     },
     setSession(id: string) {
       session = id;
+    },
+    setNativeSession(file: string) {
+      sessionFile = file;
     },
   };
 }
@@ -406,11 +437,12 @@ test('released public RPC publishes real proof/output with healthy and lost spaw
         f.registry,
         () =>
           ({
+            ...host.context,
             sessionManager: {
               getSessionId: () => host.sessionId,
               getSessionFile: () => sessionFile,
             },
-          }) as ExtensionContext,
+          }) as unknown as ExtensionContext,
         { rpcTimeoutMs: dropReply ? 100 : 10_000 },
       );
       onTestFinished(() => client.dispose());
@@ -542,7 +574,7 @@ test('native session authority is separate from the controller UUID and immutabl
           getSessionId: () => 'session',
           getSessionFile: () => '/other/session.jsonl',
         },
-      }) as ExtensionContext,
+      }) as unknown as ExtensionContext,
   );
   onTestFinished(() => foreign.dispose());
   await expect(foreign.spawn(f.run.id, f.binding)).rejects.toThrow(/session/);
@@ -1848,5 +1880,268 @@ test('readonly imported alias can receive same-session stop but never foreign co
   expect(f.requests.filter((req) => req.method === 'stop')).toHaveLength(1);
   expect(await readFile(f.registry.authorizationPath(f.run.id), 'utf8')).toBe(
     before,
+  );
+});
+
+async function admissionChild(
+  f: Awaited<ReturnType<typeof fixture>>,
+  agent: string,
+) {
+  const op = await f.client.prepare(f.run, {
+    operationId: 'admission',
+    kind: 'review',
+    agent,
+    task: 'Inspect without writes',
+    model: 'fixture/requested',
+    outputSchema: { type: 'object' },
+  });
+  f.run = await f.registry.updateLatest(f.run.id, (run) => ({
+    ...run,
+    stage: 'comprehensive_review',
+    activeOperation: op,
+  }));
+  return {
+    op,
+    binding: {
+      operationId: op.operationId,
+      requestDigest: required(op.requestDigest),
+    },
+  };
+}
+function ownedReviewer(f: Awaited<ReturnType<typeof fixture>>) {
+  const off = f.bus.on('pi-subagents:runtime-agent-register:v1', (value) => {
+    const request = value as { definition: unknown; result?: unknown };
+    expect(request.definition).toMatchObject({
+      skills: [],
+      inheritSkills: false,
+      tools: ['read', 'grep', 'find', 'ls'],
+    });
+    request.result = { ok: true, registration: { dispose() {} } };
+  });
+  const role = registerNativeReviewer(f.bus);
+  onTestFinished(() => {
+    role.dispose();
+    off();
+  });
+  return role;
+}
+const unknownReviewer = {
+  ok: false,
+  code: 'missing_agent',
+  message: 'Unknown agent: plan-exec-reviewer\nDiscovered agents: worker',
+  diagnostics: [],
+} as const;
+
+for (const reason of [
+  'missing_skill',
+  'denied_required_tool',
+  'model_scope',
+  'missing_agent',
+] as const) {
+  test(`public admission ${reason} preserves prepared intent without dispatch or retirement`, async () => {
+    const f = await fixture();
+    const before = await readFile(f.registry.authorizationPath(f.run.id));
+    admission.mockResolvedValue({
+      ok: false,
+      code: reason,
+      message: 'Required launch input unavailable',
+      diagnostics: [],
+    });
+    await expect(f.client.spawn(f.run.id, f.binding)).rejects.toThrow(
+      `admission refused (${reason})`,
+    );
+    expect(f.requests).toEqual([]);
+    expect(await readFile(f.registry.authorizationPath(f.run.id))).toEqual(
+      before,
+    );
+    expect(
+      (await f.registry.get(f.run.id))?.activeOperation?.native?.phase,
+    ).toBe('prepared');
+  });
+}
+
+test('public admission receives frozen fresh child and actual host model scope and MCP snapshot host', async () => {
+  const f = await fixture('/native-session.jsonl');
+  const { op, binding } = await admissionChild(f, 'configured-reviewer');
+  const ctx = {
+    ...f.context(),
+    model: { provider: 'fixture', id: 'inherited' },
+    scopedModels: [{ model: { provider: 'fixture', id: 'scoped' } }],
+    modelRegistry: {
+      getAvailable: () => [{ provider: 'fixture', id: 'requested' }],
+    },
+  } as unknown as ExtensionContext;
+  const host = {
+    events: f.bus,
+    getAllTools: () => [],
+    getSessionName: () => 'parent',
+  };
+  const client = new NativeRuntimeClient(f.bus, f.registry, () => ctx, {
+    rpcTimeoutMs: 30,
+    runtimeSnapshotHost: host,
+  });
+  onTestFinished(() => client.dispose());
+  await client.spawn(f.run.id, binding);
+  expect(admission).toHaveBeenCalledWith(
+    expect.objectContaining({
+      agent: 'configured-reviewer',
+      model: 'fixture/requested',
+      task: 'Inspect without writes',
+      context: 'fresh',
+      cwd: await realpath(f.directory),
+      output: op.native?.outputPath,
+      outputSchema: { type: 'object' },
+      availableModels: [{ provider: 'fixture', id: 'requested' }],
+      parentModel: { provider: 'fixture', id: 'inherited' },
+      scopedModelIds: ['fixture/scoped'],
+      parentSessionId: '/native-session.jsonl',
+      parentSessionFile: '/native-session.jsonl',
+      runtimeSnapshotHost: host,
+    }),
+  );
+  expect(f.requests[0]?.params).toEqual(op.native?.request.params);
+});
+
+for (const race of [
+  'cancel',
+  'abandon',
+  'session',
+  'native-session',
+] as const) {
+  test(`async admission rechecks ${race} before claiming dispatch`, async () => {
+    const f = await fixture();
+    let finish!: (value: Awaited<ReturnType<typeof admission>>) => void;
+    admission.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const launching = f.client
+      .spawn(f.run.id, f.binding)
+      .catch((error) => error);
+    await vi.waitFor(() => expect(admission).toHaveBeenCalledOnce());
+    if (race === 'abandon') await f.registry.abandon(f.run.id, 'session');
+    else if (race === 'cancel')
+      await f.registry.updateLatest(f.run.id, (run) => ({
+        ...run,
+        status: 'cancel_pending',
+        userStopped: true,
+        stopGeneration: 1,
+      }));
+    else if (race === 'native-session')
+      f.setNativeSession('/replacement.jsonl');
+    else f.setSession('replacement-session');
+    finish({ ok: true, contract: {} } as Awaited<ReturnType<typeof admission>>);
+    await launching;
+    expect(f.requests).toEqual([]);
+    const current = required(await f.registry.get(f.run.id));
+    expect(current.activeOperation?.native?.phase).toBe('prepared');
+    if (race === 'abandon' || race === 'cancel')
+      expect(current.status).toBe(
+        race === 'abandon' ? 'abandoned' : 'cancel_pending',
+      );
+  });
+}
+
+for (const state of [
+  'live',
+  'absent',
+  'disposed',
+  'disposed-during-admission',
+  'collision',
+  'invalid-config',
+  'missing_skill',
+  'denied_required_tool',
+  'model_scope',
+] as const) {
+  test(`owned no-skills reviewer admission ${state} never creates a generic runtime-agent bypass`, async () => {
+    const f = await fixture();
+    const { binding } = await admissionChild(f, 'plan-exec-reviewer');
+    const role = state === 'absent' ? undefined : ownedReviewer(f);
+    if (state === 'disposed') role?.dispose();
+    admission.mockResolvedValue({ ...unknownReviewer, diagnostics: [] });
+    if (state === 'collision')
+      admission.mockResolvedValue({ ok: true, contract: {} } as Awaited<
+        ReturnType<typeof admission>
+      >);
+    if (state === 'invalid-config')
+      admission.mockResolvedValue({
+        ok: false,
+        code: 'missing_agent',
+        message: 'Agent has invalid configuration',
+        diagnostics: [
+          { code: 'missing_agent', severity: 'error', message: 'bad config' },
+        ],
+      });
+    if (
+      ['missing_skill', 'denied_required_tool', 'model_scope'].includes(state)
+    )
+      admission.mockResolvedValue({
+        ok: false,
+        code: state as 'missing_skill' | 'denied_required_tool' | 'model_scope',
+        message: 'Not admissible',
+        diagnostics: [],
+      });
+    if (state === 'disposed-during-admission')
+      admission.mockImplementation(async () => {
+        role?.dispose();
+        return { ...unknownReviewer, diagnostics: [] };
+      });
+    if (state === 'live') {
+      await f.client.spawn(f.run.id, binding);
+      expect(f.requests.filter((r) => r.method === 'spawn')).toHaveLength(1);
+    } else {
+      await expect(f.client.spawn(f.run.id, binding)).rejects.toThrow(
+        /admission refused/,
+      );
+      expect(f.requests).toEqual([]);
+    }
+  });
+}
+
+test('preflight errors never become non-start and dispatched requests never reenter admission', async () => {
+  const f = await fixture();
+  admission.mockRejectedValue(new Error('preflight unavailable'));
+  await expect(f.client.spawn(f.run.id, f.binding)).rejects.toThrow(
+    'preflight unavailable',
+  );
+  expect(f.requests).toEqual([]);
+  expect((await f.registry.get(f.run.id))?.activeOperation?.native?.phase).toBe(
+    'prepared',
+  );
+  admission.mockResolvedValue({ ok: true, contract: {} } as Awaited<
+    ReturnType<typeof admission>
+  >);
+  await f.client.spawn(f.run.id, f.binding);
+  const count = admission.mock.calls.length;
+  await f.client.spawn(f.run.id, f.binding);
+  expect(admission).toHaveBeenCalledTimes(count);
+  expect(f.requests.filter((r) => r.method === 'spawn')).toHaveLength(1);
+});
+
+test('owned reviewer disposal after dispatch claim still prevents the synchronous spawn emit', async () => {
+  const f = await fixture();
+  const { binding } = await admissionChild(f, 'plan-exec-reviewer');
+  const role = ownedReviewer(f);
+  admission.mockResolvedValue({ ...unknownReviewer, diagnostics: [] });
+  const update = f.registry.updateIfCurrent.bind(f.registry);
+  vi.spyOn(f.registry, 'updateIfCurrent').mockImplementation(
+    async (...args) => {
+      const result = await update(...args);
+      if (
+        result.applied &&
+        args[0].activeOperation?.native?.phase === 'dispatching'
+      )
+        role.dispose();
+      return result;
+    },
+  );
+  const observed = await f.client.spawn(f.run.id, binding);
+  expect(f.requests).toEqual([]);
+  expect(observed.state).toBe('unknown');
+  expect(observed.reason).toContain('owned_reviewer_unavailable');
+  expect((await f.registry.get(f.run.id))?.activeOperation?.native?.phase).toBe(
+    'dispatching',
   );
 });
