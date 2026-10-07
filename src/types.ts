@@ -385,6 +385,8 @@ export interface ExternalPrerequisite {
 }
 
 export interface TaskExecution {
+  /** One proven-retired provider failure; replaced on failure, cleared with a new authorized attempt. */
+  providerFailure?: ActiveOperation;
   taskId: number;
   dependsOn: number[];
   state: TaskExecutionState;

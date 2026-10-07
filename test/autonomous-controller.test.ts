@@ -15,6 +15,7 @@ import { dirname, join, relative } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { promisify } from 'node:util';
 import { onTestFinished, type TestContext, test, vi } from 'vitest';
+import { modelRecoveryOperation } from '../src/controller.js';
 import {
   executionRequestDigest,
   processTerminalProof,
@@ -4956,4 +4957,278 @@ test('cancel waits for local command retirement before releasing the worktree fe
   } finally {
     await running;
   }
+});
+
+test('native provider failure holds only its task and explicit recovery uses one new model without changing config', async (t) => {
+  const f = await fixture(t);
+  let run = await f.registry.update({
+    ...f.run,
+    config: { ...f.run.config, workerModel: 'fixture/bad' },
+  });
+  run = await f.controller.tick(run.id, 'session');
+  const original = required(run.activeOperation);
+  await assert.rejects(
+    f.controller.resume(
+      run.id,
+      'session',
+      true,
+      undefined,
+      false,
+      'fixture/good',
+    ),
+    /failed attempt/,
+  );
+  f.worker.state = 'failed';
+  f.worker.proof = true;
+  f.worker.output = '401: invalid_api_key';
+  vi.spyOn(f.worker, 'result').mockResolvedValue({
+    success: false,
+    error: { message: '401: invalid_api_key' },
+  });
+  run = await f.controller.tick(run.id, 'session');
+  assert.equal(run.tasks?.['1']?.state, 'waiting_external');
+  assert.equal(run.failedOperation?.processTreeExited, true);
+  const retained = structuredClone(run.failedOperation);
+  assert.equal(modelRecoveryOperation(run)?.operationId, original.operationId);
+  for (const invalid of [
+    { ...run, status: 'abandoned' as const },
+    { ...run, activeOperation: original },
+    { ...run, executionGeneration: (run.executionGeneration ?? 0) + 1 },
+    { ...run, stopGeneration: (run.stopGeneration ?? 0) + 1 },
+    {
+      ...run,
+      failedOperation: {
+        ...required(run.failedOperation),
+        processTreeExited: false,
+      },
+    },
+    {
+      ...run,
+      failedOperation: {
+        ...required(run.failedOperation),
+        lastObservedState: 'complete',
+      },
+    },
+    {
+      ...run,
+      tasks: {
+        ...run.tasks,
+        '1': { ...required(run.tasks?.['1']), operationId: 'stale-operation' },
+      },
+    },
+  ])
+    assert.equal(modelRecoveryOperation(invalid), undefined);
+
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(Date.now() + 120000);
+  run = await f.controller.tick(run.id, 'session');
+  assert.equal(f.worker.launches.length, 1);
+  f.worker.state = 'running';
+  f.worker.proof = false;
+  run = await f.controller.resume(
+    run.id,
+    'session',
+    true,
+    undefined,
+    false,
+    'fixture/good',
+  );
+  assert.equal(f.worker.launches.length, 2);
+  assert.equal(f.worker.launches[1]?.params.model, 'fixture/good');
+  assert.notEqual(run.activeOperation?.operationId, original.operationId);
+  assert.equal(run.config.workerModel, 'fixture/bad');
+  assert.equal(run.recoveryModel, undefined);
+  assert.deepEqual(run.failedOperation, retained);
+  vi.mocked(f.worker.result).mockRestore();
+  f.worker.state = 'failed';
+  f.worker.proof = true;
+  f.worker.output = 'ordinary command failed';
+  run = await f.controller.tick(run.id, 'session');
+  vi.setSystemTime(Date.now() + 120000);
+  f.worker.state = 'running';
+  f.worker.proof = false;
+  run = await f.controller.tick(run.id, 'session');
+  assert.equal(f.worker.launches.at(-1)?.params.model, 'fixture/bad');
+});
+
+test('native provider hold permits independent work but model recovery cannot redirect its live writer', async (t) => {
+  const f = await fixture(
+    t,
+    '### Task 1: A\n- [ ] A\n### Task 2: B\ndependsOn: []\n- [ ] B\n',
+  );
+  let run = await f.controller.tick(f.run.id, 'session');
+  f.worker.state = 'failed';
+  f.worker.proof = true;
+  f.worker.output = '404: model_not_found';
+  vi.spyOn(f.worker, 'result').mockResolvedValue({
+    success: false,
+    error: { message: '404: model_not_found' },
+  });
+  run = await f.controller.tick(run.id, 'session');
+  f.worker.state = 'running';
+  f.worker.proof = false;
+  for (let i = 0; i < 12 && !run.activeOperation; i++)
+    run = await f.controller.tick(run.id, 'session');
+  assert.equal(run.activeOperation?.taskId, 2);
+  assert.equal(run.tasks?.['1']?.state, 'waiting_external');
+  await assert.rejects(
+    f.controller.resume(
+      run.id,
+      'session',
+      true,
+      undefined,
+      false,
+      'fixture/override',
+    ),
+    /failed attempt/,
+  );
+  assert.equal(f.worker.launches.length, 2);
+});
+
+test('stop generation winning provider recovery CAS cannot launch or retain an override for another task', async (t) => {
+  const f = await fixture(t);
+  let run = await f.controller.tick(f.run.id, 'session');
+  f.worker.state = 'failed';
+  f.worker.proof = true;
+  f.worker.output = '401: invalid_api_key';
+  vi.spyOn(f.worker, 'result').mockResolvedValue({
+    success: false,
+    error: { message: '401: invalid_api_key' },
+  });
+  run = await f.controller.tick(run.id, 'session');
+  const update = f.registry.updateIfCurrent.bind(f.registry);
+  vi.spyOn(f.registry, 'updateIfCurrent').mockImplementation(
+    async (...args) => {
+      if (args[0].recoveryModel) {
+        const current = required(await f.registry.get(run.id));
+        await update(
+          {
+            ...current,
+            status: 'paused',
+            userStopped: true,
+            stopGeneration: 1,
+          },
+          current.updatedAt,
+        );
+      }
+      return update(...args);
+    },
+  );
+  const stopped = await f.controller.resume(
+    run.id,
+    'session',
+    true,
+    undefined,
+    false,
+    'fixture/override',
+  );
+  assert.equal(stopped.status, 'paused');
+  assert.equal(stopped.userStopped, true);
+  assert.equal(stopped.recoveryModel, undefined);
+  assert.equal(f.worker.launches.length, 1);
+});
+
+test('two independent provider failures retain separate proof and recover B then A without model leakage', async (t) => {
+  const f = await fixture(
+    t,
+    '### Task 1: A\n- [ ] A\n### Task 2: B\ndependsOn: []\n- [ ] B\n',
+  );
+  let run = await f.registry.update({
+    ...f.run,
+    config: { ...f.run.config, workerModel: 'fixture/bad' },
+  });
+  run = await f.controller.tick(run.id, 'session');
+  f.worker.state = 'failed';
+  f.worker.proof = true;
+  const result = vi.spyOn(f.worker, 'result').mockResolvedValue({
+    success: false,
+    error: { message: '401: invalid_api_key' },
+  });
+  run = await f.controller.tick(run.id, 'session');
+  const a = structuredClone(required(run.tasks?.['1']?.providerFailure));
+  f.worker.state = 'running';
+  f.worker.proof = false;
+  for (let i = 0; i < 12 && !run.activeOperation; i++)
+    run = await f.controller.tick(run.id, 'session');
+  assert.equal(run.activeOperation?.taskId, 2);
+  f.worker.state = 'failed';
+  f.worker.proof = true;
+  run = await f.controller.tick(run.id, 'session');
+  const b = structuredClone(required(run.tasks?.['2']?.providerFailure));
+  assert.notEqual(a.operationId, b.operationId);
+  assert.deepEqual(run.tasks?.['1']?.providerFailure, a);
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(Date.now() + 120000);
+  run = await f.controller.tick(run.id, 'session');
+  assert.equal(f.worker.launches.length, 2);
+  assert.equal(modelRecoveryOperation(run)?.operationId, b.operationId);
+  const stale = {
+    ...run,
+    tasks: {
+      ...run.tasks,
+      '2': {
+        ...required(run.tasks?.['2']),
+        providerFailure: { ...b, requestDigest: 'contradictory' },
+      },
+    },
+    failedOperation: b,
+  };
+  // A is still independently eligible; corrupt B cannot borrow latest failedOperation's proof.
+  assert.equal(modelRecoveryOperation(stale)?.operationId, a.operationId);
+  await assert.rejects(f.registry.update(stale), /Invalid plan-exec/);
+  f.worker.state = 'running';
+  f.worker.proof = false;
+  run = await f.controller.resume(
+    run.id,
+    'session',
+    true,
+    undefined,
+    false,
+    'fixture/recover-B',
+  );
+  assert.equal(run.activeOperation?.taskId, 2);
+  assert.equal(f.worker.launches.at(-1)?.params.model, 'fixture/recover-B');
+  assert.equal(run.tasks?.['2']?.providerFailure, undefined);
+  assert.deepEqual(run.tasks?.['1']?.providerFailure, a);
+  result.mockRestore();
+  await writeFile(
+    required(run.planPath),
+    (await readFile(required(run.planPath), 'utf8')).replace(
+      '- [ ] B',
+      '- [x] B',
+    ),
+  );
+  await writeFile(join(run.worktreeCwd, 'B.txt'), 'B complete');
+  for (const args of [
+    ['add', 'plan.md', 'B.txt'],
+    ['commit', '-m', 'Complete B'],
+  ])
+    assert.equal((await command('git', args, run.worktreeCwd)).code, 0);
+  f.worker.state = 'complete';
+  f.worker.proof = true;
+  run = await f.controller.tick(run.id, 'session');
+  assert.equal(run.tasks?.['2']?.state, 'accepted');
+  assert.equal(modelRecoveryOperation(run)?.operationId, a.operationId);
+  f.worker.state = 'running';
+  f.worker.proof = false;
+  run = await f.controller.resume(
+    run.id,
+    'session',
+    true,
+    undefined,
+    false,
+    'fixture/recover-A',
+  );
+  for (let i = 0; i < 12 && !run.activeOperation; i++)
+    run = await f.controller.tick(run.id, 'session');
+  assert.equal(run.activeOperation?.taskId, 1);
+  assert.equal(f.worker.launches.at(-1)?.params.model, 'fixture/recover-A');
+  assert.equal(run.config.workerModel, 'fixture/bad');
+  assert.equal(run.recoveryModel, undefined);
+  assert.equal(run.tasks?.['1']?.providerFailure, undefined);
+  assert.deepEqual(
+    f.worker.launches.map((value) => value.params.model),
+    ['fixture/bad', 'fixture/bad', 'fixture/recover-B', 'fixture/recover-A'],
+  );
+  assert.equal(new Set(f.worker.launches.map((value) => value.id)).size, 4);
 });

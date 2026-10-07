@@ -433,3 +433,57 @@ test('legacy import publication EACCES preserves registry and SQLite bytes and r
   expect(await readFile(f.snapshot)).toEqual(snapshot);
   expect(f.calls).toEqual([]);
 });
+
+test('repeated legacy rejection import preserves an original launch fence without manufacturing dispatch authority', async () => {
+  const f = await fixture();
+  const rejection = {
+    version: 1,
+    source: 'subagents-rpc',
+    requestId: 'original-native-rpc',
+    method: 'spawn',
+    code: 'invalid_params',
+    message: 'Rejected before launch',
+    operationId: f.binding.operationId,
+    requestDigest: f.binding.requestDigest,
+    ownerRunId: f.binding.ownerRunId,
+  };
+  await writeLegacyJournal(f.snapshot, f.binding, {
+    binding: 'unknown',
+    run_id: null,
+    async_dir: null,
+    error: 'Rejected before launch',
+    launch_rejection: JSON.stringify(rejection),
+  });
+  const unfenced = await f.controller.importLegacyJournal(
+    f.run.id,
+    'owner',
+    f.snapshot,
+  );
+  expect(
+    unfenced.activeOperation?.legacyImport?.operation.launchRejection,
+  ).toEqual(rejection);
+  expect(unfenced.activeOperation?.launchFenced).toBeUndefined();
+  await f.registry.updateLatest(f.run.id, (run) => ({
+    ...run,
+    activeOperation: { ...required(run.activeOperation), launchFenced: true },
+  }));
+  const bytes = await readFile(f.snapshot);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const imported = await f.controller.importLegacyJournal(
+      f.run.id,
+      'owner',
+      f.snapshot,
+    );
+    expect(imported.activeOperation?.launchFenced).toBe(true);
+    expect(imported.activeOperation?.requestDigest).toBe(
+      f.binding.requestDigest,
+    );
+    expect(imported.activeOperation?.params).toEqual(
+      f.run.activeOperation?.params,
+    );
+    expect(imported.activeOperation?.processTreeExited).toBeUndefined();
+    expect(imported.lease).toBeUndefined();
+  }
+  expect(await readFile(f.snapshot)).toEqual(bytes);
+  expect(f.calls).toEqual([]);
+});

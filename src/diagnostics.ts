@@ -179,3 +179,18 @@ export function diagnoseOperation(
     ...(error ? { error } : {}),
   };
 }
+
+export function isModelProviderFailureText(value: string | undefined): boolean {
+  if (!value) return false;
+  return (
+    /string_above_max_length.*call[_ -]?id|call[_ -]?id.*(?:string_above_max_length|maximum length)/i.test(
+      value,
+    ) ||
+    /out of extra usage/i.test(value) ||
+    /model .*(?:not found|does not exist|unavailable)/i.test(value) ||
+    /(?:invalid|missing)[_ ]api[_ ]key|authentication failed|(?:^|\n)401\b|model_not_found/i.test(
+      value,
+    ) ||
+    /invalid_grant|refresh token expired|oauth .*refresh.*failed/i.test(value)
+  );
+}

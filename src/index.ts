@@ -16,6 +16,7 @@ import {
   isExternalManualBlocker,
   isModelProviderFailure,
   isTaskRetryConfirmationRequired,
+  modelRecoveryOperation,
   PLAN_STRUCTURE_CHANGED_ERROR,
   PlanExecController,
   TASK_RETRY_OPTION,
@@ -3765,13 +3766,22 @@ async function recoveryModelForResume(
   ctx: ExtensionCommandContext,
 ): Promise<string | undefined> {
   if (requested) {
-    if (run.status !== RUN_STATUS.FAILED)
+    if (
+      !modelRecoveryOperation(run) &&
+      (run.status !== RUN_STATUS.FAILED ||
+        run.activeOperation ||
+        run.failedOperation?.service === 'native' ||
+        (run.failedOperation &&
+          !run.failedOperation.processTreeExited &&
+          !run.failedOperation.launchFenced))
+    )
       throw new Error(
-        `${RECOVERY_MODEL_OPTION} is only valid for a failed run.`,
+        `${RECOVERY_MODEL_OPTION} requires a current failed attempt with proven retirement.`,
       );
     return resolveRecoveryModel(requested, ctx);
   }
-  if (!isModelProviderFailure(run)) return undefined;
+  if (!modelRecoveryOperation(run) && !isModelProviderFailure(run))
+    return undefined;
   if (!ctx.model)
     throw new Error('No active Pi model is available for recovery.');
   const current = modelReference(ctx.model);

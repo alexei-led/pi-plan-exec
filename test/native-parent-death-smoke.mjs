@@ -204,3 +204,46 @@ for (const [scenario, barrier, name] of [
     }
   });
 }
+
+test('S26 fresh foreign native host can take the plan lease but cannot control the original child', {
+  timeout: 100000,
+}, async () => {
+  const sandbox = await realpath(
+    await mkdtemp(join(tmpdir(), 'native-foreign-')),
+  );
+  const script = resolve('test/fixtures/native-crash-host.mjs');
+  const parent = spawn(process.execPath, [script, 'origin', sandbox], {
+    stdio: ['ignore', 'ignore', 'pipe'],
+  });
+  let errors = '';
+  parent.stderr.on('data', (value) => {
+    errors += value;
+  });
+  const closed = once(parent, 'close');
+  try {
+    const origin = await waitFor(async () => {
+      if (parent.exitCode !== null) throw new Error(errors);
+      return json(join(sandbox, 'origin.json'));
+    }, 'original owned child');
+    assert.equal(parent.kill('SIGKILL'), true);
+    assert.equal((await closed)[1], 'SIGKILL');
+    await execute(process.execPath, [script, 'foreign', sandbox], {
+      timeout: 70000,
+      maxBuffer: 2000000,
+    });
+    const report = await json(join(sandbox, 'foreign.json'));
+    assert.notEqual(report.hostPid, origin.hostPid);
+    assert.equal(report.rootId, origin.rootId);
+    assert.equal(report.leaseSession, 'foreign-native-session');
+    assert.equal(report.nativeSession, 'owned-crash-session');
+    assert.equal(report.spawns, 0);
+    assert.equal(report.adapterStops, 0);
+    assert.equal(report.sideEffects, 1);
+    console.log(JSON.stringify({ scenario: 'S26', ...report, sandbox }));
+  } finally {
+    if (parent.exitCode === null && parent.signalCode === null)
+      parent.kill('SIGKILL');
+    await writeFile(join(sandbox, 'release-child'), 'fixture cleanup');
+    console.log(`Retained foreign-session evidence: ${sandbox}; ${errors}`);
+  }
+});

@@ -104,6 +104,27 @@ test('packed normal loader: native execution, recovery, readonly controls, super
           model: input.model,
           at: Date.now(),
         });
+        if (
+          ['http401', 'http404', 'goal-http401'].includes(mode) &&
+          worker &&
+          input.model === 'fixture'
+        ) {
+          const status = mode.endsWith('http401') ? 401 : 404;
+          res.writeHead(status, { 'Content-Type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              error: {
+                message: `LOCAL_FIXTURE_${status}: ${status === 401 ? 'authentication refused' : 'model not found'}`,
+                type:
+                  status === 401
+                    ? 'authentication_error'
+                    : 'invalid_request_error',
+                code: status === 401 ? 'invalid_api_key' : 'model_not_found',
+              },
+            }),
+          );
+          return;
+        }
         if (reviewer) {
           assert.ok(
             !tools.includes('bash') &&
@@ -129,7 +150,7 @@ test('packed normal loader: native execution, recovery, readonly controls, super
           );
           if (reply) supervisorReplyOutcome = JSON.stringify(reply);
         }
-        if (mode === 'supervisor' && worker && contactCalled) {
+        if (mode.startsWith('supervisor') && worker && contactCalled) {
           supervisorReturned = body.includes('FINAL_PROBE_S25_REPLY');
           while (!releaseSupervisorChild && !res.destroyed)
             await new Promise((resolve) => setTimeout(resolve, 20));
@@ -190,7 +211,7 @@ test('packed normal loader: native execution, recovery, readonly controls, super
         const fixCommand = `node -e 'require("node:fs").writeFileSync("review-fixed.txt","reviewed\\n")' && git add review-fixed.txt && git -c commit.gpgSign=false commit -m 'Fix review metadata'`;
         let toolId;
         let special;
-        if (mode === 'supervisor' && worker && !contactCalled) {
+        if (mode.startsWith('supervisor') && worker && !contactCalled) {
           special = {
             name: 'contact_supervisor',
             arguments: JSON.stringify({
@@ -267,7 +288,7 @@ test('packed normal loader: native execution, recovery, readonly controls, super
           : {
               role: 'assistant',
               content: worker
-                ? mode === 'goal'
+                ? mode.startsWith('goal')
                   ? '<<<RALPHEX:GOAL_DONE>>>'
                   : 'Task completed and committed.'
                 : 'Fixture observation complete.',
@@ -370,9 +391,11 @@ EventEmitter.prototype.emit=function(name,value,...rest){if(process.env.PI_SUBAG
       observer,
       `import { registerSubagentCapabilityCeiling, resolveCurrentSubagentCapabilityCeiling } from ${JSON.stringify(require.resolve('pi-subagents/capability-ceiling'))};
 import { resolveSubagentLaunchContract } from ${JSON.stringify(require.resolve('pi-subagents/preflight'))};
-import{appendFileSync,existsSync,readFileSync,readdirSync,unlinkSync,writeFileSync}from'node:fs';import{join}from'node:path';
+import{appendFileSync,existsSync,readFileSync,readdirSync,unlinkSync,writeFileSync}from'node:fs';import{join}from'node:path';import{randomUUID}from'node:crypto';
 export default function(pi){
  const root=${JSON.stringify(sandbox)},home=${JSON.stringify(home)};
+ if(process.env.PI_SUBAGENT_CHILD!=='1')pi.registerCommand('fixture-native-rpc',{description:'Isolated public native control probe',handler:async(args)=>{const input=JSON.parse(args),requestId=randomUUID();const result=await new Promise((resolve,reject)=>{const timer=setTimeout(()=>{off();reject(new Error('Fixture public RPC timed out'));},5000);const off=pi.events.on('subagents:rpc:v1:reply:'+requestId,value=>{clearTimeout(timer);off();resolve(value);});pi.events.emit('subagents:rpc:v1:request',{version:1,requestId,method:input.method,params:input.params});});writeFileSync(join(root,input.label+'.json'),JSON.stringify(result));}});
+
  if(process.env.PI_SUBAGENT_CHILD!=='1'){pi.events.on('pi-intercom:detach-request',value=>writeFileSync(join(root,'supervisor-request.json'),JSON.stringify(value)));pi.events.on('pi-intercom:detach-response',value=>writeFileSync(join(root,'supervisor-detach.json'),JSON.stringify(value)));}
  pi.on('session_start',(_event,ctx)=>{if(process.env.PI_SUBAGENT_CHILD!=='1'&&ctx.cwd.endsWith('/schema-ceiling'))registerSubagentCapabilityCeiling({sessionId:ctx.sessionManager.getSessionFile()??ctx.sessionManager.getSessionId(),source:'final-probe',ceiling:{allowedTools:['read','grep','find','ls']}});});
  pi.on('session_start',(_event,ctx)=>{if(process.env.PI_SUBAGENT_CHILD!=='1'&&ctx.cwd.endsWith('/agent-ceiling'))registerSubagentCapabilityCeiling({sessionId:ctx.sessionManager.getSessionFile()??ctx.sessionManager.getSessionId(),source:'agent-ceiling-probe',ceiling:{allowedAgents:['worker']}});});
@@ -450,6 +473,9 @@ export default function(pi){
           'rpc',
           '--session',
           session,
+          ...(mode === 'goal-http401'
+            ? ['--model', 'localfixture/scoped-fixture']
+            : []),
           ...(mode === 'valid-skill'
             ? ['--models', 'localfixture/fixture,localfixture/scoped-fixture']
             : []),
@@ -526,6 +552,11 @@ export default function(pi){
       'valid-skill',
       'lazy-skill',
       'deadline',
+      'interrupt-stop',
+      'supervisor-stop',
+      'http401',
+      'http404',
+      'goal-http401',
       'supervisor',
       'cutover',
     ];
@@ -636,15 +667,22 @@ import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8')
           reviewRequired: true,
           finalizeEnabled: false,
           statsEnabled: false,
-          retryDelayMs: [
-            'deadline',
-            'missing-agent',
-            'lazy-skill',
-            'schema-ceiling',
-            'supervisor',
-          ].includes(mode)
-            ? 30000
-            : 100,
+          retryDelayMs: ['http401', 'http404', 'goal-http401'].includes(mode)
+            ? 200
+            : [
+                  'deadline',
+                  'interrupt-stop',
+                  'supervisor-stop',
+                  'http401',
+                  'http404',
+                  'goal-http401',
+                  'missing-agent',
+                  'lazy-skill',
+                  'schema-ceiling',
+                  'supervisor',
+                ].includes(mode)
+              ? 30000
+              : 100,
           ...(mode === 'missing-agent'
             ? { workerAgent: 'intentionally-missing-configured-agent' }
             : {}),
@@ -668,6 +706,10 @@ import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8')
       await git(['commit', '-m', 'Fixture baseline']);
       await git(['checkout', '-b', 'feature']);
       const session = join(sandbox, `${mode}-session.jsonl`);
+      if (mode.startsWith('supervisor')) {
+        await rm(join(sandbox, 'supervisor-request.json'), { force: true });
+        await rm(join(sandbox, 'supervisor-detach.json'), { force: true });
+      }
       if (mode === 'no-peer') {
         const settingsPath = join(agent, 'settings.json');
         const settings = await readFile(settingsPath, 'utf8');
@@ -733,7 +775,8 @@ import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8')
       host = await launch(cwd, session);
       if (mode === 'plan' || mode === 'stop')
         await writeFile(join(sandbox, 'drop-next'), 'drop');
-      hold = mode === 'stop' || mode === 'deadline';
+      hold =
+        mode === 'stop' || mode === 'deadline' || mode === 'interrupt-stop';
       supervisorReply = false;
       releaseSupervisorChild = false;
       supervisorReturned = false;
@@ -741,16 +784,219 @@ import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8')
       host.send({
         id: 'start',
         type: 'prompt',
-        message:
-          mode === 'goal'
-            ? '/goal Deliver fixture'
-            : `/exec --worktree ${cwd} plan.md`,
+        message: mode.startsWith('goal')
+          ? '/goal Deliver fixture'
+          : `/exec --worktree ${cwd} plan.md`,
       });
       const run = await waitFor(
         async () => (await listRuns()).find((r) => r.repositoryRoot === cwd),
         `create ${mode}`,
       );
-      if (
+      if (['interrupt-stop', 'supervisor-stop'].includes(mode)) {
+        await waitFor(
+          () => calls.some((call) => call.mode === mode && call.worker),
+          'actual native model request',
+        );
+        if (mode === 'supervisor-stop')
+          await waitFor(
+            () => json(join(sandbox, 'supervisor-request.json')),
+            'actual waiting supervisor request',
+          );
+        const tracked = await waitFor(async () => {
+          const current = await json(join(runs, run.id, 'run.json'));
+          return current?.activeOperation?.asyncDir && current;
+        }, 'bound selected workflow');
+        const op = tracked.activeOperation;
+        const initial = await json(join(op.asyncDir, 'status.json'));
+        assert.equal(initial.mode, 'workflow');
+        assert.equal(initial.state, 'running');
+        const childId = initial.steps.find(
+          (step) => step.workflowKey === 'main',
+        )?.runId;
+        assert.ok(childId);
+        const childPath = join(dirname(op.asyncDir), childId, 'status.json');
+        const rpc = async (method, params, label) => {
+          host.send({
+            id: label,
+            type: 'prompt',
+            message:
+              '/fixture-native-rpc ' +
+              JSON.stringify({ method, params, label }),
+          });
+          return waitFor(
+            () => json(join(sandbox, label + '.json')),
+            'public ' + method,
+          );
+        };
+        let interrupted;
+        if (mode === 'interrupt-stop') {
+          interrupted = await rpc(
+            'interrupt',
+            { id: op.externalRunId, index: 0 },
+            'interrupt-probe',
+          );
+          assert.equal(interrupted.success, false);
+          assert.match(
+            interrupted.error.message,
+            /Interrupt is unsupported for async workflow/,
+          );
+        }
+        assert.equal(
+          initial.steps.find((step) => step.workflowKey === 'main').async,
+          true,
+        );
+        const beforeStop =
+          mode === 'interrupt-stop' && interrupted.success
+            ? await waitFor(
+                async () => {
+                  const child = await json(childPath);
+                  return (
+                    child &&
+                    !['running', 'queued'].includes(child.state) &&
+                    child
+                  );
+                },
+                'actual interrupted child state',
+                25000,
+              )
+            : await json(childPath);
+        const stopped = await rpc(
+          'stop',
+          { id: op.externalRunId },
+          'stop-' + mode,
+        );
+        const root = await waitFor(
+          async () => {
+            const value = await json(join(op.asyncDir, 'status.json'));
+            return (
+              value && !['running', 'queued'].includes(value.state) && value
+            );
+          },
+          'selected root terminal disposition',
+          30000,
+        );
+        assert.equal(existsSync(join(cwd, 'result.txt')), false);
+        if (stopped.success) {
+          assert.equal(stopped.data.runId, op.externalRunId);
+          assert.equal(stopped.data.state, 'stopping');
+        } else {
+          assert.equal(stopped.error.code, 'invalid_state');
+          assert.match(
+            stopped.error.message,
+            /supports running|live run controller/,
+          );
+        }
+        console.log(
+          JSON.stringify({
+            scenario: 'S21',
+            mode,
+            initialRoot: initial.state,
+            childBeforeStop: beforeStop?.state,
+            interrupt: interrupted,
+            stop: stopped,
+            finalRoot: root.state,
+            rootProof: root.processTerminal,
+            rootId: op.externalRunId,
+          }),
+        );
+        host.send({
+          id: 'stop-probe-end',
+          type: 'prompt',
+          message: `/exec stop ${run.id} --force`,
+        });
+        await waitFor(
+          async () =>
+            (
+              (await json(join(runs, run.id, 'run.json'))) ??
+              (await json(join(runs, '.abandoned', run.id, 'run.json')))
+            )?.status === 'abandoned',
+          'permanent probe stop',
+        );
+        retainUnknownOwnership = true;
+      } else if (['http401', 'http404', 'goal-http401'].includes(mode)) {
+        const failed = await waitFor(
+          async () => {
+            const value = await json(join(runs, run.id, 'run.json'));
+            return (
+              value &&
+              !value.activeOperation &&
+              value.tasks?.['1']?.state !== 'accepted' &&
+              JSON.stringify(value).includes(
+                `LOCAL_FIXTURE_${mode.endsWith('401') ? '401' : '404'}`,
+              ) &&
+              value
+            );
+          },
+          'captured local provider failure',
+          45000,
+        );
+        assert.equal(existsSync(join(cwd, 'result.txt')), false);
+        assert.equal(failed.reviewedCommit, undefined);
+        assert.ok(
+          calls.some(
+            (call) =>
+              call.mode === mode && call.worker && call.model === 'fixture',
+          ),
+        );
+        await new Promise((resolve) => setTimeout(resolve, 1500)); // Beyond the ordinary retry deadline: no automatic bad-model launch.
+        const launchesBefore = (
+          await readFile(join(sandbox, 'spawns.jsonl'), 'utf8')
+        )
+          .trim()
+          .split('\n')
+          .map(JSON.parse)
+          .filter((value) => value.pid === host.child.pid);
+        assert.equal(
+          launchesBefore.length,
+          1,
+          'No same-bad-model redispatch before explicit recovery',
+        );
+        assert.equal(failed.failedOperation?.native?.phase, 'retired');
+        if (!mode.startsWith('goal'))
+          assert.equal(failed.tasks['1'].state, 'waiting_external');
+        host.send({
+          id: 'provider-override',
+          type: 'prompt',
+          message: `/exec resume ${run.id} --model ${mode === 'goal-http401' ? 'current' : 'localfixture/scoped-fixture'}`,
+        });
+        const completed = await waitFor(
+          async () => {
+            const value = await json(join(runs, run.id, 'run.json'));
+            return value?.status === 'completed' && value;
+          },
+          'one-attempt local model override completes',
+          90000,
+        );
+        assert.equal(completed.config.workerModel, 'localfixture/fixture');
+        assert.equal(completed.recoveryModel, undefined);
+        assert.ok(
+          calls.some(
+            (call) =>
+              call.mode === mode && call.reviewer && call.model === 'fixture',
+          ),
+          'Implementation override cannot leak into review',
+        );
+        assert.ok(
+          calls.some(
+            (call) =>
+              call.mode === mode &&
+              call.worker &&
+              call.model === 'scoped-fixture' &&
+              call.wrote,
+          ),
+        );
+        console.log(
+          JSON.stringify({
+            scenario: 'S29',
+            mode,
+            diagnostic: failed.tasks?.['1']?.reason ?? failed.error,
+            originalAttempts: failed.tasks?.['1']?.attempts,
+            override: 'localfixture/scoped-fixture',
+            frozenModel: completed.config.workerModel,
+            status: completed.status,
+          }),
+        );
+      } else if (
         [
           'missing-agent',
           'missing-skill',
@@ -1332,7 +1578,13 @@ import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8')
               'stop',
             ].includes(value)
               ? 0
-              : ['schema-ceiling', 'deadline', 'supervisor'].includes(value)
+              : [
+                    'schema-ceiling',
+                    'deadline',
+                    'supervisor',
+                    'interrupt-stop',
+                    'supervisor-stop',
+                  ].includes(value)
                 ? 1
                 : value === 'findings'
                   ? 4

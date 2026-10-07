@@ -232,3 +232,33 @@ an uncertain writer. Source-named backend tests retain capability refusals.
 
 These checks do not claim live-model reliability or repair an unavailable native
 identity/proof. The executable plan and independent review own final acceptance.
+
+
+## Confirmed provider failure and one-attempt model recovery
+
+A native implementation failure with exact retirement and a retained provider/
+model diagnostic (including actual 401 or model-not-found errors) holds that task
+as a provider prerequisite. The ordinary retry timer or credential presence is
+not evidence that a known-bad model/authentication now works. Independent ready
+tasks remain eligible; goals keep their existing explicit-pause policy.
+
+`/exec resume <id> --model current|provider/model` may recover the current eligible
+retired failed task/goal even when the overall plan is still running. Healthy,
+in-flight, unknown, contradictory/stale-generation and abandoned work cannot be
+redirected. Authority is rechecked under existing controller locks/CAS; explicit
+stop races win. Frozen config and old request/digest are not rewritten.
+
+`TaskExecution.providerFailure` holds at most one proven-retired native provider
+failure for that task, in the existing registry record. Existing identity/digest/
+workflow-proof validation applies; a state label or error string alone is not
+proof. A new provider failure replaces that task's snapshot; recording a new
+authorized attempt atomically clears it and consumes the one-attempt override.
+Held-task evidence survives independent task failures; the latest global
+failedOperation is only a selection hint, never another task's authority. Legacy
+records without this optional evidence remain readable and acquire no invented
+proof. A latest contradictory same-operation record refuses recovery.
+
+With multiple held failures, explicit recovery selects the eligible latest task
+first, then another retained eligible task after it settles (the two-task probe
+recovers B then A). The selected model cannot affect another task, required review,
+stats or subsequent attempts. Missing or stale proof remains safely fenced.

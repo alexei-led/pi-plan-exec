@@ -200,15 +200,15 @@ The table explicitly leaves genuine host-level gaps/unsupported guarantees open.
 | S18 | Pause, ordinary stop or permanent force-stop before dispatch | PASS C | `test/native-runtime.test.ts` — **stop before emit retires locally without launch; foreign control and abandoned writes denied**<br>`test/controller.test.ts` — **force stop wins while native readiness is pending without dispatch**<br>`test/native-runtime.test.ts` — **abandoned stop refusal stays pending, foreign control refuses, and prepared operations never emit** | Authorization checked before emitting the public request. |
 | S19 | Stop/force-stop races spawn, capability lookup or late success | PASS C | `test/autonomous-controller.test.ts` — **late successful worker after stop cannot accept its candidate**<br>`test/controller.test.ts` — **force stop fences a pending archive observation and holds the checkout until tick retirement**<br>`test/index.test.ts` — **force stop refreshes a foreign observer and suppresses late completion (stale=${staleCompletion})**<br>`test/native-runtime.test.ts` — **cancellation recovery binds a lost launch but cannot consume a successful review or revive the run**<br>`test/native-runtime.test.ts` — **abandoned lost spawn resolves its exact alias and stops without ordinary binding writes**<br>`test/packed-consumer-smoke.mjs` — **packed normal loader: native execution, recovery, readonly controls, supervisor reload and pinned-executor cutover** | Late success/stop race cannot accept candidate or revive final management state. Packed lost-reply force-stop targets the exact alias-resolved root. |
 | S20 | Stop delivery timeout / invalid-state / lost ack / repeated stop | PASS C | `test/autonomous-controller.test.ts` — **pending native cancellation errors survive observations and restart until delivered**<br>`test/autonomous-controller.test.ts` — **pause cancellation reply loss retries the same fence without claiming worker exit**<br>`test/native-runtime.test.ts` — **native stop refuses mismatched ${wrong} delivery and retries only the same bound run**<br>`test/native-runtime.test.ts` — **native stop refuses mismatched ${wrong} delivery and retries only the same bound run** | Persisted stop intent retries exact bound identity; a lost acknowledgement is not death. |
-| S21 | Running, queued, paused, supervisor-wait child stops | PARTIAL C/H | `test/native-runtime-contract.test.ts` — **released public RPC characterizes rejection, stop parity, ownership, and missing proof**<br>`test/autonomous-controller.test.ts` — **pending native cancellation errors survive observations and restart until delivered** | Seeded real-public-RPC queued/paused refusal characterization plus C pending-stop handling. Live queued/paused RPC parity is not claimed. Real supervisor wait/reply is in S25; live queued/paused stop parity remains unproven. |
+| S21 | Running, queued, paused, supervisor-wait child stops | FULFILLED H; SELECTED-ROUTE LIMIT | `test/packed-consumer-smoke.mjs` — **packed normal loader: native execution, recovery, readonly controls, supervisor reload and pinned-executor cutover**<br>`test/native-runtime-contract.test.ts` — **released public RPC characterizes rejection, stop parity, ownership, and missing proof**<br>`test/autonomous-controller.test.ts` — **pending native cancellation errors survive observations and restart until delivered** | Actual running and supervisor-wait selected roots receive exact public stop acknowledgement and stop without work acceptance. Public interrupt explicitly refuses async workflow pause; supervisor wait remains running. Selected root initializes running, not queued. Generic persisted queued/paused compatibility responses are separately seeded C, never mislabeled live selected states; see reachability audit below. |
 | S22 | Result says complete/failed/stopped without terminal proof | PASS P/C/H | `test/execution-contract.test.ts` — **process terminal proof accepts only complete observed upstream receipts**<br>`test/native-runtime.test.ts` — **wrong root, child identity and malformed published proof cannot retire ownership**<br>`test/native-recovery-smoke.mjs` — **failure cleanup leaves unproven runners unresolved after stop delivery**<br>`test/packed-consumer-smoke.mjs` — **packed normal loader: native execution, recovery, readonly controls, supervisor reload and pinned-executor cutover** | Exact public proof only; packed `stop` and parent-death preserve uncertainty. |
 | S23 | Parent killed before child close; orphan later exits | PASS H/X SAFE UNCERTAINTY | `test/native-parent-death-smoke.mjs` — **S23 SIGKILL after native launch barrier leaves one surviving child and no recovery redispatch** | Actual parent SIGKILL, same live child heartbeat, release, and fresh-process PlanExecController.tick (three ticks/status requests). New controller owns the lease, retains exact original operation/digest/root, sees one side effect and emits zero spawns. Missing proof leaves it bound/reserved. |
 | S24 | Proof wrong run/runner/caller; malformed/missing/private candidate only | PASS C | `test/native-runtime.test.ts` — **abandoned exact alias ${outcome} remains unknown with no stop or replay**<br>`test/native-runtime.test.ts` — **imported alias ${outcome} cannot establish a legacy binding**<br>`test/native-runtime.test.ts` — **malformed replies and unknown lookups never authorize a second spawn**<br>`test/execution-contract.test.ts` — **process terminal proof accepts only complete observed upstream receipts**<br>`test/native-runtime.test.ts` — **wrong root, child identity and malformed published proof cannot retire ownership**<br>`test/native-recovery-smoke.mjs` — **failure cleanup leaves unproven runners unresolved after stop delivery**<br>`test/packed-consumer-smoke.mjs` — **packed normal loader: native execution, recovery, readonly controls, supervisor reload and pinned-executor cutover** | Wrong root/child/correlation and malformed published proof are rejected; unknown is not non-start. |
 | S25 | Observed pause vs supervisor question vs user pause | PASS C/H PENDING-QUESTION RECOVERY; RETIREMENT LIMIT | `test/packed-consumer-smoke.mjs` — **packed normal loader: native execution, recovery, readonly controls, supervisor reload and pinned-executor cutover**<br>`test/controller.test.ts` — **resume consumes a settled detached stats child without launching a replacement**<br>`test/index.test.ts` — **generic paused operation guidance does not invent a supervisor request**<br>`test/index.test.ts` — **user-pause intent precedes generic recovery advice: ${error}** | Packed supervisor replaces the parent while contact_supervisor is unanswered. Public reply after saved-session reload reaches the same original child/session; one commit/no replacement; user pause wins. Async foreground-detach route remains refused and post-reload retirement remains unproven. |
-| S26 | New session takes plan lease but not native control ownership | PASS C; H FOREIGN-SESSION CONTROL PARTIAL | `test/native-runtime.test.ts` — **native session authority is separate from the controller UUID and immutable**<br>`test/native-runtime.test.ts` — **stop before emit retires locally without launch; foreign control and abandoned writes denied**<br>`test/native-runtime.test.ts` — **readonly imported alias can receive same-session stop but never foreign control or ordinary writes** | Separate native and controller identities with same/foreign-session refusal. Not every actual foreign-host native control permutation is exercised. |
+| S26 | New session takes plan lease but not native control ownership | FULFILLED H/X | `test/native-parent-death-smoke.mjs` — **S26 fresh foreign native host can take the plan lease but cannot control the original child** | After killing only the fixture-owned original parent, a fresh foreign native session acquires the plan lease and observes the original root. Adapter spawn/stop refuse with zero control emissions; direct public stop returns not_found in active session. Original child settles once; native authority unchanged and absent retirement proof stays fenced. |
 | S27 | Foreign host, same-machine assertion, reused PID, stale lease | PASS P/C | `test/registry.test.ts` — **a dead local pid frees the lease without waiting out the heartbeat**<br>`test/registry.test.ts` — **matching session text does not authorize takeover from a live remote owner**<br>`test/index.test.ts` — **--same-machine verifies local proof before taking a foreign lease**<br>`test/native-runtime.test.ts` — **native session authority is separate from the controller UUID and immutable** | Lease recovery and immutable native authority are distinct. No fabricated foreign-host takeover. |
 | S28 | Bounded expiry, default native deadline, unbounded request | PASS C/H | `test/packed-consumer-smoke.mjs` — **packed normal loader: native execution, recovery, readonly controls, supervisor reload and pinned-executor cutover**<br>`test/autonomous-controller.test.ts` — **confirmed bounded expiry grows later budgets while a lost reply preserves the exact request**<br>`test/autonomous-controller.test.ts` — **bounded compatibility stops growing at the supported timer maximum without ending recovery**<br>`test/autonomous-controller.test.ts` — **ordinary tool timeout text cannot grow a bounded session budget**<br>`test/autonomous-controller.test.ts` — **silent unbounded workers never acquire a synthetic execution budget**<br>`test/native-runtime.test.ts` — **prepare records unsupported limits honestly and freezes configured agent/model into awaited child**<br>`test/lifecycle.test.ts` — **legacy unknown operation lifetime is not synthesized from a changed frozen base** | Packed `deadline`: blocked real local-model request, actual root and child 8000ms expiry, exact observed runner-instance close proof. Budget growth/cap are C tests, not inferred from runtime prose. Omitted root deadlines retain native child defaults; unsupported turn/unbounded promises are not advertised. |
-| S29 | Model/auth/provider failure and explicit one-attempt override | PASS C; H AUTH/PROVIDER NOT RUN | `test/controller.test.ts` — **model failures preserve diagnostics and schedule automatic recovery**<br>`test/controller.test.ts` — **plain resume clears legacy recovery model pins before launching**<br>`test/controller.test.ts` — **resume preserves reviewer model and records unsupported larger turn request** | Controlled runtime errors and model preservation. No paid provider/auth experiment or additional claim of complete one-attempt override host coverage. |
+| S29 | Model/auth/provider failure and explicit one-attempt override | FULFILLED C/H | `test/packed-consumer-smoke.mjs` — **packed normal loader: native execution, recovery, readonly controls, supervisor reload and pinned-executor cutover**<br>`test/autonomous-controller.test.ts` — **native provider failure holds only its task and explicit recovery uses one new model without changing config**<br>`test/autonomous-controller.test.ts` — **native provider hold permits independent work but model recovery cannot redirect its live writer**<br>`test/autonomous-controller.test.ts` — **stop generation winning provider recovery CAS cannot launch or retain an override for another task**<br>`test/autonomous-controller.test.ts` — **two independent provider failures retain separate proof and recover B then A without model leakage** | Deterministic local 401 and 404 prove failure capture, no acceptance or repeated bad-model launch after backoff, exact retired-attempt eligibility and one NEW authorized override. Plan and goal (--model current) complete with unchanged frozen models and no reviewer override leak. Two independent failures retain their own proof; recover B then A, no replay. No paid credentials used. |
 | S30 | Credentials/permission/executable/runtime prerequisite | PASS C | `test/autonomous-controller.test.ts` — **unavailable runtime preflight is an explicit prerequisite and does not consume a worker attempt**<br>`test/autonomous-controller.test.ts` — **structured tool diagnosis preserves the session and schedules probes without unsupported repair**<br>`test/autonomous-controller.test.ts` — **doctor preserves the same launch identity when an empty lookup races a late spawn**<br>`test/autonomous-controller.test.ts` — **nested independent task lane preserves the cwd and excludes partial work**<br>`test/autonomous-controller.test.ts` — **external prerequisite A preserves its lane while B completes and C waits until automatic recovery** | Capability/prerequisite failures keep identity without silent repair, replay or unsupported guidance. Independent B progresses while external prerequisite A remains safely reserved. |
 | S31 | Typed review clean/blocking/minor/malformed/wrong candidate | PASS P/C/H | `test/review.test.ts` — **native reports bind clean, blocking and minor findings to the candidate commit**<br>`test/review.test.ts` — **native reports reject wrong commits, malformed findings and contradictory fields**<br>`test/autonomous-controller.test.ts` — **minor-only required review records advisory findings without an endless fixer**<br>`test/packed-consumer-smoke.mjs` — **packed normal loader: native execution, recovery, readonly controls, supervisor reload and pinned-executor cutover** | Packed plan/goal/findings/wrong-commit/malformed cases; minor terminal behavior is C. Schema acceptance still binds exact Git candidate. |
 | S32 | Missing/truncated output, deleted temporary result, retained archive | PASS P/H | `test/artifact.test.ts` — **native bound files never infer fallback output for missing, truncated or excessive reports**<br>`test/artifact.test.ts` — **recovers a settled detached workflow after its result was archived**<br>`test/native-runtime.test.ts` — **native result requires consistent bound JSON: ${scenario}**<br>`test/packed-consumer-smoke.mjs` — **packed normal loader: native execution, recovery, readonly controls, supervisor reload and pinned-executor cutover** | Packed missing bound file fails acceptance; artifact tests exercise truncated/deleted/archived evidence. Contradictory parsed JSON is never masked by envelope. |<br>`test/native-runtime.test.ts` — **native result capture EACCES preserves the operation and prevents acceptance**
@@ -254,12 +254,14 @@ The production runtime is unchanged from the full passing gate.
 
 ## Acceptance status
 
-Implementation and the named local checks are complete; whole-plan acceptance is
-not claimed. Eight checklist items remain open: the complete crash-barrier and
-supervisor-replacement matrix, all requested cross-process recovery races, broad
-controller scenario coverage, every D8 migration case and migration crash barrier,
-full scenario/platform acceptance, and final parent recheck. Linux CI has not run.
-The exact partial rows above are not waived by a green test count.
+The unchecked plan markers are parent-owned, not a count of unimplemented work.
+The reconciliation below replaces the obsolete “eight remain” coverage claim.
+Locally executable implementation/host checks are fulfilled by named evidence;
+selected-runtime states that cannot be requested are classified precisely, not
+fabricated. Separate Linux acceptance is **waived, not passed**. Final independent
+review of the parent result-capture delta and this closure delta, and the parent's
+checkbox reconciliation, are the remaining release gates. This child has no
+publication, version-bump, main/global or live-state authority.
 
 The corrected S53 requirement records observed old-format acceptance and unsafe
 cleanup, rather than the disproved old-parser rejection assumption. The earlier
@@ -289,7 +291,7 @@ Six regression cases cover absent/empty/allow/deny/lookalike lists and a ceiling
 narrowed during admission. All 80 adapter/registration tests passed. The real
 packed agent-ceiling scenario now records prepared state, zero spawns and zero
 model calls; the allowed schema-ceiling scenario still completes. npm run check
-passed. Independent recheck and the final broad gate remain pending.
+passed. The independent recheck and exact-head broad gate subsequently passed at 9f4b55b; see the post-fix closure below.
 
 The operator waived a separate Linux verification gate and authorized preparing a
 release after final review and evidence reconciliation. This is not a Linux pass.
@@ -313,3 +315,116 @@ Repeated active/failed legacy imports also preserve cancellation error/intent,
 original request/digest, quarantine inventory and SQLite bytes without dispatch.
 Four affected suites passed (221 tests), and check/TypeScript passed. Final
 independent review and broad post-fix validation remain required before release.
+
+
+## Closure host evidence and the scoped S29 correction
+
+Closure starts from parent `d713e521ba5ad0bce2b30c8da889efaae8245eb4` and preserves
+its capture-EACCES and repeated-import fixes. The review bundle includes a separate
+`parent-result-capture.diff` from `9f4b55b` to `d713e52`, not only this worker's delta.
+
+**S21 reachability, released 0.76.1:** the selected async scripted-workflow root
+is published as `running` (`subagent-executor.js` workflow status initialization,
+near line 4924); it has no queued-root transition. Its public `interrupt` route
+explicitly returns **Interrupt is unsupported for async workflow …; use stop
+instead** (near line 848), reproduced against an actual model-held workflow.
+An actual `contact_supervisor` wait also leaves this selected root `running`,
+with an async main child; public stop acknowledges that exact root and it becomes
+`stopped`. The root's `paused` error branch requires a detached-child workflow
+continuation, not the selected held async child (catch near lines 5765–5769).
+No direct-leaf, foreground-detach backend or synthetic status was introduced to
+manufacture a live queued/paused root. Existing seeded compatibility tests still
+prove invalid-state refusal and pending-intent preservation for historical states;
+they are C route characterization, not live X crashes. Parent-loss controller
+callbacks remain unavailable and retirement may remain unproven.
+
+**S26:** the foreign-host test performs real plan-lease takeover after parent
+SIGKILL while retaining the original native owner. It checks both adapter refusal
+and actual public RPC current-session refusal, plus one original side effect,
+zero replacement and no PID-derived retirement.
+
+**S29:** local HTTP 401/404 first reproduced a real gap: a retired failed native
+task remained running/retry_wait, while CLI `--model` required overall failed
+status; it retried the frozen bad model. Supervisor approved the localized fix.
+Confirmed retired provider failures now hold the affected task as an existing
+provider prerequisite without blocking ready independent tasks. Explicit resume
+uses current retired failure identity, proof and generations, not overall status
+alone. Plan and goal probes recover through a new operation with the selected
+one-attempt model (`current` covered), keeping config and old request immutable.
+Healthy/in-flight/unknown/stale/abandoned authority refuses; stop-winning CAS does
+not dispatch. The snapshot field described in runtime contracts is one bounded
+retired operation per affected task in the same registry, not another ledger.
+The two-failure regression proves B's failure cannot erase A's proof or authorize
+its override: both stay held, then B and A recover independently, four distinct
+launch IDs and exactly their intended model sequence.
+
+## D8 state-to-test reconciliation
+
+All storage paths below are disposable fixtures. “Fulfilled” includes safe refusal
+where the published contract supplies no stronger authority. Import itself never
+dispatches, and SQLite/publication errors are not called physical power loss.
+
+| Exact D8 state | Concrete evidence and actual assertion | Classification |
+| --- | --- | --- |
+| Completed/cancelled run, no active operation | `test/index.test.ts` — **legacy terminal history is visible without rewriting registry or task files**; **metadata updates cannot postpone cleanup of a legacy ${status} run**; `test/registry.test.ts` — **legacy session attribution is validated and read-only, including terminal history**. Byte-identical history/display; retention anchored to prior retirement/update. | Fulfilled C |
+| Operator-abandoned run or final archive | `test/force-stop.test.ts` — **force abandonment ends management without inventing retirement or freeing an unknown checkout**; **ordinary cleanup enforces the final abandonment archive after an interrupted force-stop**; `test/isolation.test.ts` — **force abandonment preserves isolated recovery lineage and every quarantined reservation**. No restore, ordinary CAS revival or premature checkout release. | Fulfilled C |
+| Paused run, no unresolved operation | `test/index.test.ts` — **display controls persist independently of stopped run state**; `test/autonomous-goal.test.ts` — **a goal resumes after a pause and completes**; `test/controller.test.ts` — **paused runs retain a terminal child until resume applies its completion**. Pause remains user-owned; explicit resume is separate from readonly view/observation. | Fulfilled C |
+| Active bound single/workflow with valid artifacts | `test/legacy-import.test.ts` — **repeated legacy import preserves ${slot}, cancellation and quarantined inventory without dispatch**; `test/native-runtime.test.ts` — **legacy observation and same-session stop retain the original digest without dispatch**; `test/native-recovery-smoke.mjs` — **S42/S45 real old Bridge workflow excludes a new controller and imports exact settlement after quiescence**. Exact old mapping, original params/digest, no root replay. | Fulfilled C/H/X |
+| Bound terminal result | Same S42/S45 real host test: exact old retirement and result accept one candidate with one effect/no replay. `test/native-runtime.test.ts` — **known legacy retirement without retained result state is diagnosed, not accepted or relaunched**; **native result capture EACCES preserves the operation and prevents acceptance**. Missing capture/evidence never authorizes success. | Fulfilled C/H/X |
+| Stop requested, not delivered | `test/legacy-operation.test.ts` — **legacy-operation preserves cancellation intent and ${stopReceiptState} delivery separately**; repeated-import slot test above preserves cancellationDeliveryError, stopRequested and original bytes; `test/native-runtime.test.ts` — **readonly imported alias can receive same-session stop but never foreign control or ordinary writes**. Pending intent survives; receipt is not retirement. | Fulfilled C |
+| Correlated non-start rejection | `test/legacy-operation.test.ts` — **legacy-operation preserves validated rejection evidence without interpreting retirement**; **legacy-operation rejects malformed rejection ${JSON.stringify(patch)}**; `test/legacy-import.test.ts` — **repeated legacy rejection import preserves an original launch fence without manufacturing dispatch authority**. Original trusted fence retained; raw imported receipt does not invent a new fence/exit. Later fresh-attempt policy remains separate from readonly import. | Fulfilled C; absent corroborating authority safely fenced |
+| Dispatching/unknown, no exact mapping | `test/legacy-operation.test.ts` — **legacy-operation preserves ${binding} mapping without claiming non-start**; **legacy-operation missing database and row are not absence or replay proof**; `test/controller.test.ts` — **controller never replays a historical operation merely because its old lookup is absent**. Unknown identity stays reserved. | Fulfilled C, published no-absence limitation |
+| Mapping disagrees with run/digest/session | `test/legacy-operation.test.ts` — **legacy-operation rejects wrong ${field}**; `test/legacy-import.test.ts` — **legacy ${scenario} snapshot cannot change operation identity or authorize dispatch**; `test/native-runtime.test.ts` — **imported alias ${outcome} cannot establish a legacy binding**; readonly imported same/foreign-session stop test above. No import overwrite or foreign control. | Fulfilled C |
+| Missing/locked/corrupt/unsupported journal | `test/legacy-operation.test.ts` — **legacy-operation reports exclusive lock unavailable within bounded wait**; **legacy-operation reads committed WAL rows and does not observe uncommitted updates**; **legacy-operation refuses schema ${version} without migration**; **legacy-operation does not initialize an existing empty file**. Real SQLite locks/WAL, unchanged old bytes, no empty replacement. | Fulfilled C |
+| Foreign live owner or ambiguous host | `test/legacy-import.test.ts` — **abandonment, foreign lease and changed cancellation generation win over import**; S42/S45 live dual-host refusal; S26 fresh foreign session test above; `test/index.test.ts` — **--same-machine verifies local proof before taking a foreign lease**. Lease eligibility never grants foreign native control. | Fulfilled C/H/X |
+| Quarantined generation | Repeated active/failed slot import above byte-compares inventory and retains stop/digest; `test/native-runtime.test.ts` — **late imported alias observation cannot bind across ${race}**; `test/isolation.test.ts` — **restart after cloned checkout reuses the same target and rejects old-generation state**. Old observation cannot advance new generation or release old reservation. | Fulfilled C |
+
+Shared publication evidence is intentional reuse: S08/S09/S11 physically kill
+fixture-owned parents at the same `RunRegistry` atomic `run.json` rename boundary
+used by import. `legacy import publication EACCES preserves registry and SQLite
+bytes and retries the same identity` directly covers import failure/repair, no
+lease/RPC and unchanged snapshot. Abandonment tests put an ordinary file at
+`.abandoned` and a directory at archived `run.json`, provoking real filesystem
+errors and proving backup/final-archive ordering without deletion. S42/S45 uses a
+real consistent SQLite backup after explicit old-controller quiescence. CAS race
+mocks remain C; no duplicate test or fake SIGKILL label is substituted for these
+shared boundaries.
+
+## Eight unchecked checklist lines: evidence reconciliation
+
+Markers remain unchanged for the parent. “Fulfilled” is a recommendation from
+concrete local evidence, not independent-review acceptance.
+
+| Plan line / exact item starting text | Evidence | Disposition |
+| --- | --- | --- |
+| 696 — Add deterministic barriers for prepared intent, dispatch claim, native launch, reply delivery, binding persistence, result capture and acceptance | S08/S09/S11 real publication/kill barriers; S10 dropped actual reply; parent S23 real-controller recovery; parent capture EACCES test; **correlated completion retains binding after lost reply without replay or late abandoned writes**; **candidate verification failure is recoverable and never accepts checkbox-only work**. Acceptance is a C verification boundary, not a claimed physical crash. | Fulfilled C/H/X |
+| 697 — Characterize native status/correlation after reload and process restart | Fresh keyed-workflow host recovery, S25 parent replacement while question pending, new S26 foreign takeover/refusal and preserved S23 orphan/proof uncertainty. | Fulfilled; published control/proof limitations safely fenced |
+| 743 — Add restart/race cases with real registry locks and separate host processes | **two crash recoverers admit only one run while the first pauses before publication**, **cross-process compare-and-set applies exactly one shared revision**, real S08/S09/S11/S23/S26 hosts, late-import generation races and force-stop races. | Fulfilled; controlled late-event/CAS races labelled C |
+| 793 — Exercise S01–S41, S51 and S54–S56 through the native test composition | Exact scenario table names controller/Git/goal/independent-lane tests and normal-loader plan/goal/fix/provider probes; source-named S55 retirement and S56 rejected-transition-CAS tests remain correctly mapped. Launch/effect/commit counts asserted. | Fulfilled composition; S21 reachability classification above |
+| 848 — Implement idempotent fixture migration for every D8 row | Complete D8 table above; parent repeated active/failed imports preserve quarantine/cancellation; real old workflow settles once through readonly snapshot import; original rejection fence preserved without synthesis. | Fulfilled C/H/X |
+| 849 — Add crash barriers around snapshot/import/atomic record replacement | Consistent SQLite backup/WAL/locks, direct import EACCES and shared registry rename/SIGKILL barriers; failed backup/archive filesystem probes; mismatch/schema refusal. | Fulfilled via shared writer plus direct import cases; no power-loss claim |
+| 898 — Close the S01–S56 mapping with exact tests/results | All 56 scenario columns preserved, named tests verified; S21/S26/S29 residual local host cases resolved/classified. Separate Linux validation explicitly waived, not passed; automatic checks intact. | Fulfilled local evidence, Linux waiver recorded |
+| 905 — Resolve independent review findings … scoped architecture re-review of D1–D9 | Parent D1–D9 sweep found no blocker; low-priority RPC duplication deliberately untouched. Prior admission recheck clean. Parent d713e52 result-capture and this approved S29 correction are in the final actual-diff bundle. | Final independent review and parent marker reconciliation remain required; child cannot self-accept or release |
+
+## Final local closure gate results
+
+The single final broad `test:all` run passed **764 Vitest + 143 node:test = 907**,
+3 runtime, 6 recovery and 5 parent-death/barrier tests. It then failed in the
+expanded packed suite: `supervisor-stop` left a fixture observer request file,
+so the following S25 case read that stale observation before its own model call.
+This was not a production failure. Only that fixture observation file is now
+cleared between supervisor scenarios. The affected full packed gate subsequently
+passed all **24 modes**, including S21, plan/goal HTTP
+401/404 recovery, pending-question S25, and pinned-executor S54. Check/TypeScript
+and pack:dry then passed (41 files; ten informational diagnostics). No complete
+pipeline rerun was done for this fixture-only repair or subsequent prose.
+
+Thus the final evidence is **composite green affected checks**, not a claim that
+the failed monolithic invocation passed. Failed logs, retained fixtures and the
+final packed/check/pack logs are included in `acceptance-closure.json`'s external
+bundle. The non-Linux local assertions in the eight-item reconciliation have no
+remaining unexecuted requirement; S21's selected-route limits are documented
+above. Independent review of the parent delta plus the approved S29 correction,
+and parent-owned marker/release reconciliation, are still required. Linux remains
+waived, not passed. No child release, version bump, push or main/global/live
+mutation was performed.

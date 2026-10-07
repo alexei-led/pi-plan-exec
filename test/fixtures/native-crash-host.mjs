@@ -71,8 +71,9 @@ const { RunRegistry } = await jiti.import('../../src/registry.ts');
 const { PlanExecController } = await jiti.import('../../src/controller.ts');
 const { DEFAULT_FROZEN_RUN_CONFIG } = await jiti.import('../../src/types.ts');
 const host = await createNativeRuntimeHost(sandbox, {
-  sessionId: 'owned-crash-session',
-  reattach: phase === 'recover',
+  sessionId:
+    phase === 'foreign' ? 'foreign-native-session' : 'owned-crash-session',
+  reattach: phase !== 'origin',
   holdChild: phase === 'origin' || Boolean(barrier),
 });
 const registry = new RunRegistry(join(sandbox, 'registry'));
@@ -83,9 +84,11 @@ const client = new NativeRuntimeClient(
 );
 let spawns = 0;
 let statusRequests = 0;
+let stops = 0;
 host.events.on('subagents:rpc:v1:request', (request) => {
   if (request.method === 'spawn') spawns++;
   if (request.method === 'status') statusRequests++;
+  if (request.method === 'stop') stops++;
 });
 const execute = promisify(execFile);
 const command = async (program, args, cwd) => {
@@ -188,6 +191,74 @@ if (phase === 'origin') {
     }),
   );
   setInterval(() => {}, 1000); // Parent test owns and SIGKILLs this exact ChildProcess.
+} else if (phase === 'foreign') {
+  try {
+    const origin = await readJson(join(sandbox, 'origin.json'));
+    const run = await controller.tick(origin.runId, host.sessionId);
+    assert.equal(run.lease.sessionId, host.sessionId);
+    assert.equal(run.lease.pid, process.pid);
+    const op = run.activeOperation ?? run.failedOperation;
+    assert.equal(op.operationId, origin.binding.operationId);
+    assert.equal(op.native.nativeSessionId, 'owned-crash-session');
+    assert.notEqual(op.native.nativeSessionId, host.sessionId);
+    const observed = await client.inspect(run.id, origin.binding);
+    assert.equal(observed.operation.externalRunId, origin.rootId);
+    await assert.rejects(
+      client.stop(run.id, origin.binding),
+      /Foreign session/,
+    );
+    await assert.rejects(
+      client.spawn(run.id, origin.binding),
+      /Foreign session/,
+    );
+    assert.equal(spawns, 0);
+    assert.equal(stops, 0);
+    const direct = await host.rpc('stop', { id: origin.rootId });
+    assert.equal(direct.reply.success, false);
+    assert.equal(direct.reply.error.code, 'not_found');
+    assert.match(direct.reply.error.message, /active session/);
+    assert.equal((await host.calls()).length, 0);
+    await writeFile(
+      join(sandbox, 'release-child'),
+      'let the original fixture child settle',
+    );
+    await waitFor(
+      async () => (await host.calls()).length === 1,
+      'original child one side effect',
+    );
+    await waitFor(() => {
+      try {
+        process.kill(origin.child.pid, 0);
+        return false;
+      } catch (error) {
+        if (error.code === 'ESRCH') return true;
+        throw error;
+      }
+    }, 'owned child OS cleanup, not native retirement');
+    const after = await controller.tick(run.id, host.sessionId);
+    const retained = after.activeOperation ?? after.failedOperation;
+    assert.equal(retained.operationId, op.operationId);
+    assert.notEqual(retained.processTreeExited, true);
+    assert.equal(retained.native.nativeSessionId, 'owned-crash-session');
+    assert.equal(spawns, 0);
+    await writeFile(
+      join(sandbox, 'foreign.json'),
+      JSON.stringify({
+        hostPid: process.pid,
+        leaseSession: after.lease.sessionId,
+        nativeSession: retained.native.nativeSessionId,
+        rootId: retained.externalRunId,
+        spawns,
+        adapterStops: 0,
+        directStop: direct.reply,
+        sideEffects: 1,
+        phase: retained.native.phase,
+      }),
+    );
+  } finally {
+    client.dispose();
+    await host.dispose();
+  }
 } else if (barrier) {
   try {
     assert.equal(phase, 'recover');

@@ -16,7 +16,10 @@ import { worktreeIdentity } from './git.js';
 import { validLegacyImport } from './legacy-operation.js';
 import { isSkippableStage, isTerminalStatus } from './lifecycle.js';
 import { hasActiveLocalOperations } from './local-operation.js';
-import { validNativeOperation } from './operation-safety.js';
+import {
+  validNativeOperation,
+  validProviderFailure,
+} from './operation-safety.js';
 import { parsePlan } from './plan.js';
 import { acquireLock, LockTimeoutError } from './registry-lock.js';
 import {
@@ -1493,6 +1496,12 @@ function isAutonomousState(run: PlanExecRun): boolean {
       new Set(task.dependsOn).size === task.dependsOn.length &&
       timestamp(task.nextAttemptAt) &&
       isUsage(task.usage) &&
+      (task.providerFailure === undefined ||
+        validProviderFailure(
+          task.providerFailure as ActiveOperation,
+          run.id,
+          task.taskId,
+        )) &&
       isExternalPrerequisite(task.externalPrerequisite),
   );
 }

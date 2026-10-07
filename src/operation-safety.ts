@@ -271,3 +271,33 @@ export function validNativeOperation(
     return false;
   }
 }
+
+/** Retained recovery evidence is not an additional dispatch ledger. */
+export function validProviderFailure(
+  operation: ActiveOperation | undefined,
+  runId: string,
+  taskId?: number,
+): boolean {
+  return Boolean(
+    operation &&
+      typeof operation === 'object' &&
+      operation.service === 'native' &&
+      operation.kind === 'implementation' &&
+      operation.taskId === taskId &&
+      operation.processTreeExited === true &&
+      operation.lastObservedState === 'failed' &&
+      operation.native?.phase === 'retired' &&
+      operation.native.retirement === 'native-proof' &&
+      operation.externalRunId &&
+      operation.requestDigest &&
+      validNativeOperation(operation, runId) &&
+      workflowTerminalProof(
+        operation.native.terminalProof,
+        operation.externalRunId,
+        {
+          operationId: operation.operationId,
+          requestDigest: operation.requestDigest,
+        },
+      ),
+  );
+}

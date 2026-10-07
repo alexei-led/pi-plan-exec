@@ -1,3 +1,4 @@
+import { isModelProviderFailureText } from './diagnostics.js';
 import { required } from './required.js';
 import type { PlanTask, TaskExecution } from './types.js';
 
@@ -28,6 +29,11 @@ export function reconcileTasks(
     if (['accepted', 'running', 'verifying'].includes(task.state)) continue;
     if (task.dependsOn.some((id) => tasks[String(id)]?.state !== 'accepted')) {
       tasks[String(task.taskId)] = { ...task, state: 'waiting_dependency' };
+    } else if (
+      task.externalPrerequisite?.source === 'provider' &&
+      isModelProviderFailureText(task.externalPrerequisite.evidence)
+    ) {
+      tasks[String(task.taskId)] = { ...task, state: 'waiting_external' };
     } else if ((task.nextAttemptAt ?? 0) <= now) {
       tasks[String(task.taskId)] = { ...task, state: 'ready' };
     } else {
@@ -59,7 +65,11 @@ export function nextTaskWake(
   const wakeTimes = Object.values(tasks)
     .filter(
       (task) =>
-        task.state === 'retry_wait' || task.state === 'waiting_external',
+        (task.state === 'retry_wait' || task.state === 'waiting_external') &&
+        !(
+          task.externalPrerequisite?.source === 'provider' &&
+          isModelProviderFailureText(task.externalPrerequisite.evidence)
+        ),
     )
     .map((task) => Math.max(task.nextAttemptAt ?? now, now));
   return wakeTimes.length

@@ -17,13 +17,17 @@ import {
   sep,
 } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isDeepStrictEqual } from 'node:util';
 import { parseAdvisoryObservation } from './advisory-observation.js';
 import {
   readSettledWorkflowCompletion,
   readSubagentArtifact,
 } from './artifact.js';
 import { resolveRunConfig } from './config.js';
-import { diagnoseOperation } from './diagnostics.js';
+import {
+  diagnoseOperation,
+  isModelProviderFailureText,
+} from './diagnostics.js';
 import {
   executionRequestDigest,
   hasTerminalOwnershipProof,
@@ -107,6 +111,7 @@ import type {
   NativeObservation,
   NativeRuntimeClient,
 } from './native-runtime.js';
+import { validProviderFailure } from './operation-safety.js';
 import { materializeApprovedPlan, parsePlan, readPlan } from './plan.js';
 import {
   appendProgress,
@@ -124,6 +129,7 @@ import {
 } from './review.js';
 import { RevmuxReviewClient, validateReviewResult } from './review-backend.js';
 import { nextTaskWake, reconcileTasks, selectReadyTask } from './scheduler.js';
+import type { TaskExecution } from './types.js';
 import {
   type ActiveOperation,
   COMPLETED_PLANS_DIRECTORY,
@@ -1000,6 +1006,20 @@ export class PlanExecController {
         `Isolation preparation was stopped. Review /exec recover-isolated ${existing.id} "${existing.isolationRecovery.target}" --apply before continuing.`,
       );
     if (existing.status === RUN_STATUS.ABANDONED) return existing;
+    const providerFailure = modelRecoveryOperation(existing);
+    if (
+      recoveryModel &&
+      !providerFailure &&
+      (existing.failedOperation?.service === OPERATION_SERVICE.NATIVE ||
+        existing.status !== RUN_STATUS.FAILED ||
+        existing.activeOperation ||
+        (existing.failedOperation &&
+          !existing.failedOperation.processTreeExited &&
+          !existing.failedOperation.launchFenced))
+    )
+      throw new Error(
+        'Model recovery requires a current failed attempt with proven retirement; healthy, in-flight or uncertain work cannot be redirected.',
+      );
     if (explicit) await this.registry.assertExclusive(existing);
     const claimed = await this.registry.claim(existing, sessionId);
     if (
@@ -1007,7 +1027,7 @@ export class PlanExecController {
       (claimed.stopGeneration ?? 0) !== (existing.stopGeneration ?? 0)
     )
       return claimed;
-    let prepared = claimed;
+    let prepared = explicit ? withoutRecoveryModel(claimed) : claimed;
     if (explicit) {
       const authorized = await this.registry.updateIfCurrent(
         { ...prepared, userStopped: false, nextAttemptAt: 0 },
@@ -1015,7 +1035,15 @@ export class PlanExecController {
       );
       if (!authorized.applied) return authorized.run;
       prepared = authorized.run;
-      const unpinned = withoutLegacyRecoveryModelPins(prepared);
+      const nativeHistory =
+        prepared.activeOperation?.service === OPERATION_SERVICE.NATIVE ||
+        prepared.failedOperation?.service === OPERATION_SERVICE.NATIVE ||
+        Object.values(prepared.tasks ?? {}).some(
+          (task) => task.providerFailure,
+        );
+      const unpinned = nativeHistory
+        ? prepared
+        : withoutLegacyRecoveryModelPins(prepared);
       if (unpinned !== prepared) {
         const normalized = await this.registry.updateIfCurrent(
           unpinned,
@@ -1088,7 +1116,44 @@ export class PlanExecController {
     const preservedOperationId = prepared.activeOperation?.operationId;
     if (explicit && isTaskRetryConfirmationRequired(prepared) && !retryTask)
       throw new Error(taskRetryRequiredMessage(prepared));
-    if (explicit && isRecoverableFailure(prepared)) {
+    if (explicit && providerFailure) {
+      const current = modelRecoveryOperation(prepared);
+      if (
+        !current ||
+        current.operationId !== providerFailure.operationId ||
+        current.requestDigest !== providerFailure.requestDigest
+      )
+        return prepared;
+      if (!recoveryModel)
+        throw new Error(
+          'Choose an authenticated recovery model with --model current or provider/model for this failed attempt.',
+        );
+      const next = {
+        ...prepared,
+        status: RUN_STATUS.RUNNING,
+        recoveryModel,
+        failedOperation: current,
+        nextAttemptAt: 0,
+        needsAttention: false,
+      };
+      delete next.error;
+      delete next.blocked;
+      if (current.taskId && next.tasks) {
+        const task = {
+          ...required(next.tasks[String(current.taskId)]),
+          state: 'ready' as const,
+          nextAttemptAt: 0,
+        };
+        delete task.externalPrerequisite;
+        next.tasks = { ...next.tasks, [String(current.taskId)]: task };
+      }
+      const authorized = await this.registry.updateIfCurrent(
+        next,
+        prepared.updatedAt,
+      );
+      if (!authorized.applied) return authorized.run;
+      prepared = authorized.run;
+    } else if (explicit && isRecoverableFailure(prepared)) {
       prepared = await this.recoverFailedRun(
         prepared,
         retryTask,
@@ -1509,7 +1574,14 @@ export class PlanExecController {
         'All plan checkboxes are complete.',
       );
     }
-    const selected = selectReadyTask(tasks);
+    const recoveringTask = run.recoveryModel
+      ? modelRecoveryOperation(run)?.taskId
+      : undefined;
+    const selected = recoveringTask
+      ? tasks[String(recoveringTask)]?.state === 'ready'
+        ? tasks[String(recoveringTask)]
+        : undefined
+      : selectReadyTask(tasks);
     if (!selected)
       return (
         await this.registry.updateIfCurrent(
@@ -1752,7 +1824,14 @@ export class PlanExecController {
       !isSuccessfulOperationState(state)
     )
       return this.pauseGoal(
-        run,
+        {
+          ...run,
+          failedOperation: {
+            ...operation,
+            terminalError:
+              outcome.reason ?? terminalError ?? `Goal turn ended as ${state}.`,
+          },
+        },
         outcome.reason ?? terminalError ?? `Goal turn ended as ${state}.`,
       );
     const head = await gitValue(this.runCommand, run.worktreeCwd, [
@@ -2824,7 +2903,15 @@ export class PlanExecController {
     }
     const operationId = input.operationId ?? randomUUID();
     const launchStartedAt = Date.now();
-    const model = run.recoveryModel ?? nativeModel(run.config, input.kind);
+    const providerRecovery = modelRecoveryOperation(run);
+    const canUseRecoveryModel =
+      run.failedOperation?.service !== OPERATION_SERVICE.NATIVE ||
+      (providerRecovery &&
+        input.kind === OPERATION_KIND.IMPLEMENTATION &&
+        input.taskId === providerRecovery.taskId);
+    const model =
+      (canUseRecoveryModel ? run.recoveryModel : undefined) ??
+      nativeModel(run.config, input.kind);
     const runWithoutRecoveryModel = withoutRecoveryModel(run);
     const reviewedCommit =
       input.kind === OPERATION_KIND.REVIEW
@@ -2881,7 +2968,9 @@ export class PlanExecController {
               tasks: {
                 ...run.tasks,
                 [String(input.taskId)]: {
-                  ...required(run.tasks[String(input.taskId)]),
+                  ...withoutProviderFailure(
+                    required(run.tasks[String(input.taskId)]),
+                  ),
                   state: 'running',
                   operationId,
                   attempts:
@@ -4345,7 +4434,17 @@ export class PlanExecController {
       return this.fail(run, `Task ${taskId} disappeared from the plan.`);
     const blocker = taskFailureReason(output);
     const prerequisite =
-      operation.externalPrerequisite ?? workerExternalPrerequisite(output);
+      operation.service === OPERATION_SERVICE.NATIVE &&
+      !isSuccessfulOperationState(state) &&
+      operation.processTreeExited === true &&
+      isModelProviderFailureText(terminalError)
+        ? {
+            kind: 'runtime' as const,
+            source: 'provider' as const,
+            evidence: required(terminalError),
+          }
+        : (operation.externalPrerequisite ??
+          workerExternalPrerequisite(output));
     const attempts = (run.taskAttempts[String(taskId)] ?? 0) + 1;
     const tasks = reconcileTasks(plan.tasks, run.tasks);
     const execution = required(tasks[String(taskId)]);
@@ -4506,6 +4605,11 @@ export class PlanExecController {
             reason,
             nextAttemptAt: retryAt,
             ...(prerequisite ? { externalPrerequisite: prerequisite } : {}),
+            ...(prerequisite?.source === 'provider' &&
+            isModelProviderFailureText(prerequisite.evidence) &&
+            validProviderFailure(operation, run.id, taskId)
+              ? { providerFailure: { ...operation, terminalError: reason } }
+              : {}),
             laneCwd: run.worktreeCwd,
             laneBranch: run.branch,
           },
@@ -5921,6 +6025,12 @@ function completionStatus(run: PlanExecRun) {
     : RUN_STATUS.COMPLETED;
 }
 
+function withoutProviderFailure(task: TaskExecution): TaskExecution {
+  const copy = { ...task };
+  delete copy.providerFailure;
+  return copy;
+}
+
 function withoutRecoveryModel(run: PlanExecRun): PlanExecRun {
   const copy = { ...run };
   delete copy.recoveryModel;
@@ -6378,21 +6488,79 @@ export function isTaskRetryConfirmationRequired(run: PlanExecRun): boolean {
   );
 }
 
-export function isModelProviderFailure(run: PlanExecRun): boolean {
-  return !run.blocked && isModelProviderFailureText(recoveryEvidence(run));
+/** A current, retired native implementation failure can authorize one new attempt. */
+export function modelRecoveryOperation(
+  run: PlanExecRun,
+): ActiveOperation | undefined {
+  if (
+    !['running', 'paused', 'failed'].includes(run.status) ||
+    run.stage !== RUN_STAGE.IMPLEMENTATION ||
+    run.activeOperation ||
+    run.lanePreparation ||
+    run.pendingStageSkip
+  )
+    return undefined;
+  const candidates = isGoalRun(run)
+    ? [run.failedOperation]
+    : Object.values(run.tasks ?? {}).map(
+        (task) =>
+          task.providerFailure ??
+          (run.failedOperation?.taskId === task.taskId
+            ? run.failedOperation
+            : undefined),
+      );
+  // Latest is only a selection hint. Authority always comes from that task's own snapshot.
+  candidates.sort(
+    (a, b) =>
+      Number(b?.operationId === run.failedOperation?.operationId) -
+      Number(a?.operationId === run.failedOperation?.operationId),
+  );
+  for (const op of candidates) {
+    const latest = run.failedOperation;
+    if (
+      op &&
+      latest?.operationId === op.operationId &&
+      (!validProviderFailure(latest, run.id, op.taskId) ||
+        latest.requestDigest !== op.requestDigest ||
+        latest.executionGeneration !== op.executionGeneration ||
+        latest.stopGeneration !== op.stopGeneration ||
+        latest.stopRequested !== op.stopRequested ||
+        latest.externalRunId !== op.externalRunId ||
+        !isDeepStrictEqual(
+          latest.native?.terminalProof,
+          op.native?.terminalProof,
+        ))
+    )
+      continue;
+    if (
+      !op ||
+      !validProviderFailure(
+        op,
+        run.id,
+        isGoalRun(run) ? undefined : op.taskId,
+      ) ||
+      op.stopRequested ||
+      (op.executionGeneration ?? 0) !== (run.executionGeneration ?? 0) ||
+      (op.stopGeneration ?? 0) !== (run.stopGeneration ?? 0) ||
+      !isModelProviderFailureText(op.terminalError)
+    )
+      continue;
+    if (isGoalRun(run)) return op;
+    const task = op.taskId ? run.tasks?.[String(op.taskId)] : undefined;
+    if (
+      task &&
+      task.operationId === op.operationId &&
+      !['accepted', 'running', 'verifying', 'waiting_dependency'].includes(
+        task.state,
+      )
+    )
+      return op;
+  }
+  return undefined;
 }
 
-function isModelProviderFailureText(value: string | undefined): boolean {
-  if (!value) return false;
-  return (
-    /string_above_max_length.*call[_ -]?id|call[_ -]?id.*(?:string_above_max_length|maximum length)/i.test(
-      value,
-    ) ||
-    /out of extra usage/i.test(value) ||
-    /model .*(?:not found|does not exist|unavailable)/i.test(value) ||
-    /(?:invalid|missing) api key|authentication failed/i.test(value) ||
-    /invalid_grant|refresh token expired|oauth .*refresh.*failed/i.test(value)
-  );
+export function isModelProviderFailure(run: PlanExecRun): boolean {
+  return !run.blocked && isModelProviderFailureText(recoveryEvidence(run));
 }
 
 export function taskRetryRequiredMessage(run: PlanExecRun): string {
