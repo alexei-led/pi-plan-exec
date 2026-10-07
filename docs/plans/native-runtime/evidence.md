@@ -6,7 +6,8 @@ This supersedes the earlier partial-characterization narrative (retained in Git
 history). The candidate now uses unmodified released `pi-subagents@0.76.1` through
 one keyed public workflow. Production Bridge/pi-tasks transport/dependencies are
 removed; the readonly legacy snapshot reader remains. Pi is `1.0.4`, Node
-`24.15.0`, npm `12.0.2`; package version remains `1.8.0`. No upstream patch,
+`24.15.0`, npm `12.0.2`; verification used pre-release `1.8.0` metadata.
+Release metadata is assigned after acceptance. No upstream patch,
 global/live executor upgrade, paid API, push, release or PR dispatch is part of
 this verification.
 

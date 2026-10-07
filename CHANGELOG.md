@@ -1,5 +1,53 @@
 # Changelog
 
+## 2.0.0 - 2026-10-07
+
+### Changed
+
+- Run plans, goals, reviews, fixes and statistics directly through released
+  pi-subagents 0.76.1 public workflows. Bridge, pi-tasks and cc-thingz are no
+  longer required. Task summaries use the execution registry, not a separate
+  task store.
+- Keep launch identity and cancellation in one registry. Lost replies and
+  restarts recover the original operation when evidence permits; unknown
+  ownership never authorizes a replacement writer.
+- Use a built-in readonly reviewer with commit-bound structured reports.
+  Missing, contradictory or oversized results cannot pass review. Launch
+  admission rejects missing selected skills and denied agents before dispatch.
+- Hold tasks on confirmed provider/model failures instead of repeatedly
+  launching the same bad model. Explicit `/exec resume <id> --model <provider/model>`
+  or `--model current` selects one new attempt without changing frozen
+  configuration. Independent tasks retain their own recovery evidence.
+- Preserve permanent force-stop, quarantine, checkout reservations and explicit
+  pause/resume. Legacy operations can use an explicitly supplied read-only
+  schema-7 journal snapshot; import never launches work.
+
+### Upgrade
+
+- Before upgrading, quiesce old controllers and back up the registry and a
+  consistent Bridge SQLite snapshot, including committed WAL data. Do not infer
+  that unresolved children exited merely because their parent stopped.
+- Install pi-subagents 0.76.1 and plan-exec 2.0.0, then restart every Pi session
+  sharing the registry. Do not hot-reload mixed old/new controllers. Keep
+  explicitly configured or frozen agents available; they are not silently
+  replaced. Custom agents must be discoverable by native preflight; migrate
+  runtime-only custom definitions to agent files before upgrading.
+- Existing bound native IDs need no journal. For an unbound historical launch,
+  use `/exec resume <id> --legacy-journal /absolute/offline.sqlite`.
+  Missing identity or retirement proof remains reserved.
+- Do not downgrade while any native record or artifact remains, including
+  terminal history. Older cleanup can delete that evidence. Use the
+  [read-only rollback preflight](DEVELOPMENT.md#rollback-preflight); never erase
+  records just to make it pass.
+
+### Limits
+
+- Native RPC does not enforce requested `maxTurns`; unbounded workflow requests
+  retain native child defaults. Unknown retirement after parent loss remains
+  fenced. Separate Linux acceptance was waived; local validation used macOS.
+
+[Full changes](https://github.com/alexei-led/pi-plan-exec/compare/v1.8.0...v2.0.0)
+
 ## 1.8.0 - 2026-10-06
 
 ### Changed

@@ -108,7 +108,8 @@ Target package:
 @alexeiled/pi-plan-exec
 ```
 
-Normal releases are tag-driven. Decide patch versus minor first, update
+Normal releases are tag-driven. Choose patch, minor or major from the compatibility
+impact, update
 `package.json`, `package-lock.json`, and `CHANGELOG.md`, then commit the release
 version before tagging:
 
@@ -119,7 +120,7 @@ git tag v<version>
 git push origin main --follow-tags
 ```
 
-Use `npm version patch` or `npm version minor` only when it is the command that
+Use `npm version patch`, `npm version minor` or `npm version major` only when it is the command that
 makes the intended version change; do not bump an already versioned release a
 second time.
 
