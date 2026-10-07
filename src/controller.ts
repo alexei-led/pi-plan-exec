@@ -113,7 +113,7 @@ import {
   appendProgressOnce,
   initializeProgress,
 } from './progress.js';
-import type { RunRegistry } from './registry.js';
+import { type RunRegistry, takeoverRefusal } from './registry.js';
 import { required } from './required.js';
 import {
   formatFindings,
@@ -843,6 +843,8 @@ export class PlanExecController {
     journalPath: string,
     expectedStopGeneration?: number,
   ): Promise<PlanExecRun> {
+    if (!sessionId.trim())
+      throw new Error('A Pi session ID is required to import a snapshot.');
     if (!isAbsolute(journalPath))
       throw new Error(
         '--legacy-journal requires an absolute path to a consistent offline schema-7 snapshot.',
@@ -864,7 +866,8 @@ export class PlanExecController {
         throw new Error(
           'Legacy import requires an original Bridge operation ID and request digest. No new identity is synthesized.',
         );
-      const claimed = await this.registry.claim(existing, sessionId);
+      const initialRefusal = takeoverRefusal(existing, sessionId);
+      if (initialRefusal) throw new Error(initialRefusal);
       const lookup = await lookupLegacyOperation(journalPath, {
         operationId: original.operationId,
         ownerRunId: runId,
@@ -893,13 +896,10 @@ export class PlanExecController {
       const op = current[key];
       if (
         current.status === RUN_STATUS.ABANDONED ||
-        current.status !== claimed.status ||
-        (current.stopGeneration ?? 0) !== (claimed.stopGeneration ?? 0) ||
+        current.status !== existing.status ||
+        (current.stopGeneration ?? 0) !== (existing.stopGeneration ?? 0) ||
         (current.executionGeneration ?? 0) !==
-          (claimed.executionGeneration ?? 0) ||
-        current.lease?.sessionId !== sessionId ||
-        current.lease?.pid !== claimed.lease?.pid ||
-        current.lease?.hostname !== claimed.lease?.hostname ||
+          (existing.executionGeneration ?? 0) ||
         op?.operationId !== original.operationId ||
         op.requestDigest !== original.requestDigest
       )
@@ -913,6 +913,10 @@ export class PlanExecController {
         throw new Error(
           'Legacy snapshot conflicts with a newer recorded native binding.',
         );
+      const refusal = takeoverRefusal(current, sessionId);
+      if (refusal) throw new Error(refusal);
+      // Import records evidence only. The ordinary resume path claims a lease
+      // after validation; failed imports cannot strand or roll back a lease.
       return (
         await this.registry.updateIfCurrent(
           {
@@ -3526,6 +3530,63 @@ export class PlanExecController {
     );
   }
 
+  /** Retain only a validated readonly legacy binding, never rewrite its request. */
+  private async retainLegacyBinding(
+    run: PlanExecRun,
+    expected: ActiveOperation,
+    observed: ActiveOperation,
+  ): Promise<boolean> {
+    const current = required(await this.registry.get(run.id));
+    const key = current.activeOperation ? 'activeOperation' : 'failedOperation';
+    const op = current[key];
+    if (
+      current.status === RUN_STATUS.ABANDONED ||
+      current.status !== run.status ||
+      (current.executionGeneration ?? 0) !== (run.executionGeneration ?? 0) ||
+      (current.stopGeneration ?? 0) !== (run.stopGeneration ?? 0) ||
+      current.lease?.sessionId !== run.lease?.sessionId ||
+      current.lease?.pid !== run.lease?.pid ||
+      current.lease?.hostname !== run.lease?.hostname ||
+      op?.service !== OPERATION_SERVICE.BRIDGE ||
+      (op.executionGeneration ?? 0) !== (current.executionGeneration ?? 0) ||
+      op.operationId !== expected.operationId ||
+      op.requestDigest !== expected.requestDigest ||
+      observed.operationId !== op.operationId ||
+      observed.requestDigest !== op.requestDigest ||
+      op.legacyImport?.operation.rpcRequestId !==
+        observed.legacyImport?.operation.rpcRequestId ||
+      (op.externalRunId && op.externalRunId !== observed.externalRunId) ||
+      (op.asyncDir && observed.asyncDir && op.asyncDir !== observed.asyncDir)
+    )
+      return false;
+    if (
+      !observed.externalRunId ||
+      (op.externalRunId === observed.externalRunId &&
+        (!observed.asyncDir || op.asyncDir === observed.asyncDir))
+    )
+      return true;
+    const next = {
+      ...op,
+      externalRunId: observed.externalRunId,
+      ...(observed.asyncDir ? { asyncDir: observed.asyncDir } : {}),
+      recovery: OPERATION_RECOVERY.OBSERVE,
+    };
+    return (
+      await this.registry.updateIfCurrent(
+        {
+          ...current,
+          [key]: next,
+          ...(key === 'activeOperation' &&
+          current.failedOperation?.operationId === op.operationId &&
+          current.failedOperation.requestDigest === op.requestDigest
+            ? { failedOperation: next }
+            : {}),
+        },
+        current.updatedAt,
+      )
+    ).applied;
+  }
+
   private async workerStatus(
     run: PlanExecRun,
     operation: ActiveOperation,
@@ -3536,8 +3597,29 @@ export class PlanExecController {
           run.id,
           legacyBinding(operation),
         );
+        if (
+          observed.data &&
+          run.status !== RUN_STATUS.ABANDONED &&
+          !(await this.retainLegacyBinding(run, operation, observed.operation))
+        )
+          return {
+            success: false,
+            error: {
+              message:
+                'Legacy observation changed during binding; newer authority remains fenced.',
+            },
+          };
+
         return observed.data
-          ? { success: true, data: observed.data }
+          ? {
+              success: true,
+              data: {
+                ...observed.data,
+                operationId: observed.operation.operationId,
+                requestDigest: observed.operation.requestDigest,
+                runId: observed.operation.externalRunId,
+              },
+            }
           : {
               success: false,
               error: {
@@ -3570,8 +3652,29 @@ export class PlanExecController {
           run.id,
           legacyBinding(operation),
         );
+        if (
+          observed.data &&
+          run.status !== RUN_STATUS.ABANDONED &&
+          !(await this.retainLegacyBinding(run, operation, observed.operation))
+        )
+          return {
+            success: false,
+            error: {
+              message:
+                'Legacy observation changed during binding; newer authority remains fenced.',
+            },
+          };
+
         return observed.retired && observed.data
-          ? { success: true, data: observed.data }
+          ? {
+              success: true,
+              data: {
+                ...observed.data,
+                operationId: observed.operation.operationId,
+                requestDigest: observed.operation.requestDigest,
+                runId: observed.operation.externalRunId,
+              },
+            }
           : {
               success: false,
               error: {

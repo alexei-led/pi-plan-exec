@@ -88,8 +88,8 @@ dependencies. pi-subagents is an optional versioned peer for its runtime APIs. I
 extension packages must be declared in peerDependencies”**, check the
 `package.json` path in the warning: another installed extension can cause it.
 Update or fix that package's declarations; do not suppress the warning or add
-private SDK copies here. See the [upstream audit](docs/upstream-audit.md) for
-known dependency limitations and upgrade priorities.
+private SDK copies here. See the [historical upstream audit](docs/upstream-audit.md) for
+the pre-cutover investigation; current requirements are in the runtime contracts.
 
 Restart Pi after package upgrades. `/reload` is for local source/config changes.
 Legacy records are read-only data, not another backend. Already-bound native IDs

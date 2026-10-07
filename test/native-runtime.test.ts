@@ -1412,3 +1412,441 @@ test('known legacy retirement without retained result state is diagnosed, not ac
   expect(observed.stage).toBe('implementation');
   expect(f.requests.filter((req) => req.method === 'spawn')).toHaveLength(0);
 });
+
+async function correlatedSource(
+  f: Awaited<ReturnType<typeof fixture>>,
+  state = 'running',
+) {
+  const asyncDir = join(f.directory, 'root');
+  await mkdir(asyncDir, { recursive: true });
+  const summary = f.summary(state);
+  const source = {
+    runId: 'root',
+    sessionId: 'session',
+    toolCallId: summary.parentToolCallId,
+    state: state === 'completed' ? 'complete' : state,
+    workflowChildren: summary,
+    steps: [
+      {
+        runId: 'child',
+        workflowKey: 'main',
+        parentWorkflowRunId: 'root',
+        async: true,
+        status: state === 'completed' ? 'completed' : 'running',
+      },
+    ],
+  };
+  await writeFile(join(asyncDir, 'status.json'), JSON.stringify(source));
+  const proof = {
+    version: 1,
+    kind: 'workflow',
+    state: 'observed',
+    runId: 'root',
+    dispatchClosed: true,
+    observedAt: Date.now(),
+    children: [
+      {
+        version: 1,
+        state: 'observed',
+        runId: 'child',
+        runnerProcessInstanceId: 'child-instance',
+        observedAt: Date.now(),
+        instances: [],
+      },
+    ],
+  };
+  return {
+    asyncDir,
+    source,
+    details: {
+      asyncDir,
+      workflowChildren: summary,
+      ...(state === 'completed' ? { workflowTerminalProof: proof } : {}),
+    },
+  };
+}
+
+test('abandoned lost spawn resolves its exact alias and stops without ordinary binding writes', async () => {
+  const f = await fixture();
+  await f.client.spawn(f.run.id, f.binding); // request emitted, reply lost
+  await f.registry.abandon(f.run.id, 'session');
+  const before = await readFile(f.registry.authorizationPath(f.run.id), 'utf8');
+  const { details } = await correlatedSource(f);
+  f.setHandler((req) =>
+    f.reply(
+      req,
+      req.method === 'stop'
+        ? { runId: 'root', state: 'stopping' }
+        : { details },
+    ),
+  );
+  expect(
+    (await f.client.observeAbandoned(f.run.id, f.binding)).operation
+      .externalRunId,
+  ).toBe('root');
+  await f.client.stopAbandoned(f.run.id, f.binding);
+  expect(
+    f.requests
+      .filter((req) => req.method === 'status')
+      .map((req) => req.params.id),
+  ).toEqual([
+    `rpc-spawn-${required(f.op.native).request.requestId}`,
+    `rpc-spawn-${required(f.op.native).request.requestId}`,
+  ]);
+  expect(
+    f.requests
+      .filter((req) => req.method === 'stop')
+      .map((req) => req.params.id),
+  ).toEqual(['root']);
+  expect(f.requests.filter((req) => req.method === 'spawn')).toHaveLength(1);
+  expect(await readFile(f.registry.authorizationPath(f.run.id), 'utf8')).toBe(
+    before,
+  );
+  f.setSession('foreign');
+  await expect(f.client.stopAbandoned(f.run.id, f.binding)).rejects.toThrow(
+    /session/,
+  );
+  expect(f.requests.filter((req) => req.method === 'stop')).toHaveLength(1);
+});
+
+for (const outcome of ['missing', 'mismatch'] as const) {
+  test(`abandoned exact alias ${outcome} remains unknown with no stop or replay`, async () => {
+    const f = await fixture();
+    await f.client.spawn(f.run.id, f.binding);
+    await f.registry.abandon(f.run.id, 'session');
+    const before = await readFile(
+      f.registry.authorizationPath(f.run.id),
+      'utf8',
+    );
+    f.setHandler((req) =>
+      f.reply(req, {
+        details:
+          outcome === 'missing'
+            ? {}
+            : {
+                workflowChildren: {
+                  ...f.summary(),
+                  parentToolCallId: 'foreign',
+                },
+              },
+      }),
+    );
+    expect((await f.client.stopAbandoned(f.run.id, f.binding)).state).toBe(
+      'unknown',
+    );
+    expect(f.requests.filter((req) => req.method === 'status')).toHaveLength(1);
+    expect(f.requests.filter((req) => req.method === 'stop')).toHaveLength(0);
+    expect(f.requests.filter((req) => req.method === 'spawn')).toHaveLength(1);
+    expect(await readFile(f.registry.authorizationPath(f.run.id), 'utf8')).toBe(
+      before,
+    );
+  });
+}
+
+async function importedDispatch(f: Awaited<ReturnType<typeof fixture>>) {
+  const rpcRequestId = required(f.op.native).request.requestId;
+  const operation = {
+    operationId: 'legacy-dispatch',
+    requestDigest: 'original-digest',
+    service: 'bridge' as const,
+    kind: 'implementation' as const,
+    params: { original: 'unchanged' },
+    legacyImport: {
+      journalPath: join(f.directory, 'offline.sqlite'),
+      importedAt: Date.now(),
+      operation: {
+        operationId: 'legacy-dispatch',
+        ownerRunId: f.run.id,
+        requestDigest: 'original-digest',
+        binding: 'dispatching' as const,
+        rpcRequestId,
+        nativeParams: { rpcRequestId },
+        nativeParamsJson: JSON.stringify({ rpcRequestId }),
+        nativeCorrelated: true,
+        cancelRequested: false,
+        createdAt: 1,
+        updatedAt: 2,
+      },
+    },
+  };
+  const run = await f.registry.update({ ...f.run, activeOperation: operation });
+  return {
+    run,
+    operation,
+    binding: {
+      operationId: operation.operationId,
+      requestDigest: operation.requestDigest,
+    },
+  };
+}
+
+test('imported dispatch alias resolves read-only and controller CAS binds original intent', async () => {
+  const { PlanExecController } = await import('../src/controller.js');
+  const f = await fixture();
+  const legacy = await importedDispatch(f);
+  const { details } = await correlatedSource(f);
+  f.setHandler((req) => f.reply(req, { details }));
+  const before = await readFile(f.registry.authorizationPath(f.run.id), 'utf8');
+  const observed = await f.client.observeLegacy(f.run.id, legacy.binding);
+  expect(observed.operation.externalRunId).toBe('root');
+  expect(observed.operation.asyncDir).toBe(details.asyncDir);
+  expect(await readFile(f.registry.authorizationPath(f.run.id), 'utf8')).toBe(
+    before,
+  );
+  const refuse = async () => {
+    throw new Error('Legacy recovery cannot launch or inspect Git');
+  };
+  const controller = new PlanExecController(
+    f.registry,
+    f.client,
+    {
+      start: refuse,
+      status: refuse,
+      result: refuse,
+      adopt: refuse,
+      cancel: refuse,
+    },
+    refuse,
+  );
+  const run = await controller.tick(f.run.id, 'session');
+  expect(run.activeOperation?.externalRunId).toBe('root');
+  expect(run.activeOperation?.params).toEqual(legacy.operation.params);
+  expect(run.activeOperation?.requestDigest).toBe('original-digest');
+  expect(run.activeOperation?.legacyImport).toEqual(
+    legacy.operation.legacyImport,
+  );
+  expect(f.requests.filter((req) => req.method === 'spawn')).toHaveLength(0);
+});
+
+for (const outcome of ['missing', 'mismatch', 'source-mismatch'] as const) {
+  test(`imported alias ${outcome} cannot establish a legacy binding`, async () => {
+    const f = await fixture();
+    const legacy = await importedDispatch(f);
+    const { details, source, asyncDir } = await correlatedSource(f);
+    if (outcome === 'source-mismatch')
+      await writeFile(
+        join(asyncDir, 'status.json'),
+        JSON.stringify({ ...source, toolCallId: 'foreign' }),
+      );
+    f.setHandler((req) =>
+      f.reply(req, {
+        details:
+          outcome === 'missing'
+            ? {}
+            : outcome === 'mismatch'
+              ? {
+                  ...details,
+                  workflowChildren: {
+                    ...details.workflowChildren,
+                    parentToolCallId: 'foreign',
+                  },
+                }
+              : details,
+      }),
+    );
+    const before = await readFile(
+      f.registry.authorizationPath(f.run.id),
+      'utf8',
+    );
+    expect(
+      (await f.client.observeLegacy(f.run.id, legacy.binding)).operation
+        .externalRunId,
+    ).toBeUndefined();
+    expect(f.requests[0]?.params.id).toBe(
+      `rpc-spawn-${required(f.op.native).request.requestId}`,
+    );
+    expect(await readFile(f.registry.authorizationPath(f.run.id), 'utf8')).toBe(
+      before,
+    );
+  });
+}
+
+for (const race of ['generation', 'abandonment'] as const) {
+  test(`late imported alias observation cannot bind across ${race}`, async () => {
+    const { PlanExecController } = await import('../src/controller.js');
+    const f = await fixture();
+    await importedDispatch(f);
+    const { details } = await correlatedSource(f);
+    let intercepted = false;
+    f.setHandler(async (req) => {
+      if (!intercepted) {
+        intercepted = true;
+        if (race === 'abandonment')
+          await f.registry.abandon(f.run.id, 'session');
+        else
+          await f.registry.updateLatest(f.run.id, (run) => ({
+            ...run,
+            executionGeneration: 1,
+            stopGeneration: 1,
+          }));
+      }
+      f.reply(req, { details });
+    });
+    const refuse = async () => {
+      throw new Error('No replacement work');
+    };
+    const controller = new PlanExecController(
+      f.registry,
+      f.client,
+      {
+        start: refuse,
+        status: refuse,
+        result: refuse,
+        adopt: refuse,
+        cancel: refuse,
+      },
+      refuse,
+    );
+    await controller.tick(f.run.id, 'session');
+    expect(intercepted).toBe(true);
+    const current = required(await f.registry.get(f.run.id));
+    expect(current.activeOperation?.externalRunId).toBeUndefined();
+    expect(current.activeOperation?.requestDigest).toBe('original-digest');
+    if (race === 'abandonment') expect(current.status).toBe('abandoned');
+    expect(f.requests.filter((req) => req.method === 'spawn')).toHaveLength(0);
+  });
+}
+
+for (const scenario of [
+  'clean-envelope',
+  'findings-envelope',
+  'malformed-file',
+  'missing-file',
+  'key-order',
+] as const) {
+  test(`native result requires consistent bound JSON: ${scenario}`, async () => {
+    const f = await fixture();
+    const clean = {
+      schemaVersion: 1,
+      reviewedCommit: 'a'.repeat(40),
+      findings: [],
+    };
+    const findings = {
+      ...clean,
+      findings: [
+        {
+          severity: 'MAJOR',
+          summary: 'Defect',
+          evidence: 'file:1',
+          suggestion: 'Fix it',
+        },
+      ],
+    };
+    const envelope =
+      scenario === 'findings-envelope' || scenario === 'key-order'
+        ? findings
+        : clean;
+    const file =
+      scenario === 'clean-envelope'
+        ? findings
+        : scenario === 'key-order'
+          ? {
+              findings: [
+                {
+                  suggestion: 'Fix it',
+                  evidence: 'file:1',
+                  summary: 'Defect',
+                  severity: 'MAJOR',
+                },
+              ],
+              reviewedCommit: clean.reviewedCommit,
+              schemaVersion: 1,
+            }
+          : clean;
+    const { details, source, asyncDir } = await correlatedSource(
+      f,
+      'completed',
+    );
+    await writeFile(
+      join(asyncDir, 'status.json'),
+      JSON.stringify({
+        ...source,
+        workflow: {
+          value: {
+            key: 'main',
+            runId: 'child',
+            ok: true,
+            outputReference: required(f.op.native).outputPath,
+            structuredOutput: envelope,
+          },
+        },
+      }),
+    );
+    if (scenario !== 'missing-file')
+      await writeFile(
+        required(f.op.native).outputPath,
+        scenario === 'malformed-file' ? 'NO_FINDINGS' : JSON.stringify(file),
+      );
+    f.setHandler((req) => f.reply(req, { details }));
+    await f.client.spawn(f.run.id, f.binding);
+    const result = await f.client.result(f.run.id, f.binding);
+    if (scenario === 'key-order')
+      expect(result.result?.structuredOutput).toEqual(envelope);
+    else expect(result.result).toBeUndefined();
+  });
+}
+
+test('lost native reply retirement binds only through the abandoned retirement seam', async () => {
+  const { PlanExecController } = await import('../src/controller.js');
+  const f = await fixture();
+  await f.client.spawn(f.run.id, f.binding);
+  const { details } = await correlatedSource(f, 'completed');
+  f.setHandler((req) => f.reply(req, { details }));
+  f.registry.updateIfCurrent = async () => {
+    throw new Error('Ordinary CAS is forbidden after abandonment');
+  };
+  const refuse = async () => {
+    throw new Error('No workspace or replacement work');
+  };
+  const controller = new PlanExecController(
+    f.registry,
+    f.client,
+    {
+      start: refuse,
+      status: refuse,
+      result: refuse,
+      adopt: refuse,
+      cancel: refuse,
+    },
+    refuse,
+  );
+  const stopped = await controller.forceStop(f.run.id, 'session');
+  expect(stopped.run.status).toBe('abandoned');
+  expect(stopped.run.activeOperation?.externalRunId).toBe('root');
+  expect(stopped.run.activeOperation?.processTreeExited).toBe(true);
+  expect(stopped.removed).toBe(true);
+  expect(f.requests.filter((req) => req.method === 'stop')).toHaveLength(0);
+  expect(f.requests.filter((req) => req.method === 'spawn')).toHaveLength(1);
+});
+
+test('readonly imported alias can receive same-session stop but never foreign control or ordinary writes', async () => {
+  const f = await fixture();
+  const legacy = await importedDispatch(f);
+  const { details } = await correlatedSource(f);
+  f.setHandler((req) =>
+    f.reply(
+      req,
+      req.method === 'stop'
+        ? { runId: 'root', state: 'stopping' }
+        : { details },
+    ),
+  );
+  const before = await readFile(f.registry.authorizationPath(f.run.id), 'utf8');
+  expect(
+    (await f.client.stopLegacy(f.run.id, legacy.binding)).operation
+      .externalRunId,
+  ).toBe('root');
+  expect(
+    f.requests
+      .filter((req) => req.method === 'stop')
+      .map((req) => req.params.id),
+  ).toEqual(['root']);
+  f.setSession('foreign');
+  await expect(f.client.stopLegacy(f.run.id, legacy.binding)).rejects.toThrow(
+    /session/,
+  );
+  expect(f.requests.filter((req) => req.method === 'stop')).toHaveLength(1);
+  expect(await readFile(f.registry.authorizationPath(f.run.id), 'utf8')).toBe(
+    before,
+  );
+});

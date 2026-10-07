@@ -105,10 +105,31 @@ export function nativeWorkflowIdentity(
       inventoryComplete: boolean;
     }
   | undefined {
+  return correlatedWorkflowIdentity(
+    value,
+    meta.request.requestId,
+    expectedRunId,
+    meta.childRunId,
+  );
+}
+
+export function correlatedWorkflowIdentity(
+  value: unknown,
+  requestId: string,
+  expectedRunId?: string,
+  expectedChildRunId?: string,
+):
+  | {
+      runId: string;
+      childRunId?: string;
+      state: string;
+      inventoryComplete: boolean;
+    }
+  | undefined {
   if (
     !record(value) ||
     value.version !== 1 ||
-    value.parentToolCallId !== `rpc-spawn-${meta.request.requestId}` ||
+    value.parentToolCallId !== `rpc-spawn-${requestId}` ||
     typeof value.workflowRunId !== 'string' ||
     !value.workflowRunId ||
     basename(value.workflowRunId) !== value.workflowRunId ||
@@ -138,7 +159,7 @@ export function nativeWorkflowIdentity(
       ].includes(String(child.state)) ||
       (child.runId !== undefined &&
         (typeof child.runId !== 'string' || !child.runId)) ||
-      (meta.childRunId !== undefined && child.runId !== meta.childRunId))
+      (expectedChildRunId !== undefined && child.runId !== expectedChildRunId))
   )
     return undefined;
   return {

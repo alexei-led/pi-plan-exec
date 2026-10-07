@@ -131,13 +131,20 @@ test('legacy snapshot import preserves original intent, cancellation and read-on
 
 for (const scenario of [
   'missing',
+  'absent-row',
   'mismatch',
   'corrupt',
   'unsupported',
+  'conflict',
 ] as const) {
   test(`legacy ${scenario} snapshot cannot change operation identity or authorize dispatch`, async () => {
     const f = await fixture();
-    if (scenario === 'corrupt') await writeFile(f.snapshot, 'not sqlite');
+    if (scenario === 'absent-row')
+      await writeLegacyJournal(f.snapshot, {
+        ...f.binding,
+        operationId: 'other-operation',
+      });
+    else if (scenario === 'corrupt') await writeFile(f.snapshot, 'not sqlite');
     else if (scenario === 'unsupported') {
       const { DatabaseSync } = await import('node:sqlite');
       const db = new DatabaseSync(f.snapshot);
@@ -148,11 +155,35 @@ for (const scenario of [
         ...f.binding,
         requestDigest: 'foreign',
       });
+    if (scenario === 'conflict') {
+      await f.registry.updateLatest(f.run.id, (run) => ({
+        ...run,
+        activeOperation: {
+          ...required(run.activeOperation),
+          externalRunId: 'already-recorded',
+        },
+      }));
+      await writeLegacyJournal(f.snapshot, f.binding);
+    }
+    const before = await readFile(f.registry.authorizationPath(f.run.id));
     await expect(
       f.controller.importLegacyJournal(f.run.id, 'owner', f.snapshot),
     ).rejects.toThrow(/Legacy snapshot/);
+    expect(await readFile(f.registry.authorizationPath(f.run.id))).toEqual(
+      before,
+    );
+    expect(
+      (
+        await f.registry.claim(
+          required(await f.registry.get(f.run.id)),
+          'second-session',
+        )
+      ).lease?.sessionId,
+    ).toBe('second-session');
     expect((await f.registry.get(f.run.id))?.activeOperation).toEqual(
-      f.run.activeOperation,
+      scenario === 'conflict'
+        ? { ...f.run.activeOperation, externalRunId: 'already-recorded' }
+        : f.run.activeOperation,
     );
     expect(f.calls).toEqual([]);
   });
@@ -237,17 +268,18 @@ test('resume fences an unresolved failed historical operation before touching th
 test('an import cannot overwrite a native binding that arrived after its initial snapshot', async () => {
   const f = await fixture();
   await writeLegacyJournal(f.snapshot, f.binding);
-  const claim = f.registry.claim.bind(f.registry);
-  vi.spyOn(f.registry, 'claim').mockImplementation(async (...args) => {
-    const claimed = await claim(...args);
-    await f.registry.updateLatest(f.run.id, (run) => ({
-      ...run,
-      activeOperation: {
-        ...required(run.activeOperation),
-        externalRunId: 'newer-exact-binding',
-      },
-    }));
-    return claimed;
+  const get = f.registry.get.bind(f.registry);
+  let reads = 0;
+  vi.spyOn(f.registry, 'get').mockImplementation(async (...args) => {
+    if (++reads === 2)
+      await f.registry.updateLatest(f.run.id, (run) => ({
+        ...run,
+        activeOperation: {
+          ...required(run.activeOperation),
+          externalRunId: 'newer-exact-binding',
+        },
+      }));
+    return get(...args);
   });
   await expect(
     f.controller.importLegacyJournal(f.run.id, 'owner', f.snapshot),
@@ -259,4 +291,16 @@ test('an import cannot overwrite a native binding that arrived after its initial
     f.run.activeOperation?.params,
   );
   expect(f.calls).toEqual([]);
+});
+
+test('invalid import preserves a preexisting legitimate lease byte for byte', async () => {
+  const f = await fixture();
+  await f.registry.claim(f.run, 'owner');
+  const before = await readFile(f.registry.authorizationPath(f.run.id));
+  await expect(
+    f.controller.importLegacyJournal(f.run.id, 'owner', f.snapshot),
+  ).rejects.toThrow(/Legacy snapshot/);
+  expect(await readFile(f.registry.authorizationPath(f.run.id))).toEqual(
+    before,
+  );
 });

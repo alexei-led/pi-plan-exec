@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { lstat, mkdir, readFile, realpath } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 import type { ExtensionContext } from '@earendil-works/pi-coding-agent';
 import {
   hasTerminalOwnershipProof,
@@ -9,6 +10,7 @@ import {
 } from './execution-contract.js';
 import { legacyImportGuidance } from './legacy-operation.js';
 import {
+  correlatedWorkflowIdentity,
   nativeBindingAllowed,
   nativeDispatchAllowed,
   nativeOperationDigest,
@@ -505,6 +507,13 @@ export class NativeRuntimeClient {
         throw new Error('Native output binding mismatch.');
       await this.checkOutputPath(runId, op, true);
       const output = await readFile(op.native.outputPath, 'utf8');
+      if (
+        child.structuredOutput !== undefined &&
+        !isDeepStrictEqual(JSON.parse(output), child.structuredOutput)
+      )
+        throw new Error(
+          'Bound output JSON contradicts native structured output.',
+        );
       return {
         ...observed,
         result: {
@@ -617,13 +626,17 @@ export class NativeRuntimeClient {
     binding: LegacyNativeBinding,
   ): Promise<LegacyObservation> {
     const operation = await this.loadLegacy(runId, binding);
-    if (!operation.externalRunId)
+    const rpcRequestId = operation.legacyImport?.operation.rpcRequestId;
+    const resolving = !operation.externalRunId;
+    if (!operation.externalRunId && !rpcRequestId)
       return {
         operation,
         retired: false,
         reason: legacyImportGuidance(runId),
       };
-    const reply = await this.call('status', { id: operation.externalRunId });
+    const reply = await this.call('status', {
+      id: operation.externalRunId ?? `rpc-spawn-${rpcRequestId}`,
+    });
     if (!reply.success)
       return { operation, retired: false, reason: reply.message };
     const details = reply.data.details;
@@ -636,7 +649,6 @@ export class NativeRuntimeClient {
     const summary = record(details.workflowChildren)
       ? details.workflowChildren
       : undefined;
-    const rpcRequestId = operation.legacyImport?.operation.rpcRequestId;
     if (
       summary &&
       rpcRequestId &&
@@ -647,27 +659,68 @@ export class NativeRuntimeClient {
         retired: false,
         reason: 'Imported legacy RPC correlation mismatch.',
       };
+    const correlated =
+      resolving && rpcRequestId
+        ? correlatedWorkflowIdentity(summary, rpcRequestId)
+        : undefined;
+    if (resolving && !correlated)
+      return {
+        operation,
+        retired: false,
+        reason:
+          'Imported RPC alias has no exact workflow correlation; no replay is authorized.',
+      };
+    const id = operation.externalRunId ?? required(correlated).runId;
+    if (details.runId !== undefined && details.runId !== id)
+      return {
+        operation,
+        retired: false,
+        reason: 'Legacy native root identity mismatch.',
+      };
     let source: Record<string, unknown> | undefined;
     const asyncDir =
       operation.asyncDir ??
-      (typeof details.workflowReceiptPath === 'string'
-        ? dirname(details.workflowReceiptPath)
-        : undefined);
-    if (
-      asyncDir &&
-      isAbsolute(asyncDir) &&
-      basename(asyncDir) === operation.externalRunId
-    ) {
+      (typeof details.asyncDir === 'string'
+        ? details.asyncDir
+        : typeof details.workflowReceiptPath === 'string'
+          ? dirname(details.workflowReceiptPath)
+          : undefined);
+    if (asyncDir && isAbsolute(asyncDir) && basename(asyncDir) === id) {
       try {
         const value: unknown = JSON.parse(
           await readFile(join(asyncDir, 'status.json'), 'utf8'),
         );
-        if (record(value) && value.runId === operation.externalRunId)
+        if (
+          record(value) &&
+          value.runId === id &&
+          (!resolving ||
+            (value.toolCallId === `rpc-spawn-${rpcRequestId}` &&
+              typeof value.sessionId === 'string' &&
+              value.sessionId.trim() &&
+              correlatedWorkflowIdentity(
+                value.workflowChildren,
+                required(rpcRequestId),
+                id,
+                correlated?.childRunId,
+              )))
+        )
           source = value;
       } catch {
         /* Missing legacy artifacts are not non-start or retirement evidence. */
       }
     }
+    if (resolving && !source)
+      return {
+        operation,
+        retired: false,
+        reason:
+          'Imported RPC alias source identity is unavailable or mismatched; no binding is authorized.',
+      };
+    const observedOperation: ActiveOperation = {
+      ...operation,
+      externalRunId: id,
+      ...(source && asyncDir ? { asyncDir } : {}),
+    };
     const lifecycle = record(details.lifecycleStatus)
       ? details.lifecycleStatus
       : undefined;
@@ -677,8 +730,8 @@ export class NativeRuntimeClient {
       details.processTerminal ??
       lifecycle?.processTerminal;
     if (
-      (summary && summary.workflowRunId !== operation.externalRunId) ||
-      (!summary && (!record(proof) || proof.runId !== operation.externalRunId))
+      (summary && summary.workflowRunId !== id) ||
+      (!summary && (!record(proof) || proof.runId !== id))
     )
       return {
         operation,
@@ -700,17 +753,9 @@ export class NativeRuntimeClient {
           requestDigest: binding.requestDigest,
         }
       : undefined;
-    let retired = hasTerminalOwnershipProof(
-      data,
-      operation.externalRunId,
-      caller,
-    );
+    let retired = hasTerminalOwnershipProof(data, id, caller);
     if (summary && retired) {
-      const parsed = workflowTerminalProof(
-        proof,
-        operation.externalRunId,
-        caller,
-      );
+      const parsed = workflowTerminalProof(proof, id, caller);
       const steps = source?.steps;
       retired = Boolean(
         parsed &&
@@ -733,7 +778,7 @@ export class NativeRuntimeClient {
       );
       if (!retired) delete data.workflowTerminalProof;
     }
-    return { operation, data, retired };
+    return { operation: observedOperation, data, retired };
   }
 
   async resultLegacy(
@@ -749,33 +794,57 @@ export class NativeRuntimeClient {
   ): Promise<LegacyObservation> {
     const observed = await this.observeLegacy(runId, binding);
     if (observed.retired) return observed;
-    const operation = await this.loadLegacy(runId, binding);
-    const owner = required(await this.registry.get(runId));
-    if (owner.lease && owner.lease.sessionId !== this.sessionId())
-      throw new Error('Foreign lease cannot control legacy operation.');
-    if (!operation.externalRunId || !operation.asyncDir)
+    const found = observed.operation;
+    if (!found.externalRunId || !found.asyncDir)
       return {
         ...observed,
         reason:
+          observed.reason ??
           'Legacy stop lacks retained native session identity; ownership remains reserved.',
       };
     const source: unknown = JSON.parse(
-      await readFile(join(operation.asyncDir, 'status.json'), 'utf8'),
+      await readFile(join(found.asyncDir, 'status.json'), 'utf8'),
     );
+    const operation = await this.loadLegacy(runId, binding);
+    const owner = required(await this.registry.get(runId));
+    if (
+      owner.lease &&
+      (owner.lease.sessionId !== this.sessionId() ||
+        owner.lease.pid !== process.pid)
+    )
+      throw new Error('Foreign lease cannot control legacy operation.');
+    if (
+      (operation.executionGeneration ?? 0) !==
+        (found.executionGeneration ?? 0) ||
+      (owner.status !== 'abandoned' &&
+        (operation.executionGeneration ?? 0) !==
+          (owner.executionGeneration ?? 0)) ||
+      (operation.externalRunId &&
+        operation.externalRunId !== found.externalRunId) ||
+      (operation.asyncDir && operation.asyncDir !== found.asyncDir) ||
+      operation.legacyImport?.operation.rpcRequestId !==
+        found.legacyImport?.operation.rpcRequestId
+    )
+      throw new Error('Legacy binding or generation changed before stop.');
     if (
       !record(source) ||
-      source.runId !== operation.externalRunId ||
+      source.runId !== found.externalRunId ||
       source.sessionId !== this.nativeSessionId()
     )
       throw new Error(
         'Foreign or unknown native session cannot control legacy operation.',
       );
-    const reply = await this.call('stop', { id: operation.externalRunId });
+    const reply = await this.call('stop', { id: found.externalRunId }, () => {
+      if (source.sessionId !== this.nativeSessionId())
+        throw new Error(
+          'Foreign native session cannot control legacy operation.',
+        );
+    });
     return {
       ...observed,
       reason:
         reply.success &&
-        reply.data.runId === operation.externalRunId &&
+        reply.data.runId === found.externalRunId &&
         reply.data.state === 'stopping'
           ? 'Stop delivered; retirement still unobserved.'
           : reply.success
@@ -796,14 +865,13 @@ export class NativeRuntimeClient {
         operation: { ...operation, launchFenced: true },
         stopPending: false,
       };
-    if (!operation.externalRunId)
-      return {
-        state: 'unknown',
-        operation,
-        reason:
-          'Abandoned launch has no exact native identity; checkout remains reserved.',
-      };
-    return this.observeTarget(runId, binding, operation.externalRunId, true);
+    return this.observeTarget(
+      runId,
+      binding,
+      operation.externalRunId ??
+        `rpc-spawn-${required(operation.native).request.requestId}`,
+      true,
+    );
   }
 
   /** Best effort only, after observing retirement; never adopts native authority. */
@@ -815,14 +883,25 @@ export class NativeRuntimeClient {
     if (observed.state === 'retired')
       return { ...observed, stopPending: false };
     const { operation } = await this.load(runId, binding, true, true);
-    if (!operation.externalRunId) return { ...observed, stopPending: true };
-    const reply = await this.call('stop', { id: operation.externalRunId });
+    const id = observed.operation.externalRunId;
+    if (!id) return { ...observed, stopPending: true };
+    if (operation.externalRunId && operation.externalRunId !== id)
+      throw new Error('Abandoned native binding changed before stop.');
+    const reply = await this.call('stop', { id }, () => {
+      if (
+        operation.native?.ownerSessionId !== this.sessionId() ||
+        operation.native.nativeSessionId !== this.nativeSessionId()
+      )
+        throw new Error(
+          'Foreign session cannot control abandoned native operation.',
+        );
+    });
     return {
       ...observed,
       stopPending: true,
       reason:
         reply.success &&
-        reply.data.runId === operation.externalRunId &&
+        reply.data.runId === id &&
         reply.data.state === 'stopping'
           ? 'Stop delivered; retirement still unobserved.'
           : reply.success
@@ -1207,8 +1286,12 @@ export class NativeRuntimeClient {
   private call(
     method: string,
     params: Record<string, unknown>,
+    beforeEmit?: () => void,
   ): Promise<Reply> {
-    return this.rpc({ version: 1, requestId: randomUUID(), method, params });
+    return this.rpc(
+      { version: 1, requestId: randomUUID(), method, params },
+      beforeEmit,
+    );
   }
   private rpc(
     request: {

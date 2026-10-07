@@ -1,4 +1,9 @@
-# Upstream compatibility audit
+# Historical upstream compatibility audit
+
+> Historical, pre-native-cutover record. The Bridge/pi-tasks dependency and
+> integration statements below describe the earlier implementation, not current
+> installation requirements. See [current runtime contracts](runtime-contracts.md)
+> for the released native path and supported recovery behavior.
 
 Checked 2026-10-06 against npm releases, installed source and native Pi fixtures.
 Release notes are not proof of execution ownership.

@@ -248,7 +248,7 @@ test('packed normal loader: native plan/goal/review, lost reply, force stop/rest
       preload,
       `import os from 'node:os';import{syncBuiltinESMExports}from'node:module';import{EventEmitter}from'node:events';import{appendFileSync,existsSync,unlinkSync,writeFileSync}from'node:fs';import{join}from'node:path';os.homedir=()=>${JSON.stringify(home)};syncBuiltinESMExports();
 const root=${JSON.stringify(sandbox)},original=EventEmitter.prototype.emit;let dropped;
-EventEmitter.prototype.emit=function(name,value,...rest){if(process.env.PI_SUBAGENT_CHILD!=='1'){if(name==='subagents:rpc:v1:request'&&value?.method==='spawn'){appendFileSync(join(root,'spawns.jsonl'),JSON.stringify({pid:process.pid,requestId:value.requestId})+'\\n');if(existsSync(join(root,'drop-next'))){unlinkSync(join(root,'drop-next'));dropped=value.requestId;}}if(dropped&&name==='subagents:rpc:v1:reply:'+dropped){writeFileSync(join(root,'dropped.json'),JSON.stringify({requestId:dropped}));dropped=undefined;return false;}}return original.call(this,name,value,...rest);};`,
+EventEmitter.prototype.emit=function(name,value,...rest){if(process.env.PI_SUBAGENT_CHILD!=='1'){if(name==='subagents:rpc:v1:request'&&value?.method==='stop')appendFileSync(join(root,'stops.jsonl'),JSON.stringify({pid:process.pid,runId:value.params?.id})+'\\n');if(name==='subagents:rpc:v1:request'&&value?.method==='spawn'){appendFileSync(join(root,'spawns.jsonl'),JSON.stringify({pid:process.pid,requestId:value.requestId})+'\\n');if(existsSync(join(root,'drop-next'))){unlinkSync(join(root,'drop-next'));dropped=value.requestId;}}if(dropped&&name==='subagents:rpc:v1:reply:'+dropped){writeFileSync(join(root,'dropped.json'),JSON.stringify({requestId:dropped,runId:value?.data?.details?.workflowChildren?.workflowRunId}));dropped=undefined;return false;}}return original.call(this,name,value,...rest);};`,
     );
     env.NODE_OPTIONS = `--import=${preload}`;
     const observer = join(sandbox, 'observer.mjs');
@@ -414,7 +414,8 @@ export default function(pi){
       await git(['checkout', '-b', 'feature']);
       const session = join(sandbox, `${mode}-session.jsonl`);
       host = await launch(cwd, session);
-      if (mode === 'plan') await writeFile(join(sandbox, 'drop-next'), 'drop');
+      if (mode === 'plan' || mode === 'stop')
+        await writeFile(join(sandbox, 'drop-next'), 'drop');
       hold = mode === 'stop';
       host.send({
         id: 'start',
@@ -496,11 +497,20 @@ export default function(pi){
           );
         }
       } else {
-        await waitFor(
-          async () =>
-            (await json(join(runs, run.id, 'run.json')))?.activeOperation
-              ?.externalRunId,
-          'bound worker before force stop',
+        const lost = await waitFor(async () => {
+          const current = await json(join(runs, run.id, 'run.json'));
+          const dropped = await json(join(sandbox, 'dropped.json'));
+          return (
+            current?.activeOperation?.native?.request.requestId ===
+              dropped?.requestId && dropped
+          );
+        }, 'actual lost spawn reply before force stop');
+        assert.equal(typeof lost.runId, 'string');
+        assert.equal(
+          (await json(join(runs, run.id, 'run.json'))).activeOperation
+            .externalRunId,
+          undefined,
+          'Force-stop begins before ordinary binding',
         );
         host.send({
           id: 'stop',
@@ -524,6 +534,16 @@ export default function(pi){
             ),
           'force-stop outcome',
           15000,
+        );
+        const delivered = (await readFile(join(sandbox, 'stops.jsonl'), 'utf8'))
+          .trim()
+          .split('\n')
+          .map(JSON.parse);
+        assert.ok(
+          delivered.some(
+            (stop) => stop.pid === host.child.pid && stop.runId === lost.runId,
+          ),
+          'Exact alias discovery permits native stop after abandonment',
         );
         const settled =
           (await json(join(runs, run.id, 'run.json'))) ??

@@ -2174,7 +2174,7 @@ export function nativeEvidenceProbe(
           : undefined;
       return {
         ...base,
-        ...(seen.data && operation.externalRunId
+        ...(seen.data && seen.operation.externalRunId
           ? { operationBound: true }
           : {}),
         ...(process ? { processTerminalProof: process } : {}),
