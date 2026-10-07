@@ -5,9 +5,10 @@ import { expect, onTestFinished, test, vi } from 'vitest';
 import { PlanExecController } from '../src/controller.js';
 import { parseResumeArguments } from '../src/index.js';
 import { NativeRuntimeClient } from '../src/native-runtime.js';
+import { parsePlan } from '../src/plan.js';
 import { RunRegistry } from '../src/registry.js';
 import { required } from '../src/required.js';
-import { DEFAULT_FROZEN_RUN_CONFIG } from '../src/types.js';
+import { DEFAULT_FROZEN_RUN_CONFIG, type PlanExecRun } from '../src/types.js';
 import { writeLegacyJournal } from './fixtures/legacy-journal.js';
 
 async function fixture() {
@@ -128,6 +129,102 @@ test('legacy snapshot import preserves original intent, cancellation and read-on
   expect(await readFile(f.snapshot)).toEqual(before);
   expect(f.calls).toEqual([]);
 });
+
+for (const slot of ['activeOperation', 'failedOperation'] as const) {
+  test(`repeated legacy import preserves ${slot}, cancellation and quarantined inventory without dispatch`, async () => {
+    const f = await fixture();
+    const operation = {
+      ...required(f.run.activeOperation),
+      stopRequested: true,
+      cancellationDeliveryError: {
+        message: 'Stop acknowledgement missing',
+        observedAt: 1,
+      },
+    };
+    const quarantine = {
+      id: '11111111-1111-4111-8111-111111111111',
+      generation: 0,
+      operation: { ...operation, operationId: 'quarantined-operation' },
+      repositoryRoot: f.root,
+      cwd: join(f.root, 'old-checkout'),
+      branch: 'old-feature',
+      planPath: join(f.root, 'old-checkout', 'plan.md'),
+      inventory: join(f.root, 'inventory.json'),
+      inventoryEntries: 0,
+      ignoredEntries: 0,
+      observedHead: 'a'.repeat(40),
+      baseline: 'a'.repeat(40),
+      commitDelta: '',
+      quarantinedAt: 1,
+    };
+    await writeFile(quarantine.inventory, '[]');
+    const planContent = '### Task 1: Fixture\n- [ ] Work\n';
+    const seed: PlanExecRun = {
+      ...f.run,
+      planHash: parsePlan(required(f.run.planPath), planContent).hash,
+      executionGeneration: 1,
+      isolationRecovery: {
+        id: quarantine.id,
+        state: 'active',
+        generation: 1,
+        stopGeneration: 0,
+        target: f.root,
+        sourceRoot: quarantine.cwd,
+        branch: 'feature',
+        worktreeRelativePath: '',
+        planRelativePath: 'plan.md',
+        planContent,
+        authorName: 'Fixture',
+        authorEmail: 'fixture@example.test',
+        requestedBy: 'owner',
+        taskId: 1,
+        taskTitle: 'Fixture',
+        taskItems: ['Work'],
+        bootstrapCommands: [],
+        intentDigest: 'fixture-intent',
+        baseline: quarantine.baseline,
+        requestedAt: 1,
+      },
+      status: slot === 'failedOperation' ? 'failed' : 'paused',
+      [slot]: operation,
+      quarantinedExecutions: [quarantine],
+    };
+    if (slot === 'failedOperation') delete seed.activeOperation;
+    const seeded = await f.registry.update(seed);
+    await writeLegacyJournal(f.snapshot, f.binding, {
+      cancel_requested: 1,
+      stop_receipt_state: 'stopping',
+    });
+    const source = await readFile(f.snapshot);
+    const first = await f.controller.importLegacyJournal(
+      f.run.id,
+      'owner',
+      f.snapshot,
+    );
+    const second = await f.controller.importLegacyJournal(
+      f.run.id,
+      'owner',
+      f.snapshot,
+    );
+    expect(second.status).toBe(seeded.status);
+    expect(second.userStopped).toBe(true);
+    expect(second[slot]?.params).toEqual(operation.params);
+    expect(second[slot]?.requestDigest).toBe(operation.requestDigest);
+    expect(second[slot]?.externalRunId).toBe(first[slot]?.externalRunId);
+    expect(second[slot]?.legacyImport?.operation).toEqual(
+      first[slot]?.legacyImport?.operation,
+    );
+    expect(second[slot]?.cancellationDeliveryError).toEqual(
+      operation.cancellationDeliveryError,
+    );
+    expect(second[slot]?.stopRequested).toBe(true);
+    expect(second.quarantinedExecutions).toEqual(seeded.quarantinedExecutions);
+    expect(second.lease).toEqual(seeded.lease);
+    expect(await readFile(quarantine.inventory, 'utf8')).toBe('[]');
+    expect(await readFile(f.snapshot)).toEqual(source);
+    expect(f.calls).toEqual([]);
+  });
+}
 
 for (const scenario of [
   'missing',

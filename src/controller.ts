@@ -3487,17 +3487,29 @@ export class PlanExecController {
             'Retired native operation has no validated successful child output; replacement remains fenced.',
         );
       const captured = result.result;
-      const retained = await this.registry.withAuthorizedMutation(current, () =>
-        durableJson(
-          join(dirname(captured.outputPath), 'controller-result.json'),
-          {
-            operationId: operation.operationId,
-            requestDigest: operation.requestDigest,
-            proof: result.proof,
-            result: captured,
-          },
-        ),
-      );
+      let retained: boolean;
+      try {
+        retained = await this.registry.withAuthorizedMutation(current, () =>
+          durableJson(
+            join(dirname(captured.outputPath), 'controller-result.json'),
+            {
+              operationId: operation.operationId,
+              requestDigest: operation.requestDigest,
+              proof: result.proof,
+              result: captured,
+            },
+          ),
+        );
+      } catch (error) {
+        // Observation already advanced the record; tick's initial CAS is stale.
+        const latest = required(await this.registry.get(run.id));
+        if (!sameOperationState(current, latest, operation)) return latest;
+        return this.recordObservationFailure(
+          latest,
+          required(latest.activeOperation),
+          `Native result capture failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
       if (!retained) return required(await this.registry.get(run.id));
       return this.finishWorkerOperation(
         current,

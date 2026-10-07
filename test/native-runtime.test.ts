@@ -1,4 +1,5 @@
 import {
+  chmod,
   mkdir,
   mkdtemp,
   readdir,
@@ -1823,6 +1824,78 @@ for (const scenario of [
     else expect(result.result).toBeUndefined();
   });
 }
+
+test('native result capture EACCES preserves the operation and prevents acceptance', async () => {
+  const { PlanExecController } = await import('../src/controller.js');
+  const f = await fixture();
+  const { details, source, asyncDir } = await correlatedSource(f, 'completed');
+  const outputPath = required(f.op.native).outputPath;
+  await writeFile(
+    join(asyncDir, 'status.json'),
+    JSON.stringify({
+      ...source,
+      workflow: {
+        value: {
+          key: 'main',
+          runId: 'child',
+          ok: true,
+          outputReference: outputPath,
+        },
+      },
+    }),
+  );
+  await writeFile(outputPath, 'Task completed and committed.');
+  f.setHandler((req) => f.reply(req, { details }));
+  await f.client.spawn(f.run.id, f.binding);
+  const commands = vi.fn(async () => {
+    throw new Error('No acceptance before durable result capture');
+  });
+  const controller = new PlanExecController(
+    f.registry,
+    f.client,
+    {
+      start: commands,
+      status: commands,
+      result: commands,
+      adopt: commands,
+      cancel: commands,
+    },
+    commands,
+  );
+  const ready = await f.client.result(f.run.id, f.binding);
+  expect(ready.result, ready.reason).toBeDefined();
+  const observedResult = vi.spyOn(f.client, 'result');
+  await chmod(dirname(outputPath), 0o555);
+  try {
+    const current = await controller.tick(f.run.id, 'session');
+    expect(observedResult).toHaveBeenCalled();
+    expect(current.activeOperation?.lastStatusError).toContain('EACCES');
+    expect(
+      (current.activeOperation ?? current.failedOperation)?.operationId,
+    ).toBe(f.op.operationId);
+    expect(current.stage).toBe('implementation');
+    expect(current.reviewedCommit).toBeUndefined();
+    expect(current.acceptedHead).toBeUndefined();
+    expect(commands).not.toHaveBeenCalled();
+    expect(f.requests.filter((req) => req.method === 'spawn')).toHaveLength(1);
+    await expect(
+      readFile(join(dirname(outputPath), 'controller-result.json')),
+    ).rejects.toMatchObject({ code: 'ENOENT' });
+  } finally {
+    await chmod(dirname(outputPath), 0o700);
+  }
+  vi.spyOn(Date, 'now').mockReturnValue(
+    Date.now() + f.run.config.retryDelayMs + 1,
+  );
+  const retried = await controller.tick(f.run.id, 'session');
+  expect(retried.activeOperation?.lastStatusError).toBeUndefined();
+  const captured = JSON.parse(
+    await readFile(join(dirname(outputPath), 'controller-result.json'), 'utf8'),
+  );
+  expect(captured.operationId).toBe(f.op.operationId);
+  expect(captured.requestDigest).toBe(f.op.requestDigest);
+  expect(f.requests.filter((req) => req.method === 'spawn')).toHaveLength(1);
+});
 
 test('lost native reply retirement binds only through the abandoned retirement seam', async () => {
   const { PlanExecController } = await import('../src/controller.js');
