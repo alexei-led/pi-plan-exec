@@ -375,6 +375,7 @@ export default function(pi){
  const root=${JSON.stringify(sandbox)},home=${JSON.stringify(home)};
  if(process.env.PI_SUBAGENT_CHILD!=='1'){pi.events.on('pi-intercom:detach-request',value=>writeFileSync(join(root,'supervisor-request.json'),JSON.stringify(value)));pi.events.on('pi-intercom:detach-response',value=>writeFileSync(join(root,'supervisor-detach.json'),JSON.stringify(value)));}
  pi.on('session_start',(_event,ctx)=>{if(process.env.PI_SUBAGENT_CHILD!=='1'&&ctx.cwd.endsWith('/schema-ceiling'))registerSubagentCapabilityCeiling({sessionId:ctx.sessionManager.getSessionFile()??ctx.sessionManager.getSessionId(),source:'final-probe',ceiling:{allowedTools:['read','grep','find','ls']}});});
+ pi.on('session_start',(_event,ctx)=>{if(process.env.PI_SUBAGENT_CHILD!=='1'&&ctx.cwd.endsWith('/agent-ceiling'))registerSubagentCapabilityCeiling({sessionId:ctx.sessionManager.getSessionFile()??ctx.sessionManager.getSessionId(),source:'agent-ceiling-probe',ceiling:{allowedAgents:['worker']}});});
  pi.on('session_start',async(_event,ctx)=>{if(process.env.PI_SUBAGENT_CHILD!=='1'&&['/missing-skill','/lazy-skill'].some(name=>ctx.cwd.endsWith(name))){if(ctx.cwd.endsWith('/lazy-skill'))registerSubagentCapabilityCeiling({sessionId:ctx.sessionManager.getSessionFile()??ctx.sessionManager.getSessionId(),source:'skill-probe',ceiling:{allowedTools:['grep','find','ls']}});const result=await resolveSubagentLaunchContract({agent:'skill-probe',task:'Skill admission probe',cwd:ctx.cwd,context:'fresh',sessionRoot:join(root,'skill-preflight'),parentSessionId:ctx.sessionManager.getSessionId(),capabilityCeiling:resolveCurrentSubagentCapabilityCeiling(ctx.sessionManager.getSessionFile()??ctx.sessionManager.getSessionId()),availableModels:ctx.modelRegistry.getAvailable(),runtimeSnapshotHost:pi});writeFileSync(join(ctx.cwd,'..',ctx.cwd.endsWith('/lazy-skill')?'lazy-skill-preflight.json':'missing-skill-preflight.json'),JSON.stringify(result));}});
  pi.on('session_start',(_event,ctx)=>{const dir=join(home,'.pi','plan-exec','runs');const leases=existsSync(dir)?readdirSync(dir).filter(id=>!id.startsWith('.')).flatMap(id=>{try{const r=JSON.parse(readFileSync(join(dir,id,'run.json'),'utf8'));return r.lease?[{id,pid:r.lease.pid,sessionId:r.lease.sessionId}]:[];}catch{return[];}}):[];appendFileSync(join(root,'loads.jsonl'),JSON.stringify({pid:process.pid,child:process.env.PI_SUBAGENT_CHILD==='1',commands:pi.getCommands().map(c=>c.name),sessionId:ctx.sessionManager.getSessionId(),sessionFile:ctx.sessionManager.getSessionFile(),leases})+'\\n');});
 }`,
@@ -519,6 +520,7 @@ export default function(pi){
       'tool-ceiling',
       'missing-agent',
       'schema-ceiling',
+      'agent-ceiling',
       'owned-collision',
       'missing-skill',
       'valid-skill',
@@ -578,7 +580,9 @@ import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8')
           '---\nname: plan-exec-reviewer\ndescription: Unacceptable configured substitute\ntools: read\n---\nDo not substitute this definition.\n',
         );
       }
-      if (mode === 'schema-ceiling' || mode === 'owned-collision') {
+      if (
+        ['schema-ceiling', 'owned-collision', 'agent-ceiling'].includes(mode)
+      ) {
         await writeFile(join(cwd, 'result.txt'), 'done\n');
         await writeFile(
           join(cwd, 'plan.md'),
@@ -752,6 +756,7 @@ import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8')
           'missing-skill',
           'lazy-skill',
           'owned-collision',
+          'agent-ceiling',
         ].includes(mode)
       ) {
         const refused = await waitFor(async () => {
@@ -774,9 +779,11 @@ import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8')
             ? /missing_agent/
             : mode === 'missing-skill'
               ? /missing_skill/
-              : mode === 'owned-collision'
-                ? /owned_reviewer_collision/
-                : /denied_required_tool/,
+              : mode === 'agent-ceiling'
+                ? /restricted_agent/
+                : mode === 'owned-collision'
+                  ? /owned_reviewer_collision/
+                  : /denied_required_tool/,
         );
         assert.match(refused.error, /Correct.*resume/i);
         assert.equal(refused.activeOperation?.native?.phase, 'prepared');
@@ -1321,6 +1328,7 @@ import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8')
               'missing-skill',
               'lazy-skill',
               'owned-collision',
+              'agent-ceiling',
               'stop',
             ].includes(value)
               ? 0

@@ -30,13 +30,19 @@ const admission = vi.hoisted(() =>
 vi.mock('pi-subagents/preflight', () => ({
   resolveSubagentLaunchContract: admission,
 }));
+const capabilityCeiling = vi.hoisted(() =>
+  vi.fn<
+    typeof import('pi-subagents/capability-ceiling')['resolveCurrentSubagentCapabilityCeiling']
+  >(),
+);
 vi.mock('pi-subagents/capability-ceiling', () => ({
-  resolveCurrentSubagentCapabilityCeiling: () => undefined,
+  resolveCurrentSubagentCapabilityCeiling: capabilityCeiling,
 }));
 vi.mock('pi-subagents/intercom-bridge', () => ({
   resolveIntercomSessionTarget: () => 'fixture-supervisor',
 }));
 beforeEach(() => {
+  capabilityCeiling.mockReset().mockReturnValue(undefined);
   admission
     .mockReset()
     .mockResolvedValue({ ok: true, contract: {} } as Awaited<
@@ -2099,6 +2105,64 @@ for (const state of [
     }
   });
 }
+
+for (const { allowedAgents, allowed } of [
+  { allowedAgents: undefined, allowed: true },
+  { allowedAgents: [], allowed: false },
+  { allowedAgents: ['worker'], allowed: false },
+  { allowedAgents: ['plan-exec-reviewer'], allowed: true },
+  { allowedAgents: ['plan-exec-reviewer-shadow'], allowed: false },
+]) {
+  test(`owned reviewer admission respects allowedAgents=${JSON.stringify(allowedAgents)} before emitting a workflow`, async () => {
+    const f = await fixture();
+    const { binding } = await admissionChild(f, 'plan-exec-reviewer');
+    ownedReviewer(f);
+    admission.mockResolvedValue({ ...unknownReviewer, diagnostics: [] });
+    capabilityCeiling.mockReturnValue({
+      version: 1,
+      denyExtensions: false,
+      sources: ['fixture'],
+      ...(allowedAgents === undefined ? {} : { allowedAgents }),
+    });
+    const before = await readFile(f.registry.authorizationPath(f.run.id));
+    if (allowed) {
+      await f.client.spawn(f.run.id, binding);
+      expect(
+        f.requests.filter((request) => request.method === 'spawn'),
+      ).toHaveLength(1);
+    } else {
+      await expect(f.client.spawn(f.run.id, binding)).rejects.toThrow(
+        'restricted_agent',
+      );
+      expect(f.requests).toEqual([]);
+      expect(await readFile(f.registry.authorizationPath(f.run.id))).toEqual(
+        before,
+      );
+    }
+  });
+}
+
+test('owned reviewer rechecks an agent ceiling narrowed during admission', async () => {
+  const f = await fixture();
+  const { binding } = await admissionChild(f, 'plan-exec-reviewer');
+  ownedReviewer(f);
+  admission.mockImplementation(async () => {
+    capabilityCeiling.mockReturnValue({
+      version: 1,
+      denyExtensions: false,
+      sources: ['fixture'],
+      allowedAgents: [],
+    });
+    return { ...unknownReviewer, diagnostics: [] };
+  });
+  await expect(f.client.spawn(f.run.id, binding)).rejects.toThrow(
+    'restricted_agent',
+  );
+  expect(f.requests).toEqual([]);
+  expect((await f.registry.get(f.run.id))?.activeOperation?.native?.phase).toBe(
+    'prepared',
+  );
+});
 
 test('preflight errors never become non-start and dispatched requests never reenter admission', async () => {
   const f = await fixture();

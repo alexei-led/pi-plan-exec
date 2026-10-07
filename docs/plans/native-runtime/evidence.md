@@ -66,7 +66,7 @@ contract command is a reusable subset, not extra duplicated scenarios. The
 external bundle includes the actual full-candidate and follow-up diffs produced
 with `--no-ext-diff --no-textconv`, final gate logs and clean-index proof.
 
-**Linux: NOT RUN locally.** No Docker daemon is available and no VM/service or
+**Linux: NOT RUN; separate acceptance waived by the operator.** No Docker daemon is available and no VM/service or
 remote workaround was provisioned. `.github/workflows/ci.yml` now wires four
 bounded Ubuntu native jobs (contracts/runtime/recovery/packed) with pinned
 Node/npm, full-history checkout for the frozen regression, pipeline failure
@@ -277,3 +277,21 @@ README/evidence relative-link check passed (13 links); prose lint reported 44
 advisory findings. No diagrams changed. Checking the frozen plan additionally
 reports its historical src/task-projection.ts link, whose target was deliberately
 deleted by this migration. Plan structure was not edited to conceal that history.
+
+## Final admission recheck
+
+The independent admission review found that the fixed-role discovery exception
+could emit a workflow even when allowedAgents excluded the reviewer. Parent
+reproduced four failing checks, then added an exact allowed-agent check to the
+existing disposal-aware callback. It re-reads the current ceiling before admission
+and at the existing post-await/pre-emit checkpoints. No private native API is used.
+Six regression cases cover absent/empty/allow/deny/lookalike lists and a ceiling
+narrowed during admission. All 80 adapter/registration tests passed. The real
+packed agent-ceiling scenario now records prepared state, zero spawns and zero
+model calls; the allowed schema-ceiling scenario still completes. npm run check
+passed. Independent recheck and the final broad gate remain pending.
+
+The operator waived a separate Linux verification gate and authorized preparing a
+release after final review and evidence reconciliation. This is not a Linux pass.
+The existing tag-driven publisher remains authoritative; its automatic checks
+are not bypassed. No global package or live registry upgrade is authorized.

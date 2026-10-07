@@ -321,6 +321,18 @@ export class NativeRuntimeClient {
     );
     const ownedReviewer = child.agent === NATIVE_REVIEWER_AGENT;
     const requireOwnedReviewer = () => {
+      if (ownedReviewer) {
+        const current = ceilings.resolveCurrentSubagentCapabilityCeiling(
+          this.nativeSessionId(),
+        );
+        if (
+          current?.allowedAgents !== undefined &&
+          !current.allowedAgents.includes(NATIVE_REVIEWER_AGENT)
+        )
+          throw new Error(
+            'Native launch admission refused (restricted_agent): The current capability ceiling excludes the package-owned reviewer. Correct the agent policy, then resume. No spawn was emitted.',
+          );
+      }
       if (ownedReviewer && !hasNativeReviewerRegistration(this.events))
         throw new Error(
           'Native launch admission refused (owned_reviewer_unavailable): Register the package-owned readonly reviewer in the current runtime, then resume.',
