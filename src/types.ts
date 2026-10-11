@@ -30,7 +30,7 @@ export const EXEC_ALIAS_ACTIONS = [
   EXEC_ACTION.DOCTOR,
   EXEC_ACTION.SETUP,
   EXEC_ACTION.ADOPT,
-  EXEC_ACTION.CANCEL,
+  EXEC_ACTION.STOP,
 ] as const;
 
 export type ExecAliasAction = (typeof EXEC_ALIAS_ACTIONS)[number];
@@ -550,6 +550,8 @@ export interface PlanExecRun {
   needsAttention?: boolean;
   stopGeneration?: number;
   userStopped?: boolean;
+  /** Final cancellation dismisses presentation even if worker retirement fails. */
+  displayDismissed?: boolean;
   lanePreparation?: {
     cwd: string;
     branch: string;

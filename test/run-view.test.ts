@@ -306,7 +306,7 @@ test('stale snapshot does not replace newer cancellation state; removed records 
   const view = new RunPresentation();
   view.remember(run({ revision: 3, status: 'cancel_pending' }));
   view.remember(run({ revision: 2, status: 'running' }));
-  assert.equal(view.current()?.status, 'cancel_pending');
+  assert.equal(view.current(), undefined);
   view.reconcile([]);
   assert.equal(view.current(), undefined);
   view.remember(run({ revision: 2 }));
@@ -323,3 +323,28 @@ test('explicit selection is deterministic and clear only dismisses that run', ()
   assert.equal(view.current()?.id, 'a');
   assert.throws(() => view.show('not-found'), /not found/);
 });
+
+for (const status of ['cancel_pending', 'cancelled'] as const)
+  test(`cancelled runs stay dismissed across reload, show and stale updates: ${status}`, () => {
+    const cancelled = run({ status, revision: 2 });
+    const view = new RunPresentation({
+      hidden: false,
+      dismissed: [],
+      selected: cancelled.id,
+    });
+    view.reconcile([cancelled]);
+    assert.equal(view.current(), undefined);
+    view.show(cancelled.id);
+    assert.equal(view.current(), undefined);
+    view.remember(run({ revision: 1 }));
+    assert.equal(view.current(), undefined);
+    view.remember(
+      run({ revision: 3, status: 'failed', displayDismissed: true }),
+    );
+    assert.equal(view.current(), undefined);
+    const restored = new RunPresentation();
+    restored.reconcile([cancelled]);
+    assert.equal(restored.current(), undefined);
+    restored.remember(run({ id: 'new-run' }));
+    assert.equal(restored.current()?.id, 'new-run');
+  });

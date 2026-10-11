@@ -34,12 +34,12 @@ Twelve accepted implementation tasks can still mean review/checking, not complet
 
 | Command | Effect | Changes execution? |
 | --- | --- | --- |
-| `/exec hide` | Remove strip and footer immediately | No |
+| `/exec hide` | Toggle strip and footer immediately | No |
 | `/exec show [run-id]` | Restore display, optionally pin one run | No |
 | `/exec clear [run-id]` | Dismiss one displayed run | No |
 | `/exec status [run-id]` | Read diagnostics, paths and evidence | No |
 | `/exec pause [run-id]` | Pause resumably | Yes |
-| `/exec stop [run-id]` | Final cancellation without a dialog | Yes |
+| `/exec cancel [run-id]` | Final cancellation and permanent UI dismissal | Yes |
 | `/exec stop <run-id> --force` | End management permanently; retain unresolved ownership | Yes |
 | `/exec ui on\|off` | Toggle the display without changing execution | No |
 | `/exec cleanup --apply` | Remove eligible terminal registry records | No worker control; deletes evidence |
@@ -47,13 +47,15 @@ Twelve accepted implementation tasks can still mean review/checking, not complet
 Hide/clear need no `--apply`. Preferences follow the active session branch and
 survive reload. A new independent session has its own preferences.
 Cancellation means intent first, delivery second, confirmed retirement last.
-A user can hide any intermediate state.
+A user can hide any intermediate state. Cancelled runs are dismissed automatically,
+including after reload and in new sessions. The same controls work under `/goal`.
+`stop` remains a compatibility alias for final cancellation, not pause.
 
 ## Reproduce safely
 
-Use [Development's recovery fixture](../DEVELOPMENT.md#visible-recovery-integration).
-It creates fresh repositories and an isolated home/journal. Its local HTTP model
-is scripted; Pi, Bridge, subagents, controller, Git and terminal rendering are real.
+Use [Development's integration fixtures](../DEVELOPMENT.md#native-and-packed-integration).
+They create fresh repositories and isolated runtime storage. The localhost model
+is scripted; Pi, native subagents, controller and Git are real.
 Never run these fixtures against a real run registry.
 
 For unpolled display fixtures, additionally load `test/fixtures/progress-ui.ts`

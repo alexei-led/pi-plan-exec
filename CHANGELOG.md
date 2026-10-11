@@ -1,5 +1,42 @@
 # Changelog
 
+## 2.1.0 - 2026-10-11
+
+### Changed
+
+- Use the same short command set for plans and goals: `status`, `resume`,
+  `pause`, `cancel`, `hide`, and `help`. Advanced recovery flags and
+  compatibility commands remain available through `/exec help advanced`.
+- Cancelled runs disappear from the strip and footer immediately, including
+  after reload, branch navigation, and new sessions. No separate `clear` or
+  `cleanup` command is needed. Existing cancelled records are hidden too.
+- `/goal stop` now means final cancellation, matching `/exec stop`.
+  `stop` remains a compatibility name for `cancel` in both commands.
+- `hide` toggles progress display without changing execution. Goals also
+  accept the compatibility display controls `ui on|off`, `show`, and `clear`.
+
+### Fixed
+
+- Share the lease, mutation, and recovery gates for goal and plan controls.
+  Implicit goal controls select eligible work in the current project instead
+  of a newer finished or unrelated goal.
+- Prevent resume and optional review waivers from restarting a finally
+  cancelled run whose worker retirement failed.
+
+### Upgrade
+
+- After upgrading, restart Pi sessions sharing the registry. Saved work,
+  branches, worktrees, and worker ownership evidence are preserved.
+- Change scripts that used `/goal stop` for resumable pauses to
+  `/goal pause`. Otherwise, `stop` now ends the goal finally.
+- Use `ui off` for repeated idempotent hiding in scripts.
+  Repeating `hide` now restores the display.
+- Cancellation is not successful completion or proof of worker exit. Shutdown
+  tracking continues safely in the background; unresolved ownership stays
+  reserved.
+
+[Full changes](https://github.com/alexei-led/pi-plan-exec/compare/v2.0.0...v2.1.0)
+
 ## 2.0.0 - 2026-10-07
 
 ### Changed

@@ -44,13 +44,15 @@ failed; arbitrary failed output is not success.
 
 ```text
 /exec pause <full-run-id>
-/exec stop <full-run-id>
-/exec stop <full-run-id> --force
+/exec cancel <full-run-id>
+/exec cancel <full-run-id> --force
 ```
 
-Pause preserves the checkpoint and is resumable. Ordinary stop is final
-cancellation without a dialog (`cancel` remains an alias). Both preserve newer
-stop generations over stale callbacks and refuse a live foreign controller.
+Pause preserves the checkpoint and is resumable. Ordinary cancel is final
+cancellation without a dialog (`stop` is the compatibility alias for `cancel`).
+Both plans and goals dismiss the UI immediately on cancellation, across reloads
+and new sessions. Saved work stays. Ownership evidence remains until safe retirement.
+Both preserve newer stop generations over stale callbacks and refuse a live foreign controller.
 Do not use resume merely to erase an intentional pause.
 
 Stop intent, delivery and retirement are different facts. A delivered receipt

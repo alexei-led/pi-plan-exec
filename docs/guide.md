@@ -141,13 +141,14 @@ config; when it is reached the goal pauses and can be resumed.
 
 ```text
 /goal status [run-id]   Progress, current turn, check result, blocker
-/goal resume [run-id]   Continue after a stop, blocker, or failed turn
+/goal resume [run-id]   Continue paused or stuck work
 /goal pause [run-id]    Stop scheduling turns; the current turn is preserved
-/goal cancel [run-id]   Cancel the goal and stop the current turn
+/goal cancel [run-id]   End and dismiss; saved work stays
+/goal hide             Toggle progress display; work continues
 /goal help              Command list
 ```
 
-Goal runs live in the same registry and `/exec status` lists them; the project
+Goal runs live in the same registry and `/exec status` lists them.
 There is no external task projection for goals or plans; the working list is optional
 and an empty list is not an error.
 
@@ -339,8 +340,8 @@ other agent processes.
 The progress strip uses two lines, with one extra warning when needed.
 Healthy working/review/checking and complete states are green. Retry, external
 wait, unknown worker and stopping states are amber. Failed is red.
-User-paused/cancelled runs are muted once cleanup finishes. An observed operation
-pause is amber; it does not by itself prove a pending question. When another
+User-paused runs are muted once cleanup finishes. Cancelled runs are never displayed.
+An observed operation pause is amber; it does not by itself prove a pending question. When another
 task is working, external waits appear alongside its activity rather than hiding it.
 State text and symbols do not depend on color.
 In-flight records not owned and polled by this session retain their execution
@@ -351,17 +352,21 @@ without taking ownership; `/exec status <id>` reads current evidence. Settled
 terminal states keep their normal colors without requiring ongoing polling.
 
 ```text
-/exec hide             Hide the strip and footer now; execution continues
+/exec hide             Toggle the strip and footer; execution continues
 /exec show [run-id]     Restore the display; do not resume execution
 /exec clear [run-id]    Dismiss this run's display; do not delete its record
 ```
 
+These controls are shared by `/exec` and `/goal`. Repeat `hide` to restore the display.
+`show`, `clear`, and `ui on|off` are compatibility controls.
 No `--apply` or confirmation is needed. Hide and clear without an ID act without
 waiting on the registry or worker. Show and clear with an ID re-read the registry
 to validate the selection, so a slow or unavailable registry can delay or refuse
 them. Neither writes execution state. Clear without an ID dismisses the displayed
 run; other runs can remain visible. Show without an ID restores all dismissed runs and
-selects a nonterminal run first. Use an ID to pin one run.
+selects a nonterminal run first. Use an ID to pin one run. Cancelled runs cannot
+be restored by any display command, including after reload or a new session.
+Cancellation retains worker ownership evidence and saved work, not a persistent UI.
 
 Preferences follow the active Pi session branch and survive reload. A fresh
 session starts with its own view preference. Timers and late projection replies
@@ -370,31 +375,34 @@ cannot undo hide/clear. These controls also apply to goal displays.
 
 ## Commands
 
-Use `/exec help` for the same list inside Pi. Run IDs are optional for normal
-use: when one run matches the current repository or worktree, `/exec resume` and
-`/exec stop` select it automatically. Force-skip is intentionally different: it
+Use `/exec help` for the short list inside Pi. The shared controls are
+`status`, `resume`, `pause`, `cancel`, `hide`, and `help`.
+Use `/exec help advanced` for recovery flags and compatibility commands.
+Run IDs are optional for normal use: when one run matches the current repository or worktree, `/exec resume` and
+`/exec cancel` select it automatically. Force-skip is intentionally different: it
 always requires a full run ID, reason, and interactive confirmation. If several
 runs match, Pi opens a picker; headless mode asks for the full ID. Bare
 `/exec status` never picks a run — it reports every run in the registry, so the
 full ID is always in front of you.
+Goal controls without an ID select the most recently updated eligible goal
+in this project, preferring the current worktree. Supply an ID to select another.
 
 ```text
 /goal <goal> [--check "cmd"]  Pursue a goal autonomously in place; requires a clean worktree and at least one check
 /exec [plan]            Start a run; bare /exec opens the plan picker
 /exec --worktree <path> <plan>  Use an existing worktree and its current branch
 /exec status [run-id]   No run ID: every run grouped by what it needs, any missing package, and one next command per run. With a run ID: that run in detail
-/exec resume [run-id] [--model current|provider/model]
-                        Continue a stuck run: take over a dead session's lease, reconcile a provably gone worker, retry a failure in the same stage and worktree
-/exec pause [run-id]    Stop the current attempt and keep it resumable
-/exec stop [run-id]     Request final cancellation without a dialog; preserve the worktree
-/exec stop <run-id> --force  Permanently abandon management, retaining unresolved ownership
-/exec ui on|off         Toggle the progress display without changing execution
-/exec cleanup [full-run-id] [--apply]
-                        Preview retired runs older than 7 days; --apply deletes their registry entries only
-/exec skip <full-run-id> --reason <text>
-                        Stop the tracked child, waive an optional review or statistics stage, and continue
-/exec help              Show this list
+/exec resume [run-id]  Continue paused or stuck work
+/exec pause [run-id]   Pause and keep for later
+/exec cancel [run-id]  End and dismiss immediately; saved work stays
+/exec hide            Toggle progress display; work continues
+/exec help            Show this list
 ```
+
+Advanced controls remain available: `resume --model`, `recover-isolated`,
+`cancel --force` (also `stop --force`), `cleanup`, and `skip --reason`.
+Cancellation is final intent, not a successful result or proof of worker exit.
+No separate UI cleanup is needed.
 
 ### Reading every run at once
 
@@ -418,7 +426,7 @@ operations retain their record and checkout reservation. The run stays reserved
 until controller quiescence and retirement permit cleanup. Pre-stop/final
 records are flushed to a private archive before eligible registry artifacts are
 removed. Worktrees, branches, progress and provider journals remain.
-See [force-stop recovery](../skills/exec-plan/references/recovery.md#permanent-force-stop).
+See [force-stop recovery](../skills/exec-plan/references/recovery.md#pause-cancel-and-permanent-force-stop).
 
 ### Retiring run records
 
@@ -447,7 +455,8 @@ purpose; `/skill:exec-plan` collects them for agents. `/exec runs` and
 `/exec doctor` both read exactly what `/exec status` reads, `/exec setup` still
 prints the install commands unconditionally where `/exec status` reports them
 only when a package is missing, `/exec adopt` means `/exec resume`, and
-`/exec cancel` is the deprecated alias for final `/exec stop`. `/exec pause`
+`/exec stop` is the compatibility alias for final `/exec cancel`.
+`/goal stop` now also cancels finally, rather than pausing. `/exec pause`
 is a primary resumable command, not an alias for stop.
 `/exec start` was deleted outright: it was the same code path as bare `/exec`,
 and typing it now says so instead of reading the word as a plan path.

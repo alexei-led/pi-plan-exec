@@ -121,8 +121,8 @@ const ALIAS_NOTES: Record<ExecAliasAction, string> = {
     '/exec setup is now part of /exec status; the old name still works.',
   [EXEC_ACTION.ADOPT]:
     '/exec adopt is now /exec resume; the old name still works.',
-  [EXEC_ACTION.CANCEL]:
-    '/exec cancel is deprecated; use /exec stop. Both request final cancellation.',
+  [EXEC_ACTION.STOP]:
+    '/exec stop is now /exec cancel; both end the run and dismiss its display.',
 };
 /** Every run verb the action dispatch owns; `status` is read and answered earlier. */
 type DispatchedAction = Exclude<RunAction, typeof EXEC_ACTION.STATUS>;
@@ -184,49 +184,24 @@ function requiredSetupCommands(): string[] {
 
 /** Primary verbs only: a retired name still dispatches, but is never taught. */
 const EXEC_COMMANDS: AutocompleteItem[] = [
-  { value: 'ui', label: 'ui', description: 'Toggle plan display: ui on|off' },
+  { value: 'status', label: 'status', description: 'Inspect runs' },
   {
-    value: EXEC_ACTION.PAUSE,
-    label: EXEC_ACTION.PAUSE,
-    description: 'Pause current work; resume continues later',
+    value: 'resume',
+    label: 'resume',
+    description: 'Continue paused or stuck work',
+  },
+  { value: 'pause', label: 'pause', description: 'Pause; keep for later' },
+  {
+    value: 'cancel',
+    label: 'cancel',
+    description: 'End and dismiss; preserve saved work',
   },
   {
-    value: EXEC_ACTION.ISOLATE,
-    label: EXEC_ACTION.ISOLATE,
-    description:
-      'Preview explicit local-files-only recovery in a new independent checkout',
+    value: 'hide',
+    label: 'hide',
+    description: 'Toggle progress display; work continues',
   },
-  {
-    value: EXEC_ACTION.HELP,
-    label: EXEC_ACTION.HELP,
-    description: 'Show /exec commands and recovery hints',
-  },
-  {
-    value: EXEC_ACTION.CLEANUP,
-    label: EXEC_ACTION.CLEANUP,
-    description: 'Preview or remove retired run records',
-  },
-  {
-    value: EXEC_ACTION.STATUS,
-    label: EXEC_ACTION.STATUS,
-    description: 'Show every run and what it needs, or one run in detail',
-  },
-  {
-    value: EXEC_ACTION.STOP,
-    label: EXEC_ACTION.STOP,
-    description: 'Final cancellation; --force permanently abandons management',
-  },
-  {
-    value: EXEC_ACTION.RESUME,
-    label: EXEC_ACTION.RESUME,
-    description:
-      'Continue the current run safely and reconcile its tracked worker',
-  },
-  {
-    value: EXEC_ACTION.SKIP,
-    label: EXEC_ACTION.SKIP,
-    description: 'Force-skip a blocked non-implementation stage with a reason',
-  },
+  { value: 'help', label: 'help', description: 'Show commands' },
 ];
 
 type NotificationLevel = 'info' | 'warning' | 'error';
@@ -469,7 +444,7 @@ export default function planExecExtension(pi: ExtensionAPI): void {
       const view = progressView(run, Date.now(), observing());
       ctx.ui.setStatus(
         STATUS_KEY,
-        `exec ${view.label} · /exec ui off · /exec status`,
+        `${isGoalRun(run) ? 'goal' : 'exec'} ${view.label} · /${isGoalRun(run) ? 'goal' : 'exec'} hide · /${isGoalRun(run) ? 'goal' : 'exec'} status`,
       );
       if (ctx.mode === 'tui') {
         ctx.ui.setWidget(STATUS_KEY, () => ({
@@ -583,7 +558,8 @@ export default function planExecExtension(pi: ExtensionAPI): void {
             stopBackgroundController(runId);
             const level: NotificationLevel =
               run.status === RUN_STATUS.FAILED ? 'error' : 'info';
-            notify(ctx, terminalMessage(run), level);
+            if (!run.displayDismissed && run.status !== RUN_STATUS.CANCELLED)
+              notify(ctx, terminalMessage(run), level);
           } else if (shouldStopBackgroundController(run)) {
             stopBackgroundController(runId);
             notify(ctx, pausedMessage(run), 'warning');
@@ -657,187 +633,168 @@ export default function planExecExtension(pi: ExtensionAPI): void {
     }
   };
 
+  const handleDisplayCommand = async (
+    args: string,
+    ctx: ExtensionCommandContext,
+  ): Promise<boolean> => {
+    const toggle = args.trim() === 'hide';
+    let [viewAction, viewId, ...extra] = args.trim().split(/\s+/);
+    if (viewAction === 'ui') {
+      if (extra.length || (viewId !== 'on' && viewId !== 'off'))
+        throw new Error('Usage: /exec ui on|off');
+      viewAction = viewId === 'off' ? 'hide' : 'show';
+      viewId = undefined;
+    }
+    if (
+      viewAction === 'hide' ||
+      viewAction === 'show' ||
+      viewAction === 'clear'
+    ) {
+      if (extra.length || (viewAction === 'hide' && viewId))
+        throw new Error(
+          'Usage: /exec hide | /exec show [run-id] | /exec clear [run-id]',
+        );
+      if (viewAction === 'show' || (viewAction === 'clear' && viewId)) {
+        const { runs } = await defaultRegistry.listWithErrors();
+        if (sessionClosed) return true;
+        presentation.reconcile(
+          runs.filter((run) => matchesContext(run, ctx.cwd)),
+        );
+      }
+      if (viewAction === 'hide') {
+        if (toggle && presentation.preferences().hidden) presentation.show();
+        else presentation.hide();
+      } else if (viewAction === 'show') presentation.show(viewId);
+      else presentation.clear(viewId);
+      renderStatus(ctx);
+      pi.appendEntry(VIEW_ENTRY, presentation.preferences());
+      notify(
+        ctx,
+        viewAction === 'show'
+          ? 'Plan display restored. Execution unchanged.'
+          : viewAction === 'hide'
+            ? `Plan display ${presentation.preferences().hidden ? 'hidden' : 'restored'}. Execution unchanged.`
+            : 'Plan display cleared. Execution and recovery records unchanged. /exec show restores it.',
+        'info',
+      );
+      return true;
+    }
+    return false;
+  };
+
+  const executeCommand = async (
+    args: string,
+    ctx: ExtensionCommandContext,
+  ): Promise<void> => {
+    currentContext = ctx;
+    if (sessionClosed) return;
+    let currentMutation:
+      | { settled: Promise<void>; retirementRunIds?: Set<string> }
+      | undefined;
+    try {
+      if (await handleDisplayCommand(args, ctx)) return;
+      const viewAction = args.trim().split(/\s+/)[0];
+      const message = await handleCommand(args.trim(), ctx, {
+        controller,
+        startBackgroundController,
+        syncRuntime,
+        checkRuntime,
+        runtimeProblems,
+        doctorProbe,
+        isSessionClosed: () => sessionClosed,
+        recordRun: (run) => {
+          ownedRuns.add(run.id);
+          currentMutation?.retirementRunIds?.add(run.id);
+        },
+        mutate: async (operation) => {
+          if (sessionClosed)
+            throw new Error('The requesting Pi session has been replaced.');
+          let finish!: () => void;
+          const mutation: {
+            settled: Promise<void>;
+            retirementRunIds?: Set<string>;
+          } = {
+            settled: new Promise<void>((resolve) => {
+              finish = resolve;
+            }),
+          };
+          currentMutation = mutation;
+          pendingMutations.add(mutation);
+          try {
+            return await operation();
+          } finally {
+            pendingMutations.delete(mutation);
+            currentMutation = undefined;
+            finish();
+          }
+        },
+        handoffLifecycle,
+        isRunRemoved: (id) => abandonedRuns.has(id),
+        onAbandoned: (run, context) => {
+          abandonedRuns.add(run.id);
+          stopBackgroundController(run.id);
+          setStatus(run, context);
+          void syncRuntime(run, runtimeContext(context)).catch(() => undefined);
+        },
+      });
+      if (
+        viewAction === EXEC_ACTION.CLEANUP ||
+        viewAction === EXEC_ACTION.STOP ||
+        viewAction === EXEC_ACTION.CANCEL
+      ) {
+        const { runs } = await defaultRegistry.listWithErrors();
+        if (sessionClosed) return;
+        presentation.reconcile(
+          runs.filter((run) => matchesContext(run, ctx.cwd)),
+        );
+        renderStatus(ctx);
+      }
+      if (message) notify(ctx, message, 'info');
+    } catch (error: unknown) {
+      notify(
+        ctx,
+        error instanceof Error ? error.message : String(error),
+        'error',
+      );
+    }
+  };
+
   pi.registerCommand('exec', {
     description:
       'Execute a checked Markdown plan with worktree isolation, progress, reviews, and recovery; use /exec help for commands',
     getArgumentCompletions: getExecArgumentCompletions,
-    handler: async (args, ctx) => {
-      currentContext = ctx;
-      if (sessionClosed) return;
-      let currentMutation:
-        | { settled: Promise<void>; retirementRunIds?: Set<string> }
-        | undefined;
-      try {
-        let [viewAction, viewId, ...extra] = args.trim().split(/\s+/);
-        if (viewAction === 'ui') {
-          if (extra.length || (viewId !== 'on' && viewId !== 'off'))
-            throw new Error('Usage: /exec ui on|off');
-          viewAction = viewId === 'off' ? 'hide' : 'show';
-          viewId = undefined;
-        }
-        if (
-          viewAction === 'hide' ||
-          viewAction === 'show' ||
-          viewAction === 'clear'
-        ) {
-          if (extra.length || (viewAction === 'hide' && viewId))
-            throw new Error(
-              'Usage: /exec hide | /exec show [run-id] | /exec clear [run-id]',
-            );
-          if (viewAction === 'show' || (viewAction === 'clear' && viewId)) {
-            const { runs } = await defaultRegistry.listWithErrors();
-            if (sessionClosed) return;
-            presentation.reconcile(
-              runs.filter((run) => matchesContext(run, ctx.cwd)),
-            );
-          }
-          if (viewAction === 'hide') presentation.hide();
-          else if (viewAction === 'show') presentation.show(viewId);
-          else presentation.clear(viewId);
-          renderStatus(ctx);
-          pi.appendEntry(VIEW_ENTRY, presentation.preferences());
-          notify(
-            ctx,
-            viewAction === 'show'
-              ? 'Plan display restored. Execution unchanged.'
-              : viewAction === 'hide'
-                ? 'Plan display hidden. Execution unchanged. /exec show restores it.'
-                : 'Plan display cleared. Execution and recovery records unchanged. /exec show restores it.',
-            'info',
-          );
-          return;
-        }
-        const message = await handleCommand(args.trim(), ctx, {
-          controller,
-          startBackgroundController,
-          syncRuntime,
-          checkRuntime,
-          runtimeProblems,
-          doctorProbe,
-          isSessionClosed: () => sessionClosed,
-          recordRun: (run) => {
-            ownedRuns.add(run.id);
-            currentMutation?.retirementRunIds?.add(run.id);
-          },
-          mutate: async (operation) => {
-            if (sessionClosed)
-              throw new Error('The requesting Pi session has been replaced.');
-            let finish!: () => void;
-            const mutation: {
-              settled: Promise<void>;
-              retirementRunIds?: Set<string>;
-            } = {
-              settled: new Promise<void>((resolve) => {
-                finish = resolve;
-              }),
-            };
-            currentMutation = mutation;
-            pendingMutations.add(mutation);
-            try {
-              return await operation();
-            } finally {
-              pendingMutations.delete(mutation);
-              currentMutation = undefined;
-              finish();
-            }
-          },
-          handoffLifecycle,
-          isRunRemoved: (id) => abandonedRuns.has(id),
-          onAbandoned: (run, context) => {
-            abandonedRuns.add(run.id);
-            stopBackgroundController(run.id);
-            setStatus(run, context);
-            void syncRuntime(run, runtimeContext(context)).catch(
-              () => undefined,
-            );
-          },
-        });
-        if (
-          viewAction === EXEC_ACTION.CLEANUP ||
-          viewAction === EXEC_ACTION.STOP
-        ) {
-          const { runs } = await defaultRegistry.listWithErrors();
-          if (sessionClosed) return;
-          presentation.reconcile(
-            runs.filter((run) => matchesContext(run, ctx.cwd)),
-          );
-          renderStatus(ctx);
-        }
-        if (message) notify(ctx, message, 'info');
-      } catch (error: unknown) {
-        notify(
-          ctx,
-          error instanceof Error ? error.message : String(error),
-          'error',
-        );
-      }
-    },
+    handler: executeCommand,
   });
 
   pi.registerCommand('goal', {
     description:
       'Pursue a goal autonomously in place; use /goal help for commands',
-    getArgumentCompletions: (prefix: string) => {
-      const request = prefix.trim().toLowerCase();
-      if (request.includes(' ')) return [];
-      return ['help', 'status', 'resume', 'pause', 'stop', 'cancel']
-        .filter((value) => value.startsWith(request))
-        .map((value) => ({ value, label: value }));
-    },
+    getArgumentCompletions: getExecArgumentCompletions,
     handler: async (args, ctx) => {
       currentContext = ctx;
       const sessionId = ctx.sessionManager.getSessionId();
-      const parsed = parseGoalCommand(args);
       try {
+        if (sessionClosed || (await handleDisplayCommand(args, ctx))) return;
+        const parsed = parseGoalCommand(args);
+        if (parsed.action === 'hide') return;
         if (parsed.action === EXEC_ACTION.HELP) {
           notify(ctx, goalHelp(), 'info');
           return;
         }
         if (parsed.action === EXEC_ACTION.STATUS) {
-          const run = await resolveGoalRun(parsed.id);
+          const run = await resolveGoalRun(parsed.id, ctx.cwd);
           if (!run) throw new Error('No goal run found.');
           notify(ctx, goalStatusText(run), 'info');
           return;
         }
-        if (parsed.action === EXEC_ACTION.RESUME) {
-          const run = await resolveGoalRun(parsed.id);
-          if (!run) throw new Error('No goal run found.');
-          const resumed = await controller.resume(run.id, sessionId, true);
-          if (
-            resumed.status === RUN_STATUS.ABANDONED ||
-            abandonedRuns.has(run.id)
-          )
-            throw new Error(
-              `Goal ${shortRunId(run.id)} was abandoned permanently and cannot resume.`,
-            );
-          startBackgroundController(resumed, sessionId, ctx.cwd, ctx);
-          notify(
-            ctx,
-            `Goal ${shortRunId(resumed.id)} resumed (${resumed.status}/${resumed.stage}).`,
-            'info',
-          );
-          return;
-        }
         if (
+          parsed.action === EXEC_ACTION.RESUME ||
           parsed.action === EXEC_ACTION.PAUSE ||
           parsed.action === EXEC_ACTION.CANCEL
         ) {
-          const run = await resolveGoalRun(parsed.id);
+          const run = await resolveGoalRun(parsed.id, ctx.cwd, parsed.action);
           if (!run) throw new Error('No goal run found.');
-          const requested = await requestStatus(
-            run,
-            parsed.action === EXEC_ACTION.PAUSE
-              ? EXEC_ACTION.PAUSE
-              : EXEC_ACTION.CANCEL,
-          );
-          startBackgroundController(requested, sessionId, ctx.cwd, ctx);
-          notify(
-            ctx,
-            parsed.action === EXEC_ACTION.PAUSE
-              ? `Goal ${shortRunId(requested.id)} paused; run /goal resume ${requested.id} to continue.`
-              : `Goal ${shortRunId(requested.id)} cancellation requested.`,
-            'info',
-          );
+          await executeCommand(`${parsed.action} ${run.id}`, ctx);
           return;
         }
         const run = await withPendingMutation((recordRun) =>
@@ -1116,6 +1073,14 @@ export function recoveryGuidance(
       classification: 'stop cannot establish worker retirement',
       action: `To end management permanently, run ${stop} --force. This hides the run across restarts, preserves unknown ownership and never proves worker exit.`,
       command: `${stop} --force`,
+    };
+  if (run.displayDismissed && run.status !== RUN_STATUS.CANCELLED)
+    return {
+      classification: 'cancelled at your request; ownership evidence retained',
+      action: polled
+        ? `Shutdown tracking continues without restoring the UI. Run ${status} to inspect retirement; this run cannot resume.`
+        : `Run ${stop} to retry shutdown of the same tracked work. This run cannot resume; saved work stays.`,
+      command: polled ? status : stop,
     };
   if (isTerminal(run.status) && run.status !== RUN_STATUS.FAILED)
     return {
@@ -2271,7 +2236,10 @@ export function abandonedRunsNotice(
   sweep: AbandonmentSweep,
 ): string | undefined {
   const abandoned = sweep.diagnoses.filter(
-    (diagnosis) => diagnosis.classification === ABANDONMENT.ABANDONED,
+    (diagnosis) =>
+      diagnosis.classification === ABANDONMENT.ABANDONED &&
+      !diagnosis.run.displayDismissed &&
+      diagnosis.run.status !== RUN_STATUS.CANCEL_PENDING,
   ).length;
   if (abandoned === 0) return undefined;
   return `${abandoned} plan execution ${abandoned === 1 ? 'run claims' : 'runs claim'} to be running with no worker. Use /exec status.`;
@@ -2905,7 +2873,7 @@ export async function handleCommand(
     ? (args.match(/"[^"]*"|'[^']*'|\S+/g) ?? [])
     : args.split(/\s+/).filter(Boolean);
   const [subcommand, ...rest] = words;
-  if (subcommand === EXEC_ACTION.HELP) return execHelp();
+  if (subcommand === EXEC_ACTION.HELP) return execHelp(rest[0] === 'advanced');
   if (subcommand === ISOLATION_ACTION)
     return recoverIsolatedCommand(args, ctx, dependencies);
   if (subcommand === EXEC_ACTION.CLEANUP)
@@ -3059,6 +3027,10 @@ async function recoverIsolatedCommand(
   const options = parseIsolationArguments(args);
   const run = await defaultRegistry.get(options.runId);
   if (!run) throw new Error('Plan run not found.');
+  if (run.displayDismissed)
+    throw new Error(
+      'Cancellation is final; this run cannot continue in another checkout.',
+    );
   const preview = await dependencies.controller.previewIsolated(
     run.id,
     options.target,
@@ -3141,7 +3113,10 @@ async function runAction(
   dependencies: CommandDependencies,
 ): Promise<string | undefined> {
   const { startBackgroundController, syncRuntime } = dependencies;
-  if (action === EXEC_ACTION.STOP && rest.includes('--force')) {
+  if (
+    (action === EXEC_ACTION.STOP || action === EXEC_ACTION.CANCEL) &&
+    rest.includes('--force')
+  ) {
     const selectors = rest.filter((arg) => arg !== '--force');
     if (
       selectors.length !== 1 ||
@@ -3687,6 +3662,7 @@ export function isActionAllowed(
   adoptCurrentBranch = false,
 ): boolean {
   if (action === EXEC_ACTION.STATUS) return true;
+  if (run.displayDismissed && action === EXEC_ACTION.RESUME) return false;
   if (action === EXEC_ACTION.STOP)
     return isActionAllowed(EXEC_ACTION.CANCEL, run);
   if (action === EXEC_ACTION.PAUSE)
@@ -3723,6 +3699,7 @@ export function isActionAllowed(
  * offer the waiver on the same terms `skip` will accept it.
  */
 export function isStageWaiverAvailable(run: PlanExecRun): boolean {
+  if (run.displayDismissed) return false;
   if (isReviewStage(run.stage) && run.config.reviewRequired) return false;
   if (run.stage === RUN_STAGE.FINALIZE) return false;
   return (
@@ -3957,6 +3934,7 @@ export async function requestStatus(
       {
         ...current,
         userStopped: true,
+        ...(action === EXEC_ACTION.CANCEL ? { displayDismissed: true } : {}),
         nextAttemptAt: 0,
         stopGeneration: (current.stopGeneration ?? 0) + 1,
         status:
@@ -4126,12 +4104,14 @@ function terminalMessage(run: PlanExecRun): string {
 export type GoalCommand =
   | { action: 'start'; goal: string; checks: string[][] }
   | { action: 'help' }
+  | { action: 'hide' }
   | { action: 'status'; id?: string }
   | { action: 'resume'; id?: string }
   | { action: 'pause'; id?: string }
   | { action: 'cancel'; id?: string };
 
 const GOAL_ACTIONS = new Set<string>([
+  'hide',
   EXEC_ACTION.HELP,
   EXEC_ACTION.STATUS,
   EXEC_ACTION.RESUME,
@@ -4146,8 +4126,17 @@ export function parseGoalCommand(input: string): GoalCommand {
   if (!trimmed) return { action: 'help' };
   const [head, ...rest] = trimmed.split(/\s+/u);
   if (head && GOAL_ACTIONS.has(head)) {
+    if (
+      rest.length > 1 ||
+      rest.some((arg) => arg.startsWith('--')) ||
+      ((head === 'hide' || head === 'help') && rest.length)
+    )
+      throw new Error(
+        `Usage: /goal ${head} ${head === 'hide' || head === 'help' ? '' : '[run-id]'}`.trim(),
+      );
     if (head === EXEC_ACTION.HELP) return { action: 'help' };
-    const action = head === EXEC_ACTION.STOP ? EXEC_ACTION.PAUSE : head;
+    if (head === 'hide') return { action: 'hide' };
+    const action = head === EXEC_ACTION.STOP ? EXEC_ACTION.CANCEL : head;
     return {
       action: action as 'status' | 'resume' | 'pause' | 'cancel',
       ...(rest[0] ? { id: rest[0] } : {}),
@@ -4177,13 +4166,28 @@ export function parseGoalChecks(input: string): {
   return { goal, checks };
 }
 
-async function resolveGoalRun(id?: string): Promise<PlanExecRun | undefined> {
+async function resolveGoalRun(
+  id: string | undefined,
+  cwd: string,
+  action: RunAction = EXEC_ACTION.STATUS,
+): Promise<PlanExecRun | undefined> {
   if (id) {
     const run = await defaultRegistry.get(id);
     return run && isGoalRun(run) ? run : undefined;
   }
   const { runs } = await defaultRegistry.listWithErrors();
-  return runs.filter(isGoalRun).sort((a, b) => b.updatedAt - a.updatedAt)[0];
+  return prioritizeRunCandidates(
+    runs.filter(
+      (run) =>
+        isGoalRun(run) &&
+        isActionAllowed(action, run) &&
+        matchesContext(run, cwd) &&
+        !run.displayDismissed &&
+        run.status !== RUN_STATUS.CANCELLED &&
+        run.status !== RUN_STATUS.CANCEL_PENDING,
+    ),
+    cwd,
+  ).sort((a, b) => b.updatedAt - a.updatedAt)[0];
 }
 
 export function goalStatusText(run: PlanExecRun): string {
@@ -4222,9 +4226,10 @@ export function goalHelp(): string {
     '/goal <goal text> [--check "command"]',
     '                        Pursue the goal autonomously in place. The worktree must be clean and at least one check must exist.',
     '/goal status [run-id]  Show goal progress, checks, blocker, and current turn.',
-    '/goal resume [run-id]  Continue after a stop, blocker, or failed turn.',
+    '/goal resume [run-id]  Continue paused or stuck work.',
     '/goal pause [run-id]   Stop scheduling turns; the current turn is stopped and preserved.',
-    '/goal cancel [run-id]  Cancel the goal and stop the current turn.',
+    '/goal cancel [run-id]  End and dismiss the goal; saved work stays.',
+    '/goal hide            Toggle progress display; work continues.',
     '/goal help              Show this list.',
     '',
     'The goal is complete only when the required checks pass on the committed work. Deleting tests or adding skip/only markers pauses completion for confirmation.',
@@ -4243,7 +4248,21 @@ export function execSetup(): string {
   ].join('\n');
 }
 
-export function execHelp(): string {
+export function execHelp(advanced = false): string {
+  if (!advanced)
+    return [
+      '/exec [plan-path]     Start a plan (or open the picker).',
+      '/exec status [run-id] Inspect runs.',
+      '/exec resume [run-id] Continue paused or stuck work.',
+      '/exec pause [run-id]  Pause; keep for later.',
+      '/exec cancel [run-id] End and dismiss; saved work stays.',
+      '/exec hide           Toggle progress display; work continues.',
+      '/exec help           Show this list.',
+      '',
+      '/goal <text> starts a goal. Both commands use the same controls.',
+      'Cancellation is final, not successful completion. Worker shutdown continues safely in the background.',
+      'Advanced recovery and compatibility commands: /exec help advanced.',
+    ].join('\n');
   return [
     'Plan execution commands:',
     '/exec [plan-path]       Start a plan (bare /exec opens the plan picker).',
@@ -4254,8 +4273,9 @@ export function execHelp(): string {
     "                        Continue a stuck run: take over a dead session's lease while retaining the existing operation and saved result. Explicit pauses require resume; automatic task retries preserve their checkpoints.",
     '/exec ui on|off         Toggle the display without changing execution.',
     '/exec pause [run-id]    Pause current work; resume continues after confirmed exit.',
-    '/exec stop [run-id]     Request final cancellation; preserve the worktree.',
-    '/exec stop <run-id> --force  End management permanently and clean eligible registry artifacts. Unknown workers keep a hidden ownership record; no worker-exit claim or worktree deletion.',
+    '/exec cancel [run-id]   Final cancellation and permanent UI dismissal; preserve saved work.',
+    '/exec stop [run-id]     Compatibility alias for cancel.',
+    '/exec cancel <run-id> --force (also stop <run-id> --force)  End management permanently and clean eligible registry artifacts. Unknown workers keep a hidden ownership record; no worker-exit claim or worktree deletion.',
     `/exec cleanup [full-run-id] [${CLEANUP_APPLY_OPTION}]`,
     `                        Preview retired runs older than ${CLEANUP_RETENTION_DAYS} days; ${CLEANUP_APPLY_OPTION} deletes their registry entries only.`,
     '/exec skip <full-run-id> --reason <text>',

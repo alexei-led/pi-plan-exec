@@ -341,7 +341,13 @@ export class RunPresentation {
     )
       return;
     this.runs.set(run.id, run);
-    if (run.status === RUN_STATUS.ABANDONED) this.removed.add(run.id);
+    if (
+      run.displayDismissed ||
+      run.status === RUN_STATUS.CANCEL_PENDING ||
+      run.status === RUN_STATUS.CANCELLED ||
+      run.status === RUN_STATUS.ABANDONED
+    )
+      this.removed.add(run.id);
   }
   reconcile(runs: PlanExecRun[]): void {
     const ids = new Set(runs.map((run) => run.id));

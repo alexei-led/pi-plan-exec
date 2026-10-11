@@ -408,7 +408,7 @@ test('/goal parses verbs, checks, and goal text', () => {
     action: 'status',
     id: 'abc',
   });
-  assert.deepEqual(parseGoalCommand('stop'), { action: 'pause' });
+  assert.deepEqual(parseGoalCommand('stop'), { action: 'cancel' });
   assert.deepEqual(
     parseGoalChecks('Fix tests --check "npm test" --check tsc'),
     { goal: 'Fix tests', checks: [['npm', 'test'], ['tsc']] },
@@ -646,4 +646,15 @@ test('a failed native child cannot complete a goal by printing GOAL_DONE', async
   assert.equal(run.status, 'paused');
   assert.equal(run.stage, 'implementation');
   assert.equal(f.worker.launches.length, 1);
+});
+
+test('goal controls reject extra arguments instead of ignoring them', () => {
+  for (const input of [
+    'cancel abc extra',
+    'stop --force',
+    'pause --bad',
+    'hide abc',
+  ])
+    assert.throws(() => parseGoalCommand(input), /Usage:/);
+  assert.deepEqual(parseGoalCommand('hide'), { action: 'hide' });
 });

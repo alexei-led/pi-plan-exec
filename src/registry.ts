@@ -1456,6 +1456,11 @@ function isAutonomousState(run: PlanExecRun): boolean {
     (!Number.isSafeInteger(run.recoveryAttempts) || run.recoveryAttempts < 0)
   )
     return false;
+  if (
+    run.displayDismissed !== undefined &&
+    typeof run.displayDismissed !== 'boolean'
+  )
+    return false;
   if (run.userStopped !== undefined && typeof run.userStopped !== 'boolean')
     return false;
   if (run.tasks === undefined) return true;

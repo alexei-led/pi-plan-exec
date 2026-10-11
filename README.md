@@ -145,26 +145,43 @@ progress pause the goal with a recorded reason, and a blocker pauses it until
 
 Pi shows a two-line progress strip: plan title, state, accepted task count and
 current action. Green means healthy running or complete. Amber means waiting,
-uncertain or stopping. Failures are red; paused/cancelled runs are muted.
+uncertain or stopping. Failures are red; paused runs are muted.
+Cancelled runs are not displayed.
 Text and symbols carry the same meaning without color. In-flight runs are shown
 as amber snapshots unless this session's local controller owns and polls them.
-Snapshots retain the saved execution label, such as **Cancelling · Snapshot**.
+Snapshots retain the saved execution label.
 A snapshot is not a claim that the worker is healthy or still running.
 An observed operation pause is amber, not green Working. If one task waits on
 a prerequisite while another runs, the strip shows both work and the wait.
 
-- `/exec ui off` removes the strip and footer immediately. Execution continues.
-- `/exec ui on` restores the display, without resuming execution.
-- Legacy `hide` and `show [run-id]` remain compatibility aliases.
-- `/exec clear [run-id]` dismisses the displayed run, without deleting its record.
-- These display actions need no `--apply`. They survive reload in the same
-  session. Updates cannot undo a hide or a per-run dismissal.
-- `/exec status [run-id]` keeps paths, owners, diagnostics, usage and evidence
-  available on demand.
+Both commands use the same controls:
+
+| Control | Meaning |
+| --- | --- |
+| `status [run-id]` | Inspect progress and recovery evidence |
+| `resume [run-id]` | Continue paused or stuck work |
+| `pause [run-id]` | Pause and keep for later |
+| `cancel [run-id]` | End the run and dismiss its UI permanently |
+| `hide` | Toggle the strip and footer without stopping work |
+| `help` | Show the short command list |
+
+For example, `/goal cancel` or `/exec cancel`.
+`/goal stop` also cancels finally. Use `/goal pause` when you want to resume later. Cancellation hides the run
+immediately, including after reload or in another session. Saved work stays.
+It does not mean successful completion or prove worker exit: the controller
+keeps the ownership record while it safely stops tracked work. No `clear` or
+`cleanup` command is needed to dismiss a cancelled run.
+
+`hide` preferences survive reload in the active session branch. Compatibility
+controls `ui on|off`, `show [run-id]`, and `clear [run-id]` remain accepted by
+both commands. They cannot restore a cancelled run.
 
 See [live Pi screenshots and checks](docs/ui-validation.md).
 
-Run controls are separate from display controls:
+<details>
+<summary>Advanced recovery and compatibility controls</summary>
+
+Use `/exec help advanced` for the full command reference.
 
 - `/exec status` never interrupts or restarts a run. It may idempotently repair
   advisory Fleet visibility and task summaries from `run.json`. With no
@@ -198,8 +215,9 @@ Run controls are separate from display controls:
   retained. This is not a security sandbox; refuse external-side-effect tasks.
   Quarantined trees remain reserved and prevent record cleanup.
 - `/exec pause [run-id]` stops the current attempt and keeps it resumable.
-- `/exec stop [run-id]` requests final cancellation, without a dialog.
-  It stays `cancel_pending` until worker retirement is proven.
+- `/exec cancel [run-id]` requests final cancellation and dismisses the UI.
+  The compatibility name `stop` has the same meaning for plans and goals.
+  The record stays `cancel_pending` until worker retirement is proven.
 - `/exec stop <full-run-id> --force` permanently ends controller management,
   including unresolved legacy launches. It dismisses the run across sessions
   and restarts, revokes new work and result acceptance, and attempts cancellation
@@ -209,7 +227,7 @@ Run controls are separate from display controls:
   operations/local commands/quarantined checkouts retain their ownership record
   and reservation. Worktrees, branches, progress files and provider journals
   are never deleted. See [force-stop recovery](skills/exec-plan/references/recovery.md#pause-cancel-and-permanent-force-stop).
-  `cancel` remains a deprecated alias for ordinary `stop`.
+  `/exec cancel <full-run-id> --force` is also accepted.
 - `/exec cleanup` retires run records. It previews by default and deletes
   nothing; `--apply` removes the registry entry — never the worktree, branch, or
   progress file — for terminal runs that finished more than 7 days ago.
@@ -218,8 +236,8 @@ Run controls are separate from display controls:
 After Pi starts or reloads, the native controller restores unfinished runs when
 their lease is claimable and reattaches durable operations by ID. The strip
 shows current state; `/exec status` holds detailed evidence. Cancellation intent
-wins over an old task state: the strip says “Cancelling” until worker exit is
-confirmed, unless the operator ends management with `stop --force`. Abandoned
+wins over an old task state: the strip disappears immediately while worker
+retirement continues in the background. Abandoned
 runs are hidden from the default list; inspect them by ID or with `status --all`.
 Native control distinguishes stop intent from delivery. Neither is exit proof. Advisory Fleet visibility cannot gate
 recovery. Statistics are deterministic usage/task bookkeeping by default;
@@ -248,6 +266,8 @@ The run finishes as `completed_with_findings`.
 The installed `exec-plan` skill is also available as `/skill:exec-plan` for the
 plan format, the recovery rules, and the retired names and flags a scripted agent
 uses instead of a prompt.
+
+</details>
 
 The **[Guide](docs/guide.md#executable-plan-format)** defines the accepted
 heading-based formats and checkbox rules. Omit the path to select an eligible

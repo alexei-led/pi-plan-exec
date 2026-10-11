@@ -99,8 +99,11 @@ a missing directory, elapsed time and a dead PID are not retirement proof.
 Queued/paused/reloaded workflows can refuse public stop; intent and delivery
 errors remain recorded and observation/delivery can retry against the same ID.
 
-`/exec stop <id>` requests final cancellation; `/exec pause <id>` is resumable.
-`/exec stop <id> --force` durably backs up and abandons the run **before**
+`/exec cancel <id>` and `/goal cancel <id>` request final cancellation and
+permanently dismiss the UI. Saved work and ownership evidence remain.
+`pause` is resumable; `stop` is a compatibility alias for final cancellation
+in both commands. `/exec cancel <id> --force` (also `stop <id> --force`)
+durably backs up and abandons the run **before**
 best-effort native control. Abandonment ends management, not necessarily worker
 ownership. Ordinary writes, automatic recovery and UI restoration cannot revive
 it. Only the registry's narrow exact-retirement path can release its reservation.

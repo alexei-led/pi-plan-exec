@@ -94,7 +94,9 @@ This selected-extension manual harness is not the packed normal-loader gate.
 
 The chosen UI and native screenshots are in [UI validation](docs/ui-validation.md).
 `test/run-view.test.ts` covers column widths, status precedence, colors and display
-preferences. Lifecycle tests cover hide/clear across reload and late projection.
+preferences. Lifecycle tests cover shared exec/goal controls, permanent
+cancellation dismissal across reload/new sessions, and late projection.
+`hide` toggles display only; legacy `ui off` stays idempotent.
 The recovery fixture uses a real Pi TUI, released native subagents and a local
 scripted model. `test/fixtures/progress-ui.ts` adds display-only states inside
 that explicitly isolated sandbox; its foreign lease prevents worker dispatch.

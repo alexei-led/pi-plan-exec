@@ -7,7 +7,10 @@ description: Plan, run, inspect, pause, resume, adopt, diagnose, reconcile, reti
 
 # Plan Execution
 
-Use `/exec` for a plan-exec workflow. The controller owns the worktree writer,
+Use `/exec` for a plan-exec workflow. Use `/goal <text>` without a plan file.
+Both expose `status`, `resume`, `pause`, `cancel`, `hide`, and `help`.
+`/exec help advanced` lists recovery flags and compatibility commands.
+The controller owns the worktree writer,
 dependency scheduling, retries, recovery, accepted commits, and review stages.
 Never replace controller recovery with a manually launched subagent.
 
@@ -29,9 +32,10 @@ Never replace controller recovery with a manually launched subagent.
   its install command, and prints one next command per run. Pi also points at it
   at session start when its startup sweep finds an abandoned run.
 - Inspect one run: `/exec status <full-run-id>`.
-- Hide the strip and footer immediately: `/exec ui off`. Execution continues.
-- Restore the display without resuming work: `/exec ui on`.
-- Compatibility display aliases: `/exec hide`, `/exec show [full-run-id]`.
+- Toggle the strip and footer: `/exec hide` or `/goal hide`. Execution continues.
+  Repeat to restore.
+- Compatibility display controls: `/exec ui off`, `/exec ui on`,
+  `/exec show [full-run-id]`. Goal accepts these too.
 - Dismiss the displayed run: `/exec clear [full-run-id]`. This does not cancel
   execution or delete recovery evidence. No `--apply`; preferences survive reload
   in the active Pi session branch.
@@ -63,15 +67,17 @@ and schedules an automatic wake. Generic blocker wording never proves an
 external prerequisite.
 
 - Pause resumably: `/exec pause <full-run-id>`.
-- Stop finally: `/exec stop <full-run-id>`. No outcome dialog. Wait for
-  `cancelled` before claiming worker retirement.
+- Cancel finally: `/exec cancel <full-run-id>` or `/goal cancel <full-run-id>`.
+  Dismiss the UI immediately and across reloads. No separate display cleanup.
+  Saved work and ownership evidence stay. Wait for `cancelled` before claiming
+  worker retirement. Cancellation is not successful completion.
 - End management permanently: `/exec stop <full-run-id> --force`. Requires
   explicit operator approval of abandonment. Stops automatic recovery and hides
   the run across restarts; attempts exact-operation cancellation but never
   equates delivery with worker exit. Unknown ownership retains a hidden record
   and checkout reservation. Eligible registry artifacts are backed up and
   removed; worktrees, branches, progress and provider journals stay.
-  Read [permanent force-stop](references/recovery.md#permanent-force-stop).
+  Read [permanent force-stop](references/recovery.md#pause-cancel-and-permanent-force-stop).
 - Retire terminal run records: `/exec cleanup` previews and deletes nothing;
   `/exec cleanup --apply` deletes. A terminal run becomes removable 7 days
   after completion or cancellation; projection repair does not restart the clock.
@@ -84,7 +90,7 @@ external prerequisite.
   `--apply` confirms. It quarantines the old unknown operation, does not prove
   retirement, and leaves the new independent checkout paused. Read recovery
   before applying; ordinary resume never performs this change.
-- Inspect live command support: `/exec help`.
+- Inspect basic commands: `/exec help`. Advanced recovery: `/exec help advanced`.
 
 Use the full run ID whenever more than one run exists, after a reload, or when
 working outside the execution worktree. Do not rely on implicit run selection in
@@ -107,8 +113,9 @@ Retired names, each still dispatching to its replacement and saying so once:
 - `/exec setup` → `/exec status`, which reports a missing package with its
   install command.
 - `/exec adopt <full-run-id>` → `/exec resume <full-run-id>`.
-- `/exec cancel <full-run-id>` → `/exec stop`. Deprecated compatibility alias;
-  final cancellation preserves the worktree. `pause` is a primary command.
+- `/exec stop <full-run-id>` → `/exec cancel`. Compatibility alias;
+  final cancellation preserves the worktree and dismisses the UI.
+  `/goal stop` now cancels too, rather than pausing. Use `pause` to resume later.
 
 Flags that answer a prompt in advance:
 
@@ -196,7 +203,7 @@ unfinished run when its lease is claimable. It preserves explicit user pauses,
 does not steal a live foreign lease, and reattaches durable operations by ID.
 The progress strip reports state, accepted count and current action. Healthy
 working/complete is green; waiting/uncertain/stopping amber; failed red;
-paused/cancelled muted. Stop intent takes precedence over old task state.
+paused muted; cancelled runs are never displayed. Stop intent takes precedence over old task state.
 `/exec status` retains paths, usage, ownership and diagnostic evidence.
 Native advisory observations are display-only, not verified progress or exit.
 An unpolled in-flight view keeps its execution label with an amber Snapshot

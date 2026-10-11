@@ -276,6 +276,13 @@ for (const status of ['paused', 'completed'] as const)
       'RPC fallback must remain a string array',
     );
     assert.ok(h.footer());
+    await h.command('ui off');
+    await h.command('ui off');
+    assert.equal(h.widget(), undefined);
+    await h.command('hide', 'goal');
+    assert.ok(h.widget());
+    await h.command('hide', 'goal');
+    assert.equal(h.widget(), undefined);
     await h.emit('session_shutdown');
   });
 
@@ -555,7 +562,7 @@ test('only a locally owned successful poll paints live progress; poll failure re
 for (const staleCompletion of [false, true])
   test(`force stop refreshes a foreign observer and suppresses late completion (stale=${staleCompletion})`, async (t) => {
     const held = run({
-      status: 'cancel_pending',
+      status: 'running',
       lease: { ...liveLease(), sessionId: 'force-owner' },
       activeOperation: {
         operationId: 'legacy',
@@ -679,7 +686,9 @@ test('cross-project stop still handles terminal results and retires its timer', 
   t.mock.timers.tick(5000);
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(tick.mock.callCount(), 1);
-  assert.match(h.notifications.join('\n'), /cancelled/);
+  assert.match(h.notifications.join('\n'), /cancel-pending/);
+  assert.equal(h.widget(), undefined);
+  assert.equal(h.footer(), undefined);
   await h.emit('session_shutdown');
 });
 
@@ -711,7 +720,7 @@ test('goal resume refuses permanent abandonment without announcing a resume', as
   await h.command(`resume ${held.id}`, 'goal');
   assert.match(
     h.notifications.at(-1) ?? '',
-    /abandoned permanently and cannot resume/,
+    /cannot be resumed while abandoned/,
   );
   assert.doesNotMatch(h.notifications.at(-1) ?? '', /resumed \(/);
   await h.emit('session_shutdown');
@@ -790,7 +799,7 @@ test('a pause waiting on its registry write cannot restart a removed force-stopp
 
 test('force stop stays dismissed through late updates, branch navigation, and a fresh session', async (t) => {
   const held = run({
-    status: 'cancel_pending',
+    status: 'running',
     activeOperation: {
       operationId: 'legacy',
       service: 'bridge',
@@ -1165,17 +1174,17 @@ test('exec command completions explain the command family', () => {
   const items = getExecArgumentCompletions('st');
   assert.deepEqual(
     items?.map((item) => item.value),
-    ['status', 'stop'],
+    ['status'],
   );
-  assert.match(items?.[0]?.description ?? '', /every run and what it needs/);
+  assert.match(items?.[0]?.description ?? '', /Inspect runs/);
   const allItems = getExecArgumentCompletions('') ?? [];
   assert.match(
     allItems.find((item) => item.value === 'resume')?.description ?? '',
-    /Continue the current run safely/,
+    /Continue paused or stuck work/,
   );
   assert.match(
-    allItems.find((item) => item.value === 'skip')?.description ?? '',
-    /Force-skip/,
+    allItems.find((item) => item.value === 'cancel')?.description ?? '',
+    /End and dismiss/,
   );
 });
 
@@ -1250,14 +1259,14 @@ test('start arguments accept an explicit existing worktree', () => {
 });
 
 test('help and setup explain the installed command surface', () => {
-  assert.match(execHelp(), /\/exec status \[run-id\]/);
-  assert.match(execHelp(), /Continue a stuck run/);
-  assert.match(execHelp(), /\/exec skip <full-run-id> --reason <text>/);
-  assert.match(execHelp(), /--model current\|provider\/model/);
-  assert.match(execHelp(), /completed_with_findings/);
-  assert.match(execHelp(), /\/exec cleanup \[full-run-id\]/);
-  assert.match(execHelp(), /registry entries only/);
-  assert.match(execHelp(), /\/skill:exec-plan/);
+  assert.match(execHelp(true), /\/exec status \[run-id\]/);
+  assert.match(execHelp(true), /Continue a stuck run/);
+  assert.match(execHelp(true), /\/exec skip <full-run-id> --reason <text>/);
+  assert.match(execHelp(true), /--model current\|provider\/model/);
+  assert.match(execHelp(true), /completed_with_findings/);
+  assert.match(execHelp(true), /\/exec cleanup \[full-run-id\]/);
+  assert.match(execHelp(true), /registry entries only/);
+  assert.match(execHelp(true), /\/skill:exec-plan/);
   for (const alias of EXEC_ALIAS_ACTIONS)
     assert.doesNotMatch(execHelp(), new RegExp(`/exec ${alias}`), alias);
   assert.doesNotMatch(execSetup(), /pi-subagents-bridge/);
@@ -3104,7 +3113,7 @@ test('the retired adopt verb runs resume and names it once', () => {
 });
 
 test('help drops both interactive flags but keeps them working', () => {
-  const help = execHelp();
+  const help = execHelp(true);
   assert.doesNotMatch(help, /--adopt-current-branch/);
   assert.doesNotMatch(help, /--retry-task/);
   assert.match(help, /--model current\|provider\/model/);
@@ -3604,6 +3613,7 @@ test('pause and cancel persist a stop fence before later recovery can run', asyn
   const cancelled = await requestStatus(paused, EXEC_ACTION.CANCEL, registry);
   assert.equal(cancelled.status, 'cancel_pending');
   assert.equal(cancelled.userStopped, true);
+  assert.equal(cancelled.displayDismissed, true);
   assert.equal(cancelled.stopGeneration, 6);
   const persisted = await registry.get(stored.id);
   assert.deepEqual(
@@ -3651,9 +3661,8 @@ test('stop is final without a dialog; pause remains a primary resumable command'
   assert.deepEqual(runActionFor('pause'), { action: 'pause' });
   assert.deepEqual(runActionFor('cancel'), {
     action: 'cancel',
-    note: '/exec cancel is deprecated; use /exec stop. Both request final cancellation.',
   });
-  assert.match(execHelp(), /stop <run-id> --force/);
+  assert.match(execHelp(true), /stop <run-id> --force/);
   assert.ok(
     (getExecArgumentCompletions('') ?? []).some(
       (item) => item.value === 'pause',
@@ -3739,10 +3748,7 @@ test('required review and finalize stages never suggest force-skip', () => {
 test('help lists every primary verb and no retired alias', () => {
   const help = execHelp();
   const aliases = new Set<string>(EXEC_ALIAS_ACTIONS);
-  const primary = [
-    ...Object.values(EXEC_ACTION).filter((action) => !aliases.has(action)),
-    'ui',
-  ];
+  const primary = ['status', 'resume', 'pause', 'cancel', 'hide', 'help'];
   // Only the command list is line-anchored; the hints under it are prose.
   const listed = [...help.matchAll(/^\/exec[ \t]+(?<verb>[a-z][a-z-]*)/gm)].map(
     (match) => match.groups?.verb,
@@ -3759,7 +3765,7 @@ test('help lists every primary verb and no retired alias', () => {
 });
 
 test('what help drops, the skill keeps for scripted callers', async () => {
-  const help = execHelp();
+  const help = execHelp(true);
   const skill = await readFile(
     fileURLToPath(new URL('../skills/exec-plan/SKILL.md', import.meta.url)),
     'utf8',
@@ -5840,4 +5846,240 @@ test('native ambient child startup is inert before any registration or runtime a
     if (previous === undefined) delete process.env.PI_SUBAGENT_CHILD;
     else process.env.PI_SUBAGENT_CHILD = previous;
   }
+});
+
+for (const status of ['cancel_pending', 'cancelled'] as const)
+  test(`cancelled UI is absent on startup and cannot be restored: ${status}`, async (t) => {
+    const held = run({ status });
+    delete held.activeOperation;
+    delete held.lease;
+    const { registry, directory } = await seedDirectory([held]);
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    t.mock.method(
+      RunRegistry.prototype,
+      'listWithErrors',
+      registry.listWithErrors.bind(registry),
+    );
+    t.mock.method(RunRegistry.prototype, 'get', registry.get.bind(registry));
+    const h = executionHarness(held.worktreeCwd, 'new-session');
+    await h.emit('session_start');
+    assert.equal(h.widget(), undefined);
+    assert.equal(h.footer(), undefined);
+    await h.command(`show ${held.id}`);
+    assert.equal(h.widget(), undefined);
+    await h.command('hide', 'goal');
+    await h.command('hide', 'goal');
+    assert.equal(h.widget(), undefined);
+    await h.emit('session_shutdown');
+  });
+
+for (const name of ['exec', 'goal'])
+  for (const verb of ['cancel', 'stop'])
+    test(`${name} ${verb} dismisses immediately and keeps shutdown tracking`, async (t) => {
+      const held = run({
+        status: 'running',
+        goal: {
+          text: 'fixture',
+          hash: 'a'.repeat(12),
+          iteration: 0,
+          maxTurns: 1,
+          noProgress: 0,
+        },
+      });
+      delete held.planPath;
+      delete held.planHash;
+      delete held.activeOperation;
+      delete held.lease;
+      const { registry, directory } = await seedDirectory([held]);
+      t.after(() => rm(directory, { recursive: true, force: true }));
+      t.mock.method(RunRegistry.prototype, 'get', registry.get.bind(registry));
+      t.mock.method(
+        RunRegistry.prototype,
+        'listWithErrors',
+        registry.listWithErrors.bind(registry),
+      );
+      t.mock.method(
+        RunRegistry.prototype,
+        'claim',
+        registry.claim.bind(registry),
+      );
+      t.mock.method(
+        RunRegistry.prototype,
+        'updateIfCurrent',
+        registry.updateIfCurrent.bind(registry),
+      );
+      t.mock.method(
+        PlanExecRuntimeIntegration.prototype,
+        'sync',
+        async (current: PlanExecRun) => current,
+      );
+      let settle!: (run: PlanExecRun) => void;
+      const settled = new Promise<PlanExecRun>((resolve) => {
+        settle = resolve;
+      });
+      const tick = t.mock.method(
+        PlanExecController.prototype,
+        'tick',
+        async () => {
+          const current = required(await registry.get(held.id));
+          const cancelled = await registry.update({
+            ...current,
+            status: 'cancelled',
+          });
+          settle(cancelled);
+          return cancelled;
+        },
+      );
+      t.mock.timers.enable({ apis: ['setInterval'] });
+      const h = executionHarness(held.repositoryRoot, 'cancel-owner');
+      await h.command('show');
+      assert.ok(h.widget());
+      await h.command(`${verb} ${held.id}`, name);
+      const requested = required(await registry.get(held.id));
+      assert.equal(requested.status, 'cancel_pending');
+      assert.equal(requested.displayDismissed, true);
+      assert.equal(h.widget(), undefined);
+      assert.equal(h.footer(), undefined);
+      t.mock.timers.tick(1000);
+      await settled;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(tick.mock.callCount(), 1);
+      assert.equal((await registry.get(held.id))?.status, 'cancelled');
+      await h.command('show');
+      await h.emit('session_tree');
+      assert.equal(h.widget(), undefined);
+      await h.emit('session_shutdown');
+      const restored = executionHarness(held.repositoryRoot, 'fresh-session');
+      await restored.emit('session_start');
+      assert.equal(restored.widget(), undefined);
+      await restored.command(`resume ${held.id}`, name);
+      assert.match(restored.notifications.at(-1) ?? '', /cannot be resumed/);
+      await restored.emit('session_shutdown');
+    });
+
+test('final cancellation cannot be resumed after failed retirement', () => {
+  const cancelled = run({
+    status: 'failed',
+    displayDismissed: true,
+    userStopped: true,
+  });
+  assert.equal(isActionAllowed('resume', cancelled), false);
+  assert.equal(isActionAllowed('resume', cancelled, true), false);
+  assert.equal(isActionAllowed('cancel', cancelled), true);
+  assert.equal(isActionAllowed('status', cancelled), true);
+});
+
+test('final cancellation cannot waive a review stage to continue execution', () => {
+  const cancelled = run({
+    status: 'failed',
+    stage: 'comprehensive_review',
+    displayDismissed: true,
+    userStopped: true,
+    config: { ...config, reviewRequired: false },
+  });
+  assert.equal(isStageWaiverAvailable(cancelled), false);
+  assert.equal(isActionAllowed('skip', cancelled), false);
+});
+
+test('implicit goal cancellation selects actionable local work, not newer completed or foreign goals', async (t) => {
+  const goal = {
+    text: 'fixture',
+    hash: 'a'.repeat(12),
+    iteration: 0,
+    maxTurns: 1,
+    noProgress: 0,
+  };
+  const active = run({
+    id: '11111111-1111-4111-8111-111111111111',
+    status: 'running',
+    goal,
+    updatedAt: 1,
+  });
+  const completed = run({
+    id: '22222222-2222-4222-8222-222222222222',
+    status: 'completed',
+    goal,
+    updatedAt: 2,
+  });
+  const foreign = run({
+    id: '33333333-3333-4333-8333-333333333333',
+    status: 'running',
+    goal,
+    updatedAt: 3,
+    repositoryRoot: '/foreign',
+    worktreeCwd: '/foreign',
+  });
+  for (const held of [active, completed, foreign]) {
+    delete held.planPath;
+    delete held.planHash;
+    delete held.activeOperation;
+    delete held.lease;
+  }
+  const { registry, directory } = await seedDirectory([
+    active,
+    completed,
+    foreign,
+  ]);
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  t.mock.method(RunRegistry.prototype, 'get', registry.get.bind(registry));
+  t.mock.method(
+    RunRegistry.prototype,
+    'listWithErrors',
+    registry.listWithErrors.bind(registry),
+  );
+  t.mock.method(RunRegistry.prototype, 'claim', registry.claim.bind(registry));
+  t.mock.method(
+    RunRegistry.prototype,
+    'updateIfCurrent',
+    registry.updateIfCurrent.bind(registry),
+  );
+  t.mock.method(
+    PlanExecRuntimeIntegration.prototype,
+    'sync',
+    async (current: PlanExecRun) => current,
+  );
+  const h = executionHarness(active.repositoryRoot, 'goal-owner');
+  await h.command('cancel', 'goal');
+  assert.equal((await registry.get(active.id))?.status, 'cancel_pending');
+  assert.equal((await registry.get(completed.id))?.status, 'completed');
+  assert.equal((await registry.get(foreign.id))?.status, 'running');
+  await h.emit('session_shutdown');
+});
+
+test('final cancellation refuses isolated continuation before inspecting a new checkout', async (t) => {
+  const held = run({
+    status: 'failed',
+    displayDismissed: true,
+    userStopped: true,
+  });
+  const { registry, directory } = await seedDirectory([held]);
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  t.mock.method(RunRegistry.prototype, 'get', registry.get.bind(registry));
+  const preview = t.mock.method(
+    PlanExecController.prototype,
+    'previewIsolated',
+    async () => {
+      assert.fail('A cancelled run must not prepare another checkout');
+    },
+  );
+  const h = executionHarness(held.repositoryRoot, 'cancel-owner');
+  await h.command(`recover-isolated ${held.id} /new-checkout`);
+  assert.match(h.notifications.at(-1) ?? '', /Cancellation is final/);
+  assert.equal(preview.mock.callCount(), 0);
+  assert.equal((await registry.get(held.id))?.displayDismissed, true);
+  await h.emit('session_shutdown');
+});
+
+test('cancelled retained failures recommend shutdown, never resume or a review waiver', () => {
+  const held = run({
+    status: 'failed',
+    displayDismissed: true,
+    userStopped: true,
+    stage: 'comprehensive_review',
+    config: { ...config, reviewRequired: false },
+  });
+  const guidance = recoveryGuidance(held);
+  assert.match(guidance.command, /cancel|stop/);
+  assert.equal(isActionAllowed('cancel', held), true);
+  assert.doesNotMatch(guidance.command, /resume|skip/);
 });
