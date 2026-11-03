@@ -1,5 +1,43 @@
 # Changelog
 
+## 2.2.0 - 2026-11-03
+
+### Changed
+
+- Keep a goal running when a completed worker reports that one assignment failed
+  or was superseded. The next turn reassesses the goal without repeating a
+  stopped assignment or bypassing an approval. Unchanged tracked HEAD and
+  check results now trigger reassessment rather than a false stall pause.
+- Show the actual blocker, its resolution and the safe next command in goal
+  status and progress displays. Clear resolved observation and pause warnings;
+  retain independent prerequisites and distinguish unpolled snapshots.
+- Resume goals with the saved pause reason and requested next step in the worker
+  context. The progress display uses the current authorized turn budget.
+
+### Safety and limits
+
+- Explicit goal blockers and observed prerequisites still pause. User stops,
+  approval guards, turn budgets, completion verification and unknown worker
+  ownership remain enforced. A classified bounded expiry continues only after
+  confirmed worker retirement; native-default timeouts without a structured
+  cause still pause for recovery.
+- A `TASK_FAILED` marker alone now means the assignment failed, not that the
+  entire goal is blocked. Goal workers must use `GOAL_BLOCKED` with a reason
+  and next step when no authorized goal work can continue.
+
+### Upgrade
+
+- Quiesce controllers and restart Pi sessions sharing the registry after
+  upgrading. A reload of an active session can mix loaded versions and leave
+  operation ownership uncertain.
+- Before upgrading, update custom goal-worker instructions to use
+  `<<<RALPHEX:GOAL_BLOCKED>>>` for a whole-goal blocker. Otherwise, new turns can spend
+  remaining authorized budget reassessing assignment failures. Old in-flight
+  workers retain their original blocker semantics across upgrade; resume
+  launches a turn with the new protocol.
+
+[Full changes](https://github.com/alexei-led/pi-plan-exec/compare/v2.1.0...v2.2.0)
+
 ## 2.1.0 - 2026-10-11
 
 ### Changed
