@@ -26,6 +26,7 @@
     "node": ">=22.19.0"
   },
   "files": [
+    "CHANGELOG.md",
     "src/*.ts",
     "src/*.mjs",
     "skills/exec-plan"

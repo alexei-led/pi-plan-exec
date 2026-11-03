@@ -11,8 +11,9 @@
 - Show the actual blocker, its resolution and the safe next command in goal
   status and progress displays. Clear resolved observation and pause warnings;
   retain independent prerequisites and distinguish unpolled snapshots.
-- Resume goals with the saved pause reason and requested next step in the worker
-  context. The progress display uses the current authorized turn budget.
+- Resumed workers retain the pause reason and next step. Progress shows the
+  current authorized turn budget.
+- Include the changelog in installed packages for upgrade notices.
 
 ### Safety and limits
 
