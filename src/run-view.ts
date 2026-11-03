@@ -26,6 +26,10 @@ function clean(text: string): string {
     .trim();
 }
 
+function control(run: PlanExecRun, action: 'status' | 'resume'): string {
+  return `/${isGoalRun(run) ? 'goal' : 'exec'} ${action} ${clean(run.id)}`;
+}
+
 function pendingCleanup(run: PlanExecRun): boolean {
   return Boolean(
     run.localOperationActive ||
@@ -39,24 +43,26 @@ export function progressView(
   run: PlanExecRun,
   now = Date.now(),
   observing = false,
+  probeError?: string,
 ): ProgressView {
   const view = currentProgressView(run, now);
   const inFlight =
     isInFlightStatus(run.status) ||
     (run.status === 'paused' && pendingCleanup(run));
-  if (inFlight && !observing)
+  if (inFlight && (!observing || probeError))
     return {
       ...view,
       label: `${view.label} · Snapshot`,
       tone: 'warning',
       detail: `Saved: ${view.detail}`,
-      warning: 'No live updates here · /exec status',
+      warning: `${probeError ? `Probe failed: ${clean(probeError)} · automatic retry` : 'No live updates here'} · ${control(run, 'status')}`,
     };
   return view;
 }
 
 function currentProgressView(run: PlanExecRun, now: number): ProgressView {
   const summary = taskSummary(run);
+  const status = control(run, 'status');
   const title = isGoalRun(run)
     ? run.goal.text
     : basename(run.planPath ?? 'Plan')
@@ -83,18 +89,31 @@ function currentProgressView(run: PlanExecRun, now: number): ProgressView {
       ...view,
       label: '◌ Cancelling',
       tone: 'warning',
-      detail: 'Stop requested · worker exit not confirmed',
+      detail: clean(
+        run.activeOperation?.cancellationDeliveryError?.message ??
+          'Stop requested · worker exit not confirmed',
+      ),
+      warning: `Waiting for confirmed exit · ${status}`,
     };
   }
   if (run.status === 'paused') {
     const stopping = pendingCleanup(run);
+    const reason = run.blocked?.reason || run.error;
     return {
       ...view,
-      label: stopping ? '◌ Pausing' : 'Ⅱ Paused',
-      tone: stopping ? 'warning' : 'muted',
-      detail: stopping
-        ? 'Stop requested · worker exit not confirmed'
-        : 'Checkpoint saved · resume when ready',
+      label: stopping ? '◌ Pausing' : reason ? 'Ⅱ Blocked' : 'Ⅱ Paused',
+      tone: stopping || reason ? 'warning' : 'muted',
+      detail: clean(
+        stopping
+          ? (run.activeOperation?.cancellationDeliveryError?.message ??
+              'Stop requested · worker exit not confirmed')
+          : reason || 'Checkpoint saved · resume when ready',
+      ),
+      warning: stopping
+        ? `Waiting for confirmed exit · ${status}`
+        : reason
+          ? `Resolve blocker, then ${control(run, 'resume')}`
+          : control(run, 'resume'),
     };
   }
   if (run.status === RUN_STATUS.ABANDONED)
@@ -116,8 +135,12 @@ function currentProgressView(run: PlanExecRun, now: number): ProgressView {
       ...view,
       label: '! Failed',
       tone: 'error',
-      detail: 'Inspect /exec status for recovery',
-      warning: 'Recovery needs attention',
+      detail: clean(
+        run.error ||
+          run.failedOperation?.terminalError ||
+          `Failure at ${run.stage}`,
+      ),
+      warning: status,
     };
   if (run.status === 'completed')
     return {
@@ -130,7 +153,8 @@ function currentProgressView(run: PlanExecRun, now: number): ProgressView {
       ...view,
       label: '! Complete with findings',
       tone: 'warning',
-      detail: 'Inspect unresolved findings with /exec status',
+      detail: 'Unresolved findings remain',
+      warning: status,
     };
   if (run.status === 'skip_pending')
     return {
@@ -138,6 +162,7 @@ function currentProgressView(run: PlanExecRun, now: number): ProgressView {
       label: '◌ Stopping optional stage',
       tone: 'warning',
       detail: 'Waiting for confirmed worker exit',
+      warning: status,
     };
   if (
     run.activeOperation?.lastObservedState === 'unknown_launch' ||
@@ -148,7 +173,12 @@ function currentProgressView(run: PlanExecRun, now: number): ProgressView {
       ...view,
       label: '? Worker status unknown',
       tone: 'warning',
-      detail: 'Checking the same operation · no replacement worker',
+      detail: clean(
+        run.activeOperation?.lastStatusError ||
+          run.activeOperation?.lastLaunchError ||
+          'Launch outcome is unknown; worker ownership is retained',
+      ),
+      warning: `Tracking the same operation · ${status}`,
     };
   }
   if (run.activeOperation?.lastObservedState === 'paused')
@@ -156,20 +186,33 @@ function currentProgressView(run: PlanExecRun, now: number): ProgressView {
       ...view,
       label: 'Ⅱ Operation paused',
       tone: 'warning',
-      detail: 'Still tracking the same operation · inspect /exec status',
+      detail: 'Worker reported paused; no confirmed reason',
+      warning: `Tracking the same operation · ${status}`,
     };
   if (summary.external > 0 || run.activeOperation?.externalPrerequisite) {
+    const waiting = Object.values(run.tasks ?? {}).find(
+      (task) => task.state === 'waiting_external',
+    );
+    const reason = clean(
+      run.activeOperation?.externalPrerequisite?.evidence ||
+        waiting?.externalPrerequisite?.evidence ||
+        waiting?.reason ||
+        'External prerequisite not reported',
+    );
     if (active && !run.activeOperation?.externalPrerequisite)
       return {
         ...view,
         label: `● Working · ${summary.external} task${summary.external === 1 ? '' : 's'} waiting`,
         tone: 'warning',
+        detail: `${view.detail} · waiting: ${reason}`,
+        warning: status,
       };
     return {
       ...view,
       label: '◌ Waiting on prerequisite',
       tone: 'warning',
-      detail: 'External prerequisite · inspect /exec status',
+      detail: reason,
+      warning: status,
     };
   }
   const taskRetryAt = Math.min(
@@ -186,19 +229,37 @@ function currentProgressView(run: PlanExecRun, now: number): ProgressView {
       : Number.isFinite(taskRetryAt)
         ? taskRetryAt
         : undefined;
-  if (retryAt && retryAt > now)
+  if (
+    retryAt &&
+    retryAt > now &&
+    !run.activeOperation &&
+    !run.localOperationActive
+  ) {
+    const reason =
+      run.blocked?.reason ||
+      run.error ||
+      run.goal?.lastCheck?.failures ||
+      Object.values(run.tasks ?? {}).find(
+        (task) => task.state === 'retry_wait' && task.nextAttemptAt === retryAt,
+      )?.reason;
+    const continuing = isGoalRun(run) && !reason && !run.failedOperation;
     return {
       ...view,
-      label: '↻ Retry scheduled',
-      tone: 'warning',
-      detail: `Retry in ${Math.ceil((retryAt - now) / 1000)}s · pause to prevent retry`,
+      label: continuing ? '◌ Continuing' : '↻ Retry scheduled',
+      tone: continuing ? 'success' : 'warning',
+      detail: `${continuing ? 'Next turn' : 'Retry'} in ${Math.ceil((retryAt - now) / 1000)}s${reason ? ` · ${clean(reason)}` : ''}`,
+      ...(!continuing
+        ? { warning: `Automatic retry; pause to stop it · ${status}` }
+        : {}),
     };
-  if (run.needsAttention || run.blocked)
+  }
+  if (run.blocked || run.error)
     return {
       ...view,
-      label: '! Needs attention',
+      label: run.blocked ? '! Blocked' : '↻ Recovering',
       tone: 'warning',
-      detail: 'Inspect /exec status for the blocker',
+      detail: clean(run.blocked?.reason || run.error || ''),
+      warning: status,
     };
   if (run.stage.includes('review'))
     return {
@@ -243,8 +304,9 @@ export function renderProgressStrip(
   ) => text,
   now = Date.now(),
   observing = false,
+  probeError?: string,
 ): string[] {
-  const view = progressView(run, now, observing);
+  const view = progressView(run, now, observing, probeError);
   const columns = Math.max(0, Math.floor(width));
   const slots = Math.min(12, Math.max(2, Math.floor(columns / 6)));
   const filled = view.total

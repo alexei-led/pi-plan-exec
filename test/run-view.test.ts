@@ -124,6 +124,121 @@ for (const [runWake, expected] of [
     assert.match(view.label, /Retry scheduled/);
     assert.match(view.detail, new RegExp(`Retry in ${expected / 1000}s`));
   });
+for (const goal of [
+  undefined,
+  {
+    text: 'Release the project',
+    hash: 'goal',
+    iteration: 4,
+    maxTurns: 20,
+    noProgress: 0,
+  },
+])
+  test(`a resolved ${goal ? 'goal' : 'plan'} warning is not resurrected by a saved attention flag`, () => {
+    const view = progressView(
+      run({ needsAttention: true, ...(goal ? { goal } : {}) }),
+      1_000,
+      true,
+    );
+    assert.equal(view.tone, 'success');
+    assert.match(view.label, /Working/);
+    assert.doesNotMatch(
+      renderProgressStrip(
+        run({ needsAttention: true, ...(goal ? { goal } : {}) }),
+        140,
+        undefined,
+        1_000,
+        true,
+      ).join('\n'),
+      /attention|blocker/i,
+    );
+  });
+
+for (const goal of [
+  undefined,
+  {
+    text: 'Release the project',
+    hash: 'goal',
+    iteration: 4,
+    maxTurns: 20,
+    noProgress: 0,
+  },
+])
+  test(`a blocked ${goal ? 'goal' : 'plan'} pause explains the reason and recovery command`, () => {
+    const held = run({
+      status: 'paused',
+      ...(goal ? { goal } : {}),
+      blocked: {
+        reason: 'Approval UI unavailable\u001b[31m\nRestore the UI\u202e',
+      },
+      needsAttention: true,
+    });
+    const view = progressView(held, 1_000, true);
+    assert.equal(view.tone, 'warning');
+    assert.match(view.label, /Blocked/);
+    assert.match(view.detail, /Approval UI unavailable.*Restore the UI/);
+    assert.equal(view.detail, 'Approval UI unavailable Restore the UI');
+    assert.match(
+      view.warning ?? '',
+      new RegExp(`/${goal ? 'goal' : 'exec'} resume run-1`),
+    );
+  });
+
+test('a current observation failure shows its reason and a safe inspection action', () => {
+  const view = progressView(
+    run({
+      activeOperation: {
+        operationId: 'op',
+        service: 'bridge',
+        kind: 'implementation',
+        lastStatusError: 'Native runtime disconnected',
+      },
+    }),
+    1_000,
+    true,
+  );
+  assert.equal(view.tone, 'warning');
+  assert.match(view.detail, /Native runtime disconnected/);
+  assert.match(view.warning ?? '', /\/exec status run-1/);
+  assert.doesNotMatch(view.warning ?? '', /resume/);
+});
+
+test('routine goal continuation is healthy, not a failed-attempt warning', () => {
+  const view = progressView(
+    run({
+      goal: {
+        text: 'Release',
+        hash: 'goal',
+        iteration: 4,
+        maxTurns: 20,
+        noProgress: 0,
+      },
+      nextAttemptAt: 6_000,
+      tasks: {},
+    }),
+    1_000,
+    true,
+  );
+  assert.equal(view.tone, 'success');
+  assert.match(view.label, /Continuing/);
+  assert.match(view.detail, /5s/);
+});
+
+test('a past retry deadline does not hide a current recovery reason', () => {
+  const view = progressView(
+    run({
+      error: 'Required check failed',
+      needsAttention: true,
+      nextAttemptAt: 500,
+    }),
+    1_000,
+    true,
+  );
+  assert.equal(view.tone, 'warning');
+  assert.match(view.detail, /Required check failed/);
+  assert.match(view.warning ?? '', /\/exec status run-1/);
+});
+
 test('unknown launch is amber, never healthy from controller heartbeat', () => {
   const view = progressView(
     run({
@@ -225,6 +340,35 @@ test('snapshot labels retain cancellation and pending pause intent', () => {
     assert.match(view.warning ?? '', /No live updates/);
   }
 });
+test('a failed controller probe keeps independent saved blocker evidence visible', () => {
+  const held = run({
+    tasks: {
+      '1': {
+        taskId: 1,
+        dependsOn: [],
+        attempts: 1,
+        state: 'waiting_external',
+        reason: 'Approval required',
+      },
+    },
+  });
+  const view = progressView(held, 1_000, false, 'Controller disconnected');
+  assert.match(view.label, /Waiting on prerequisite.*Snapshot/);
+  assert.match(view.detail, /Saved: Approval required/);
+  assert.match(view.warning ?? '', /Controller disconnected/);
+  assert.match(view.warning ?? '', /\/exec status run-1/);
+  const strip = renderProgressStrip(
+    held,
+    160,
+    undefined,
+    1_000,
+    false,
+    'Controller disconnected',
+  ).join('\n');
+  assert.match(strip, /Approval required/);
+  assert.match(strip, /Controller disconnected/);
+});
+
 test('all tasks accepted does not complete required review', () => {
   const view = progressView(
     run({

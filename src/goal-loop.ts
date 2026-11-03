@@ -3,7 +3,7 @@ import type { PlanExecRun } from './types.js';
 
 export const GOAL_DONE_MARKER = '<<<RALPHEX:GOAL_DONE>>>';
 export const TASK_FAILED_MARKER = '<<<RALPHEX:TASK_FAILED>>>';
-export const GOAL_NO_PROGRESS_LIMIT = 3;
+export const GOAL_REASSESS_THRESHOLD = 3;
 export const GOAL_FINGERPRINT_LENGTH = 12;
 export const GOAL_DISABLED_SAMPLE_LIMIT = 3;
 export const GOAL_CHECK_OUTPUT_LIMIT = 1_200;
@@ -70,7 +70,12 @@ export function goalPrompt(
   return [
     'You are pursuing a goal autonomously in this repository. Work only from the current state; never assume a plan file or checkbox list exists.',
     `Goal: ${goal.text}`,
-    `Turn: ${goal.iteration + 1}.`,
+    `Turn: ${goal.iteration + 1} of ${goal.maxTurns} authorized turns.`,
+    ...(goal.noProgress >= GOAL_REASSESS_THRESHOLD
+      ? [
+          `The tracked HEAD and required-check results have been unchanged for ${goal.noProgress} turns. This does not rule out useful investigation or external evidence. Reassess the current state, choose a different approach instead of repeating the same attempt, and report an exact blocker if an external decision or prerequisite is required. Stay within the authorized goal and turn budget.`,
+        ]
+      : []),
     context.lastOutcome
       ? `Previous turn outcome: ${tail(context.lastOutcome)}`
       : 'Previous turn outcome: none yet; start by inspecting the repository state relevant to the goal.',
@@ -81,6 +86,7 @@ export function goalPrompt(
       ? `Commits made so far:\n${tail(context.recentCommits)}`
       : 'No commits have been made for this goal yet.',
     'Inspect the current state, choose and execute the single most useful next action, verify what you changed, and commit your work with a clear message. Leave the worktree clean. Do not start work that belongs to a later turn.',
+    'A read-only investigation or verification turn need not create a commit; report its evidence without manufacturing repository changes.',
     'When the goal is fully achieved and verified, end your final response with this marker on its own line:',
     GOAL_DONE_MARKER,
     'If you cannot continue without an external decision, credential, or prerequisite, end with:',

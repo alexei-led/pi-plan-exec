@@ -552,10 +552,14 @@ test('only a locally owned successful poll paints live progress; poll failure re
   t.mock.timers.tick(1000);
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.match(String(h.footer()), /Snapshot/);
+  assert.match(String(h.footer()), /poll unavailable/);
+  assert.match((h.widget() as string[]).join('\n'), /poll unavailable/);
   failing = false;
   t.mock.timers.tick(1000);
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.match(String(h.footer()), /Working/);
+  assert.doesNotMatch(String(h.footer()), /poll unavailable|Snapshot/);
+  assert.doesNotMatch((h.widget() as string[]).join('\n'), /poll unavailable/);
   await h.emit('session_shutdown');
 });
 

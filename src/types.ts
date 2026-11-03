@@ -430,6 +430,7 @@ export interface GoalState {
   hash: string;
   iteration: number;
   maxTurns: number;
+  /** Consecutive unchanged tracked HEAD/check comparisons, not proof of no useful work. */
   noProgress: number;
   lastOutcome?: string;
   lastCheck?: GoalCheckEvidence;

@@ -9,7 +9,7 @@ import {
   type ExtensionContext,
   SessionManager,
 } from '@earendil-works/pi-coding-agent';
-import type { AutocompleteItem } from '@earendil-works/pi-tui';
+import { type AutocompleteItem, truncateToWidth } from '@earendil-works/pi-tui';
 import { parseAdvisoryObservation } from './advisory-observation.js';
 import {
   isDetachedWorkflowFailure,
@@ -441,10 +441,18 @@ export default function planExecExtension(pi: ExtensionAPI): void {
         run.lease?.sessionId === ctx.sessionManager.getSessionId() &&
         run.lease.pid === process.pid &&
         isLocalRun(run);
-      const view = progressView(run, Date.now(), observing());
+      const view = progressView(
+        run,
+        Date.now(),
+        observing(),
+        lastProbeErrors.get(run.id),
+      );
+      const footerDetail = lastProbeErrors.has(run.id)
+        ? (view.warning ?? view.detail)
+        : view.detail;
       ctx.ui.setStatus(
         STATUS_KEY,
-        `${isGoalRun(run) ? 'goal' : 'exec'} ${view.label} · /${isGoalRun(run) ? 'goal' : 'exec'} hide · /${isGoalRun(run) ? 'goal' : 'exec'} status`,
+        `${isGoalRun(run) ? 'goal' : 'exec'} ${view.label}${view.tone !== 'success' ? ` · ${truncateToWidth(footerDetail, 80)}` : ''} · /${isGoalRun(run) ? 'goal' : 'exec'} hide · /${isGoalRun(run) ? 'goal' : 'exec'} status`,
       );
       if (ctx.mode === 'tui') {
         ctx.ui.setWidget(STATUS_KEY, () => ({
@@ -455,13 +463,21 @@ export default function planExecExtension(pi: ExtensionAPI): void {
               (tone, text) => ctx.ui.theme.fg(tone, text),
               Date.now(),
               observing(),
+              lastProbeErrors.get(run.id),
             ),
           invalidate() {},
         }));
       } else {
         ctx.ui.setWidget(
           STATUS_KEY,
-          renderProgressStrip(run, 100, undefined, Date.now(), observing()),
+          renderProgressStrip(
+            run,
+            100,
+            undefined,
+            Date.now(),
+            observing(),
+            lastProbeErrors.get(run.id),
+          ),
         );
       }
     } catch {
@@ -1534,7 +1550,7 @@ export function formatRunStatus(
     `review: ${run.config.reviewRequired ? 'required' : 'optional'} · ${run.config.reviewBackend}`,
   );
   if (run.goal !== undefined) {
-    lines.push(`turn: ${run.goal.iteration}/${run.config.maxTaskIterations}`);
+    lines.push(`turn: ${run.goal.iteration}/${run.goal.maxTurns}`);
     if (run.goal.lastCheck)
       lines.push(
         `checks: ${run.goal.lastCheck.failures ? `failing — ${run.goal.lastCheck.failures}` : 'passing'}`,
@@ -4198,7 +4214,7 @@ export function goalStatusText(run: PlanExecRun): string {
     `goal: ${goal.text}`,
     `status: ${run.status}`,
     `stage: ${run.stage}`,
-    `turn: ${goal.iteration}/${run.config.maxTaskIterations}`,
+    `turn: ${goal.iteration}/${goal.maxTurns}`,
     `branch: ${run.branch}`,
     `worktree: ${run.worktreeCwd}`,
     `checks: ${run.config.requiredChecks.map((command) => command.join(' ')).join(' · ') || 'none'}`,
@@ -4213,7 +4229,8 @@ export function goalStatusText(run: PlanExecRun): string {
     lines.push(
       `last outcome: ${goal.lastOutcome.slice(0, GOAL_STATUS_TAIL_LIMIT)}`,
     );
-  if (goal.noProgress) lines.push(`turns without progress: ${goal.noProgress}`);
+  if (goal.noProgress)
+    lines.push(`turns with unchanged tracked HEAD/checks: ${goal.noProgress}`);
   if (run.activeOperation)
     lines.push(
       `operation: ${run.activeOperation.service}/${run.activeOperation.kind} · ${run.activeOperation.operationId}`,

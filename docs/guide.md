@@ -134,10 +134,14 @@ and completion requires a clean tree at the verified commit.
 
 A worker that needs external help ends with `<<<RALPHEX:TASK_FAILED>>>`,
 `Blocker: <reason>`, and `Next step: <what is needed>`. The goal pauses with
-that reason and schedules nothing; `/goal resume <run-id>` continues it. Three
-consecutive turns that neither move HEAD nor change the check result pause the
-goal as stalled. The turn budget is `maxTaskIterations` from the project
-config; when it is reached the goal pauses and can be resumed.
+that reason and schedules nothing; `/goal resume <run-id>` continues it. After
+three unchanged tracked HEAD/check comparisons the next worker is asked to
+reassess its approach. This does not prove that investigation in another
+worktree made no progress. Automatic turns remain bounded by the turn budget
+(`maxTaskIterations`); when it is reached the goal pauses until resume authorizes
+another budget. Confirmed bounded lifetime expiry continues only after worker
+retirement is proven. An unclassified native failure still pauses for recovery;
+unknown retirement never permits a replacement.
 
 ```text
 /goal status [run-id]   Progress, current turn, check result, blocker

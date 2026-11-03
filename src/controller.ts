@@ -61,8 +61,8 @@ import {
   GOAL_CHECK_OUTPUT_LIMIT,
   GOAL_DISABLED_SAMPLE_LIMIT,
   GOAL_FINGERPRINT_LENGTH,
-  GOAL_NO_PROGRESS_LIMIT,
   GOAL_OUTCOME,
+  GOAL_REASSESS_THRESHOLD,
   goalHash,
   goalPrompt,
   normalizeCheckOutput,
@@ -1135,6 +1135,9 @@ export class PlanExecController {
         failedOperation: current,
         nextAttemptAt: 0,
         needsAttention: false,
+        ...(prepared.status === RUN_STATUS.PAUSED && isGoalRun(prepared)
+          ? { goal: { ...prepared.goal, noProgress: 0 } }
+          : {}),
       };
       delete next.error;
       delete next.blocked;
@@ -1161,7 +1164,13 @@ export class PlanExecController {
       );
     } else if (explicit && prepared.status === RUN_STATUS.PAUSED) {
       const resumed = await this.registry.updateIfCurrent(
-        clearError({ ...prepared, status: RUN_STATUS.RUNNING }),
+        clearError({
+          ...prepared,
+          status: RUN_STATUS.RUNNING,
+          ...(isGoalRun(prepared)
+            ? { goal: { ...prepared.goal, noProgress: 0 } }
+            : {}),
+        }),
         prepared.updatedAt,
       );
       if (!resumed.applied) return resumed.run;
@@ -1818,10 +1827,28 @@ export class PlanExecController {
   ): Promise<PlanExecRun> {
     if (!isGoalRun(run)) throw new Error('finishGoal requires a goal run.');
     const goal = run.goal;
-    const outcome = parseGoalOutcome(output);
+    const reported = parseGoalOutcome(output);
+    const providerFailure = [terminalError, output].find(
+      isModelProviderFailureText,
+    );
+    // Only a classified bounded expiry with proven retirement authorizes a new
+    // turn. Native-default timeout prose is not classification or exit proof.
+    const expired =
+      operation.terminationReason === 'execution_lifetime_expired' &&
+      operation.expectedLifetime?.mode === 'bounded' &&
+      operation.processTreeExited &&
+      !operation.externalPrerequisite &&
+      !providerFailure;
+    const outcome =
+      expired && reported.kind !== GOAL_OUTCOME.BLOCKED
+        ? {
+            kind: GOAL_OUTCOME.CONTINUE,
+            summary: `Bounded execution lifetime expired; inspect the preserved checkpoint before continuing.\n${reported.summary}`,
+          }
+        : reported;
     if (
       outcome.kind === GOAL_OUTCOME.BLOCKED ||
-      !isSuccessfulOperationState(state)
+      (!isSuccessfulOperationState(state) && !expired)
     )
       return this.pauseGoal(
         {
@@ -1829,10 +1856,16 @@ export class PlanExecController {
           failedOperation: {
             ...operation,
             terminalError:
-              outcome.reason ?? terminalError ?? `Goal turn ended as ${state}.`,
+              outcome.reason ??
+              providerFailure ??
+              terminalError ??
+              `Goal turn ended as ${state}.`,
           },
         },
-        outcome.reason ?? terminalError ?? `Goal turn ended as ${state}.`,
+        outcome.reason ??
+          providerFailure ??
+          terminalError ??
+          `Goal turn ended as ${state}.`,
       );
     const head = await gitValue(this.runCommand, run.worktreeCwd, [
       'rev-parse',
@@ -1859,11 +1892,6 @@ export class PlanExecController {
         at: Date.now(),
       },
     };
-    if (noProgress >= GOAL_NO_PROGRESS_LIMIT)
-      return this.pauseGoal(
-        { ...run, goal: nextGoal },
-        `No progress after ${noProgress} goal turns: HEAD is unchanged and the required checks produced the same result.`,
-      );
     if (outcome.kind === GOAL_OUTCOME.DONE && !failure) {
       const violation = await this.goalCompletionGuard(run);
       if (violation)
@@ -1899,7 +1927,9 @@ export class PlanExecController {
         nextAttemptAt: Date.now() + run.config.retryDelayMs,
         wakeReason: failure
           ? `Goal checks failing: ${failure.text}`
-          : 'Goal turn completed; continuing.',
+          : noProgress >= GOAL_REASSESS_THRESHOLD
+            ? `Tracked HEAD/checks unchanged for ${noProgress} turns; reassessing automatically within the authorized turn budget.`
+            : 'Goal turn completed; continuing.',
       }),
       run.updatedAt,
     );
@@ -2913,6 +2943,10 @@ export class PlanExecController {
       (canUseRecoveryModel ? run.recoveryModel : undefined) ??
       nativeModel(run.config, input.kind);
     const runWithoutRecoveryModel = withoutRecoveryModel(run);
+    // New admission resolves the previous attempt's warning, not its retained
+    // provider-failure identity, which recovery and concurrent stops still need.
+    delete runWithoutRecoveryModel.error;
+    delete runWithoutRecoveryModel.needsAttention;
     const reviewedCommit =
       input.kind === OPERATION_KIND.REVIEW
         ? await gitValue(this.runCommand, run.worktreeCwd, [
@@ -4079,6 +4113,10 @@ export class PlanExecController {
     else delete observedOperation.workerSignal;
     return this.registry.heartbeat({
       ...run,
+      needsAttention: Boolean(run.blocked || run.error),
+      ...(operation.statusFailures || operation.lastStatusError
+        ? { nextAttemptAt: 0 }
+        : {}),
       activeOperation: observedOperation,
       ...(Object.keys(runUsage).length ? { usage: runUsage } : {}),
       ...(operation.taskId && task
@@ -6379,6 +6417,7 @@ function clearError(run: PlanExecRun): PlanExecRun {
   delete next.error;
   delete next.failedOperation;
   delete next.blocked;
+  delete next.needsAttention;
   return next;
 }
 
