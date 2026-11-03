@@ -141,12 +141,14 @@ unchanged tracked `HEAD`/check comparisons ask the next worker to reassess its
 approach, not pause useful investigation or verification. This counter is not
 proof of no useful work. Automatic turns remain limited by the authorized turn
 budget; exhausting it requires `/goal resume <run-id>` to authorize more turns.
-An unsuccessful or superseded assignment (`TASK_FAILED`) does not by itself
-pause the whole goal. The next turn reassesses the owning work and must not
+For new goal turns, an unsuccessful or superseded assignment (`TASK_FAILED`)
+does not by itself pause the whole goal. The next turn reassesses the owning work and must not
 repeat a stopped assignment or bypass a denied action. A goal-wide
 `<<<RALPHEX:GOAL_BLOCKED>>>` report, or an observed prerequisite with a valid
 `Prerequisite:` and `Evidence:`, pauses with the saved reason and resolution.
-`/goal resume <run-id>` continues after that blocker is resolved.
+`/goal resume <run-id>` continues after that blocker is resolved. An old
+in-flight turn retains its original blocker protocol across upgrade; newly
+launched turns use the new distinction.
 `/goal status`, `/goal pause`, `/goal cancel`, and
 `/goal help` manage the run.
 

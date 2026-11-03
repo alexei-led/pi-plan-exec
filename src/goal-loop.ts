@@ -5,6 +5,7 @@ export const GOAL_DONE_MARKER = '<<<RALPHEX:GOAL_DONE>>>';
 export const GOAL_BLOCKED_MARKER = '<<<RALPHEX:GOAL_BLOCKED>>>';
 export const TASK_FAILED_MARKER = '<<<RALPHEX:TASK_FAILED>>>';
 export const GOAL_REASSESS_THRESHOLD = 3;
+export const GOAL_OUTCOME_VERSION = 2;
 export const GOAL_FINGERPRINT_LENGTH = 12;
 export const GOAL_DISABLED_SAMPLE_LIMIT = 3;
 export const GOAL_CHECK_OUTPUT_LIMIT = 1_200;
@@ -140,7 +141,12 @@ export function parseGoalOutcome(output: string | undefined): GoalOutcome {
   const failedAssignment = exact(TASK_FAILED_MARKER);
   const blockerIndex = goalBlocker >= 0 ? goalBlocker : failedAssignment;
   if (blockerIndex >= 0) {
-    const fields = lines.slice(blockerIndex + 1).map((line) => line.trim());
+    const fields = [
+      ...lines.slice(blockerIndex + 1),
+      ...(failedAssignment >= 0 && failedAssignment < goalBlocker
+        ? lines.slice(failedAssignment + 1, goalBlocker)
+        : []),
+    ].map((line) => line.trim());
     const field = (name: string) => {
       const prefix = new RegExp(`^${name}:\\s*`, 'iu');
       return fields

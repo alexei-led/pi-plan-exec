@@ -62,6 +62,7 @@ import {
   GOAL_DISABLED_SAMPLE_LIMIT,
   GOAL_FINGERPRINT_LENGTH,
   GOAL_OUTCOME,
+  GOAL_OUTCOME_VERSION,
   GOAL_REASSESS_THRESHOLD,
   goalHash,
   goalPrompt,
@@ -1826,7 +1827,12 @@ export class PlanExecController {
   ): Promise<PlanExecRun> {
     if (!isGoalRun(run)) throw new Error('finishGoal requires a goal run.');
     const goal = run.goal;
-    const reported = parseGoalOutcome(output);
+    const parsed = parseGoalOutcome(output);
+    const reported =
+      parsed.kind === GOAL_OUTCOME.REASSESS &&
+      operation.goalOutcomeVersion !== GOAL_OUTCOME_VERSION
+        ? { ...parsed, kind: GOAL_OUTCOME.BLOCKED }
+        : parsed;
     const turnFailed =
       reported.kind === GOAL_OUTCOME.REASSESS ||
       !isSuccessfulOperationState(state);
@@ -3011,6 +3017,9 @@ export class PlanExecController {
             : RUN_STATUS.RUNNING,
         activeOperation: {
           ...prepared,
+          ...(isGoalRun(run) && input.kind === OPERATION_KIND.IMPLEMENTATION
+            ? { goalOutcomeVersion: GOAL_OUTCOME_VERSION }
+            : {}),
           ...(reviewedCommit ? { reviewedCommit } : {}),
           launchStartedAt,
           recovery: OPERATION_RECOVERY.OBSERVE,

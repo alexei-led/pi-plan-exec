@@ -295,6 +295,8 @@ export interface NativeOperationMetadata {
 }
 
 export interface ActiveOperation {
+  /** Missing on legacy launches, whose TASK_FAILED still blocks the whole goal. */
+  goalOutcomeVersion?: 2;
   /** Explicit read-only schema-7 snapshot import; never dispatch authority. */
   legacyImport?: {
     journalPath: string;

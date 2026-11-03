@@ -73,6 +73,13 @@ function currentProgressView(run: PlanExecRun, now: number): ProgressView {
   const active = Object.values(run.tasks ?? {}).find(
     (task) => task.state === 'running' || task.state === 'verifying',
   );
+  const waiting = Object.values(run.tasks ?? {}).find(
+    (task) => task.state === 'waiting_external',
+  );
+  const savedPrerequisite =
+    run.activeOperation?.externalPrerequisite?.evidence ||
+    waiting?.externalPrerequisite?.evidence ||
+    waiting?.reason;
   const view: ProgressView = {
     title: clean(title),
     label: '● Working',
@@ -185,6 +192,11 @@ function currentProgressView(run: PlanExecRun, now: number): ProgressView {
           run.activeOperation?.lastLaunchError ||
           'Launch outcome is unknown; worker ownership is retained',
       ),
+      ...(savedPrerequisite
+        ? {
+            resolution: `Recheck the saved prerequisite: ${clean(savedPrerequisite)}`,
+          }
+        : {}),
       warning: `Tracking the same operation · ${status}`,
     };
   }
@@ -194,17 +206,16 @@ function currentProgressView(run: PlanExecRun, now: number): ProgressView {
       label: 'Ⅱ Operation paused',
       tone: 'warning',
       detail: 'Worker reported paused; no confirmed reason',
+      ...(savedPrerequisite
+        ? {
+            resolution: `Recheck the saved prerequisite: ${clean(savedPrerequisite)}`,
+          }
+        : {}),
       warning: `Tracking the same operation · ${status}`,
     };
   if (summary.external > 0 || run.activeOperation?.externalPrerequisite) {
-    const waiting = Object.values(run.tasks ?? {}).find(
-      (task) => task.state === 'waiting_external',
-    );
     const reason = clean(
-      run.activeOperation?.externalPrerequisite?.evidence ||
-        waiting?.externalPrerequisite?.evidence ||
-        waiting?.reason ||
-        'External prerequisite not reported',
+      savedPrerequisite || 'External prerequisite not reported',
     );
     if (active && !run.activeOperation?.externalPrerequisite)
       return {

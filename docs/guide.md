@@ -132,7 +132,8 @@ checks fail is recorded and the goal continues. Before completion, a diff guard
 pauses the goal if the work deleted test files or added `skip`/`only` markers,
 and completion requires a clean tree at the verified commit.
 
-Stopping a duplicate or superseded assignment does not stop the goal. A
+For newly launched turns, stopping a duplicate or superseded assignment does
+not stop the goal. A
 `<<<RALPHEX:TASK_FAILED>>>` assignment result triggers another goal turn to
 reassess the owning work, without repeating the stopped assignment or bypassing
 an approval guard. The goal remains active within its authorized turn budget.
@@ -144,6 +145,8 @@ fields also pauses the goal, even with an assignment-failure marker. The saved
 pause shows Why, Resolve and Resume separately. Resolve the reported condition,
 then use `/goal resume <run-id>`; resume does not grant missing approval.
 Unclassified native failures and unknown retirement keep their existing guards.
+Old in-flight turns retain their original blocker protocol across upgrades;
+a newly launched turn uses the new assignment-versus-goal distinction.
 After
 three unchanged tracked HEAD/check comparisons the next worker is asked to
 reassess its approach. This does not prove that investigation in another

@@ -14,7 +14,8 @@ The controller owns the worktree writer,
 dependency scheduling, retries, recovery, accepted commits, and review stages.
 Never replace controller recovery with a manually launched subagent.
 
-Goal turns distinguish an unsuccessful assignment from a blocked goal.
+New goal turns distinguish an unsuccessful assignment from a blocked goal.
+Old in-flight turns keep their original blocker protocol across upgrades.
 `TASK_FAILED` alone asks the next goal turn to reassess; it does not pause the
 whole goal. Preserve supervisor stops: do not repeat a stopped assignment or
 bypass a denied action. Only report `<<<RALPHEX:GOAL_BLOCKED>>>` when the entire

@@ -1506,11 +1506,15 @@ function reportedActivity(
     : undefined;
 }
 
+function safeStatusOutput(value: string): string {
+  return stripTerminalSequences(value).replace(
+    /[\p{Cc}\p{Bidi_Control}]/gu,
+    (character) => (character === '\n' ? character : ' '),
+  );
+}
+
 function safeStatusText(value: string): string {
-  return stripTerminalSequences(value)
-    .replace(/[\p{Cc}\p{Bidi_Control}]/gu, ' ')
-    .replace(/\s+/gu, ' ')
-    .trim();
+  return safeStatusOutput(value).replace(/\s+/gu, ' ').trim();
 }
 
 export function formatRunStatus(
@@ -1573,6 +1577,10 @@ export function formatRunStatus(
     if (run.blocked.nextStep)
       lines.push(`resolve: ${safeStatusText(run.blocked.nextStep)}`);
   }
+  if (operation?.externalPrerequisite)
+    lines.push(
+      `prerequisite: ${operation.externalPrerequisite.kind} — ${operation.externalPrerequisite.evidence}`,
+    );
   if (operation) lines.push(`operation ID: ${operation.operationId}`);
   if (operation?.requestDigest)
     lines.push(`request digest: ${operation.requestDigest}`);
@@ -1695,7 +1703,7 @@ export function formatRunStatus(
       `owner: stale lease for ${run.lease?.sessionId ?? 'unknown session'}; that Pi session is no longer running.`,
     );
   lines.push(`next safe action: ${guidance.action}`);
-  return lines.join('\n');
+  return safeStatusOutput(lines.join('\n'));
 }
 
 function taskStatusLines(run: PlanExecRun): string[] {
@@ -4134,11 +4142,12 @@ export function pausedMessage(run: PlanExecRun): string {
       'No automatic retries while paused. Saved work is preserved; resume does not bypass approvals.',
     ].join('\n');
   }
-  return run.blocked
+  const message = run.blocked
     ? run.blocked.taskId === undefined
       ? `Goal run ${shortRunId(run.id)} paused: ${run.blocked.reason}\nNo automatic retries. Worktree preserved. Resolve the blocker, then use /goal resume ${run.id}.`
       : `Plan execution ${shortRunId(run.id)} paused at Task ${run.blocked.taskId}: ${run.blocked.reason}\nNo automatic retries. Worktree and checkboxes preserved. Resolve the blocker, then use /exec resume ${run.id}; it asks before retrying the same task.`
     : `Plan execution ${shortRunId(run.id)} is paused; the current attempt is stopping and its checkpoint is preserved. Use /exec resume ${run.id} to continue after confirmed exit.`;
+  return safeStatusOutput(message);
 }
 
 function terminalMessage(run: PlanExecRun): string {
@@ -4276,11 +4285,18 @@ export function goalStatusText(run: PlanExecRun): string {
     );
   if (goal.noProgress)
     lines.push(`turns with unchanged tracked HEAD/checks: ${goal.noProgress}`);
-  if (run.activeOperation)
+  if (run.activeOperation) {
     lines.push(
       `operation: ${run.activeOperation.service}/${run.activeOperation.kind} · ${run.activeOperation.operationId}`,
     );
-  return lines.join('\n');
+    if (run.activeOperation.externalPrerequisite)
+      lines.push(
+        `prerequisite: ${run.activeOperation.externalPrerequisite.kind} — ${run.activeOperation.externalPrerequisite.evidence}`,
+      );
+    if (run.activeOperation.lastStatusError)
+      lines.push(`observation error: ${run.activeOperation.lastStatusError}`);
+  }
+  return safeStatusOutput(lines.join('\n'));
 }
 
 export function goalHelp(): string {

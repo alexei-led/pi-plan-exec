@@ -420,6 +420,71 @@ test('a goal pending retirement explains the wait instead of offering a replacem
   assert.equal(f.worker.launches.length, 1);
 });
 
+test('an old in-flight goal result keeps legacy whole-goal blocker semantics after upgrade', async (t) => {
+  const f = await fixture(t);
+  let run = await start(f);
+  assert.ok(run.activeOperation);
+  const legacy = { ...run.activeOperation };
+  delete legacy.goalOutcomeVersion;
+  run = await f.registry.update({ ...run, activeOperation: legacy });
+  run = await finishTurn(
+    f,
+    run,
+    '<<<RALPHEX:TASK_FAILED>>>\nBlocker: External decision required\nNext step: Ask the owner',
+  );
+  assert.equal(run.status, 'paused');
+  assert.equal(run.blocked?.reason, 'External decision required');
+  assert.equal(run.blocked?.nextStep, 'Ask the owner');
+  run = await f.controller.resume(run.id, 'session', true);
+  assert.equal(run.activeOperation?.goalOutcomeVersion, 2);
+  assert.match(
+    String(f.worker.launches.at(-1)?.params.task),
+    /Previous pause: External decision required/,
+  );
+});
+
+test('native-default timeout prose without a classified expiry never launches a replacement', async (t) => {
+  const f = await fixture(t);
+  let run = await start(f);
+  const operationId = run.activeOperation?.operationId;
+  f.worker.state = 'failed';
+  f.worker.proof = true;
+  f.worker.output =
+    '<<<RALPHEX:TASK_FAILED>>>\nBlocker: Subagent timed out after 1800000ms.\nNext step: Inspect its preserved output.';
+  run = await f.controller.tick(run.id, 'session');
+  assert.equal(run.status, 'paused');
+  assert.match(run.blocked?.reason ?? '', /timed out after 1800000ms/);
+  assert.equal(run.failedOperation?.operationId, operationId);
+  assert.equal(run.failedOperation?.terminationReason, undefined);
+  await f.controller.tick((await due(f, run)).id, 'session');
+  assert.equal(f.worker.launches.length, 1);
+});
+
+test('hostile worker output remains evidence, not terminal control, after pause and resume', async (t) => {
+  const f = await fixture(t);
+  let run = await start(f);
+  run = await finishTurn(
+    f,
+    run,
+    'Observed\u001b[31m failure\u202e\n<<<RALPHEX:GOAL_BLOCKED>>>\nBlocker: Approval\u001b[31m required\nNext step: Ask\u001b]0;spoof\u0007 the owner',
+  );
+  for (const message of [
+    goalStatusText(run),
+    formatRunStatus(run),
+    pausedMessage(run),
+  ]) {
+    assert.equal(message.includes('\u001b'), false);
+    assert.equal(message.includes('\u202e'), false);
+  }
+  assert.match(run.goal?.lastOutcome ?? '', /Observed/);
+  run = await f.controller.resume(run.id, 'session', true);
+  assert.match(run.goal?.lastOutcome ?? '', /Previous pause/);
+  for (const message of [goalStatusText(run), formatRunStatus(run)]) {
+    assert.equal(message.includes('\u001b'), false);
+    assert.equal(message.includes('\u202e'), false);
+  }
+});
+
 test('a goal that claims done with failing checks continues instead of completing', async (t) => {
   const f = await fixture(t);
   let run = await start(f);
@@ -690,6 +755,18 @@ test('a healthy probe does not erase an independent prerequisite without resolut
       },
     },
   });
+  assert.match(
+    goalStatusText(run),
+    /prerequisite: permission.*Approval required/,
+  );
+  assert.match(
+    goalStatusText(run),
+    /observation error: Temporary status outage/,
+  );
+  assert.match(
+    formatRunStatus(run),
+    /prerequisite: permission.*Approval required/,
+  );
   run = await f.controller.tick(run.id, 'session');
   assert.equal(run.activeOperation?.lastStatusError, undefined);
   assert.equal(
@@ -801,6 +878,15 @@ test('markers count only as standalone lines and a blocker outranks a mention', 
   assert.equal(blocked.kind, 'blocked');
   assert.match(blocked.reason ?? '', /need a token/);
   assert.equal(blocked.nextStep, 'provide one');
+  for (const output of [
+    '<<<RALPHEX:TASK_FAILED>>>\nBlocker: Need owner input\nNext step: Ask the owner\n<<<RALPHEX:GOAL_BLOCKED>>>',
+    '<<<RALPHEX:GOAL_BLOCKED>>>\n<<<RALPHEX:TASK_FAILED>>>\nBlocker: Need owner input\nNext step: Ask the owner',
+  ]) {
+    const conflict = parseGoalOutcome(output);
+    assert.equal(conflict.kind, 'blocked');
+    assert.equal(conflict.reason, 'Need owner input');
+    assert.equal(conflict.nextStep, 'Ask the owner');
+  }
   const failedAssignment = parseGoalOutcome(
     '<<<RALPHEX:TASK_FAILED>>>\nBlocker: Superseded task\n<<<RALPHEX:GOAL_DONE>>>',
   );

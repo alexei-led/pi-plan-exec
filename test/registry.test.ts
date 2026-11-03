@@ -1406,6 +1406,24 @@ test('registry rejects invalid persisted lifecycle shapes', async () => {
   }
 
   const path = join(directory, run.id, 'run.json');
+  for (const goalOutcomeVersion of [1, 3, null, '2']) {
+    await writeFile(
+      path,
+      JSON.stringify({
+        ...run,
+        activeOperation: {
+          operationId: 'invalid-goal-contract',
+          kind: 'implementation',
+          service: 'bridge',
+          goalOutcomeVersion,
+        },
+      }),
+    );
+    await assert.rejects(
+      registry.get(run.id),
+      /Invalid plan-exec run registry entry/,
+    );
+  }
   for (const nextStep of [null, 42, [], {}]) {
     await writeFile(
       path,

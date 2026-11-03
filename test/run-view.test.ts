@@ -269,6 +269,30 @@ test('unknown launch is amber, never healthy from controller heartbeat', () => {
   assert.equal(view.tone, 'warning');
   assert.match(view.label, /unknown/i);
 });
+test('a failed status probe retains the saved operation prerequisite alongside its own error', () => {
+  const held = run({
+    activeOperation: {
+      operationId: 'op',
+      service: 'bridge',
+      kind: 'implementation',
+      lastStatusError: 'Status service unavailable',
+      externalPrerequisite: {
+        kind: 'permission',
+        source: 'provider',
+        evidence: 'Owner approval required',
+      },
+    },
+  });
+  const view = progressView(held, 1_000, true);
+  assert.match(view.detail, /Status service unavailable/);
+  assert.match(view.resolution ?? '', /Owner approval required/);
+  const strip = renderProgressStrip(held, 180, undefined, 1_000, true).join(
+    '\n',
+  );
+  assert.match(strip, /Status service unavailable/);
+  assert.match(strip, /Owner approval required/);
+});
+
 test('an observed operation pause is not working or proof of a question', () => {
   const operation = {
     operationId: 'op',
