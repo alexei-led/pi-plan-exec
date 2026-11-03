@@ -21,6 +21,7 @@ import {
   goalStatusText,
   parseGoalChecks,
   parseGoalCommand,
+  pausedMessage,
 } from '../src/index.js';
 import { LocalOperationFailedError } from '../src/local-operation.js';
 import { RunRegistry } from '../src/registry.js';
@@ -284,6 +285,141 @@ test('a goal continues after an intermediate answer and completes when checks pa
   assert.equal(await readFile(join(f.root, 'done.txt'), 'utf8'), 'fixed\n');
 });
 
+test('a superseded assignment does not pause the entire goal or repeat the stopped work', async (t) => {
+  const f = await fixture(t);
+  let run = await start(f);
+  run = await finishTurn(
+    f,
+    run,
+    [
+      'Stopped the duplicate assignment without changes.',
+      '<<<RALPHEX:TASK_FAILED>>>',
+      'Blocker: Supervisor stopped this stale assignment; the existing PR owns this work.',
+      'Next step: Check the owning PR review and CI, not another duplicate worktree.',
+    ].join('\n'),
+  );
+  assert.equal(run.status, 'running');
+  assert.equal(run.blocked, undefined);
+  assert.equal(run.error, undefined);
+  assert.ok(!run.needsAttention);
+  assert.equal(run.activeOperation, undefined);
+  assert.match(
+    run.goal?.lastOutcome ?? '',
+    /Supervisor stopped this stale assignment/,
+  );
+  run = await f.controller.tick((await due(f, run)).id, 'session');
+  assert.equal(f.worker.launches.length, 2);
+  const prompt = String(f.worker.launches.at(-1)?.params.task);
+  assert.match(prompt, /Do not repeat.*stopped assignment/);
+  assert.match(prompt, /existing PR owns this work/);
+  assert.match(prompt, /GOAL_BLOCKED/);
+});
+
+for (const prerequisite of [
+  'credentials',
+  'permission',
+  'missing_executable',
+  'runtime',
+])
+  test(`a worker-reported ${prerequisite} prerequisite pauses with a resolution and recovery command`, async (t) => {
+    const f = await fixture(t);
+    let run = await start(f);
+    run = await finishTurn(
+      f,
+      run,
+      [
+        'The assignment cannot proceed.',
+        '<<<RALPHEX:TASK_FAILED>>>',
+        'Blocker: Required prerequisite is unavailable.',
+        `Prerequisite: ${prerequisite}`,
+        'Evidence: The required boundary rejected the operation.',
+        'Next step: Restore the prerequisite in the owning session.',
+      ].join('\n'),
+    );
+    assert.equal(run.status, 'paused');
+    assert.equal(run.blocked?.reason, 'Required prerequisite is unavailable.');
+    assert.equal(
+      run.blocked?.nextStep,
+      'Restore the prerequisite in the owning session.',
+    );
+    const message = pausedMessage(run);
+    assert.match(message, /Why: Required prerequisite is unavailable/);
+    assert.match(
+      message,
+      /Resolve: Restore the prerequisite in the owning session/,
+    );
+    assert.match(message, new RegExp(`Resume: /goal resume ${run.id}`));
+    assert.match(goalStatusText(run), /resolve: Restore the prerequisite/);
+    assert.equal(f.worker.launches.length, 1);
+  });
+
+test('a late assignment failure cannot undo an explicit in-flight goal pause', async (t) => {
+  const f = await fixture(t);
+  let run = await start(f);
+  run = await f.registry.update({
+    ...run,
+    status: 'paused',
+    userStopped: true,
+  });
+  f.worker.proof = true;
+  f.worker.state = 'complete';
+  f.worker.output =
+    '<<<RALPHEX:TASK_FAILED>>>\nBlocker: Superseded assignment.';
+  run = await f.controller.tick(run.id, 'session');
+  assert.equal(run.status, 'paused');
+  assert.equal(run.userStopped, true);
+  assert.equal(f.worker.launches.length, 1);
+  const message = pausedMessage(run);
+  assert.match(message, /Why: Paused by user request/);
+  assert.match(message, new RegExp(`Resume: /goal resume ${run.id}`));
+});
+
+test('status sanitizes saved blocker and resolution control sequences', async (t) => {
+  const f = await fixture(t);
+  let run = await start(f);
+  run = await finishTurn(f, run, 'Previous turn completed.');
+  run = await f.registry.update({
+    ...run,
+    status: 'paused',
+    blocked: {
+      reason: 'Approval\u001b[31m required\u202e',
+      nextStep: 'Restore\u001b]0;spoof\u0007 UI\u202e',
+    },
+  });
+  for (const output of [
+    goalStatusText(run),
+    formatRunStatus(run),
+    pausedMessage(run),
+  ]) {
+    assert.match(output, /Approval required/);
+    assert.match(output, /Restore UI/);
+    assert.equal(output.includes('\u001b'), false);
+    assert.equal(output.includes('\u202e'), false);
+  }
+});
+
+test('a goal pending retirement explains the wait instead of offering a replacement', async (t) => {
+  const f = await fixture(t);
+  let run = await start(f);
+  run = await f.registry.update({
+    ...run,
+    status: 'paused',
+    blocked: {
+      reason: 'Waiting for the current worker to stop.',
+      nextStep: 'Wait for retirement.',
+    },
+  });
+  assert.match(pausedMessage(run), /Wait for confirmed worker exit/);
+  assert.match(
+    pausedMessage(run),
+    new RegExp(`Inspect: /goal status ${run.id}`),
+  );
+  assert.doesNotMatch(pausedMessage(run), /Resume:|\/goal resume/);
+  assert.match(goalStatusText(run), /waiting for confirmed worker exit/);
+  assert.doesNotMatch(goalStatusText(run), /resume:|\/goal resume/);
+  assert.equal(f.worker.launches.length, 1);
+});
+
 test('a goal that claims done with failing checks continues instead of completing', async (t) => {
   const f = await fixture(t);
   let run = await start(f);
@@ -350,7 +486,7 @@ for (const blocker of ['worker', 'prerequisite', 'provider'] as const)
     f.worker.terminationReason = 'execution_lifetime_expired';
     f.worker.output =
       blocker === 'worker'
-        ? '<<<RALPHEX:TASK_FAILED>>>\nBlocker: Operator approval required\nNext step: Restore approval UI'
+        ? '<<<RALPHEX:GOAL_BLOCKED>>>\nBlocker: Operator approval required\nNext step: Restore approval UI'
         : blocker === 'provider'
           ? '401: invalid_api_key'
           : '';
@@ -448,7 +584,7 @@ test('a goal resumes after a pause and completes', async (t) => {
   run = await finishTurn(
     f,
     run,
-    `<<<RALPHEX:TASK_FAILED>>>\nBlocker: need a fixture file\nNext step: provide one`,
+    `<<<RALPHEX:GOAL_BLOCKED>>>\nBlocker: need a fixture file\nNext step: provide one`,
   );
   assert.equal(run.status, 'paused');
   assert.match(run.blocked?.reason ?? '', /need a fixture file/);
@@ -462,12 +598,41 @@ test('a goal resumes after a pause and completes', async (t) => {
   assert.equal(run.blocked, undefined);
   assert.equal(run.error, undefined);
   assert.equal(run.goal?.noProgress, 0);
+  assert.match(
+    String(f.worker.launches.at(-1)?.params.task),
+    /Previous pause: need a fixture file/,
+  );
+  assert.match(
+    String(f.worker.launches.at(-1)?.params.task),
+    /Next step: provide one/,
+  );
   await writeFile(join(f.root, 'done.txt'), 'fixed\n');
   await f.git('add', '--all');
   await f.git('commit', '-m', 'fix failing tests');
   run = await finishTurn(f, run, '<<<RALPHEX:GOAL_DONE>>>\nDone.');
   run = await advanceToCompletion(f, run);
   assert.equal(run.status, 'completed');
+});
+
+test('resuming a legacy goal preserves the saved stop reason instead of forgetting it', async (t) => {
+  const f = await fixture(t);
+  let run = await start(f);
+  run = await finishTurn(f, run, 'Earlier implementation finished.');
+  run = await f.registry.update({
+    ...run,
+    status: 'paused',
+    blocked: {
+      reason:
+        'Supervisor stopped a stale assignment; existing PR owns the work.',
+    },
+    error: 'Supervisor stopped a stale assignment; existing PR owns the work.',
+  });
+  run = await f.controller.resume(run.id, 'session', true);
+  assert.equal(run.status, 'running');
+  assert.equal(run.blocked, undefined);
+  const prompt = String(f.worker.launches.at(-1)?.params.task);
+  assert.match(prompt, /Previous pause: Supervisor stopped a stale assignment/);
+  assert.match(prompt, /Do not repeat a stopped assignment/);
 });
 
 test('a recovered native runtime starts a goal without retaining its readiness warning', async (t) => {
@@ -631,10 +796,25 @@ test('markers count only as standalone lines and a blocker outranks a mention', 
   assert.equal(parseGoalOutcome('<<<RALPHEX:GOAL_DONE>>>>').kind, 'continue');
   assert.equal(parseGoalOutcome('<<<RALPHEX:GOAL_DONE>>>\nextra').kind, 'done');
   const blocked = parseGoalOutcome(
-    'I cannot emit <<<RALPHEX:GOAL_DONE>>> yet\n<<<RALPHEX:TASK_FAILED>>>\nBlocker: need a token\nNext step: provide one',
+    'I cannot emit <<<RALPHEX:GOAL_DONE>>> yet\n<<<RALPHEX:GOAL_BLOCKED>>>\nBlocker: need a token\nNext step: provide one',
   );
   assert.equal(blocked.kind, 'blocked');
   assert.match(blocked.reason ?? '', /need a token/);
+  assert.equal(blocked.nextStep, 'provide one');
+  const failedAssignment = parseGoalOutcome(
+    '<<<RALPHEX:TASK_FAILED>>>\nBlocker: Superseded task\n<<<RALPHEX:GOAL_DONE>>>',
+  );
+  assert.equal(
+    failedAssignment.kind,
+    'reassess',
+    'a failed assignment cannot complete the goal',
+  );
+  assert.equal(
+    parseGoalOutcome(
+      '<<<RALPHEX:GOAL_BLOCKED>>>\n<<<RALPHEX:TASK_FAILED>>>\n<<<RALPHEX:GOAL_DONE>>>',
+    ).kind,
+    'blocked',
+  );
 });
 
 test('a goal paused for its turn budget grants more turns on explicit resume', async (t) => {

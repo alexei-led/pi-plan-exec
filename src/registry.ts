@@ -1005,7 +1005,10 @@ function assertRun(run: PlanExecRun): void {
         (run.blocked.taskId !== undefined &&
           (!Number.isInteger(run.blocked.taskId) || run.blocked.taskId < 1)) ||
         typeof run.blocked.reason !== 'string' ||
-        !run.blocked.reason.trim())) ||
+        !run.blocked.reason.trim() ||
+        (run.blocked.nextStep !== undefined &&
+          (typeof run.blocked.nextStep !== 'string' ||
+            !run.blocked.nextStep.trim())))) ||
     !isValidOperationForStage(run.activeOperation, run.stage) ||
     !isValidOperationForStage(run.failedOperation, run.stage)
   ) {

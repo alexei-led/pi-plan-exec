@@ -575,7 +575,7 @@ export interface PlanExecRun {
   activeOperation?: ActiveOperation;
   failedOperation?: ActiveOperation;
   /** Explicit stop: incomplete task or unmet goal, no automatic retry, resumable after confirmation. */
-  blocked?: { taskId?: number; reason: string };
+  blocked?: { taskId?: number; reason: string; nextStep?: string };
   /** One recovery launch only; consumed when the replacement child is recorded. */
   recoveryModel?: string;
   config: FrozenRunConfig;

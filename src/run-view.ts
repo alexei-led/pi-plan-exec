@@ -16,6 +16,7 @@ export interface ProgressView {
   accepted: number;
   total: number;
   detail: string;
+  resolution?: string;
   warning?: string;
 }
 
@@ -30,7 +31,7 @@ function control(run: PlanExecRun, action: 'status' | 'resume'): string {
   return `/${isGoalRun(run) ? 'goal' : 'exec'} ${action} ${clean(run.id)}`;
 }
 
-function pendingCleanup(run: PlanExecRun): boolean {
+export function pendingCleanup(run: PlanExecRun): boolean {
   return Boolean(
     run.localOperationActive ||
       (run.activeOperation &&
@@ -107,12 +108,18 @@ function currentProgressView(run: PlanExecRun, now: number): ProgressView {
         stopping
           ? (run.activeOperation?.cancellationDeliveryError?.message ??
               'Stop requested · worker exit not confirmed')
-          : reason || 'Checkpoint saved · resume when ready',
+          : reason ||
+              (run.userStopped
+                ? 'Paused by user request'
+                : 'No pause reason was recorded; inspect saved goal or plan status'),
       ),
+      ...(!stopping && run.blocked?.nextStep
+        ? { resolution: clean(run.blocked.nextStep) }
+        : {}),
       warning: stopping
         ? `Waiting for confirmed exit · ${status}`
         : reason
-          ? `Resolve blocker, then ${control(run, 'resume')}`
+          ? `Resume after resolving: ${control(run, 'resume')}`
           : control(run, 'resume'),
     };
   }
@@ -259,6 +266,9 @@ function currentProgressView(run: PlanExecRun, now: number): ProgressView {
       label: run.blocked ? '! Blocked' : '↻ Recovering',
       tone: 'warning',
       detail: clean(run.blocked?.reason || run.error || ''),
+      ...(run.blocked?.nextStep
+        ? { resolution: clean(run.blocked.nextStep) }
+        : {}),
       warning: status,
     };
   if (run.stage.includes('review'))
@@ -321,6 +331,7 @@ export function renderProgressStrip(
   return [
     `${color(view.tone, view.label)}${color('text', ` · ${view.title}`)}`,
     `${bar}${color('text', ` ${count} · ${view.detail}`)}`,
+    ...(view.resolution ? [color('text', `Resolve: ${view.resolution}`)] : []),
     ...(view.warning ? [color(view.tone, view.warning)] : []),
   ].map((line) => truncateToWidth(line, columns));
 }

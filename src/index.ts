@@ -9,7 +9,11 @@ import {
   type ExtensionContext,
   SessionManager,
 } from '@earendil-works/pi-coding-agent';
-import { type AutocompleteItem, truncateToWidth } from '@earendil-works/pi-tui';
+import {
+  type AutocompleteItem,
+  stripTerminalSequences,
+  truncateToWidth,
+} from '@earendil-works/pi-tui';
 import { parseAdvisoryObservation } from './advisory-observation.js';
 import {
   isDetachedWorkflowFailure,
@@ -60,6 +64,7 @@ import {
 } from './registry.js';
 import { required } from './required.js';
 import {
+  pendingCleanup,
   progressView,
   RunPresentation,
   readViewPreferences,
@@ -1347,8 +1352,8 @@ export function recoveryGuidance(
             : 'paused for a task blocker',
         action:
           run.blocked.taskId === undefined
-            ? `Goal: ${run.blocked.reason} Resolve the blocker, then run interactive /goal resume ${run.id}; no automatic retry is scheduled.`
-            : `Task ${run.blocked.taskId}: ${run.blocked.reason} Resolve the blocker, then run interactive ${resume}; it asks before retrying the same task. No task was skipped and no automatic retry is scheduled.`,
+            ? `Goal: ${safeStatusText(run.blocked.reason)} Resolve the blocker, then run interactive /goal resume ${run.id}; no automatic retry is scheduled.`
+            : `Task ${run.blocked.taskId}: ${safeStatusText(run.blocked.reason)} Resolve the blocker, then run interactive ${resume}; it asks before retrying the same task. No task was skipped and no automatic retry is scheduled.`,
         command:
           run.blocked.taskId === undefined ? `/goal resume ${run.id}` : resume,
       };
@@ -1501,6 +1506,13 @@ function reportedActivity(
     : undefined;
 }
 
+function safeStatusText(value: string): string {
+  return stripTerminalSequences(value)
+    .replace(/[\p{Cc}\p{Bidi_Control}]/gu, ' ')
+    .replace(/\s+/gu, ' ')
+    .trim();
+}
+
 export function formatRunStatus(
   run: PlanExecRun,
   evidence?: AbandonmentEvidence,
@@ -1556,7 +1568,11 @@ export function formatRunStatus(
         `checks: ${run.goal.lastCheck.failures ? `failing — ${run.goal.lastCheck.failures}` : 'passing'}`,
       );
   }
-  if (run.blocked) lines.push(`blocked: ${run.blocked.reason}`);
+  if (run.blocked) {
+    lines.push(`blocked: ${safeStatusText(run.blocked.reason)}`);
+    if (run.blocked.nextStep)
+      lines.push(`resolve: ${safeStatusText(run.blocked.nextStep)}`);
+  }
   if (operation) lines.push(`operation ID: ${operation.operationId}`);
   if (operation?.requestDigest)
     lines.push(`request digest: ${operation.requestDigest}`);
@@ -4098,6 +4114,26 @@ function boundedPromise<T>(
 }
 
 export function pausedMessage(run: PlanExecRun): string {
+  if (isGoalRun(run)) {
+    const stopping = pendingCleanup(run);
+    const view = progressView(run, Date.now(), true);
+    return [
+      `Goal run ${shortRunId(run.id)} paused.`,
+      `Why: ${view.detail}`,
+      `Resolve: ${
+        view.resolution ??
+        (stopping
+          ? 'Wait for confirmed worker exit; do not start a replacement.'
+          : run.userStopped
+            ? 'Resume when you want the goal to continue.'
+            : 'Inspect the saved goal status and resolve its recorded failure before resuming.')
+      }`,
+      stopping
+        ? `Inspect: /goal status ${run.id}`
+        : `Resume: /goal resume ${run.id}`,
+      'No automatic retries while paused. Saved work is preserved; resume does not bypass approvals.',
+    ].join('\n');
+  }
   return run.blocked
     ? run.blocked.taskId === undefined
       ? `Goal run ${shortRunId(run.id)} paused: ${run.blocked.reason}\nNo automatic retries. Worktree preserved. Resolve the blocker, then use /goal resume ${run.id}.`
@@ -4220,7 +4256,16 @@ export function goalStatusText(run: PlanExecRun): string {
     `checks: ${run.config.requiredChecks.map((command) => command.join(' ')).join(' · ') || 'none'}`,
     `updated: ${new Date(run.updatedAt).toISOString()}`,
   ];
-  if (run.blocked) lines.push(`blocked: ${run.blocked.reason}`);
+  if (run.blocked) {
+    lines.push(`blocked: ${safeStatusText(run.blocked.reason)}`);
+    if (run.blocked.nextStep)
+      lines.push(`resolve: ${safeStatusText(run.blocked.nextStep)}`);
+    lines.push(
+      pendingCleanup(run)
+        ? `next: /goal status ${run.id} (waiting for confirmed worker exit)`
+        : `resume: /goal resume ${run.id}`,
+    );
+  }
   if (goal.lastCheck)
     lines.push(
       `checks: ${goal.lastCheck.failures ? `failing — ${goal.lastCheck.failures}` : 'passing'}`,

@@ -1136,7 +1136,7 @@ export class PlanExecController {
         nextAttemptAt: 0,
         needsAttention: false,
         ...(prepared.status === RUN_STATUS.PAUSED && isGoalRun(prepared)
-          ? { goal: { ...prepared.goal, noProgress: 0 } }
+          ? { goal: resumedGoal(prepared) }
           : {}),
       };
       delete next.error;
@@ -1167,9 +1167,7 @@ export class PlanExecController {
         clearError({
           ...prepared,
           status: RUN_STATUS.RUNNING,
-          ...(isGoalRun(prepared)
-            ? { goal: { ...prepared.goal, noProgress: 0 } }
-            : {}),
+          ...(isGoalRun(prepared) ? { goal: resumedGoal(prepared) } : {}),
         }),
         prepared.updatedAt,
       );
@@ -1789,7 +1787,8 @@ export class PlanExecController {
     if (goal.iteration >= goal.maxTurns)
       return this.pauseGoal(
         run,
-        `Goal turn budget reached after ${goal.iteration} turns; run /goal resume ${run.id} to authorize ${run.config.maxTaskIterations} more turns.`,
+        `Goal turn budget reached after ${goal.iteration} turns.`,
+        `Authorize ${run.config.maxTaskIterations} more turns with resume; this permits additional model usage.`,
       );
     return this.launchNative(run, {
       kind: OPERATION_KIND.IMPLEMENTATION,
@@ -1828,45 +1827,62 @@ export class PlanExecController {
     if (!isGoalRun(run)) throw new Error('finishGoal requires a goal run.');
     const goal = run.goal;
     const reported = parseGoalOutcome(output);
-    const providerFailure = [terminalError, output].find(
-      isModelProviderFailureText,
-    );
+    const turnFailed =
+      reported.kind === GOAL_OUTCOME.REASSESS ||
+      !isSuccessfulOperationState(state);
+    const providerFailure = turnFailed
+      ? [terminalError, output].find(isModelProviderFailureText)
+      : undefined;
+    const prerequisite =
+      operation.externalPrerequisite ??
+      parseExternalPrerequisite(reported.prerequisite, 'worker');
     // Only a classified bounded expiry with proven retirement authorizes a new
     // turn. Native-default timeout prose is not classification or exit proof.
     const expired =
       operation.terminationReason === 'execution_lifetime_expired' &&
       operation.expectedLifetime?.mode === 'bounded' &&
       operation.processTreeExited &&
-      !operation.externalPrerequisite &&
+      !prerequisite &&
       !providerFailure;
     const outcome =
       expired && reported.kind !== GOAL_OUTCOME.BLOCKED
         ? {
+            ...reported,
             kind: GOAL_OUTCOME.CONTINUE,
             summary: `Bounded execution lifetime expired; inspect the preserved checkpoint before continuing.\n${reported.summary}`,
           }
         : reported;
     if (
       outcome.kind === GOAL_OUTCOME.BLOCKED ||
+      prerequisite ||
+      providerFailure ||
       (!isSuccessfulOperationState(state) && !expired)
-    )
+    ) {
+      const reason =
+        outcome.reason ??
+        prerequisite?.evidence ??
+        providerFailure ??
+        terminalError ??
+        (outcome.kind === GOAL_OUTCOME.BLOCKED
+          ? 'Worker reported a goal blocker without a reason.'
+          : `Goal turn ended as ${state}.`);
+      const nextStep =
+        outcome.nextStep ??
+        (prerequisite?.kind === 'permission'
+          ? 'Provide the required approval in the owning interactive session; do not bypass the guard.'
+          : providerFailure
+            ? 'Restore an authenticated model/provider in the owning session before resuming.'
+            : `Inspect /goal status ${run.id} and resolve the reported prerequisite or worker failure.`);
       return this.pauseGoal(
         {
           ...run,
-          failedOperation: {
-            ...operation,
-            terminalError:
-              outcome.reason ??
-              providerFailure ??
-              terminalError ??
-              `Goal turn ended as ${state}.`,
-          },
+          goal: { ...goal, lastOutcome: outcome.summary || reason },
+          failedOperation: { ...operation, terminalError: reason },
         },
-        outcome.reason ??
-          providerFailure ??
-          terminalError ??
-          `Goal turn ended as ${state}.`,
+        reason,
+        nextStep,
       );
+    }
     const head = await gitValue(this.runCommand, run.worktreeCwd, [
       'rev-parse',
       'HEAD',
@@ -1929,7 +1945,9 @@ export class PlanExecController {
           ? `Goal checks failing: ${failure.text}`
           : noProgress >= GOAL_REASSESS_THRESHOLD
             ? `Tracked HEAD/checks unchanged for ${noProgress} turns; reassessing automatically within the authorized turn budget.`
-            : 'Goal turn completed; continuing.',
+            : outcome.kind === GOAL_OUTCOME.REASSESS
+              ? 'Assignment ended without completing the goal; reassessing the current state.'
+              : 'Goal turn completed; continuing.',
       }),
       run.updatedAt,
     );
@@ -2041,12 +2059,13 @@ export class PlanExecController {
   private async pauseGoal(
     run: PlanExecRun,
     reason: string,
+    nextStep = 'Inspect the saved goal status and resolve the reported blocker.',
   ): Promise<PlanExecRun> {
     const paused = await this.registry.updateIfCurrent(
       withoutOperation({
         ...run,
         status: RUN_STATUS.PAUSED,
-        blocked: { reason },
+        blocked: { reason, nextStep },
         nextAttemptAt: 0,
         wakeReason: reason,
         error: reason,
@@ -2072,7 +2091,11 @@ export class PlanExecController {
       ...run,
       stage: RUN_STAGE.IMPLEMENTATION,
       status: RUN_STATUS.PAUSED,
-      blocked: { reason },
+      blocked: {
+        reason,
+        nextStep:
+          'Repair the reported completion-guard failure without disabling required checks.',
+      },
       nextAttemptAt: 0,
       wakeReason: reason,
       error: reason,
@@ -6410,6 +6433,30 @@ function withoutOperation(run: PlanExecRun): PlanExecRun {
   const next = { ...run };
   delete next.activeOperation;
   return next;
+}
+
+function resumedGoal(run: PlanExecRun) {
+  if (!isGoalRun(run)) throw new Error('Goal resume requires a goal run.');
+  const reason =
+    run.blocked?.reason ?? run.error ?? run.failedOperation?.terminalError;
+  return {
+    ...run.goal,
+    noProgress: 0,
+    ...(reason
+      ? {
+          lastOutcome: [
+            run.goal.lastOutcome,
+            `Previous pause: ${reason}`,
+            run.blocked?.nextStep
+              ? `Next step: ${run.blocked.nextStep}`
+              : undefined,
+            'Resume was authorized; recheck this condition before acting. Do not bypass guards or repeat a stopped assignment.',
+          ]
+            .filter(Boolean)
+            .join('\n'),
+        }
+      : {}),
+  };
 }
 
 function clearError(run: PlanExecRun): PlanExecRun {

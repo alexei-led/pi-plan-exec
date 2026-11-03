@@ -132,9 +132,19 @@ checks fail is recorded and the goal continues. Before completion, a diff guard
 pauses the goal if the work deleted test files or added `skip`/`only` markers,
 and completion requires a clean tree at the verified commit.
 
-A worker that needs external help ends with `<<<RALPHEX:TASK_FAILED>>>`,
-`Blocker: <reason>`, and `Next step: <what is needed>`. The goal pauses with
-that reason and schedules nothing; `/goal resume <run-id>` continues it. After
+Stopping a duplicate or superseded assignment does not stop the goal. A
+`<<<RALPHEX:TASK_FAILED>>>` assignment result triggers another goal turn to
+reassess the owning work, without repeating the stopped assignment or bypassing
+an approval guard. The goal remains active within its authorized turn budget.
+
+A worker that cannot continue the entire goal ends with
+`<<<RALPHEX:GOAL_BLOCKED>>>`, `Blocker: <reason>`, and `Next step: <what is needed>`.
+An observed prerequisite reported with valid `Prerequisite:` and `Evidence:`
+fields also pauses the goal, even with an assignment-failure marker. The saved
+pause shows Why, Resolve and Resume separately. Resolve the reported condition,
+then use `/goal resume <run-id>`; resume does not grant missing approval.
+Unclassified native failures and unknown retirement keep their existing guards.
+After
 three unchanged tracked HEAD/check comparisons the next worker is asked to
 reassess its approach. This does not prove that investigation in another
 worktree made no progress. Automatic turns remain bounded by the turn budget

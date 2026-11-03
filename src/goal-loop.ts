@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import type { PlanExecRun } from './types.js';
 
 export const GOAL_DONE_MARKER = '<<<RALPHEX:GOAL_DONE>>>';
+export const GOAL_BLOCKED_MARKER = '<<<RALPHEX:GOAL_BLOCKED>>>';
 export const TASK_FAILED_MARKER = '<<<RALPHEX:TASK_FAILED>>>';
 export const GOAL_REASSESS_THRESHOLD = 3;
 export const GOAL_FINGERPRINT_LENGTH = 12;
@@ -10,6 +11,7 @@ export const GOAL_CHECK_OUTPUT_LIMIT = 1_200;
 export const GOAL_OUTCOME = {
   DONE: 'done',
   CONTINUE: 'continue',
+  REASSESS: 'reassess',
   BLOCKED: 'blocked',
 } as const;
 export type GoalOutcomeKind = (typeof GOAL_OUTCOME)[keyof typeof GOAL_OUTCOME];
@@ -23,6 +25,9 @@ export interface GoalOutcome {
   kind: GoalOutcomeKind;
   summary: string;
   reason?: string;
+  nextStep?: string;
+  /** Untrusted worker fields; the controller validates them before classification. */
+  prerequisite?: { kind: string; evidence: string };
 }
 
 /** Normalize only the command input; the goal keeps its exact meaning after this. */
@@ -89,10 +94,13 @@ export function goalPrompt(
     'A read-only investigation or verification turn need not create a commit; report its evidence without manufacturing repository changes.',
     'When the goal is fully achieved and verified, end your final response with this marker on its own line:',
     GOAL_DONE_MARKER,
-    'If you cannot continue without an external decision, credential, or prerequisite, end with:',
-    TASK_FAILED_MARKER,
+    'Do not repeat a stopped assignment or a denied action. A supervisor stopping one stale or duplicate assignment does not stop this goal: reconcile the owning work, inspect its status, or choose another authorized action. Never launch a duplicate writer or bypass an approval guard.',
+    'If only this assignment failed or was superseded, report its reason and what remains; the controller reassesses the goal automatically. TASK_FAILED is an assignment outcome, not a goal pause.',
+    'Only when the entire goal cannot continue without an external decision, credential, or prerequisite, end with:',
+    GOAL_BLOCKED_MARKER,
     'Blocker: <exact reason>',
-    'Next step: <what is needed>',
+    'Next step: <the concrete action needed in the owning session>',
+    'For an observed prerequisite failure, also report Prerequisite: credentials|permission|missing_executable|runtime and Evidence: <exact observed failure>. Do not invent these fields from generic blocker wording.',
     'Otherwise end with a concise summary of what changed and what remains; the controller continues automatically.',
   ].join('\n');
 }
@@ -128,27 +136,33 @@ export function parseGoalOutcome(output: string | undefined): GoalOutcome {
   const lines = text.split(/\r?\n/u);
   const exact = (marker: string) =>
     lines.findIndex((line) => line.trim() === marker);
-  const blockerIndex = exact(TASK_FAILED_MARKER);
+  const goalBlocker = exact(GOAL_BLOCKED_MARKER);
+  const failedAssignment = exact(TASK_FAILED_MARKER);
+  const blockerIndex = goalBlocker >= 0 ? goalBlocker : failedAssignment;
   if (blockerIndex >= 0) {
-    const blocker = lines
-      .slice(blockerIndex + 1)
-      .find((line) => /^Blocker:/iu.test(line.trim()))
-      ?.replace(/^Blocker:\s*/iu, '')
-      .trim();
-    const next = lines
-      .slice(blockerIndex + 1)
-      .find((line) => /^Next step:/iu.test(line.trim()))
-      ?.replace(/^Next step:\s*/iu, '')
-      .trim();
+    const fields = lines.slice(blockerIndex + 1).map((line) => line.trim());
+    const field = (name: string) => {
+      const prefix = new RegExp(`^${name}:\\s*`, 'iu');
+      return fields
+        .find((line) => prefix.test(line))
+        ?.replace(prefix, '')
+        .trim();
+    };
+    const reason = field('Blocker');
+    const nextStep = field('Next step');
+    const kind = field('Prerequisite');
+    const evidence = field('Evidence');
     return {
-      kind: GOAL_OUTCOME.BLOCKED,
+      kind: goalBlocker >= 0 ? GOAL_OUTCOME.BLOCKED : GOAL_OUTCOME.REASSESS,
       summary: lines
-        .filter((_, index) => index !== blockerIndex)
+        .filter(
+          (_, index) => index !== goalBlocker && index !== failedAssignment,
+        )
         .join('\n')
         .trim(),
-      reason:
-        [blocker, next].filter(Boolean).join(' — ') ||
-        'Worker reported a blocker.',
+      ...(reason ? { reason } : {}),
+      ...(nextStep ? { nextStep } : {}),
+      ...(kind && evidence ? { prerequisite: { kind, evidence } } : {}),
     };
   }
   const doneIndex = exact(GOAL_DONE_MARKER);

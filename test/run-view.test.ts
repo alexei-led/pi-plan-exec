@@ -170,6 +170,8 @@ for (const goal of [
       ...(goal ? { goal } : {}),
       blocked: {
         reason: 'Approval UI unavailable\u001b[31m\nRestore the UI\u202e',
+        nextStep:
+          'Restore approval UI\u001b[31m\nwithout bypassing the guard\u202e',
       },
       needsAttention: true,
     });
@@ -178,6 +180,17 @@ for (const goal of [
     assert.match(view.label, /Blocked/);
     assert.match(view.detail, /Approval UI unavailable.*Restore the UI/);
     assert.equal(view.detail, 'Approval UI unavailable Restore the UI');
+    assert.equal(
+      view.resolution,
+      'Restore approval UI without bypassing the guard',
+    );
+    const strip = renderProgressStrip(held, 160, undefined, 1_000, true).join(
+      '\n',
+    );
+    assert.match(
+      strip,
+      /Resolve: Restore approval UI without bypassing the guard/,
+    );
     assert.match(
       view.warning ?? '',
       new RegExp(`/${goal ? 'goal' : 'exec'} resume run-1`),

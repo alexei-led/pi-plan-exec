@@ -1396,6 +1396,8 @@ test('registry rejects invalid persisted lifecycle shapes', async () => {
     { taskId: 1.5, reason: 'Blocked' },
     { taskId: 1, reason: '  ' },
     { reason: '' },
+    { reason: 'Blocked', nextStep: '' },
+    { reason: 'Blocked', nextStep: '  ' },
   ]) {
     await assert.rejects(
       registry.update({ ...run, blocked }),
@@ -1404,6 +1406,27 @@ test('registry rejects invalid persisted lifecycle shapes', async () => {
   }
 
   const path = join(directory, run.id, 'run.json');
+  for (const nextStep of [null, 42, [], {}]) {
+    await writeFile(
+      path,
+      JSON.stringify({ ...run, blocked: { reason: 'Blocked', nextStep } }),
+    );
+    await assert.rejects(
+      registry.get(run.id),
+      /Invalid plan-exec run registry entry/,
+    );
+  }
+  await writeFile(
+    path,
+    JSON.stringify({
+      ...run,
+      blocked: { reason: 'Blocked', nextStep: 'Restore the approval UI.' },
+    }),
+  );
+  assert.equal(
+    (await registry.get(run.id))?.blocked?.nextStep,
+    'Restore the approval UI.',
+  );
   await writeFile(path, JSON.stringify({ ...run, skippedStages: {} }));
   await assert.rejects(
     registry.get(run.id),
