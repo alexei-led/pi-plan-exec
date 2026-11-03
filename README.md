@@ -136,16 +136,30 @@ commits. An ordinary turn summary is an intermediate answer and the controller
 schedules the next turn automatically. A completion claim only starts
 verification: the required checks, then the configured review and final
 verification, must pass on the committed work. Deleting test files or adding
-`skip`/`only` markers pauses completion for confirmation; three turns without
-progress pause the goal with a recorded reason, and a blocker pauses it until
-`/goal resume <run-id>`. `/goal status`, `/goal pause`, `/goal cancel`, and
+`skip`/`only` markers pauses completion for confirmation. Three consecutive
+unchanged tracked `HEAD`/check comparisons ask the next worker to reassess its
+approach, not pause useful investigation or verification. This counter is not
+proof of no useful work. Automatic turns remain limited by the authorized turn
+budget; exhausting it requires `/goal resume <run-id>` to authorize more turns.
+For new goal turns, an unsuccessful or superseded assignment (`TASK_FAILED`)
+does not by itself pause the whole goal. The next turn reassesses the owning work and must not
+repeat a stopped assignment or bypass a denied action. A goal-wide
+`<<<RALPHEX:GOAL_BLOCKED>>>` report, or an observed prerequisite with a valid
+`Prerequisite:` and `Evidence:`, pauses with the saved reason and resolution.
+`/goal resume <run-id>` continues after that blocker is resolved. An old
+in-flight turn retains its original blocker protocol across upgrade; newly
+launched turns use the new distinction.
+`/goal status`, `/goal pause`, `/goal cancel`, and
 `/goal help` manage the run.
 
 ## Progress without the noise
 
 Pi shows a two-line progress strip: plan title, state, accepted task count and
 current action. Green means healthy running or complete. Amber means waiting,
-uncertain or stopping. Failures are red; paused runs are muted.
+uncertain or stopping. Failures are red; explicit user pauses are muted.
+A blocker-paused run is amber and shows its reason, a separate resolution step,
+and the resume command. Pause notifications spell out Why, Resolve and Resume;
+user pauses and pending worker retirement have distinct explanations.
 Cancelled runs are not displayed.
 Text and symbols carry the same meaning without color. In-flight runs are shown
 as amber snapshots unless this session's local controller owns and polls them.
@@ -153,6 +167,19 @@ Snapshots retain the saved execution label.
 A snapshot is not a claim that the worker is healthy or still running.
 An observed operation pause is amber, not green Working. If one task waits on
 a prerequisite while another runs, the strip shows both work and the wait.
+Warnings come from current blocker, prerequisite or observation evidence, not a
+saved attention flag. The strip shows the reason and the next command; the
+footer includes a shortened reason. Recovered probes and authorized resumes
+remove resolved warnings without hiding independent blockers. Failed controller
+probes show their error as a snapshot until a successful poll restores live
+progress. Routine goal continuation delays are healthy, not retry warnings.
+
+A confirmed, explicitly bounded execution-lifetime expiry continues from the
+preserved checkpoint only after worker retirement is proven; failure output
+cannot complete the goal. Unclassified native child failures (including native
+default timeout messages) still pause with their recorded reason and recovery
+command. Missing retirement proof keeps tracking the same operation, never a
+replacement. Approval and permission blockers are never retried around.
 
 Both commands use the same controls:
 

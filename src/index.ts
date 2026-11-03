@@ -9,7 +9,11 @@ import {
   type ExtensionContext,
   SessionManager,
 } from '@earendil-works/pi-coding-agent';
-import type { AutocompleteItem } from '@earendil-works/pi-tui';
+import {
+  type AutocompleteItem,
+  stripTerminalSequences,
+  truncateToWidth,
+} from '@earendil-works/pi-tui';
 import { parseAdvisoryObservation } from './advisory-observation.js';
 import {
   isDetachedWorkflowFailure,
@@ -60,6 +64,7 @@ import {
 } from './registry.js';
 import { required } from './required.js';
 import {
+  pendingCleanup,
   progressView,
   RunPresentation,
   readViewPreferences,
@@ -441,10 +446,18 @@ export default function planExecExtension(pi: ExtensionAPI): void {
         run.lease?.sessionId === ctx.sessionManager.getSessionId() &&
         run.lease.pid === process.pid &&
         isLocalRun(run);
-      const view = progressView(run, Date.now(), observing());
+      const view = progressView(
+        run,
+        Date.now(),
+        observing(),
+        lastProbeErrors.get(run.id),
+      );
+      const footerDetail = lastProbeErrors.has(run.id)
+        ? (view.warning ?? view.detail)
+        : view.detail;
       ctx.ui.setStatus(
         STATUS_KEY,
-        `${isGoalRun(run) ? 'goal' : 'exec'} ${view.label} · /${isGoalRun(run) ? 'goal' : 'exec'} hide · /${isGoalRun(run) ? 'goal' : 'exec'} status`,
+        `${isGoalRun(run) ? 'goal' : 'exec'} ${view.label}${view.tone !== 'success' ? ` · ${truncateToWidth(footerDetail, 80)}` : ''} · /${isGoalRun(run) ? 'goal' : 'exec'} hide · /${isGoalRun(run) ? 'goal' : 'exec'} status`,
       );
       if (ctx.mode === 'tui') {
         ctx.ui.setWidget(STATUS_KEY, () => ({
@@ -455,13 +468,21 @@ export default function planExecExtension(pi: ExtensionAPI): void {
               (tone, text) => ctx.ui.theme.fg(tone, text),
               Date.now(),
               observing(),
+              lastProbeErrors.get(run.id),
             ),
           invalidate() {},
         }));
       } else {
         ctx.ui.setWidget(
           STATUS_KEY,
-          renderProgressStrip(run, 100, undefined, Date.now(), observing()),
+          renderProgressStrip(
+            run,
+            100,
+            undefined,
+            Date.now(),
+            observing(),
+            lastProbeErrors.get(run.id),
+          ),
         );
       }
     } catch {
@@ -1331,8 +1352,8 @@ export function recoveryGuidance(
             : 'paused for a task blocker',
         action:
           run.blocked.taskId === undefined
-            ? `Goal: ${run.blocked.reason} Resolve the blocker, then run interactive /goal resume ${run.id}; no automatic retry is scheduled.`
-            : `Task ${run.blocked.taskId}: ${run.blocked.reason} Resolve the blocker, then run interactive ${resume}; it asks before retrying the same task. No task was skipped and no automatic retry is scheduled.`,
+            ? `Goal: ${safeStatusText(run.blocked.reason)} Resolve the blocker, then run interactive /goal resume ${run.id}; no automatic retry is scheduled.`
+            : `Task ${run.blocked.taskId}: ${safeStatusText(run.blocked.reason)} Resolve the blocker, then run interactive ${resume}; it asks before retrying the same task. No task was skipped and no automatic retry is scheduled.`,
         command:
           run.blocked.taskId === undefined ? `/goal resume ${run.id}` : resume,
       };
@@ -1485,6 +1506,17 @@ function reportedActivity(
     : undefined;
 }
 
+function safeStatusOutput(value: string): string {
+  return stripTerminalSequences(value).replace(
+    /[\p{Cc}\p{Bidi_Control}]/gu,
+    (character) => (character === '\n' ? character : ' '),
+  );
+}
+
+function safeStatusText(value: string): string {
+  return safeStatusOutput(value).replace(/\s+/gu, ' ').trim();
+}
+
 export function formatRunStatus(
   run: PlanExecRun,
   evidence?: AbandonmentEvidence,
@@ -1534,13 +1566,21 @@ export function formatRunStatus(
     `review: ${run.config.reviewRequired ? 'required' : 'optional'} · ${run.config.reviewBackend}`,
   );
   if (run.goal !== undefined) {
-    lines.push(`turn: ${run.goal.iteration}/${run.config.maxTaskIterations}`);
+    lines.push(`turn: ${run.goal.iteration}/${run.goal.maxTurns}`);
     if (run.goal.lastCheck)
       lines.push(
         `checks: ${run.goal.lastCheck.failures ? `failing — ${run.goal.lastCheck.failures}` : 'passing'}`,
       );
   }
-  if (run.blocked) lines.push(`blocked: ${run.blocked.reason}`);
+  if (run.blocked) {
+    lines.push(`blocked: ${safeStatusText(run.blocked.reason)}`);
+    if (run.blocked.nextStep)
+      lines.push(`resolve: ${safeStatusText(run.blocked.nextStep)}`);
+  }
+  if (operation?.externalPrerequisite)
+    lines.push(
+      `prerequisite: ${operation.externalPrerequisite.kind} — ${operation.externalPrerequisite.evidence}`,
+    );
   if (operation) lines.push(`operation ID: ${operation.operationId}`);
   if (operation?.requestDigest)
     lines.push(`request digest: ${operation.requestDigest}`);
@@ -1663,7 +1703,7 @@ export function formatRunStatus(
       `owner: stale lease for ${run.lease?.sessionId ?? 'unknown session'}; that Pi session is no longer running.`,
     );
   lines.push(`next safe action: ${guidance.action}`);
-  return lines.join('\n');
+  return safeStatusOutput(lines.join('\n'));
 }
 
 function taskStatusLines(run: PlanExecRun): string[] {
@@ -4082,11 +4122,32 @@ function boundedPromise<T>(
 }
 
 export function pausedMessage(run: PlanExecRun): string {
-  return run.blocked
+  if (isGoalRun(run)) {
+    const stopping = pendingCleanup(run);
+    const view = progressView(run, Date.now(), true);
+    return [
+      `Goal run ${shortRunId(run.id)} paused.`,
+      `Why: ${view.detail}`,
+      `Resolve: ${
+        view.resolution ??
+        (stopping
+          ? 'Wait for confirmed worker exit; do not start a replacement.'
+          : run.userStopped
+            ? 'Resume when you want the goal to continue.'
+            : 'Inspect the saved goal status and resolve its recorded failure before resuming.')
+      }`,
+      stopping
+        ? `Inspect: /goal status ${run.id}`
+        : `Resume: /goal resume ${run.id}`,
+      'No automatic retries while paused. Saved work is preserved; resume does not bypass approvals.',
+    ].join('\n');
+  }
+  const message = run.blocked
     ? run.blocked.taskId === undefined
       ? `Goal run ${shortRunId(run.id)} paused: ${run.blocked.reason}\nNo automatic retries. Worktree preserved. Resolve the blocker, then use /goal resume ${run.id}.`
       : `Plan execution ${shortRunId(run.id)} paused at Task ${run.blocked.taskId}: ${run.blocked.reason}\nNo automatic retries. Worktree and checkboxes preserved. Resolve the blocker, then use /exec resume ${run.id}; it asks before retrying the same task.`
     : `Plan execution ${shortRunId(run.id)} is paused; the current attempt is stopping and its checkpoint is preserved. Use /exec resume ${run.id} to continue after confirmed exit.`;
+  return safeStatusOutput(message);
 }
 
 function terminalMessage(run: PlanExecRun): string {
@@ -4198,13 +4259,22 @@ export function goalStatusText(run: PlanExecRun): string {
     `goal: ${goal.text}`,
     `status: ${run.status}`,
     `stage: ${run.stage}`,
-    `turn: ${goal.iteration}/${run.config.maxTaskIterations}`,
+    `turn: ${goal.iteration}/${goal.maxTurns}`,
     `branch: ${run.branch}`,
     `worktree: ${run.worktreeCwd}`,
     `checks: ${run.config.requiredChecks.map((command) => command.join(' ')).join(' · ') || 'none'}`,
     `updated: ${new Date(run.updatedAt).toISOString()}`,
   ];
-  if (run.blocked) lines.push(`blocked: ${run.blocked.reason}`);
+  if (run.blocked) {
+    lines.push(`blocked: ${safeStatusText(run.blocked.reason)}`);
+    if (run.blocked.nextStep)
+      lines.push(`resolve: ${safeStatusText(run.blocked.nextStep)}`);
+    lines.push(
+      pendingCleanup(run)
+        ? `next: /goal status ${run.id} (waiting for confirmed worker exit)`
+        : `resume: /goal resume ${run.id}`,
+    );
+  }
   if (goal.lastCheck)
     lines.push(
       `checks: ${goal.lastCheck.failures ? `failing — ${goal.lastCheck.failures}` : 'passing'}`,
@@ -4213,12 +4283,20 @@ export function goalStatusText(run: PlanExecRun): string {
     lines.push(
       `last outcome: ${goal.lastOutcome.slice(0, GOAL_STATUS_TAIL_LIMIT)}`,
     );
-  if (goal.noProgress) lines.push(`turns without progress: ${goal.noProgress}`);
-  if (run.activeOperation)
+  if (goal.noProgress)
+    lines.push(`turns with unchanged tracked HEAD/checks: ${goal.noProgress}`);
+  if (run.activeOperation) {
     lines.push(
       `operation: ${run.activeOperation.service}/${run.activeOperation.kind} · ${run.activeOperation.operationId}`,
     );
-  return lines.join('\n');
+    if (run.activeOperation.externalPrerequisite)
+      lines.push(
+        `prerequisite: ${run.activeOperation.externalPrerequisite.kind} — ${run.activeOperation.externalPrerequisite.evidence}`,
+      );
+    if (run.activeOperation.lastStatusError)
+      lines.push(`observation error: ${run.activeOperation.lastStatusError}`);
+  }
+  return safeStatusOutput(lines.join('\n'));
 }
 
 export function goalHelp(): string {

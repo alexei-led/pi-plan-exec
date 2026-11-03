@@ -104,6 +104,7 @@ test('pack accepts the tested host peer without private runtime copies', {
   );
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /@alexeiled\/pi-plan-exec@/);
+  assert.match(result.stdout, /- CHANGELOG\.md/);
 });
 
 test('package manifest ships only plan-exec resources, needs no runtime dependency, and requires native peers without removed packages', async () => {

@@ -13,6 +13,7 @@ import { homedir, hostname } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { parseOperationActivity } from './diagnostics.js';
 import { worktreeIdentity } from './git.js';
+import { GOAL_OUTCOME_VERSION } from './goal-loop.js';
 import { validLegacyImport } from './legacy-operation.js';
 import { isSkippableStage, isTerminalStatus } from './lifecycle.js';
 import { hasActiveLocalOperations } from './local-operation.js';
@@ -1005,7 +1006,10 @@ function assertRun(run: PlanExecRun): void {
         (run.blocked.taskId !== undefined &&
           (!Number.isInteger(run.blocked.taskId) || run.blocked.taskId < 1)) ||
         typeof run.blocked.reason !== 'string' ||
-        !run.blocked.reason.trim())) ||
+        !run.blocked.reason.trim() ||
+        (run.blocked.nextStep !== undefined &&
+          (typeof run.blocked.nextStep !== 'string' ||
+            !run.blocked.nextStep.trim())))) ||
     !isValidOperationForStage(run.activeOperation, run.stage) ||
     !isValidOperationForStage(run.failedOperation, run.stage)
   ) {
@@ -1227,6 +1231,11 @@ function isAutonomousState(run: PlanExecRun): boolean {
     if (
       !validNativeOperation(operation, run.id) ||
       !validLegacyImport(operation, run.id)
+    )
+      return false;
+    if (
+      operation?.goalOutcomeVersion !== undefined &&
+      operation.goalOutcomeVersion !== GOAL_OUTCOME_VERSION
     )
       return false;
     const commit = operation?.reviewedCommit;

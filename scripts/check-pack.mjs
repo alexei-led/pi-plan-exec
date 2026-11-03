@@ -40,8 +40,14 @@ if (invalid.length > 0) {
   process.exit(1);
 }
 
-const ALWAYS_ALLOWED = new Set(['LICENSE', 'README.md', 'package.json']);
+const ALWAYS_ALLOWED = new Set([
+  'CHANGELOG.md',
+  'LICENSE',
+  'README.md',
+  'package.json',
+]);
 const REQUIRED = new Set([
+  'CHANGELOG.md',
   'LICENSE',
   'README.md',
   'package.json',

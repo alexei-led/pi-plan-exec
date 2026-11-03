@@ -14,6 +14,17 @@ The controller owns the worktree writer,
 dependency scheduling, retries, recovery, accepted commits, and review stages.
 Never replace controller recovery with a manually launched subagent.
 
+New goal turns distinguish an unsuccessful assignment from a blocked goal.
+Old in-flight turns keep their original blocker protocol across upgrades.
+`TASK_FAILED` alone asks the next goal turn to reassess; it does not pause the
+whole goal. Preserve supervisor stops: do not repeat a stopped assignment or
+bypass a denied action. Only report `<<<RALPHEX:GOAL_BLOCKED>>>` when the entire
+goal cannot continue, followed by `Blocker:` and a concrete `Next step:`.
+An observed prerequisite with valid `Prerequisite:` and `Evidence:` fields also
+pauses the goal. The pause reports Why, Resolve and Resume separately; resolve
+the condition before `/goal resume <run-id>`. Explicit user pauses, turn-budget
+approval, native failure and retirement guards still apply.
+
 ## Choose the job
 
 - Create a plan: write a Markdown plan under `docs/plans/` using the supported

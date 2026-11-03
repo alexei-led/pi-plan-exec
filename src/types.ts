@@ -295,6 +295,8 @@ export interface NativeOperationMetadata {
 }
 
 export interface ActiveOperation {
+  /** Missing on legacy launches, whose TASK_FAILED still blocks the whole goal. */
+  goalOutcomeVersion?: 2;
   /** Explicit read-only schema-7 snapshot import; never dispatch authority. */
   legacyImport?: {
     journalPath: string;
@@ -430,6 +432,7 @@ export interface GoalState {
   hash: string;
   iteration: number;
   maxTurns: number;
+  /** Consecutive unchanged tracked HEAD/check comparisons, not proof of no useful work. */
   noProgress: number;
   lastOutcome?: string;
   lastCheck?: GoalCheckEvidence;
@@ -574,7 +577,7 @@ export interface PlanExecRun {
   activeOperation?: ActiveOperation;
   failedOperation?: ActiveOperation;
   /** Explicit stop: incomplete task or unmet goal, no automatic retry, resumable after confirmation. */
-  blocked?: { taskId?: number; reason: string };
+  blocked?: { taskId?: number; reason: string; nextStep?: string };
   /** One recovery launch only; consumed when the replacement child is recorded. */
   recoveryModel?: string;
   config: FrozenRunConfig;
