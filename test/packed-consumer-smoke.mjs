@@ -18,11 +18,21 @@ import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import test from 'node:test';
+import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 
 const execute = promisify(execFile);
 const project = resolve('.');
 const removed = ['@alexeiled/pi-subagents-bridge', '@tintinweb/pi-tasks'];
+const piBaseline = '1.0.4';
+const piHostFamily = [
+  'chord',
+  'pi-agent-core',
+  'pi-ai',
+  'pi-codemode',
+  'pi-mcp',
+  'pi-tui',
+].map((name) => `@earendil-works/${name}`);
 
 async function waitFor(read, label, timeout = 90000) {
   const deadline = Date.now() + timeout;
@@ -347,6 +357,9 @@ test('packed normal loader: native execution, recovery, readonly controls, super
         name: 'isolated-plan-consumer',
         private: true,
         type: 'module',
+        overrides: Object.fromEntries(
+          piHostFamily.map((name) => [name, piBaseline]),
+        ),
       }),
     );
     await execute(
@@ -376,6 +389,25 @@ test('packed normal loader: native execution, recovery, readonly controls, super
         createRequire(join(installed, 'src/index.ts')).resolve(name),
       );
     }
+    for (const name of [...piHostFamily, '@earendil-works/pi-coding-agent']) {
+      const installedHost = await json(
+        join(consumer, 'node_modules', name, 'package.json'),
+      );
+      assert.equal(
+        installedHost?.version,
+        piBaseline,
+        `${name} must use the tested Pi baseline`,
+      );
+    }
+    const declarations = await import(
+      pathToFileURL(
+        join(
+          consumer,
+          'node_modules/@earendil-works/pi-codemode/dist/declarations.js',
+        ),
+      ).href
+    );
+    assert.equal(typeof declarations.MCP_TYPESCRIPT_PREAMBLE, 'string');
     const native = join(consumer, 'node_modules/pi-subagents');
     assert.equal((await json(join(native, 'package.json'))).version, '0.76.1');
     const preload = join(sandbox, 'isolate.mjs');

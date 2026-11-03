@@ -9,8 +9,8 @@ pi install /absolute/path/to/pi-plan-exec
 ```
 
 Restart Pi after upgrading installed packages. Reload is for local extension
-source/config changes, not mixed loaded/installed package versions:
-
+source/config changes, not mixed loaded/installed package versions. For local
+source/config changes only:
 
 ```text
 /reload
@@ -62,9 +62,11 @@ hosts to prove keyed-workflow request correlation and exact child retirement;
 direct-leaf missing correlation remains an explicit negative case.
 
 `test:packed-consumer` creates a real npm tarball and a dedicated temporary
-consumer, using npm 12.0.2 to install only Pi 1.0.4, pi-subagents 0.76.1 and the
-package. It asserts that neither removed package resolves from the consumer or
-extension. A localhost OpenAI-compatible scripted model uses no user credentials
+consumer, using npm 12.0.2 to install Pi 1.0.4, pi-subagents 0.76.1 and the
+package. The fixture overrides and checks Pi's six host-family packages at 1.0.4;
+it verifies the codemode declaration export before starting Pi. Other transitive
+dependencies are resolved at install time. It asserts that neither removed
+package resolves from the consumer or extension. A localhost OpenAI-compatible scripted model uses no user credentials
 or paid API. Pi loads packages and observer extensions normally, without
 `--no-extensions` or replacement production clients. Child-mode loading must not
 register `/exec`/`/goal` or take parent leases. Tests cover plan/goal, default
@@ -113,20 +115,32 @@ Target package:
 Normal releases are tag-driven. Choose patch, minor or major from the compatibility
 impact, update
 `package.json`, `package-lock.json`, and `CHANGELOG.md`, then commit the release
-version before tagging:
+version in a release branch or worktree. Merge the reviewed release PR only
+after all checks pass; do not commit or push directly to `main`.
 
 ```bash
 npm run test:all
 git commit -am "chore: release <version>"
-git tag v<version>
-git push origin main --follow-tags
+git push -u origin HEAD
+gh pr create --repo alexei-led/pi-plan-exec --base main
+```
+
+After the PR merges, fetch its merge commit and tag that exact commit:
+
+```bash
+git fetch origin main
+git merge-base --is-ancestor <release-commit> origin/main
+git tag v<version> <release-commit>
+git push origin refs/tags/v<version>
 ```
 
 Use `npm version patch`, `npm version minor` or `npm version major` only when it is the command that
 makes the intended version change; do not bump an already versioned release a
 second time.
 
-The release workflow runs only for pushed `v*` tags. It rejects a tag that does
+PR CI runs the native and packed integration gates. The release workflow runs
+only for pushed `v*` tags; it runs lint, types, unit tests and package dry run,
+not the native or packed gates. It rejects a tag that does
 not match `package.json` or is not on `main`, runs the validation gate, publishes
 with npm provenance, and creates a GitHub Release.
 
