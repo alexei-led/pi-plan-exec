@@ -32,6 +32,11 @@ import {
 } from './execution-contract.js';
 import { FusionClient } from './fusion.js';
 import { isPathWithin } from './git.js';
+import {
+  executionPreviewText,
+  type InspectorAction,
+  inspectRun,
+} from './inspector.js';
 import { legacyImportGuidance } from './legacy-operation.js';
 import {
   ABANDONMENT,
@@ -50,7 +55,7 @@ import {
   requirePlanPath,
 } from './lifecycle.js';
 import { registerNativeReviewer } from './native-reviewer.js';
-import { NativeRuntimeClient } from './native-runtime.js';
+import { NativeSingleRuntimeClient as NativeRuntimeClient } from './native-single-runtime.js';
 import { readPlan } from './plan.js';
 import { appendProgress } from './progress.js';
 import {
@@ -96,7 +101,10 @@ import { workspaceCommand } from './workspace-environment.js';
 
 const defaultRegistry = new RunRegistry();
 const STATUS_KEY = 'plan-exec';
+const INSPECT_ACTION = 'inspect';
 const RUNTIME_TIMEOUT_MS = 1_500;
+const OBSERVATION_FRESHNESS_MS = 15_000;
+const GIT_EVIDENCE_MAX_BYTES = 16 * 1024 * 1024;
 const COMMAND_CAS_RETRIES = 5;
 const SESSION_RETIREMENTS_KEY = Symbol.for(
   'pi-plan-exec.session-retirements.v1',
@@ -190,6 +198,11 @@ function requiredSetupCommands(): string[] {
 /** Primary verbs only: a retired name still dispatches, but is never taught. */
 const EXEC_COMMANDS: AutocompleteItem[] = [
   { value: 'status', label: 'status', description: 'Inspect runs' },
+  {
+    value: INSPECT_ACTION,
+    label: INSPECT_ACTION,
+    description: 'Run details and exact-ID actions',
+  },
   {
     value: 'resume',
     label: 'resume',
@@ -374,7 +387,14 @@ export default function planExecExtension(pi: ExtensionAPI): void {
   const fusion = new FusionClient(pi.events);
   const runCommand = async (command: string, args: string[], cwd: string) => {
     const invocation = workspaceCommand(command, args);
-    const result = await pi.exec(invocation.command, invocation.args, { cwd });
+    const result = await pi.exec(invocation.command, invocation.args, {
+      cwd,
+      maxBuffer: GIT_EVIDENCE_MAX_BYTES,
+    });
+    if (result.truncated)
+      throw new Error(
+        'Command evidence exceeded the output limit; no partial output was accepted. Narrow the command or repository scope.',
+      );
     return {
       stdout: result.stdout,
       stderr: result.stderr,
@@ -392,6 +412,9 @@ export default function planExecExtension(pi: ExtensionAPI): void {
 
   const activeControllers = new Map<string, ReturnType<typeof setInterval>>();
   const inFlightControllers = new Map<string, Promise<PlanExecRun>>();
+  const lastSuccessfulObservations = new Map<string, number>();
+  const controllerTicks = new Map<string, () => void>();
+  let disposeJobsChanged: (() => void) | undefined;
   const ownedRuns = new Set<string>();
   const handoffPreparations = new Set<{
     settled: Promise<void>;
@@ -443,6 +466,8 @@ export default function planExecExtension(pi: ExtensionAPI): void {
       const observing = () =>
         activeControllers.has(run.id) &&
         !lastProbeErrors.has(run.id) &&
+        Date.now() - (lastSuccessfulObservations.get(run.id) ?? -Infinity) <=
+          OBSERVATION_FRESHNESS_MS &&
         run.lease?.sessionId === ctx.sessionManager.getSessionId() &&
         run.lease.pid === process.pid &&
         isLocalRun(run);
@@ -452,12 +477,10 @@ export default function planExecExtension(pi: ExtensionAPI): void {
         observing(),
         lastProbeErrors.get(run.id),
       );
-      const footerDetail = lastProbeErrors.has(run.id)
-        ? (view.warning ?? view.detail)
-        : view.detail;
+      const probeProblem = lastProbeErrors.get(run.id);
       ctx.ui.setStatus(
         STATUS_KEY,
-        `${isGoalRun(run) ? 'goal' : 'exec'} ${view.label}${view.tone !== 'success' ? ` · ${truncateToWidth(footerDetail, 80)}` : ''} · /${isGoalRun(run) ? 'goal' : 'exec'} hide · /${isGoalRun(run) ? 'goal' : 'exec'} status`,
+        `${isGoalRun(run) ? 'goal' : 'exec'} ${view.label} · ${shortRunId(run.id)}${probeProblem ? ` · ${truncateToWidth(safeStatusText(probeProblem), 60)}` : ''} · /exec inspect`,
       );
       if (ctx.mode === 'tui') {
         ctx.ui.setWidget(STATUS_KEY, () => ({
@@ -469,6 +492,7 @@ export default function planExecExtension(pi: ExtensionAPI): void {
               Date.now(),
               observing(),
               lastProbeErrors.get(run.id),
+              lastSuccessfulObservations.get(run.id),
             ),
           invalidate() {},
         }));
@@ -482,6 +506,7 @@ export default function planExecExtension(pi: ExtensionAPI): void {
             Date.now(),
             observing(),
             lastProbeErrors.get(run.id),
+            lastSuccessfulObservations.get(run.id),
           ),
         );
       }
@@ -498,6 +523,8 @@ export default function planExecExtension(pi: ExtensionAPI): void {
     const timer = activeControllers.get(runId);
     if (timer) clearInterval(timer);
     activeControllers.delete(runId);
+    controllerTicks.delete(runId);
+    lastSuccessfulObservations.delete(runId);
     lastStates.delete(runId);
     lastProbeErrors.delete(runId);
   };
@@ -552,7 +579,7 @@ export default function planExecExtension(pi: ExtensionAPI): void {
     ownedRuns.add(runId);
     lastStates.set(runId, runState(initialRun));
     setStatus(initialRun, ctx);
-    const timer = setInterval(() => {
+    const tick = () => {
       if (sessionClosed || inFlightControllers.has(runId)) return;
       const ticking = controller.tick(runId, sessionId);
       inFlightControllers.set(runId, ticking);
@@ -560,6 +587,7 @@ export default function planExecExtension(pi: ExtensionAPI): void {
         .then(async (run) => {
           if (sessionClosed || abandonedRuns.has(runId)) return run;
           lastProbeErrors.delete(runId);
+          lastSuccessfulObservations.set(runId, Date.now());
           if (handoffWhenReady && canHandoffPreparedWorktree(run)) {
             // Session startup must be able to install the target's controller.
             stopBackgroundController(runId);
@@ -624,9 +652,11 @@ export default function planExecExtension(pi: ExtensionAPI): void {
           if (inFlightControllers.get(runId) === ticking)
             inFlightControllers.delete(runId);
         });
-    }, CONTROLLER_POLL_INTERVAL_MS);
+    };
+    const timer = setInterval(tick, CONTROLLER_POLL_INTERVAL_MS);
     timer.unref();
     activeControllers.set(runId, timer);
+    controllerTicks.set(runId, tick);
   };
 
   /** Track a run allocation so session retirement waits for it, exactly as /exec does. */
@@ -683,7 +713,7 @@ export default function planExecExtension(pi: ExtensionAPI): void {
         );
       }
       if (viewAction === 'hide') {
-        if (toggle && presentation.preferences().hidden) presentation.show();
+        if (toggle) presentation.toggleVisibility();
         else presentation.hide();
       } else if (viewAction === 'show') presentation.show(viewId);
       else presentation.clear(viewId);
@@ -715,6 +745,7 @@ export default function planExecExtension(pi: ExtensionAPI): void {
     try {
       if (await handleDisplayCommand(args, ctx)) return;
       const viewAction = args.trim().split(/\s+/)[0];
+      const selectedRun = presentation.current();
       const message = await handleCommand(args.trim(), ctx, {
         controller,
         startBackgroundController,
@@ -722,6 +753,13 @@ export default function planExecExtension(pi: ExtensionAPI): void {
         checkRuntime,
         runtimeProblems,
         doctorProbe,
+        ...(selectedRun ? { preferredRunId: selectedRun.id } : {}),
+        onSelected: (run) => {
+          presentation.remember(run);
+          presentation.show(run.id);
+          pi.appendEntry(VIEW_ENTRY, presentation.preferences());
+          renderStatus(ctx);
+        },
         isSessionClosed: () => sessionClosed,
         recordRun: (run) => {
           ownedRuns.add(run.id);
@@ -770,7 +808,10 @@ export default function planExecExtension(pi: ExtensionAPI): void {
         );
         renderStatus(ctx);
       }
-      if (message) notify(ctx, message, 'info');
+      if (message) {
+        if (ctx.mode === 'print') process.stdout.write(`${message}\n`);
+        else notify(ctx, message, 'info');
+      }
     } catch (error: unknown) {
       notify(
         ctx,
@@ -797,15 +838,29 @@ export default function planExecExtension(pi: ExtensionAPI): void {
       try {
         if (sessionClosed || (await handleDisplayCommand(args, ctx))) return;
         const parsed = parseGoalCommand(args);
+        if (parsed.action === INSPECT_ACTION) {
+          await executeCommand(args, ctx);
+          return;
+        }
         if (parsed.action === 'hide') return;
         if (parsed.action === EXEC_ACTION.HELP) {
           notify(ctx, goalHelp(), 'info');
           return;
         }
         if (parsed.action === EXEC_ACTION.STATUS) {
-          const run = await resolveGoalRun(parsed.id, ctx.cwd);
+          const displayed = presentation.current();
+          const run = await resolveGoalRun(
+            parsed.id,
+            ctx,
+            EXEC_ACTION.STATUS,
+            displayed && isGoalRun(displayed) ? displayed.id : undefined,
+          );
           if (!run) throw new Error('No goal run found.');
-          notify(ctx, goalStatusText(run), 'info');
+          notify(
+            ctx,
+            goalStatusText(run, await runEvidence(run, doctorProbe)),
+            'info',
+          );
           return;
         }
         if (
@@ -813,11 +868,30 @@ export default function planExecExtension(pi: ExtensionAPI): void {
           parsed.action === EXEC_ACTION.PAUSE ||
           parsed.action === EXEC_ACTION.CANCEL
         ) {
-          const run = await resolveGoalRun(parsed.id, ctx.cwd, parsed.action);
+          const displayed = presentation.current();
+          const run = await resolveGoalRun(
+            parsed.id,
+            ctx,
+            parsed.action,
+            displayed && isGoalRun(displayed) ? displayed.id : undefined,
+          );
           if (!run) throw new Error('No goal run found.');
-          await executeCommand(`${parsed.action} ${run.id}`, ctx);
+          await executeCommand(
+            `${parsed.action} ${run.id} ${(parsed.options ?? []).join(' ')}`,
+            ctx,
+          );
           return;
         }
+        if (
+          ctx.mode === 'tui' &&
+          !(await ctx.ui.confirm(
+            'Start goal execution?',
+            executionPreviewText(
+              await controller.previewGoal(ctx.cwd, parsed.checks),
+            ),
+          ))
+        )
+          return;
         const run = await withPendingMutation((recordRun) =>
           controller.startGoal({
             goal: parsed.goal,
@@ -856,6 +930,14 @@ export default function planExecExtension(pi: ExtensionAPI): void {
   });
 
   pi.on('session_start', async (_event, ctx) => {
+    disposeJobsChanged?.();
+    disposeJobsChanged = pi.events.on(
+      'subagent:jobs-changed',
+      (value: unknown) => {
+        if (sessionClosed || !isRecord(value) || value.version !== 1) return;
+        for (const tick of controllerTicks.values()) tick();
+      },
+    );
     currentContext = ctx;
     reviewer?.dispose();
     try {
@@ -877,13 +959,11 @@ export default function planExecExtension(pi: ExtensionAPI): void {
     if (displayTimer) clearInterval(displayTimer);
     displayTimer = setInterval(() => {
       const displayed = presentation.current();
-      if (
-        sessionClosed ||
-        refreshingDisplay ||
-        !displayed ||
-        activeControllers.has(displayed.id)
-      )
+      if (sessionClosed || refreshingDisplay || !displayed) return;
+      if (activeControllers.has(displayed.id)) {
+        renderStatus(ctx);
         return;
+      }
       refreshingDisplay = true;
       void defaultRegistry
         .get(displayed.id)
@@ -960,6 +1040,8 @@ export default function planExecExtension(pi: ExtensionAPI): void {
   });
 
   pi.on('session_shutdown', async (event, ctx) => {
+    disposeJobsChanged?.();
+    disposeJobsChanged = undefined;
     native.dispose();
     reviewer?.dispose();
     presentation.hide();
@@ -1344,6 +1426,12 @@ export function recoveryGuidance(
         };
   }
   if (run.status === RUN_STATUS.PAUSED) {
+    if (pendingCleanup(run))
+      return {
+        classification: 'paused; waiting for confirmed worker exit',
+        action: `Wait for confirmed worker exit. Inspect ${status}; cleanup is not a replacement authorization.`,
+        command: status,
+      };
     if (run.blocked)
       return {
         classification:
@@ -1532,7 +1620,7 @@ export function formatRunStatus(
       }`
     : 'idle';
   const lines = [
-    `Run ${run.id}`,
+    `${isGoalRun(run) ? 'Goal' : 'Run'} ${run.id}`,
     run.goal !== undefined ? `goal: ${run.goal.text}` : `plan: ${run.planPath}`,
     `status: ${run.status}`,
     `stage: ${run.stage}`,
@@ -1567,6 +1655,17 @@ export function formatRunStatus(
   );
   if (run.goal !== undefined) {
     lines.push(`turn: ${run.goal.iteration}/${run.goal.maxTurns}`);
+    lines.push(
+      `checks: ${run.config.requiredChecks.map((command) => command.join(' ')).join(' · ') || 'none'}`,
+    );
+    if (run.goal.lastOutcome)
+      lines.push(
+        `last outcome: ${run.goal.lastOutcome.slice(0, GOAL_STATUS_TAIL_LIMIT)}`,
+      );
+    if (run.goal.noProgress)
+      lines.push(
+        `turns with unchanged tracked HEAD/checks: ${run.goal.noProgress}`,
+      );
     if (run.goal.lastCheck)
       lines.push(
         `checks: ${run.goal.lastCheck.failures ? `failing — ${run.goal.lastCheck.failures}` : 'passing'}`,
@@ -1582,6 +1681,19 @@ export function formatRunStatus(
       `prerequisite: ${operation.externalPrerequisite.kind} — ${operation.externalPrerequisite.evidence}`,
     );
   if (operation) lines.push(`operation ID: ${operation.operationId}`);
+  if (operation?.native) {
+    const requested = operation.native.request.params.model;
+    lines.push(
+      `native adapter: ${operation.native.version === 2 ? 'direct single (v2)' : 'historical workflow (v1)'}`,
+    );
+    lines.push(
+      `model requested: ${typeof requested === 'string' ? requested : 'inherited by the native launch'}`,
+    );
+    lines.push(
+      `model reported: ${operation.native.reportedModel ?? 'unavailable'}`,
+    );
+    lines.push('native maxTurns: requested only, not enforced');
+  }
   if (operation?.requestDigest)
     lines.push(`request digest: ${operation.requestDigest}`);
   if (operation?.lastLaunchError)
@@ -1632,7 +1744,8 @@ export function formatRunStatus(
     );
   lines.push(...taskStatusLines(run));
   const usage = totalUsage(run);
-  if (usage) lines.push(`usage: ${usage}`);
+  if (usage)
+    lines.push(`usage: ${usage} (native-reported; billing basis unavailable)`);
   if (run.statsReport)
     lines.push(
       `stats report: ${run.statsReport.state} — ${run.statsReport.error ?? run.statsReport.summary}`,
@@ -1661,6 +1774,8 @@ export function formatRunStatus(
   // observed live lease adds the claim that something is still trying.
   const polling =
     evidence?.leaseLive === true && isLocalRun(run) ? '; retrying' : '';
+  if (operation?.lastStatusError && !operation.statusFailures)
+    lines.push(`observation error: ${operation.lastStatusError}`);
   if (operation?.statusFailures) {
     lines.push(
       `observation: unavailable (${operation.statusFailures} failed probes)${polling}${operation.lastStatusError ? ` — ${operation.lastStatusError}` : ''}`,
@@ -2797,6 +2912,8 @@ interface CommandDependencies {
   checkRuntime: RuntimeCheck;
   runtimeProblems: RuntimeProbe;
   doctorProbe: EvidenceProbe;
+  preferredRunId?: string;
+  onSelected?: (run: PlanExecRun) => void;
   handoff?: typeof handoffToWorktree;
   isSessionClosed?: () => boolean;
   handoffLifecycle?: HandoffLifecycle;
@@ -2833,14 +2950,7 @@ export function shouldAutoRestoreRun(
   run: PlanExecRun,
   sessionId: string,
 ): boolean {
-  const pausedCleanup =
-    run.status === RUN_STATUS.PAUSED &&
-    (run.localOperationActive === true ||
-      Boolean(
-        run.activeOperation &&
-          !run.activeOperation.processTreeExited &&
-          !run.activeOperation.launchFenced,
-      ));
+  const pausedCleanup = run.status === RUN_STATUS.PAUSED && pendingCleanup(run);
   if (
     (!isInFlightStatus(run.status) && !pausedCleanup) ||
     isTerminal(run.status)
@@ -2862,11 +2972,7 @@ export function shouldAutoRestoreRun(
 export function shouldStopBackgroundController(run: PlanExecRun): boolean {
   return (
     isTerminal(run.status) ||
-    (run.status === RUN_STATUS.PAUSED &&
-      !run.localOperationActive &&
-      (!run.activeOperation ||
-        run.activeOperation.processTreeExited === true ||
-        run.activeOperation.launchFenced === true))
+    (run.status === RUN_STATUS.PAUSED && !pendingCleanup(run))
   );
 }
 
@@ -2914,6 +3020,29 @@ export async function handleCommand(
     : args.split(/\s+/).filter(Boolean);
   const [subcommand, ...rest] = words;
   if (subcommand === EXEC_ACTION.HELP) return execHelp(rest[0] === 'advanced');
+  if (subcommand === INSPECT_ACTION) {
+    if (rest.length > 1 || rest[0]?.startsWith('--'))
+      throw new Error('Usage: /exec inspect [full-run-id]');
+    const run = await resolveRunForAction(
+      EXEC_ACTION.STATUS,
+      rest[0],
+      ctx,
+      false,
+      dependencies.preferredRunId,
+    );
+    dependencies.onSelected?.(run);
+    const actions: InspectorAction[] = ['resume', 'pause', 'cancel'];
+    const result = await inspectRun(
+      ctx,
+      run,
+      formatRunStatus(run, await runEvidence(run, doctorProbe)),
+      actions.filter((action) => isActionAllowed(action, run)),
+    );
+    if (result.kind === 'text') return result.text;
+    if (result.kind === 'action')
+      return runAction(result.action, [run.id], ctx, dependencies);
+    return undefined;
+  }
   if (subcommand === ISOLATION_ACTION)
     return recoverIsolatedCommand(args, ctx, dependencies);
   if (subcommand === EXEC_ACTION.CLEANUP)
@@ -2971,6 +3100,22 @@ export async function handleCommand(
   await checkRuntime();
   const useWorktree =
     worktreePath === undefined && (await chooseIsolation(ctx));
+  if (dependencies.isSessionClosed?.()) return undefined;
+  if (
+    ctx.mode === 'tui' &&
+    !(await ctx.ui.confirm(
+      'Start plan execution?',
+      executionPreviewText(
+        await controller.previewStart({
+          cwd: ctx.cwd,
+          planPath,
+          useWorktree,
+          ...(worktreePath ? { existingWorktree: worktreePath } : {}),
+        }),
+      ),
+    ))
+  )
+    return 'Plan execution cancelled before allocation.';
   if (dependencies.isSessionClosed?.()) return undefined;
   const started = await mutateCommand(dependencies, async () => {
     const run = await controller.start({
@@ -3191,6 +3336,7 @@ async function runAction(
     resumeArguments ? resumeArguments.selector : rest[0],
     ctx,
     resumeArguments?.adoptCurrentBranch,
+    dependencies.preferredRunId,
   );
   dependencies.recordRun?.(resolved);
   if (dependencies.isSessionClosed?.()) return undefined;
@@ -3441,6 +3587,7 @@ async function resolveRunForAction(
   selector: string | undefined,
   ctx: ExtensionContext,
   adoptCurrentBranch = false,
+  preferredRunId?: string,
 ): Promise<PlanExecRun> {
   if (selector) {
     const run = await defaultRegistry.get(selector);
@@ -3466,6 +3613,23 @@ async function resolveRunForAction(
     throw new Error(
       `No ${verb} plan execution run found here. Use /exec status or /exec <plan> to start one.`,
     );
+  }
+  return selectContextualRun(candidates, action, ctx, preferredRunId);
+}
+
+export async function selectContextualRun(
+  candidates: PlanExecRun[],
+  action: RunAction,
+  ctx: ExtensionContext,
+  selectedId?: string,
+): Promise<PlanExecRun> {
+  if (selectedId) {
+    const selected = candidates.find((run) => run.id === selectedId);
+    if (!selected)
+      throw new Error(
+        `The selected run cannot ${action}; specify another full run ID.`,
+      );
+    return selected;
   }
   const preferred = prioritizeRunCandidates(candidates, ctx.cwd);
   if (preferred.length === 1) return required(preferred[0]);
@@ -3529,7 +3693,7 @@ async function handoffToWorktree(
   }
 }
 
-async function prepareSessionHandoff(
+export async function prepareSessionHandoff(
   ctx: ExtensionCommandContext,
   run: PlanExecRun,
   syncRuntime: SyncRuntime,
@@ -3613,7 +3777,10 @@ async function prepareSessionHandoff(
           `Plan-exec switched to its worktree:\n${claimed.worktreeCwd}\nBranch: ${claimed.branch}`,
           'info',
         );
-        if (followUp) await worktreeCtx.sendUserMessage(`/exec ${followUp}`);
+        if (followUp)
+          await worktreeCtx.sendUserMessage(`/exec ${followUp}`, {
+            expandPromptTemplates: true,
+          });
       },
     });
     if (!result.cancelled) {
@@ -4056,7 +4223,7 @@ function observationLabel(run: PlanExecRun): string {
   if (!isLocalRun(run)) return 'owner is on an unobserved host';
   const failures = run.activeOperation?.statusFailures;
   return failures
-    ? `cannot observe worker (${failures} failed probes)`
+    ? 'cannot observe worker; automatic retry continues'
     : 'polling worker';
 }
 
@@ -4167,11 +4334,13 @@ export type GoalCommand =
   | { action: 'help' }
   | { action: 'hide' }
   | { action: 'status'; id?: string }
-  | { action: 'resume'; id?: string }
-  | { action: 'pause'; id?: string }
-  | { action: 'cancel'; id?: string };
+  | { action: typeof INSPECT_ACTION; id?: string }
+  | { action: 'resume'; id?: string; options?: string[] }
+  | { action: 'pause'; id?: string; options?: string[] }
+  | { action: 'cancel'; id?: string; options?: string[] };
 
 const GOAL_ACTIONS = new Set<string>([
+  INSPECT_ACTION,
   'hide',
   EXEC_ACTION.HELP,
   EXEC_ACTION.STATUS,
@@ -4185,8 +4354,29 @@ const GOAL_ACTIONS = new Set<string>([
 export function parseGoalCommand(input: string): GoalCommand {
   const trimmed = input.trim();
   if (!trimmed) return { action: 'help' };
-  const [head, ...rest] = trimmed.split(/\s+/u);
+  const [head, ...rest] = trimmed.match(/"[^"]*"|'[^']*'|\S+/gu) ?? [];
   if (head && GOAL_ACTIONS.has(head)) {
+    if (head === EXEC_ACTION.RESUME) {
+      const parsed = parseResumeArguments(rest);
+      const options = rest.slice(parsed.selector ? 1 : 0);
+      return {
+        action: 'resume',
+        ...(parsed.selector ? { id: parsed.selector } : {}),
+        ...(options.length ? { options } : {}),
+      };
+    }
+    if (
+      (head === EXEC_ACTION.CANCEL || head === EXEC_ACTION.STOP) &&
+      rest.includes('--force')
+    ) {
+      if (
+        rest.length !== 2 ||
+        rest[1] !== '--force' ||
+        rest[0]?.startsWith('--')
+      )
+        throw new Error('Usage: /goal cancel <full-run-id> --force');
+      return { action: 'cancel', id: required(rest[0]), options: ['--force'] };
+    }
     if (
       rest.length > 1 ||
       rest.some((arg) => arg.startsWith('--')) ||
@@ -4199,7 +4389,7 @@ export function parseGoalCommand(input: string): GoalCommand {
     if (head === 'hide') return { action: 'hide' };
     const action = head === EXEC_ACTION.STOP ? EXEC_ACTION.CANCEL : head;
     return {
-      action: action as 'status' | 'resume' | 'pause' | 'cancel',
+      action: action as 'status' | 'inspect' | 'resume' | 'pause' | 'cancel',
       ...(rest[0] ? { id: rest[0] } : {}),
     };
   }
@@ -4229,74 +4419,34 @@ export function parseGoalChecks(input: string): {
 
 async function resolveGoalRun(
   id: string | undefined,
-  cwd: string,
+  ctx: ExtensionContext,
   action: RunAction = EXEC_ACTION.STATUS,
+  preferredId?: string,
 ): Promise<PlanExecRun | undefined> {
   if (id) {
     const run = await defaultRegistry.get(id);
     return run && isGoalRun(run) ? run : undefined;
   }
   const { runs } = await defaultRegistry.listWithErrors();
-  return prioritizeRunCandidates(
-    runs.filter(
-      (run) =>
-        isGoalRun(run) &&
-        isActionAllowed(action, run) &&
-        matchesContext(run, cwd) &&
-        !run.displayDismissed &&
-        run.status !== RUN_STATUS.CANCELLED &&
-        run.status !== RUN_STATUS.CANCEL_PENDING,
-    ),
-    cwd,
-  ).sort((a, b) => b.updatedAt - a.updatedAt)[0];
+  const candidates = runs.filter(
+    (run) =>
+      isGoalRun(run) &&
+      isActionAllowed(action, run) &&
+      matchesContext(run, ctx.cwd) &&
+      !run.displayDismissed &&
+      run.status !== RUN_STATUS.CANCELLED &&
+      run.status !== RUN_STATUS.CANCEL_PENDING,
+  );
+  if (!candidates.length) return undefined;
+  return selectContextualRun(candidates, action, ctx, preferredId);
 }
 
-export function goalStatusText(run: PlanExecRun): string {
+export function goalStatusText(
+  run: PlanExecRun,
+  evidence?: AbandonmentEvidence,
+): string {
   if (!isGoalRun(run)) return `Run ${run.id} is not a goal run.`;
-  const goal = run.goal;
-  const lines = [
-    `Goal ${run.id}`,
-    `goal: ${goal.text}`,
-    `status: ${run.status}`,
-    `stage: ${run.stage}`,
-    `turn: ${goal.iteration}/${goal.maxTurns}`,
-    `branch: ${run.branch}`,
-    `worktree: ${run.worktreeCwd}`,
-    `checks: ${run.config.requiredChecks.map((command) => command.join(' ')).join(' · ') || 'none'}`,
-    `updated: ${new Date(run.updatedAt).toISOString()}`,
-  ];
-  if (run.blocked) {
-    lines.push(`blocked: ${safeStatusText(run.blocked.reason)}`);
-    if (run.blocked.nextStep)
-      lines.push(`resolve: ${safeStatusText(run.blocked.nextStep)}`);
-    lines.push(
-      pendingCleanup(run)
-        ? `next: /goal status ${run.id} (waiting for confirmed worker exit)`
-        : `resume: /goal resume ${run.id}`,
-    );
-  }
-  if (goal.lastCheck)
-    lines.push(
-      `checks: ${goal.lastCheck.failures ? `failing — ${goal.lastCheck.failures}` : 'passing'}`,
-    );
-  if (goal.lastOutcome)
-    lines.push(
-      `last outcome: ${goal.lastOutcome.slice(0, GOAL_STATUS_TAIL_LIMIT)}`,
-    );
-  if (goal.noProgress)
-    lines.push(`turns with unchanged tracked HEAD/checks: ${goal.noProgress}`);
-  if (run.activeOperation) {
-    lines.push(
-      `operation: ${run.activeOperation.service}/${run.activeOperation.kind} · ${run.activeOperation.operationId}`,
-    );
-    if (run.activeOperation.externalPrerequisite)
-      lines.push(
-        `prerequisite: ${run.activeOperation.externalPrerequisite.kind} — ${run.activeOperation.externalPrerequisite.evidence}`,
-      );
-    if (run.activeOperation.lastStatusError)
-      lines.push(`observation error: ${run.activeOperation.lastStatusError}`);
-  }
-  return safeStatusOutput(lines.join('\n'));
+  return formatRunStatus(run, evidence);
 }
 
 export function goalHelp(): string {
@@ -4304,6 +4454,7 @@ export function goalHelp(): string {
     '/goal <goal text> [--check "command"]',
     '                        Pursue the goal autonomously in place. The worktree must be clean and at least one check must exist.',
     '/goal status [run-id]  Show goal progress, checks, blocker, and current turn.',
+    '/goal inspect [run-id] Open run details and exact-ID actions.',
     '/goal resume [run-id]  Continue paused or stuck work.',
     '/goal pause [run-id]   Stop scheduling turns; the current turn is stopped and preserved.',
     '/goal cancel [run-id]  End and dismiss the goal; saved work stays.',
@@ -4331,6 +4482,7 @@ export function execHelp(advanced = false): string {
     return [
       '/exec [plan-path]     Start a plan (or open the picker).',
       '/exec status [run-id] Inspect runs.',
+      '/exec inspect [run-id] Open run details and exact-ID actions.',
       '/exec resume [run-id] Continue paused or stuck work.',
       '/exec pause [run-id]  Pause; keep for later.',
       '/exec cancel [run-id] End and dismiss; saved work stays.',

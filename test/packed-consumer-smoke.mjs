@@ -24,9 +24,10 @@ import { promisify } from 'node:util';
 const execute = promisify(execFile);
 const project = resolve('.');
 const removed = ['@alexeiled/pi-subagents-bridge', '@tintinweb/pi-tasks'];
-const piBaseline = '1.0.4';
+const piBaseline = '1.5.0';
 const piHostFamily = [
-  'chord',
+  'pi-schema',
+  'pi-telemetry',
   'pi-agent-core',
   'pi-ai',
   'pi-codemode',
@@ -185,7 +186,7 @@ test('packed normal loader: native execution, recovery, readonly controls, super
         let command = `node -e 'const fs=require("node:fs");fs.writeFileSync("result.txt","done\\n");if(fs.existsSync("plan.md"))fs.writeFileSync("plan.md",fs.readFileSync("plan.md","utf8").replace("[ ]","[x]"));' && git add result.txt plan.md && git -c commit.gpgSign=false commit -m 'Deliver fixture'`;
         if (mode === 'cutover')
           command =
-            'npm exec --yes --package=npm@12.0.2 -- npm uninstall --ignore-scripts @alexeiled/pi-subagents-bridge @tintinweb/pi-tasks && ' +
+            'env -u NODE_OPTIONS npm exec --yes --package=npm@12.0.2 -- npm uninstall --ignore-scripts @alexeiled/pi-subagents-bridge @tintinweb/pi-tasks && ' +
             command.replace(
               'git add result.txt plan.md',
               'git add result.txt plan.md package.json package-lock.json',
@@ -375,8 +376,8 @@ test('packed normal loader: native execution, recovery, readonly controls, super
         '--no-audit',
         '--no-fund',
         tarball,
-        'pi-subagents@0.76.1',
-        '@earendil-works/pi-coding-agent@1.0.4',
+        'pi-subagents@0.84.0',
+        '@earendil-works/pi-coding-agent@1.5.0',
       ],
       { cwd: consumer, env, timeout: 120000, maxBuffer: 2000000 },
     );
@@ -407,15 +408,28 @@ test('packed normal loader: native execution, recovery, readonly controls, super
         ),
       ).href
     );
-    assert.equal(typeof declarations.MCP_TYPESCRIPT_PREAMBLE, 'string');
+    assert.equal(typeof declarations.renderDeclarations, 'function');
+    assert.match(
+      declarations.renderDeclarations({
+        tools: [
+          {
+            name: 'fixture',
+            description: 'Fixture tool',
+            inputSchema: { type: 'object', properties: {} },
+          },
+        ],
+      }),
+      /fixture\(/u,
+    );
     const native = join(consumer, 'node_modules/pi-subagents');
-    assert.equal((await json(join(native, 'package.json'))).version, '0.76.1');
+    assert.equal((await json(join(native, 'package.json'))).version, '0.84.0');
     const preload = join(sandbox, 'isolate.mjs');
     await writeFile(
       preload,
-      `import os from 'node:os';import{syncBuiltinESMExports}from'node:module';import{EventEmitter}from'node:events';import{appendFileSync,existsSync,unlinkSync,writeFileSync}from'node:fs';import{join}from'node:path';os.homedir=()=>${JSON.stringify(home)};syncBuiltinESMExports();
-const root=${JSON.stringify(sandbox)},original=EventEmitter.prototype.emit;let dropped;
-EventEmitter.prototype.emit=function(name,value,...rest){if(process.env.PI_SUBAGENT_CHILD!=='1'){if(name==='subagents:rpc:v1:request'&&value?.method==='stop')appendFileSync(join(root,'stops.jsonl'),JSON.stringify({pid:process.pid,runId:value.params?.id})+'\\n');if(name==='subagents:rpc:v1:request'&&value?.method==='spawn'){appendFileSync(join(root,'spawns.jsonl'),JSON.stringify({pid:process.pid,requestId:value.requestId})+'\\n');if(existsSync(join(root,'drop-next'))){unlinkSync(join(root,'drop-next'));dropped=value.requestId;}}if(dropped&&name==='subagents:rpc:v1:reply:'+dropped){writeFileSync(join(root,'dropped.json'),JSON.stringify({requestId:dropped,runId:value?.data?.details?.workflowChildren?.workflowRunId}));dropped=undefined;return false;}}return original.call(this,name,value,...rest);};`,
+      `import os from 'node:os';import{syncBuiltinESMExports}from'node:module';import{EventEmitter}from'node:events';import{appendFileSync,existsSync,readFileSync,unlinkSync,writeFileSync}from'node:fs';import{join}from'node:path';os.homedir=()=>${JSON.stringify(home)};syncBuiltinESMExports();
+const root=${JSON.stringify(sandbox)},original=EventEmitter.prototype.emit,statusRequests=new Set();let dropped;
+function bindingHeld(){const marker=join(root,'hold-binding');if(!existsSync(marker))return false;const id=readFileSync(marker,'utf8');for(const file of [join(root,'home','.pi','plan-exec','runs',id,'run.json'),join(root,'home','.pi','plan-exec','runs','.abandoned',id,'run.json')]){try{if(JSON.parse(readFileSync(file,'utf8')).status==='abandoned')return false;}catch{}}return true;}
+EventEmitter.prototype.emit=function(name,value,...rest){if(process.env.PI_SUBAGENT_CHILD!=='1'){if((name==='subagent:async-started'||name==='subagent:async-complete')&&bindingHeld())return false;if(name==='subagents:rpc:v1:request'&&value?.method==='status')statusRequests.add(value.requestId);if(name.startsWith('subagents:rpc:v1:reply:')&&statusRequests.has(name.slice('subagents:rpc:v1:reply:'.length))&&bindingHeld()){appendFileSync(join(root,'held-status.jsonl'),JSON.stringify({requestId:value.requestId})+'\\n');return false;}if(name==='subagents:rpc:v1:request'&&value?.method==='stop')appendFileSync(join(root,'stops.jsonl'),JSON.stringify({pid:process.pid,runId:value.params?.id})+'\\n');if(name==='subagents:rpc:v1:request'&&value?.method==='spawn'){appendFileSync(join(root,'spawns.jsonl'),JSON.stringify({pid:process.pid,requestId:value.requestId})+'\\n');if(existsSync(join(root,'drop-next'))){unlinkSync(join(root,'drop-next'));dropped=value.requestId;}}if(dropped&&name==='subagents:rpc:v1:reply:'+dropped){writeFileSync(join(root,'dropped.json'),JSON.stringify({requestId:dropped,runId:value?.data?.details?.runId??value?.data?.details?.workflowChildren?.workflowRunId}));dropped=undefined;return false;}}return original.call(this,name,value,...rest);};`,
     );
     env.NODE_OPTIONS = `--import=${preload}`;
     const observer = join(sandbox, 'observer.mjs');
@@ -429,9 +443,9 @@ export default function(pi){
  if(process.env.PI_SUBAGENT_CHILD!=='1')pi.registerCommand('fixture-native-rpc',{description:'Isolated public native control probe',handler:async(args)=>{const input=JSON.parse(args),requestId=randomUUID();const result=await new Promise((resolve,reject)=>{const timer=setTimeout(()=>{off();reject(new Error('Fixture public RPC timed out'));},5000);const off=pi.events.on('subagents:rpc:v1:reply:'+requestId,value=>{clearTimeout(timer);off();resolve(value);});pi.events.emit('subagents:rpc:v1:request',{version:1,requestId,method:input.method,params:input.params});});writeFileSync(join(root,input.label+'.json'),JSON.stringify(result));}});
 
  if(process.env.PI_SUBAGENT_CHILD!=='1'){pi.events.on('pi-intercom:detach-request',value=>writeFileSync(join(root,'supervisor-request.json'),JSON.stringify(value)));pi.events.on('pi-intercom:detach-response',value=>writeFileSync(join(root,'supervisor-detach.json'),JSON.stringify(value)));}
- pi.on('session_start',(_event,ctx)=>{if(process.env.PI_SUBAGENT_CHILD!=='1'&&ctx.cwd.endsWith('/schema-ceiling'))registerSubagentCapabilityCeiling({sessionId:ctx.sessionManager.getSessionFile()??ctx.sessionManager.getSessionId(),source:'final-probe',ceiling:{allowedTools:['read','grep','find','ls']}});});
- pi.on('session_start',(_event,ctx)=>{if(process.env.PI_SUBAGENT_CHILD!=='1'&&ctx.cwd.endsWith('/agent-ceiling'))registerSubagentCapabilityCeiling({sessionId:ctx.sessionManager.getSessionFile()??ctx.sessionManager.getSessionId(),source:'agent-ceiling-probe',ceiling:{allowedAgents:['worker']}});});
- pi.on('session_start',async(_event,ctx)=>{if(process.env.PI_SUBAGENT_CHILD!=='1'&&['/missing-skill','/lazy-skill'].some(name=>ctx.cwd.endsWith(name))){if(ctx.cwd.endsWith('/lazy-skill'))registerSubagentCapabilityCeiling({sessionId:ctx.sessionManager.getSessionFile()??ctx.sessionManager.getSessionId(),source:'skill-probe',ceiling:{allowedTools:['grep','find','ls']}});const result=await resolveSubagentLaunchContract({agent:'skill-probe',task:'Skill admission probe',cwd:ctx.cwd,context:'fresh',sessionRoot:join(root,'skill-preflight'),parentSessionId:ctx.sessionManager.getSessionId(),capabilityCeiling:resolveCurrentSubagentCapabilityCeiling(ctx.sessionManager.getSessionFile()??ctx.sessionManager.getSessionId()),availableModels:ctx.modelRegistry.getAvailable(),runtimeSnapshotHost:pi});writeFileSync(join(ctx.cwd,'..',ctx.cwd.endsWith('/lazy-skill')?'lazy-skill-preflight.json':'missing-skill-preflight.json'),JSON.stringify(result));}});
+ pi.on('session_start',(_event,ctx)=>{if(process.env.PI_SUBAGENT_CHILD!=='1'&&ctx.cwd.endsWith('/schema-ceiling'))registerSubagentCapabilityCeiling({sessionId:ctx.sessionManager.getSessionId(),source:'final-probe',ceiling:{allowedTools:['read','grep','find','ls']}});});
+ pi.on('session_start',(_event,ctx)=>{if(process.env.PI_SUBAGENT_CHILD!=='1'&&ctx.cwd.endsWith('/agent-ceiling'))registerSubagentCapabilityCeiling({sessionId:ctx.sessionManager.getSessionId(),source:'agent-ceiling-probe',ceiling:{allowedAgents:['worker']}});});
+ pi.on('session_start',async(_event,ctx)=>{if(process.env.PI_SUBAGENT_CHILD!=='1'&&['/missing-skill','/lazy-skill'].some(name=>ctx.cwd.endsWith(name))){if(ctx.cwd.endsWith('/lazy-skill'))registerSubagentCapabilityCeiling({sessionId:ctx.sessionManager.getSessionId(),source:'skill-probe',ceiling:{allowedTools:['grep','find','ls']}});const result=await resolveSubagentLaunchContract({agent:'skill-probe',task:'Skill admission probe',cwd:ctx.cwd,context:'fresh',sessionRoot:join(root,'skill-preflight'),parentSessionId:ctx.sessionManager.getSessionId(),capabilityCeiling:resolveCurrentSubagentCapabilityCeiling(ctx.sessionManager.getSessionId()),availableModels:ctx.modelRegistry.getAvailable(),runtimeSnapshotHost:pi});writeFileSync(join(ctx.cwd,'..',ctx.cwd.endsWith('/lazy-skill')?'lazy-skill-preflight.json':'missing-skill-preflight.json'),JSON.stringify(result));}});
  pi.on('session_start',(_event,ctx)=>{const dir=join(home,'.pi','plan-exec','runs');const leases=existsSync(dir)?readdirSync(dir).filter(id=>!id.startsWith('.')).flatMap(id=>{try{const r=JSON.parse(readFileSync(join(dir,id,'run.json'),'utf8'));return r.lease?[{id,pid:r.lease.pid,sessionId:r.lease.sessionId}]:[];}catch{return[];}}):[];appendFileSync(join(root,'loads.jsonl'),JSON.stringify({pid:process.pid,child:process.env.PI_SUBAGENT_CHILD==='1',commands:pi.getCommands().map(c=>c.name),sessionId:ctx.sessionManager.getSessionId(),sessionFile:ctx.sessionManager.getSessionFile(),leases})+'\\n');});
 }`,
     );
@@ -464,10 +478,12 @@ export default function(pi){
         extensions: [observer],
       }),
     );
-    const cli = join(
+    const piRoot = join(
       consumer,
-      'node_modules/@earendil-works/pi-coding-agent/dist/cli.js',
+      'node_modules/@earendil-works/pi-coding-agent',
     );
+    const piManifest = await json(join(piRoot, 'package.json'));
+    const cli = resolve(piRoot, piManifest.bin.pi);
     async function executorFingerprint() {
       const hash = createHash('sha256');
       for (const file of (await readdir(join(installed, 'src'))).sort()) {
@@ -676,7 +692,12 @@ import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8')
             '@alexeiled/pi-subagents-bridge@0.5.5',
             '@tintinweb/pi-tasks@0.9.0',
           ],
-          { cwd, env, timeout: 120000, maxBuffer: 2000000 },
+          {
+            cwd,
+            env: { ...env, NODE_OPTIONS: '' },
+            timeout: 120000,
+            maxBuffer: 2000000,
+          },
         );
         for (const [name, version] of [
           [removed[0], '0.5.5'],
@@ -813,6 +834,7 @@ import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8')
       releaseSupervisorChild = false;
       supervisorReturned = false;
       supervisorReplyOutcome = undefined;
+      if (mode === 'stop') await writeFile(join(sandbox, 'hold-binding'), '');
       host.send({
         id: 'start',
         type: 'prompt',
@@ -824,6 +846,8 @@ import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8')
         async () => (await listRuns()).find((r) => r.repositoryRoot === cwd),
         `create ${mode}`,
       );
+      if (mode === 'stop')
+        await writeFile(join(sandbox, 'hold-binding'), run.id);
       if (['interrupt-stop', 'supervisor-stop'].includes(mode)) {
         await waitFor(
           () => calls.some((call) => call.mode === mode && call.worker),
@@ -837,16 +861,14 @@ import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8')
         const tracked = await waitFor(async () => {
           const current = await json(join(runs, run.id, 'run.json'));
           return current?.activeOperation?.asyncDir && current;
-        }, 'bound selected workflow');
+        }, 'bound selected single');
         const op = tracked.activeOperation;
         const initial = await json(join(op.asyncDir, 'status.json'));
-        assert.equal(initial.mode, 'workflow');
+        assert.equal(initial.mode, 'single');
         assert.equal(initial.state, 'running');
-        const childId = initial.steps.find(
-          (step) => step.workflowKey === 'main',
-        )?.runId;
-        assert.ok(childId);
-        const childPath = join(dirname(op.asyncDir), childId, 'status.json');
+        assert.equal(initial.runId, op.externalRunId);
+        assert.equal(initial.steps.length, 1);
+        const childPath = join(op.asyncDir, 'status.json');
         const rpc = async (method, params, label) => {
           host.send({
             id: label,
@@ -867,16 +889,14 @@ import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8')
             { id: op.externalRunId, index: 0 },
             'interrupt-probe',
           );
-          assert.equal(interrupted.success, false);
+          assert.equal(interrupted.success, true);
           assert.match(
-            interrupted.error.message,
-            /Interrupt is unsupported for async workflow/,
+            JSON.stringify(interrupted.data),
+            /Interrupt requested for async run/,
           );
         }
-        assert.equal(
-          initial.steps.find((step) => step.workflowKey === 'main').async,
-          true,
-        );
+        assert.equal(op.native.request.params.async, true);
+        assert.equal(initial.steps[0].agent, op.native.admittedAgent);
         const beforeStop =
           mode === 'interrupt-stop' && interrupted.success
             ? await waitFor(
@@ -911,6 +931,12 @@ import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8')
         if (stopped.success) {
           assert.equal(stopped.data.runId, op.externalRunId);
           assert.equal(stopped.data.state, 'stopping');
+        } else if (stopped.error.code === 'execution_failed') {
+          assert.match(
+            stopped.error.message,
+            /Stop request persisted for paused async run .* terminal proof is not ready/,
+          );
+          assert.equal(root.processTerminal?.runId, op.externalRunId);
         } else {
           assert.equal(stopped.error.code, 'invalid_state');
           assert.match(
@@ -1173,15 +1199,13 @@ import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8')
         );
         assert.equal(failed.status.timeoutMs, 8000);
         assert.equal(existsSync(join(cwd, 'result.txt')), false);
-        const step = failed.status.steps.find(
-          (value) => value.workflowKey === 'main',
-        );
-        assert.ok(step?.runId);
+        assert.equal(failed.status.mode, 'single');
+        assert.equal(failed.status.steps.length, 1);
+        const nativeRunId = failed.op.externalRunId;
+        assert.equal(failed.status.runId, nativeRunId);
         const child = await waitFor(
           async () => {
-            const status = await json(
-              join(dirname(failed.op.asyncDir), step.runId, 'status.json'),
-            );
+            const status = await json(join(failed.op.asyncDir, 'status.json'));
             return (
               status &&
               !['running', 'queued'].includes(status.state) &&
@@ -1194,15 +1218,11 @@ import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8')
         );
         assert.equal(child.timeoutMs, 8000);
         assert.match(JSON.stringify(child), /timeout|timed.out|deadline/i);
-        assert.equal(child.processTerminal.runId, step.runId);
+        assert.equal(child.processTerminal.runId, nativeRunId);
         const proof = await waitFor(
           async () => {
             const value = await json(
-              join(
-                dirname(failed.op.asyncDir),
-                step.runId,
-                'process-terminal.json',
-              ),
+              join(failed.op.asyncDir, 'process-terminal.json'),
             );
             return (
               value && ['observed', 'unknown'].includes(value.state) && value
@@ -1211,7 +1231,7 @@ import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8')
           'published deadline retirement disposition',
           10000,
         );
-        assert.equal(proof.runId, step.runId);
+        assert.equal(proof.runId, nativeRunId);
         assert.equal(
           proof.runnerProcessInstanceId,
           child.processTerminal.runnerProcessInstanceId,
@@ -1532,11 +1552,13 @@ import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8')
             );
             assert.equal(evidence.result.structuredOutput.schemaVersion, 1);
           }
-          assert.equal(evidence.result.envelope.steps[0].async, true);
-          assert.equal(evidence.proof.children.length, 1);
-          assert.equal(
-            evidence.proof.children[0].runId,
-            evidence.result.childRunId,
+          assert.equal(evidence.result.envelope.mode, 'single');
+          assert.equal(evidence.proof.state, 'observed');
+          assert.equal(evidence.proof.runId, evidence.result.runId);
+          assert.ok(
+            evidence.proof.instances.some(
+              (instance) => instance.kind === 'runner',
+            ),
           );
         }
       } else {
@@ -1549,6 +1571,10 @@ import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8')
           );
         }, 'actual lost spawn reply before force stop');
         assert.equal(typeof lost.runId, 'string');
+        await waitFor(
+          () => existsSync(join(sandbox, 'held-status.jsonl')),
+          'status reply transport barrier',
+        );
         assert.equal(
           (await json(join(runs, run.id, 'run.json'))).activeOperation
             .externalRunId,
@@ -1566,6 +1592,7 @@ import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8')
             (await json(join(runs, '.abandoned', run.id, 'run.json')));
           return current?.status === 'abandoned' && current;
         }, 'durable abandonment');
+        await rm(join(sandbox, 'hold-binding'));
         assert.equal(abandoned.userStopped, true);
         assert.ok(await json(join(runs, '.abandoned', run.id, 'before.json')));
         await waitFor(

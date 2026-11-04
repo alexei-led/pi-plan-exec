@@ -85,6 +85,49 @@ for (const [patch, label] of [
       new RegExp(label),
     );
   });
+test('visibility toggles preserve the pinned run and dismissals', () => {
+  const presentation = new RunPresentation();
+  presentation.remember(run());
+  presentation.remember(run({ id: 'run-2', updatedAt: 3 }));
+  presentation.show('run-1');
+  presentation.clear('run-2');
+  presentation.toggleVisibility();
+  assert.equal(presentation.current(), undefined);
+  presentation.toggleVisibility();
+  assert.equal(presentation.current()?.id, 'run-1');
+  assert.deepEqual(presentation.preferences(), {
+    hidden: false,
+    selected: 'run-1',
+    dismissed: ['run-2'],
+  });
+});
+
+test('narrow snapshots retain source and expose details without clipped runnable IDs', () => {
+  const narrow = renderProgressStrip(
+    run({ id: '11111111-1111-4111-8111-111111111111' }),
+    40,
+  );
+  assert.match(narrow[0] ?? '', /^Snapshot/);
+  assert.match(narrow.join('\n'), /11111111/);
+  assert.match(narrow.join('\n'), /Inspect: \/exec inspect/);
+  assert.doesNotMatch(narrow.join('\n'), /\/exec status 11111111/);
+  assert.match(renderProgressStrip(run(), 20)[0] ?? '', /^Snapshot/);
+});
+
+test('locally observed strips report observation age separately from task progress', () => {
+  const text = renderProgressStrip(
+    run(),
+    160,
+    undefined,
+    10_000,
+    true,
+    undefined,
+    8_000,
+  ).join('\n');
+  assert.match(text, /Observed 2s ago/);
+  assert.match(text, /1\/2 accepted/);
+});
+
 test('strip removes bidi controls but preserves emoji joiners', () => {
   const view = progressView(run({ planPath: '/repo/test\u202e-👩‍💻.md' }));
   assert.equal(view.title.includes('\u202e'), false);

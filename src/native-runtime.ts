@@ -58,7 +58,7 @@ export interface NativeObservation {
   reason?: string;
   launchError?: { code: string; message: string };
   workflowState?: string;
-  proof?: WorkflowTerminalProof;
+  proof?: WorkflowTerminalProof | import('./lifecycle.js').ProcessTerminalProof;
   stopPending?: boolean;
   successfulChild?: boolean;
   /** Bound diagnostic text from a retired failed child; never successful output. */
@@ -67,8 +67,8 @@ export interface NativeObservation {
   /** Only exact, terminal, caller-bound output is returned here. */
   result?: {
     runId: string;
-    childRunId: string;
-    key: 'main';
+    childRunId?: string;
+    key?: 'main';
     outputPath: string;
     output: string;
     structuredOutput?: unknown;
@@ -102,10 +102,10 @@ export class NativeRuntimeClient {
   private readonly pending = new Set<() => void>();
   private readonly unsubscribeCompletion: (() => void) | undefined;
   constructor(
-    private readonly events: EventBus,
-    private readonly registry: RunRegistry,
-    private readonly getContext: () => ExtensionContext,
-    private readonly options: {
+    protected readonly events: EventBus,
+    protected readonly registry: RunRegistry,
+    protected readonly getContext: () => ExtensionContext,
+    protected readonly options: {
       rpcTimeoutMs?: number;
       runtimeSnapshotHost?: SubagentLaunchContractInput['runtimeSnapshotHost'] & {
         getSessionName?(): string | undefined;
@@ -140,7 +140,7 @@ export class NativeRuntimeClient {
       if (this.disposed || run.status === 'abandoned') continue;
       const operation = run.activeOperation ?? run.failedOperation;
       if (
-        !operation?.native ||
+        operation?.native?.version !== 1 ||
         operation.native.phase === 'prepared' ||
         !operation.requestDigest ||
         value.sessionId !== operation.native.nativeSessionId ||
@@ -165,6 +165,14 @@ export class NativeRuntimeClient {
   async prepare(
     run: PlanExecRun,
     input: NativePrepareInput,
+  ): Promise<ActiveOperation> {
+    return this.prepareIntent(run, input, 1);
+  }
+
+  protected async prepareIntent(
+    run: PlanExecRun,
+    input: NativePrepareInput,
+    version: 1 | 2,
   ): Promise<ActiveOperation> {
     this.assertLive();
     const sessionId = this.sessionId();
@@ -224,7 +232,9 @@ export class NativeRuntimeClient {
       output: outputPath,
       // 0.76.1 settles structured_output before file-only persistence. Default
       // inline settlement still persists the schema value at this bound path.
-      ...(input.outputSchema ? {} : { outputMode: 'file-only' }),
+      ...(version === 1 && input.outputSchema
+        ? {}
+        : { outputMode: 'file-only' }),
       ...timeout,
       ...(input.model ? { model: input.model } : {}),
       ...(input.outputSchema ? { outputSchema: input.outputSchema } : {}),
@@ -241,7 +251,7 @@ export class NativeRuntimeClient {
       executionGeneration: run.executionGeneration ?? 0,
       stopGeneration: run.stopGeneration ?? 0,
       native: {
-        version: 1,
+        version,
         ownerRunId: run.id,
         ownerSessionId: sessionId,
         nativeSessionId: this.nativeSessionId(),
@@ -250,16 +260,19 @@ export class NativeRuntimeClient {
           version: 1,
           requestId,
           method: 'spawn',
-          params: {
-            script: `return await runs.run("main", ${JSON.stringify(child)});`,
-            async: true,
-            cwd,
-            context: 'fresh',
-            worktree: false,
-            mission: false,
-            acceptance: false,
-            ...timeout,
-          },
+          params:
+            version === 2
+              ? { ...child, async: true }
+              : {
+                  script: `return await runs.run("main", ${JSON.stringify(child)});`,
+                  async: true,
+                  cwd,
+                  context: 'fresh',
+                  worktree: false,
+                  mission: false,
+                  acceptance: false,
+                  ...timeout,
+                },
         },
         outputPath,
         limits: {
@@ -277,25 +290,28 @@ export class NativeRuntimeClient {
     return operation;
   }
 
-  private async validateAdmission(
+  protected async validateAdmission(
     operation: ActiveOperation,
-  ): Promise<() => void> {
+  ): Promise<{ recheck(): void; agent: string }> {
     const meta = required(operation.native);
     const script = meta.request.params.script;
     const prefix = 'return await runs.run("main", ';
     // Decode only the fixed JSON literal this adapter durably prepared. Never
     // re-resolve or rewrite the request from mutable controller configuration.
     if (
-      typeof script !== 'string' ||
-      !script.startsWith(prefix) ||
-      !script.endsWith(');')
+      meta.version === 1 &&
+      (typeof script !== 'string' ||
+        !script.startsWith(prefix) ||
+        !script.endsWith(');'))
     )
       throw new Error(
         'Native launch admission cannot validate this prepared workflow. Restore its original request before resume.',
       );
-    const child = JSON.parse(
-      script.slice(prefix.length, -2),
-    ) as SubagentLaunchContractInput;
+    const child = (meta.version === 2
+      ? meta.request.params
+      : JSON.parse(
+          String(script).slice(prefix.length, -2),
+        )) as unknown as SubagentLaunchContractInput;
     if (
       child.context !== 'fresh' ||
       child.cwd !== meta.request.params.cwd ||
@@ -317,13 +333,18 @@ export class NativeRuntimeClient {
     });
     const ctx = this.getContext();
     const ceiling = ceilings.resolveCurrentSubagentCapabilityCeiling(
-      this.nativeSessionId(),
+      ctx.sessionManager.getSessionId(),
     );
+    const projectTrusted = ctx.isProjectTrusted();
     const ownedReviewer = child.agent === NATIVE_REVIEWER_AGENT;
     const requireOwnedReviewer = () => {
+      if (this.getContext().isProjectTrusted() !== projectTrusted)
+        throw new Error(
+          'Native launch admission refused (project_trust_changed): project trust changed during admission; inspect and resume. No spawn was emitted.',
+        );
       if (ownedReviewer) {
         const current = ceilings.resolveCurrentSubagentCapabilityCeiling(
-          this.nativeSessionId(),
+          ctx.sessionManager.getSessionId(),
         );
         if (
           current?.allowedAgents !== undefined &&
@@ -349,7 +370,8 @@ export class NativeRuntimeClient {
         ? { parentModel: { provider: ctx.model.provider, id: ctx.model.id } }
         : {}),
       parentSessionFile: ctx.sessionManager.getSessionFile() ?? null,
-      parentSessionId: this.nativeSessionId(),
+      parentSessionId: ctx.sessionManager.getSessionId(),
+      projectTrusted,
       ...(ceiling ? { capabilityCeiling: ceiling } : {}),
       ...(this.options.runtimeSnapshotHost
         ? { runtimeSnapshotHost: this.options.runtimeSnapshotHost }
@@ -368,9 +390,13 @@ export class NativeRuntimeClient {
       !result.ok &&
       result.code === 'missing_agent' &&
       result.diagnostics.length === 0 &&
-      result.message.startsWith(`Unknown agent: ${NATIVE_REVIEWER_AGENT}\n`)
+      (result.message.startsWith(`Unknown agent: ${NATIVE_REVIEWER_AGENT}\n`) ||
+        (result.message.startsWith(
+          `Unknown agent: ${NATIVE_REVIEWER_AGENT}. Did you mean '`,
+        ) &&
+          result.message.split('\n', 1)[0]?.endsWith("'?")))
     )
-      return requireOwnedReviewer;
+      return { recheck: requireOwnedReviewer, agent: NATIVE_REVIEWER_AGENT };
     if (!result.ok)
       throw new Error(
         `Native launch admission refused (${result.code}): ${result.message}. Correct the selected agent/skills/model/tool configuration, then resume. No spawn was emitted; the prepared request is unchanged.`,
@@ -379,7 +405,12 @@ export class NativeRuntimeClient {
       throw new Error(
         'Native launch admission refused (owned_reviewer_collision): A configured agent resolves to the package-owned reviewer name. Correct the collision, then resume; no substitute will be dispatched.',
       );
-    return requireOwnedReviewer;
+    const agent = result.contract.agent?.name;
+    if (meta.version === 2 && (typeof agent !== 'string' || !agent.trim()))
+      throw new Error(
+        'Native launch admission lacks the resolved agent identity; no spawn was emitted.',
+      );
+    return { recheck: requireOwnedReviewer, agent: agent ?? child.agent };
   }
 
   async spawn(
@@ -397,47 +428,36 @@ export class NativeRuntimeClient {
       };
     await this.checkExecutionTarget(run, operation);
     await this.checkOutputPath(runId, operation);
-    const requireAdmission = await this.validateAdmission(operation);
-    // Admission is asynchronous validation, not dispatch or non-start evidence.
-    // The original revision still gates the claim; recheck session authority too.
+    const admission = await this.validateAdmission(operation);
     await this.load(runId, binding, true);
-    requireAdmission();
-    const claimed = await this.registry.updateIfCurrent(
+    admission.recheck();
+    await this.checkExecutionTarget(run, operation);
+    await this.checkOutputPath(runId, operation);
+    let pending: Promise<Reply> | undefined;
+    const claimed = await this.registry.dispatchNative(
+      run,
       {
-        ...run,
-        activeOperation: {
-          ...operation,
-          launchStartedAt: Date.now(),
-          native: { ...operation.native, phase: 'dispatching' },
+        ...operation,
+        native: {
+          ...required(operation.native),
+          admittedAgent: admission.agent,
         },
       },
-      run.updatedAt,
+      this.sessionId(),
+      () => {
+        pending = this.rpc(required(operation.native).request, () => {
+          admission.recheck();
+          if (
+            this.sessionId() !== operation.native?.ownerSessionId ||
+            this.nativeSessionId() !== operation.native?.nativeSessionId
+          )
+            throw new Error('Current session changed before dispatch.');
+        });
+      },
     );
     if (!claimed.applied) return this.operation(runId, binding);
-    // Re-read authorization after fsync and before the synchronous bus emit.
-    const checked = await this.load(runId, binding, true);
-    await this.checkExecutionTarget(checked.run, checked.operation);
-    // Re-read after filesystem canonicalization. A new target cannot borrow an
-    // earlier operation's authority, even when another writer forgot an epoch.
-    const fresh = await this.load(runId, binding, true);
-    if (fresh.run.worktreeCwd !== checked.run.worktreeCwd)
-      throw new Error('Native execution target changed before dispatch.');
-    if (this.stopIntent(fresh.run, fresh.operation))
-      return this.retireNotStarted(runId, binding);
-    if (this.disposed)
-      return {
-        state: 'unknown',
-        operation: fresh.operation,
-        reason: 'Disposed before dispatch; operation remains fenced.',
-      };
-    const reply = await this.rpc(operation.native.request, () => {
-      requireAdmission();
-      if (
-        this.sessionId() !== operation.native?.ownerSessionId ||
-        this.nativeSessionId() !== operation.native?.nativeSessionId
-      )
-        throw new Error('Current session changed before dispatch.');
-    });
+    const fresh = { operation: required(claimed.run.activeOperation) };
+    const reply = await required(pending);
     if (!reply.success)
       return {
         state: 'unknown',
@@ -1062,7 +1082,7 @@ export class NativeRuntimeClient {
     );
   }
 
-  private async observeData(
+  protected async observeData(
     runId: string,
     binding: NativeOperationBinding,
     data: Record<string, unknown>,
@@ -1273,18 +1293,7 @@ export class NativeRuntimeClient {
     }));
     return { state: 'retired', operation, stopPending: false };
   }
-  private stopIntent(run: PlanExecRun, operation: ActiveOperation): boolean {
-    return Boolean(
-      operation.stopRequested ||
-        operation.launchFenced ||
-        run.activeOperation?.operationId !== operation.operationId ||
-        run.userStopped ||
-        run.pendingStageSkip ||
-        !['running', 'starting'].includes(run.status) ||
-        (operation.stopGeneration ?? 0) !== (run.stopGeneration ?? 0),
-    );
-  }
-  private async load(
+  protected async load(
     runId: string,
     binding: NativeOperationBinding,
     control = false,
@@ -1320,7 +1329,7 @@ export class NativeRuntimeClient {
       throw new Error('Foreign session cannot control native operation.');
     return { run, operation };
   }
-  private async mutate(
+  protected async mutate(
     runId: string,
     binding: NativeOperationBinding,
     apply: (op: ActiveOperation) => ActiveOperation,
@@ -1362,7 +1371,7 @@ export class NativeRuntimeClient {
       );
   }
 
-  private async checkOutputPath(
+  protected async checkOutputPath(
     runId: string,
     op: ActiveOperation,
     mustExist = false,
@@ -1388,12 +1397,12 @@ export class NativeRuntimeClient {
       if (mustExist || !record(error) || error.code !== 'ENOENT') throw error;
     }
   }
-  private sessionId(): string {
+  protected sessionId(): string {
     const id = this.getContext().sessionManager.getSessionId();
     if (!id) throw new Error('Current Pi session required.');
     return id;
   }
-  private nativeSessionId(): string {
+  protected nativeSessionId(): string {
     const manager = this.getContext().sessionManager;
     const id = manager.getSessionFile() ?? manager.getSessionId();
     if (!id) throw new Error('Current native runtime session required.');
@@ -1402,7 +1411,7 @@ export class NativeRuntimeClient {
   private assertLive(): void {
     if (this.disposed) throw new Error('Native runtime client disposed.');
   }
-  private call(
+  protected call(
     method: string,
     params: Record<string, unknown>,
     beforeEmit?: () => void,

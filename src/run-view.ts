@@ -4,9 +4,16 @@ import {
   truncateToWidth,
 } from '@earendil-works/pi-tui';
 import { parseAdvisoryObservation } from './advisory-observation.js';
-import { isGoalRun, isInFlightStatus, isTerminalStatus } from './lifecycle.js';
+import {
+  isGoalRun,
+  isInFlightStatus,
+  isTerminalStatus,
+  pendingCleanup,
+} from './lifecycle.js';
 import { taskSummary } from './task-summary.js';
 import { type PlanExecRun, RUN_STATUS } from './types.js';
+
+export { pendingCleanup } from './lifecycle.js';
 
 export type ProgressTone = 'success' | 'warning' | 'error' | 'muted';
 export interface ProgressView {
@@ -29,15 +36,6 @@ function clean(text: string): string {
 
 function control(run: PlanExecRun, action: 'status' | 'resume'): string {
   return `/${isGoalRun(run) ? 'goal' : 'exec'} ${action} ${clean(run.id)}`;
-}
-
-export function pendingCleanup(run: PlanExecRun): boolean {
-  return Boolean(
-    run.localOperationActive ||
-      (run.activeOperation &&
-        !run.activeOperation.processTreeExited &&
-        !run.activeOperation.launchFenced),
-  );
 }
 
 export function progressView(
@@ -326,6 +324,7 @@ export function renderProgressStrip(
   now = Date.now(),
   observing = false,
   probeError?: string,
+  lastObservedAt?: number,
 ): string[] {
   const view = progressView(run, now, observing, probeError);
   const columns = Math.max(0, Math.floor(width));
@@ -339,11 +338,42 @@ export function renderProgressStrip(
     : isGoalRun(run)
       ? 'Goal'
       : 'Preparing plan';
+  const observed =
+    observing && lastObservedAt !== undefined
+      ? `Observed ${Math.max(0, Math.floor((now - lastObservedAt) / 1000))}s ago`
+      : undefined;
+  let warning = view.warning;
+  for (const action of ['status', 'resume'] as const) {
+    const command = control(run, action);
+    if (warning?.endsWith(command))
+      warning = warning.slice(0, -command.length).replace(/[\s·:]+$/u, '');
+  }
+  if (columns < 60) {
+    const snapshot = view.label.endsWith(' · Snapshot');
+    const label = view.label.replace(' · Snapshot', '');
+    const action =
+      columns >= 22 ? 'Inspect: /exec inspect' : 'Inspect run details';
+    return [
+      color(view.tone, snapshot ? `Snapshot · ${label}` : label),
+      color(
+        'text',
+        `${isGoalRun(run) ? 'Goal' : 'Plan'} ${clean(run.id).slice(0, 8)} · ${count}`,
+      ),
+      color('text', observed ? `${observed} · ${view.detail}` : view.detail),
+      ...(view.resolution
+        ? [color('text', `Resolve: ${view.resolution}`)]
+        : []),
+      ...(warning ? [color(view.tone, warning)] : []),
+      ...(view.warning || view.resolution ? [color(view.tone, action)] : []),
+    ].map((line) => truncateToWidth(line, columns));
+  }
   return [
-    `${color(view.tone, view.label)}${color('text', ` · ${view.title}`)}`,
-    `${bar}${color('text', ` ${count} · ${view.detail}`)}`,
+    `${color(view.tone, view.label)}${color('text', ` · ${view.title} · ${clean(run.id).slice(0, 8)}`)}`,
+    `${bar}${color('text', ` ${count} · ${observed ? observed + ' · ' : ''}${view.detail}`)}`,
     ...(view.resolution ? [color('text', `Resolve: ${view.resolution}`)] : []),
-    ...(view.warning ? [color(view.tone, view.warning)] : []),
+    ...(view.warning
+      ? [color(view.tone, warning || 'Inspect: /exec inspect')]
+      : []),
   ].map((line) => truncateToWidth(line, columns));
 }
 
@@ -467,6 +497,9 @@ export class RunPresentation {
   }
   hide(): void {
     this.hidden = true;
+  }
+  toggleVisibility(): void {
+    this.hidden = !this.hidden;
   }
   show(id?: string): void {
     if (id && !this.runs.has(id))

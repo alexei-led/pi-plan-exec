@@ -55,6 +55,7 @@ import planExecExtension, {
   parseStartArguments,
   parseStatusArguments,
   pausedMessage,
+  prepareSessionHandoff,
   prioritizeRunCandidates,
   reconcileForResume,
   recoveryGuidance,
@@ -561,6 +562,115 @@ test('only a locally owned successful poll paints live progress; poll failure re
   assert.doesNotMatch(String(h.footer()), /poll unavailable|Snapshot/);
   assert.doesNotMatch((h.widget() as string[]).join('\n'), /poll unavailable/);
   await h.emit('session_shutdown');
+});
+
+test('a pending poll ages into a snapshot without launching another poll', async (t) => {
+  const held = run({ status: 'running' });
+  delete held.lease;
+  delete held.activeOperation;
+  delete held.ownerSessionId;
+  const { registry, directory } = await seedDirectory([held]);
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  t.mock.method(
+    RunRegistry.prototype,
+    'listWithErrors',
+    registry.listWithErrors.bind(registry),
+  );
+  t.mock.method(RunRegistry.prototype, 'get', registry.get.bind(registry));
+  t.mock.method(
+    PlanExecRuntimeIntegration.prototype,
+    'sync',
+    async (current: PlanExecRun) => current,
+  );
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  let finish!: (value: PlanExecRun) => void;
+  const pending = new Promise<PlanExecRun>((resolve) => {
+    finish = resolve;
+  });
+  const live = {
+    ...held,
+    lease: {
+      sessionId: 'aging-observer',
+      pid: process.pid,
+      hostname: hostname(),
+      heartbeatAt: now,
+    },
+  };
+  let polls = 0;
+  t.mock.method(PlanExecController.prototype, 'tick', async () => {
+    polls++;
+    return polls === 1 ? live : pending;
+  });
+  const h = executionHarness(held.repositoryRoot, 'aging-observer');
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  await h.emit('session_start');
+  t.mock.timers.tick(1000);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.doesNotMatch(String(h.footer()), /Snapshot/);
+  t.mock.timers.tick(1000);
+  now += 30_000;
+  t.mock.timers.tick(1000);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.match(String(h.footer()), /Snapshot/);
+  assert.equal(polls, 2);
+  finish(live);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.doesNotMatch(String(h.footer()), /Snapshot/);
+  await h.emit('session_shutdown');
+});
+
+test('worktree follow-up dispatches an exact command in the replacement session', async (t) => {
+  const originalCwd = process.cwd();
+  t.after(() => process.chdir(originalCwd));
+  const root = await mkdtemp(join(tmpdir(), 'exec-follow-up-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const target = join(root, 'target');
+  await mkdir(target);
+  const session = persistedSession(root, join(root, 'sessions'));
+  const held = run({
+    repositoryRoot: root,
+    worktreeCwd: target,
+    lease: { ...liveLease(), sessionId: session.getSessionId() },
+  });
+  t.mock.method(
+    RunRegistry.prototype,
+    'claim',
+    async (candidate: PlanExecRun) => candidate,
+  );
+  t.mock.method(
+    RunRegistry.prototype,
+    'release',
+    async (candidate: PlanExecRun) => candidate,
+  );
+  const messages: unknown[] = [];
+  const ctx = {
+    cwd: root,
+    sessionManager: session,
+    switchSession: async (
+      _path: string,
+      options: { withSession(context: unknown): Promise<void> },
+    ) => {
+      await options.withSession({
+        ui: { notify() {} },
+        sendUserMessage: async (message: string, options: unknown) =>
+          messages.push([message, options]),
+      });
+      return { cancelled: false };
+    },
+  } as unknown as ExtensionCommandContext;
+  await prepareSessionHandoff(
+    ctx,
+    held,
+    async (current) => current,
+    `resume ${held.id}`,
+    false,
+    () => false,
+    () => {},
+  );
+  assert.deepEqual(messages, [
+    [`/exec resume ${held.id}`, { expandPromptTemplates: true }],
+  ]);
 });
 
 for (const staleCompletion of [false, true])
@@ -1276,7 +1386,7 @@ test('help and setup explain the installed command surface', () => {
   assert.doesNotMatch(execSetup(), /pi-subagents-bridge/);
   assert.match(
     execSetup(),
-    /pi install -l npm:@alexeiled\/pi-fusion@\^0\.9\.3$/m,
+    /pi install -l npm:@alexeiled\/pi-fusion@\^0\.12\.0$/m,
   );
   assert.match(execSetup(), /No Git dependency pins are required/);
   assert.match(execSetup(), /strict plan-exec review remains unsupported/);
@@ -1284,11 +1394,11 @@ test('help and setup explain the installed command surface', () => {
 });
 
 test('setup installs native and optional fusion without removed packages', () => {
-  assert.match(execSetup(), /^pi install -l npm:pi-subagents@\^0\.76\.1$/m);
+  assert.match(execSetup(), /^pi install -l npm:pi-subagents@0\.84\.0$/m);
   assert.doesNotMatch(execSetup(), /pi-subagents-bridge/);
   assert.match(
     execSetup(),
-    /^pi install -l npm:@alexeiled\/pi-fusion@\^0\.9\.3$/m,
+    /^pi install -l npm:@alexeiled\/pi-fusion@\^0\.12\.0$/m,
   );
   assert.doesNotMatch(
     execSetup(),
@@ -2943,7 +3053,7 @@ test('status reports a missing package with its install commands', async () => {
   });
 
   assert.match(report, /Plan-exec prerequisites — missing: pi-subagents\./);
-  assert.match(report, /^pi install -l npm:pi-subagents@\^0\.76\.1$/m);
+  assert.match(report, /^pi install -l npm:pi-subagents@0\.84\.0$/m);
   assert.doesNotMatch(report, /pi-fusion/);
   assert.match(report, /No plan execution runs\. Start one with \/exec\./);
   assert.equal(
@@ -2998,7 +3108,7 @@ test('the retired read verbs still work and name their replacement', async () =>
   assert.match(doctor ?? '', /\/exec doctor is now \/exec status/);
 
   const setup = await execRead(registry, 'setup', []);
-  assert.match(setup ?? '', /^pi install -l npm:pi-subagents@\^0\.76\.1$/m);
+  assert.match(setup ?? '', /^pi install -l npm:pi-subagents@0\.84\.0$/m);
   assert.match(setup ?? '', /\/exec setup is now part of \/exec status/);
 
   assert.equal(await execRead(registry, 'resume', []), undefined);
@@ -3053,6 +3163,7 @@ test('the exec-plan skill documents exactly the subcommands /exec implements', a
   );
   const actions = new Set<string>([
     ...Object.values(EXEC_ACTION),
+    'inspect',
     'hide',
     'show',
     'clear',
@@ -3752,7 +3863,15 @@ test('required review and finalize stages never suggest force-skip', () => {
 test('help lists every primary verb and no retired alias', () => {
   const help = execHelp();
   const aliases = new Set<string>(EXEC_ALIAS_ACTIONS);
-  const primary = ['status', 'resume', 'pause', 'cancel', 'hide', 'help'];
+  const primary = [
+    'status',
+    'inspect',
+    'resume',
+    'pause',
+    'cancel',
+    'hide',
+    'help',
+  ];
   // Only the command list is line-anchored; the hints under it are prose.
   const listed = [...help.matchAll(/^\/exec[ \t]+(?<verb>[a-z][a-z-]*)/gm)].map(
     (match) => match.groups?.verb,

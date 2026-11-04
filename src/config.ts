@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { bootstrapCommands, requiredChecks } from './lanes.js';
 import {
   DEFAULT_FROZEN_RUN_CONFIG,
   type FrozenRunConfig,
@@ -19,6 +20,24 @@ export async function resolveRunConfig(
     throw error;
   }
   return parseRunConfig(JSON.parse(raw) as unknown);
+}
+
+export async function resolveExecutionConfig(
+  repositoryRoot: string,
+  cwd: string,
+  options: { checks?: string[][]; detectBootstrap?: boolean } = {},
+): Promise<FrozenRunConfig> {
+  const configured = await resolveRunConfig(repositoryRoot);
+  return {
+    ...configured,
+    requiredChecks: await requiredChecks(
+      cwd,
+      options.checks?.length ? options.checks : configured.requiredChecks,
+    ),
+    bootstrapCommands: options.detectBootstrap
+      ? await bootstrapCommands(cwd, configured.bootstrapCommands)
+      : configured.bootstrapCommands,
+  };
 }
 
 export function parseRunConfig(value: unknown): FrozenRunConfig {

@@ -1,5 +1,6 @@
 name: CI
 on:
+  workflow_call:
   push:
     branches:
       - main
@@ -16,9 +17,13 @@ defaults:
     shell: bash # Explicit bash makes GitHub use -eo pipefail, including tee pipelines.
 jobs:
   verify:
-    name: Verify
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    name: Verify (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, macos-15]
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

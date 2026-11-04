@@ -17,8 +17,8 @@ const jiti = createJiti(import.meta.url);
 const { createNativeRuntimeHost } = await jiti.import(
   './native-runtime-host.ts',
 );
-const { NativeRuntimeClient } = await jiti.import(
-  '../../src/native-runtime.ts',
+const { NativeSingleRuntimeClient: NativeRuntimeClient } = await jiti.import(
+  '../../src/native-single-runtime.ts',
 );
 const { PlanExecController } = await jiti.import('../../src/controller.ts');
 const { RunRegistry } = await jiti.import('../../src/registry.ts');
@@ -102,6 +102,7 @@ host.events.on('plan-exec:bridge:v1:request', () => {
 host.events.on('plan-exec:bridge:v2:request', () => {
   throw new Error('Bridge RPC emitted');
 });
+let verified = false;
 try {
   await command('git', ['branch', 'main'], host.repository);
   await mkdir(join(host.repository, '.pi'), { recursive: true });
@@ -181,13 +182,14 @@ try {
         'utf8',
       ),
     );
-    assert.equal(
-      evidence.result.envelope.steps[0].async,
-      true,
-      'Selected workflow actually launches an async child',
+    assert.equal(op.native.version, 2);
+    assert.equal(op.native.request.params.script, undefined);
+    assert.equal(evidence.result.envelope.mode, 'single');
+    assert.equal(evidence.proof.state, 'observed');
+    assert.equal(evidence.proof.runId, evidence.result.runId);
+    assert.ok(
+      evidence.proof.instances.some((instance) => instance.kind === 'runner'),
     );
-    assert.equal(evidence.proof.children.length, 1);
-    assert.equal(evidence.proof.children[0].runId, evidence.result.childRunId);
   }
   const calls = await host.calls();
   assert.deepEqual(
@@ -203,6 +205,7 @@ try {
     'Real detached native children',
   );
   assert.equal(run.reviewFindings.length, 0);
+  verified = true;
   console.log(
     JSON.stringify({
       mode,
@@ -216,5 +219,6 @@ try {
   role.dispose();
   native.dispose();
   await host.dispose();
-  await rm(sandbox, { recursive: true, force: true });
+  if (verified) await rm(sandbox, { recursive: true, force: true });
+  else console.error(`Retained failed native fixture: ${sandbox}`);
 }

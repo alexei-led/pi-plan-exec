@@ -138,7 +138,7 @@ export async function cancelActiveLocalOperations(
         ? cursor.name
         : '';
     const after = names.findIndex((name) => name > previous);
-    const offset = after < 0 ? 0 : after;
+    const offset = Math.max(after, 0);
     const ordered = [...names.slice(offset), ...names.slice(0, offset)].slice(
       0,
       CANCELLATION_BATCH_SIZE,

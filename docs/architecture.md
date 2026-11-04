@@ -1,177 +1,100 @@
-# pi-plan-exec Architecture
+# Architecture
 
-`PlanExecController` owns domain policy, not a second workflow engine. It keeps
-one writer per execution target, fresh model context per operation, deterministic
-task eligibility, accepted/reviewed commits and deliberate recovery. New work
-uses unmodified pi-subagents 0.76.1 through public native RPC. See
-[runtime contracts](runtime-contracts.md) for evidence and safe limitations.
+Plan-exec owns domain policy and durable authorization. Pi and pi-subagents own
+agent execution. The [runtime contract](../skills/exec-plan/references/runtime-contracts.md)
+defines proof/compatibility; this document defines module responsibilities.
 
 ## Boundaries
 
-| Module | Owned responsibility |
+| Module | Responsibility |
 | --- | --- |
-| `src/index.ts` | `/exec` and `/goal`, session lifecycle, one polling loop, readonly view, parent-only activation |
-| `src/controller.ts` | Task/goal stages, operation preparation/observation, checks, review, acceptance, retry, stop and archive |
-| `src/registry.ts` | Authoritative run ledger, CAS, leases, reservations, stable locks, fsynced abandonment backup/archive |
-| `src/registry-lock.ts` | OS `flock` locks at stable never-unlinked paths |
-| `src/native-runtime.ts` | Public RPC correlation, immutable request dispatch, exact observation/control, native result binding |
-| `src/operation-safety.ts` | Native request digest, metadata validation, distinct dispatch and late-binding predicates |
-| `src/execution-contract.ts` | Pure lifetime, request digest and published retirement-proof validation |
-| `src/legacy-operation.ts` | Bounded lazy read-only schema-7 snapshot lookup and imported-evidence validation |
-| `src/native-reviewer.ts` | Namespaced readonly role registration through public runtime-agent events |
-| `src/artifact.ts`, `src/review.ts` | Explicit native result contracts, commit-bound typed review; separate legacy decoding |
-| `src/task-summary.ts` | Pure summaries derived from `run.tasks`, no external task store |
-| `src/runtime-integration.ts`, `src/run-view.ts` | Advisory Fleet/background-work and session-local presentation |
-| `src/plan.ts`, `src/scheduler.ts` | Markdown/task identity, approved plan structure, dependencies and wake selection |
-| `src/goal-loop.ts` | Goal marker protocol, committed check evidence, stall/iteration policy |
-| `src/lanes.ts`, `src/git.ts`, `src/isolation.ts` | Frozen commands, worktree identity, selective checkpoints, lanes and quarantine |
-| `src/local-operation.ts`, `src/owned-process.ts` | Local command intent, process-group ownership, cancellation and retirement |
-| `src/fusion.ts`, `src/review-backend.ts` | Explicit alternative backends with independent capability refusals |
-| `src/progress.ts` | Applied-transition-only progress history |
+| src/index.ts | Commands, session lifecycle/handoff, polling and native UI wiring |
+| src/controller.ts | Task/goal stages, checks, review, Git acceptance, retries and stop policy |
+| src/registry.ts | Sole operation ledger, CAS, leases, reservations and durable critical transitions |
+| src/registry-lock.ts | Stable-path kernel flock; no stale-lock guessing |
+| src/native-single-runtime.ts | Version-2 direct-single identity/status/output/process-proof mapping |
+| src/native-runtime.ts | Shared authority/transport/admission and historical workflow decoder |
+| src/operation-safety.ts | Immutable native digest, dispatch/binding and record validation |
+| src/execution-contract.ts | Versioned capability and native proof validation |
+| src/native-reviewer.ts | Public namespaced readonly runtime role registration |
+| src/config.ts / src/lanes.ts | Effective configuration, bootstrap/check detection and frozen argv |
+| src/plan.ts / src/scheduler.ts | Plan identity/dependencies and eligible task selection |
+| src/goal-loop.ts | Goal outcome protocol, fingerprints and reassessment signals |
+| src/inspector.ts / src/run-view.ts | Read-only preview/details and semantic responsive presentation |
+| src/runtime-integration.ts | Advisory subagents Fleet/background-work projection |
+| src/local-operation.ts / src/owned-process.ts | Durable local-command intent, group ownership and retirement |
+| src/git.ts / src/isolation.ts | Checkout identity, lanes, checkpoints and explicit quarantine |
+| src/legacy-operation.ts | Lazy read-only offline schema-7 import |
+| src/fusion.ts / src/review-backend.ts | Explicit optional backends and capability refusals |
+| src/progress.ts | Applied-transition progress history, not execution authority |
 
-There is no Bridge client/RPC server, new launch journal or pi-tasks adapter.
-The production package imports no private native runtime modules. Fixture-only
-runtime seams are pinned and distinguished from the packed normal-loader gate.
+## Data flow
 
-```mermaid
-flowchart LR
-    commands["/exec or /goal"] --> controller
-    controller --> registry["RunRegistry: operation ledger and reservations"]
-    controller --> native["public native RPC: one keyed main workflow"]
-    native --> child["fresh worker / readonly reviewer"]
-    child --> files["authorized checkout and unique bound output"]
-    files --> controller
-    controller --> checks["owned local checks and Git acceptance"]
-    controller --> views["advisory Fleet / progress view"]
-    controller --> alternatives["explicit Fusion / Revmux only"]
-```
+Commands allocate one run and freeze its effective plan/check/review policy.
+The controller chooses one eligible operation. New native intent is a **direct
+single**, not a script workflow; native workflow auto-resume cannot create a new
+root for that operation. The registry persists UUID/digest/cwd/output before
+emission. Native alias lookup and published artifacts provide exact observations;
+they do not authorize another spawn.
 
-## Durable operation protocol
+The record lock serializes the final prepared CAS, fsynced dispatch intent and
+synchronous emit with stop/abandon writes. It is released before any provider
+wait. Authority, reservation, acceptance and control transitions are fsynced;
+repeated heartbeat/diagnostic updates remain atomic without an unnecessary flush.
 
-Records live at `~/.pi/plan-exec/runs/<run-id>/run.json`. Registry-wide,
-controller and record locks have stable paths. CAS writes use atomic rename and
-monotonic revisions; unrelated metadata must not erase stop intent or reset a
-terminal retention anchor. Controller-to-record lock ordering is preserved.
-Never hold the record lock across provider RPC.
+Binding is not retirement. Process proof must identify the exact single and
+runner closure; result settlement then needs consistent native status and
+caller-bound output. Native result JSON is transient after notification delivery,
+so it is checked when supplied but is not the only settlement source.
 
-Preparation freezes logical operation/kind/task/review/candidate, cwd, request,
-RPC UUID, controller session UUID, native runtime identity, output path and
-requested limits. Input cwd must canonically match the current authorized
-`run.worktreeCwd`, including nested/task lanes. Dispatch revalidates it against
-fresh authority rather than permitting any absolute override.
+The controller independently verifies committed checkbox truth, ancestry,
+checkpoint integration, required commands, clean-tree state and reviewed/final
+commits. Model prose, activity and tool receipts cannot replace these gates.
 
-`prepared -> dispatching -> bound -> retired`: dispatch CAS precedes emission.
-Only an intact prepared record or exact retirement permits another authorized
-attempt. Unknown dispatch never emits another spawn. Targeted status uses
-`rpc-spawn-<uuid>` and verifies both `workflowChildren.parentToolCallId` and its
-root ID. Completion events can retain a fast binding but cannot replace proof.
-Facts for the same active/failed operation are synchronized, so an older failed
-snapshot cannot resurrect an already-retired attempt after lost-reply recovery.
+## Recovery and history
 
-The awaited `main` normally runs detached. Its recorded `async:true` requires
-one exact child proof in the published closed workflow roster. Recorded
-synchronous mode is handled explicitly; empty arrays alone are not retirement.
-A failed no-child workflow cannot provide task success. Missing/expired
-correlation stays fenced with a useful diagnosis, not a guessed identity.
+Prepared, dispatching, bound and retired are distinct phases. A lost response
+uses the saved exact RPC alias; unknown/expired/ambiguous correlation stays
+reserved. Native spawn itself is not idempotent. Neither a registry lease nor
+readable foreign status transfers native session control authority.
 
-Status/doctor use `NativeRuntimeClient.inspect`, sharing validation without any
-registry writes or native control. Exact binding is identity, not retirement;
-unknown/absent/refused observations stay inconclusive. Explicit reconciliation
-uses the scanned revision under CAS, so inspection cannot authorize a stale
-release or replay.
+Version-1 records retain their original decoder and immutable requests. The
+new production path refuses unresolved historical workflow continuation rather
+than manufacturing a no-successor guarantee. Explicit isolated recovery keeps
+the old identity/target quarantined and requires local-files-only approval.
 
-## Domain acceptance stays controller-owned
+Pause/cancel intent is independent of stop delivery and exit. Cancel hides the
+view immediately; pending cleanup still counts as background work. Force-stop
+backs up and abandons management before best-effort exact control, preserving
+unknown ownership. Cleanup does not remove worktrees/branches.
 
-The plan parser freezes task structure separately from checkbox completion.
-Omitted `dependsOn` preserves sequential order; `dependsOn: []` makes a task
-independent. The scheduler never treats unchecked prerequisites as accepted.
-A failed partial task retains its lane; independent work can start in a clean
-lane at the accepted baseline, excluding unaccepted and ignored user content.
-When the baseline advances, recovery creates a fresh lane with a selective
-checkpoint rather than revalidating an old candidate against a new baseline.
+Local bootstrap/checks use their own durable process-group runner, not native
+agent retirement. Escaped-descendant limitations are explicit; no stronger
+containment is inferred from a PID or wrapper exit.
 
-A task is accepted only after a successful exact child, committed checked plan
-items, accepted/checkpoint ancestry, frozen required checks and a clean tree.
-An output marker is not Git evidence. Bound `TASK_FAILED` diagnostics can record
-an observed external prerequisite and schedule bounded backoff; generic prose
-cannot infer credentials or permission failure. Failed-child output is diagnostic
-only. Local commands retain durable authorization and owned-process retirement.
+## Presentation
 
-`/goal` uses the same controller without a task DAG or plan file. A goal marker
-requires a successful turn, committed work and the frozen checks; failed turns
-cannot pass by printing `GOAL_DONE`. Only implementation turns consume the goal
-iteration budget. Test deletion/weakening and uncommitted changes remain final
-acceptance blockers. Review/fix and final verification use the same gates.
+The same pending-cleanup policy is shared by controller, strip and background
+projection. Shared diagnosis serves plan and goal status. A selected eligible
+run governs actions; stale menus are revalidated against fresh registry state.
 
-Required review is one readonly `plan-exec-reviewer` by default, with no implicit
-backend fallback. Configured frozen agents/models are honored. The typed report
-binds the exact candidate commit; all findings require severity, summary,
-evidence and suggestion. The controller verifies HEAD again before accepting
-review. Schema failure, missing output and wrong commits never become a clean
-review. Optional statistics cannot waive mandatory checks or review.
+Only a matching locally observed lease with a recent successful poll earns live
+presentation. Pending polls age into Snapshot. Native jobs-changed events are
+coalesced refresh hints; the periodic controller remains the recovery fallback.
+Native model/activity/usage projections are advisory.
 
-New artifacts are unique under the owning run. Validated result/proof copies
-are written via the existing authorized record-lock seam before acceptance.
-Structured requests omit file-only mode to avoid 0.76.1's premature required-file
-guard on structured-output-only completion; the runtime still persists the exact
-bound JSON. Marker operations keep file-only mode. The specific successful
-sole-child `settled-awaiting-resume` receipt can be consumed after wrapper
-failure; missing or inconsistent evidence is fenced, not a fresh worker launch.
+View preferences use branch-relative Pi custom entries, not model context.
+The inspector uses native selection/confirmation instead of replacing Pi's
+editor/footer or inventing terminal attention events.
 
-After all tasks, review and checks succeed, `outputTarget` guards promotion back
-to the original branch: known accepted ancestor, clean target and no ignored or
-preserved file overwrite. Promotion and plan archival are durable local
-operations. Progress is logged only after the matching state transition applies.
+## Verification
 
-## Stop, sessions and retention
+Pure tests cover parsers, policy, identity, proof and rendering matrices.
+Real native fixtures cover detached execution and recovery. Packed normal-loader
+tests use an actual tarball, unmodified Pi/native dependencies, default readonly
+review and a local scripted model. Agterm covers actual interactive rendering
+and controls. These layers are complementary; substituted child-session fixtures
+do not certify normal-loader or real-TUI behavior.
 
-Stop intent and delivery are separate from retirement. Pause is resumable;
-ordinary stop is final cancellation. Cancellation can bind a late identity but
-cannot consume a result, advance review or erase a newer stop generation.
-Provider refusal or timeout retries the same operation, never another worker.
-
-Force-stop durably backs up, abandons and revokes ordinary mutation before
-best-effort native stop. It ends management even if ownership remains unknown.
-No polling, session reload, result callback or UI preference may revive it.
-Only exact retirement through the registry's narrow abandoned-operation path
-can release reservations. Final archive fsync and controller-lock quiescence
-precede registry cleanup; workspace and provider storage are not deleted.
-
-A native early stop may leave `writer-close-unverified`. That target remains
-reserved. Neither stopped text nor runner PID disappearance is a substitute
-proof. Local process groups similarly retain their documented escaped-descendant
-limits rather than inventing stronger containment.
-
-Lease UUID/host/pid, display owner attribution and native session file identity
-are different concepts. A lease takeover never grants another native session's
-control authority. A foreign-host lease requires explicit same-machine handling
-or recovery on its host. The native runner's `PI_SUBAGENT_CHILD=1` makes the
-extension inert before registration or registry access, while leaving unrelated
-ambient extensions available for provider/MCP functionality.
-
-## Read-only legacy recovery
-
-Known historical native IDs can be observed without a journal. An unbound record
-requires explicit `resume --legacy-journal /absolute/path/to/offline.sqlite`.
-The snapshot must be schema 7 and SQLite-consistent; the importer checks original
-run/operation/digest and fresh CAS, retaining binding/rejection/cancel evidence
-without rewriting original intent. Absence, a receipt or a mapping is not
-non-start/retirement/replay authority. No default live journal is opened, migrated
-or reset. Abandoned records cannot import or resume.
-
-Native isolated recovery can fence its old registry generation and preserve the
-quarantined original target while preparing a separate checkout. Read-only legacy
-import cannot revoke a historical dispatch service, so unresolved legacy
-isolation refuses before filesystem mutation. Unknown active, failed and
-quarantined identities continue reserving their targets.
-
-## Validation
-
-Source-named tests preserve domain, CAS, generations, leases, force-stop and
-retention behavior. `test:runtime-smoke` exercises real detached native execution;
-`test:native-recovery` checks correlation across new OS hosts and preserves the
-negative direct-leaf case. `test:packed-consumer` installs a real tarball with
-neither removed package present and uses normal ambient loading plus a localhost
-scripted model. It proves default reviewer registration, typed clean/findings and
-rejection, lost replies, stop/restart, child inertness and no lease takeover.
-These are runtime/control guarantees, not claims about live model reliability.
+See [development](../DEVELOPMENT.md) for commands and
+[UI validation](ui-validation.md) for measured evidence.
