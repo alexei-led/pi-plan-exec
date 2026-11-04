@@ -69,11 +69,10 @@ test('imported host packages use tested peers, never private runtime copies', as
   for (const name of [
     '@earendil-works/pi-coding-agent',
     '@earendil-works/pi-tui',
-    'typebox',
   ]) {
     assert.equal(
       manifest.peerDependencies[name],
-      name === '@earendil-works/pi-coding-agent' ? '^1.0.4' : '*',
+      name === '@earendil-works/pi-coding-agent' ? '^1.5.0' : '*',
     );
   }
   for (const name of hostPackages) {
@@ -82,7 +81,7 @@ test('imported host packages use tested peers, never private runtime copies', as
     if (manifest.peerDependencies[name] !== undefined)
       assert.equal(
         manifest.peerDependencies[name],
-        name === '@earendil-works/pi-coding-agent' ? '^1.0.4' : '*',
+        name === '@earendil-works/pi-coding-agent' ? '^1.5.0' : '*',
       );
   }
 });
@@ -125,16 +124,13 @@ test('package manifest ships only plan-exec resources, needs no runtime dependen
     manifest.dependencies?.['@alexeiled/pi-subagents-bridge'],
     undefined,
   );
-  assert.match(
-    manifest.devDependencies?.['pi-subagents'] ?? '',
-    /^\^0\.76\.1$/,
-  );
-  assert.equal(manifest.peerDependencies['pi-subagents'], '>=0.76.1 <0.77.0');
+  assert.match(manifest.devDependencies?.['pi-subagents'] ?? '', /^0\.84\.0$/);
+  assert.equal(manifest.peerDependencies['pi-subagents'], '>=0.84.0 <0.85.0');
   assert.equal(manifest.peerDependenciesMeta['pi-subagents']?.optional, true);
   assert.equal(manifest.bundledDependencies, undefined);
   assert.equal(
     manifest.peerDependencies['@alexeiled/pi-fusion'],
-    '>=0.9.3 <1.0.0',
+    '>=0.12.0 <0.13.0',
   );
   assert.equal(
     manifest.peerDependenciesMeta['@alexeiled/pi-fusion']?.optional,

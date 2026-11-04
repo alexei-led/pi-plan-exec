@@ -263,7 +263,8 @@ export interface WorkerSignal {
 }
 
 export interface NativeOperationMetadata {
-  version: 1;
+  /** 1: historical workflow; 2: direct single, excluded from workflow auto-resume. */
+  version: 1 | 2;
   ownerRunId: string;
   ownerSessionId: string;
   /** Native runtime authority is the transcript path, or UUID before persistence. */
@@ -291,7 +292,13 @@ export interface NativeOperationMetadata {
   childRunId?: string;
   workflowReceiptPath?: string;
   retirement?: 'local-not-started' | 'native-proof';
-  terminalProof?: import('./execution-contract.js').WorkflowTerminalProof;
+  terminalProof?:
+    | import('./execution-contract.js').WorkflowTerminalProof
+    | import('./lifecycle.js').ProcessTerminalProof;
+  resultPath?: string;
+  launchContractDigest?: string;
+  reportedModel?: string;
+  admittedAgent?: string;
 }
 
 export interface ActiveOperation {

@@ -1,6 +1,10 @@
 import { createHash } from 'node:crypto';
 import { basename, isAbsolute } from 'node:path';
-import { workflowTerminalProof } from './execution-contract.js';
+import {
+  processTerminalProof,
+  terminalProofObserved,
+  workflowTerminalProof,
+} from './execution-contract.js';
 import type {
   ActiveOperation,
   NativeOperationMetadata,
@@ -36,6 +40,7 @@ export function nativeOperationDigest(operation: ActiveOperation): string {
   const meta = operation.native;
   if (!meta) throw new Error('Native operation metadata missing.');
   return nativeDigest({
+    ...(meta.version === 2 ? { adapterVersion: 2 } : {}),
     operationId: operation.operationId,
     kind: operation.kind,
     ...(operation.taskId !== undefined ? { taskId: operation.taskId } : {}),
@@ -183,7 +188,7 @@ export function validNativeOperation(
   if (
     operation.service !== 'native' ||
     !record(meta) ||
-    meta.version !== 1 ||
+    (meta.version !== 1 && meta.version !== 2) ||
     meta.ownerRunId !== runId ||
     typeof meta.ownerSessionId !== 'string' ||
     !meta.ownerSessionId.trim() ||
@@ -201,6 +206,39 @@ export function validNativeOperation(
     !record(meta.limits) ||
     meta.limits.maxTurnsEnforced !== false ||
     !['native-default', 'explicit'].includes(meta.limits.childTimeout)
+  )
+    return false;
+  if (meta.version === 2) {
+    const params = meta.request.params;
+    if (
+      typeof params.agent !== 'string' ||
+      !params.agent.trim() ||
+      typeof params.task !== 'string' ||
+      !params.task.trim() ||
+      params.output !== meta.outputPath ||
+      params.outputMode !== 'file-only' ||
+      params.async !== true ||
+      params.context !== 'fresh' ||
+      params.worktree !== false ||
+      params.mission !== false ||
+      params.acceptance !== false ||
+      params.script !== undefined ||
+      params.workflow !== undefined ||
+      params.tasks !== undefined ||
+      params.chain !== undefined
+    )
+      return false;
+  }
+  if (
+    meta.admittedAgent !== undefined &&
+    (typeof meta.admittedAgent !== 'string' ||
+      !meta.admittedAgent.trim() ||
+      meta.admittedAgent.length > 256)
+  )
+    return false;
+  if (
+    meta.resultPath !== undefined &&
+    (typeof meta.resultPath !== 'string' || !isAbsolute(meta.resultPath))
   )
     return false;
   const lifetime = meta.limits.requestedLifetime;
@@ -261,7 +299,10 @@ export function validNativeOperation(
   if (
     meta.terminalProof !== undefined &&
     (!operation.externalRunId ||
-      !workflowTerminalProof(meta.terminalProof, operation.externalRunId))
+      !(meta.version === 2
+        ? processTerminalProof(meta.terminalProof, operation.externalRunId)
+            ?.state === 'observed'
+        : workflowTerminalProof(meta.terminalProof, operation.externalRunId)))
   )
     return false;
   if (meta.retirement === 'native-proof' && !meta.terminalProof) return false;
@@ -291,7 +332,7 @@ export function validProviderFailure(
       operation.externalRunId &&
       operation.requestDigest &&
       validNativeOperation(operation, runId) &&
-      workflowTerminalProof(
+      terminalProofObserved(
         operation.native.terminalProof,
         operation.externalRunId,
         {

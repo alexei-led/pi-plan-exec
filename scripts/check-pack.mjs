@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
+import { missingPackedLinks } from './packed-links.ts';
 
 // Match Pi's host module aliases, including the legacy package names.
 const HOST_PACKAGES = new Set([
@@ -22,7 +23,7 @@ for (const name of HOST_PACKAGES) {
       invalid.push(`${field}: ${name}`);
   }
   const expectedPeerRange =
-    name === '@earendil-works/pi-coding-agent' ? '^1.0.4' : '*';
+    name === '@earendil-works/pi-coding-agent' ? '^1.5.0' : '*';
   if (
     Object.hasOwn(packageJson.peerDependencies ?? {}, name) &&
     packageJson.peerDependencies[name] !== expectedPeerRange
@@ -53,6 +54,7 @@ const REQUIRED = new Set([
   'package.json',
   'skills/exec-plan/SKILL.md',
   'skills/exec-plan/references/recovery.md',
+  'skills/exec-plan/references/runtime-contracts.md',
   'src/index.ts',
   'src/local-operation-worker.mjs',
 ]);
@@ -91,6 +93,19 @@ if (unexpected.length > 0 || missing.length > 0) {
       `Missing required package files:\n${missing.map((file) => `- ${file}`).join('\n')}`,
     );
   }
+  process.exit(1);
+}
+
+const packedFiles = new Set(files);
+const brokenLinks = files
+  .filter((file) => file.endsWith('.md'))
+  .flatMap((file) =>
+    missingPackedLinks(file, readFileSync(file, 'utf8'), packedFiles).map(
+      (target) => `${file}: ${target}`,
+    ),
+  );
+if (brokenLinks.length) {
+  console.error('Broken links in packed Markdown:\n' + brokenLinks.join('\n'));
   process.exit(1);
 }
 

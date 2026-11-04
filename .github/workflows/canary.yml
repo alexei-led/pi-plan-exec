@@ -1,0 +1,42 @@
+name: Dependency canary
+on:
+  schedule:
+    - cron: '23 7 * * 1'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: dependency-canary
+  cancel-in-progress: true
+jobs:
+  public-contracts:
+    name: Latest public API canary (nonblocking)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.15.0
+          cache: npm
+      - name: Install declared baseline
+        run: npm exec --yes --package=npm@12.0.2 -- npm ci --ignore-scripts
+      - name: Try latest stable host and native peers without changing the manifest
+        run: npm exec --yes --package=npm@12.0.2 -- npm install --no-save --ignore-scripts @earendil-works/pi-coding-agent@latest @earendil-works/pi-tui@latest pi-subagents@latest
+      - name: Types and public presentation contracts
+        run: |
+          npm exec --yes --package=npm@12.0.2 -- npm run tsc
+          npm exec --yes --package=npm@12.0.2 -- npx --no-install vitest run test/runtime-integration.test.ts test/native-reviewer.test.ts test/run-view.test.ts --maxWorkers=1
+      - name: Retain resolved versions
+        if: always()
+        run: npm ls --depth=0 > canary-versions.txt 2>&1 || true
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: canary-versions
+          path: canary-versions.txt
+          if-no-files-found: error
+          retention-days: 14

@@ -47,6 +47,7 @@ type NativeState = {
 type NativeContext = {
   cwd: string;
   hasUI: boolean;
+  isProjectTrusted(): boolean;
   ui: Record<string, unknown>;
   sessionManager: {
     getSessionId(): string;
@@ -238,9 +239,9 @@ export async function createNativeRuntimeHost(
         'utf8',
       ),
     ) as { version?: unknown };
-    if (packageJson.version !== '0.76.1') {
+    if (packageJson.version !== '0.84.0') {
       throw new Error(
-        `Fixture private seams are pinned to pi-subagents 0.76.1; found ${String(packageJson.version)}.`,
+        `Fixture private seams are pinned to pi-subagents 0.84.0; found ${String(packageJson.version)}.`,
       );
     }
 
@@ -336,6 +337,7 @@ export async function createNativeRuntimeHost(
     const context: NativeContext = {
       cwd: repository,
       hasUI: false,
+      isProjectTrusted: () => true,
       ui: {},
       sessionManager: {
         getSessionId: () => currentSessionId,

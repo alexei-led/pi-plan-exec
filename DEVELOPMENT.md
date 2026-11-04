@@ -1,184 +1,139 @@
 # Development
 
-## Local setup
+## Setup
+
+Development uses Node **24.15.0** and npm **12.0.2**. Runtime supports
+Node >=22.19.0; npm 12's development requirement is higher. Darwin/Linux need
+the platform C compiler for the Node-API kernel-lock binding.
 
 ```bash
-npm exec --yes --package=npm@12.0.2 -- npm ci
+npm exec --yes --package=npm@12.0.2 -- npm ci --ignore-scripts
 npm run test:all
-pi install /absolute/path/to/pi-plan-exec
 ```
 
-Restart Pi after upgrading installed packages. Reload is for local extension
-source/config changes, not mixed loaded/installed package versions. For local
-source/config changes only:
+The released development stack is Pi/TUI 1.5.0, pi-subagents 0.84.0 and optional
+Fusion 0.12.0. Use registry releases, not Git overrides. No Bridge/pi-tasks
+dependency is needed. Host modules stay peers, never private runtime copies.
 
-```text
-/reload
-```
+For local source development, load the checkout in a separate Pi session.
+Restart after installed package changes; reload is for source/config only.
+Read the [runtime contract](skills/exec-plan/references/runtime-contracts.md)
+before executing or recovering native work.
 
-Use npm 12.0.2. The default subagent backend uses released packages; see
-[runtime contracts](docs/runtime-contracts.md) before attempting an execution.
-
-Tooling: TypeScript 7, Biome (lint and format, replacing ESLint), and Vitest.
-`npm test` runs Vitest over `test/**/*.test.ts`. `test/index.test.ts` still runs
-under `node:test` because its session-lifecycle mocks depend on node:test's
-timer/mock semantics that Vitest does not reproduce yet; the script runs both
-runners. `test/autonomous-runtime-smoke.mjs` stays a separate `node --test`
-script (`npm run test:runtime-smoke`).
-
-## Validation
+## Checks
 
 ```bash
 npm run check
 npm test
 npm run test:runtime-smoke
+npm run test:native-contracts
 npm run test:native-recovery
 npm run test:parent-death
 npm run test:packed-consumer
 npm run pack:dry
 ```
 
-`npm run check` runs Biome and `tsc`; `npm run lint` and `npm run format` are
-available for focused runs. `npm run test:all` runs all local unit/native/recovery/parent-death/packed gates
-and packaging checks. CI also runs bounded Ubuntu native gate jobs and retains
-logs plus unresolved fixture metadata. Linux CI results are distinct from local
-Darwin results; wiring a job is not evidence that it ran.
-`npm run pack:dry` rejects private host SDK/TUI/TypeBox dependencies and checks
-the final npm tarball against a runtime-only allowlist. Host packages stay peers,
-never runtime copies: Pi core uses `^1.0.4`; the other host aliases use `"*"`.
-Development dependencies use the tested host range. The release workflow checks npm before
-it performs an actual publish. The real Pi RPC smoke test loads the package
-root and checks command registration without host-module warnings.
+check runs Biome and TypeScript. test runs Vitest plus the node:test
+command/session file, whose timer/mocking semantics are intentional.
+test:all runs the full relevant gates. Do not weaken per-test deadlines or infer
+success from a command budget timeout. Git/process-heavy suites need bounded
+worker fanout; retain full output and diagnose contention separately from defects.
 
-The tested baseline and deferred integration work are recorded in the
-[upstream audit](docs/upstream-audit.md).
+pack:dry verifies the runtime-only manifest, host peers and relative Markdown
+destinations against packed files—not documents merely present in the checkout.
+Installed safety contracts live under the shipped skill references. Source-only
+guides use versioned repository URLs from the installed README.
 
-## Native and packed integration
+### Native versus normal-loader coverage
 
-`test:runtime-smoke` launches real 0.76.1 detached workers with deterministic
-scripted sessions, verifying controller checks, typed review/fix/stats and bound
-artifacts. No removed package is loaded. `test:native-recovery` uses fresh OS
-hosts to prove keyed-workflow request correlation and exact child retirement;
-direct-leaf missing correlation remains an explicit negative case.
+native-single-runtime tests cover exact request/source/agent/cwd/output identity,
+sparse initial status, lost replies, missing delivered results, proof states,
+foreign control and stop/dispatch order. Historical workflow tests preserve v1
+decoding and old evidence semantics; they are not the new production launch path.
 
-`test:packed-consumer` creates a real npm tarball and a dedicated temporary
-consumer, using npm 12.0.2 to install Pi 1.0.4, pi-subagents 0.76.1 and the
-package. The fixture overrides and checks Pi's six host-family packages at 1.0.4;
-it verifies the codemode declaration export before starting Pi. Other transitive
-dependencies are resolved at install time. It asserts that neither removed
-package resolves from the consumer or extension. A localhost OpenAI-compatible scripted model uses no user credentials
-or paid API. Pi loads packages and observer extensions normally, without
-`--no-extensions` or replacement production clients. Child-mode loading must not
-register `/exec`/`/goal` or take parent leases. Tests cover plan/goal, default
-readonly reviewer, clean/findings output, malformed/missing/wrong-commit refusal,
-a dropped public RPC reply and force-stop/restart.
+runtime-smoke launches real detached native singles with deterministic substituted
+sessions. It verifies controller acceptance/review/fix/stats and output/proof
+capture. This is lower-level integration, not a real model/normal-loader claim.
 
-The isolated preload only sets the temporary home and injects a single dropped
-public event response; it does not patch installed runtime code. Failed evidence
-is retained with its path. If an early stop yields `writer-close-unverified`, the
-passing safety case retains the isolated ownership record/workspace instead of
-pretending exit and deleting it. Do not clean unknown ownership merely to make
-tests leave an empty directory.
+packed-consumer installs an actual tarball in a new isolated home with Pi1.5/
+native0.84. Normal package loading, actual SDK sessions and a localhost scripted
+OpenAI-compatible model exercise default readonly review, schema failures, plan/
+goal/fix, controls, lost replies, provider recovery and child inertness. No user
+credentials or live registry are read. Peer absence and capability ceilings are
+tested explicitly. The Pi host family includes schema/telemetry; the old chord
+package and codemode MCP preamble constant are not current API requirements.
 
-The normal loader exposed 0.76.1's structured-output-only/file-only settlement
-failure. Schema requests now keep the bound output path but use supported inline
-settlement; marker requests remain file-only. The smoke checks actual persisted
-JSON and exact native proof, not a model summary.
+A native completion watcher removes delivered result JSON. Tests therefore
+validate retained exact status, process proof and unique bound output, while
+rejecting any explicitly contradictory raw artifact/path. Never accept a
+recent-output tail as the complete caller result.
 
-For optional visible manual probes, use
-`node test/recovery-agterm.mjs <new-sandbox> <runtime-root> --server-only`.
-The runtime root is a local checkout with released native/Pi dependencies, not a
-Bridge checkout. `/fixture-seed [lost-reply]` creates only isolated native intent
-and closed schema-7 fixture data. It never constructs a removed journal service.
-This selected-extension manual harness is not the packed normal-loader gate.
+Native recovery/parent-death gates are separate from pure tests. Pending or
+writer-close-unverified proof retains its isolated evidence and reservation;
+deleting it is not a valid way to make cleanup pass.
 
-## Progress strip validation
+### Real Pi in agterm
 
-The chosen UI and native screenshots are in [UI validation](docs/ui-validation.md).
-`test/run-view.test.ts` covers column widths, status precedence, colors and display
-preferences. Lifecycle tests cover shared exec/goal controls, permanent
-cancellation dismissal across reload/new sessions, and late projection.
-`hide` toggles display only; legacy `ui off` stays idempotent.
-The recovery fixture uses a real Pi TUI, released native subagents and a local
-scripted model. `test/fixtures/progress-ui.ts` adds display-only states inside
-that explicitly isolated sandbox; its foreign lease prevents worker dispatch.
-It is never shipped in the npm package.
+Use only a new sandbox outside both checkouts, with its own HOME, agent directory,
+native temp root, repository, registry and fake localhost model. Record installed
+versions, loaded paths, source/lockfile hashes and terminal dimensions. No user
+auth/settings/MCP/active-run data may be copied.
+
+The real interactive validation must cover plan and goal completion, required
+review/fix, pause/resume/cancel, reload/reopen, exact inspector selection,
+narrow widths and light/dark themes. Save scoped terminal readbacks and palette
+evidence. Display-only foreign-lease fixtures are screenshots, not execution
+proof. A scripted model proves integration, not live-model quality.
+
+Current evidence belongs in [UI validation](docs/ui-validation.md). Historical
+screenshots and the selected-extension recovery harness do not certify the
+current normal-loader stack.
 
 ## Release
 
-Target package:
+Target: @alexeiled/pi-plan-exec. Releases are tag-driven through
+.github/workflows/release.yml using GitHub OIDC; never publish around that
+workflow with local npm credentials.
 
-```text
-@alexeiled/pi-plan-exec
-```
-
-Normal releases are tag-driven. Choose patch, minor or major from the compatibility
-impact, update
-`package.json`, `package-lock.json`, and `CHANGELOG.md`, then commit the release
-version in a release branch or worktree. Merge the reviewed release PR only
-after all checks pass; do not commit or push directly to `main`.
+1. Work in an isolated branch/worktree.
+2. Update package.json, package-lock.json and the committed changelog once.
+3. Pass checks, full tests, native/recovery/packed and real-TUI validation.
+4. Review the complete staged diff and release notes.
+5. Commit, push and create a PR. Merge only after exact-commit gates pass.
+6. Fetch the merged release commit and tag that exact commit.
+7. Push the version tag to trigger the publisher.
+8. Verify npm/GitHub versions, title, notes, tarball and provenance.
 
 ```bash
-npm run test:all
-git commit -am "chore: release <version>"
 git push -u origin HEAD
 gh pr create --repo alexei-led/pi-plan-exec --base main
-```
-
-After the PR merges, fetch its merge commit and tag that exact commit:
-
-```bash
 git fetch origin main
 git merge-base --is-ancestor <release-commit> origin/main
 git tag v<version> <release-commit>
 git push origin refs/tags/v<version>
 ```
 
-Use `npm version patch`, `npm version minor` or `npm version major` only when it is the command that
-makes the intended version change; do not bump an already versioned release a
-second time.
+Do not edit/push main directly, move a published tag, overwrite a package version
+or bypass failed hooks. CI/release use the same pinned npm. Publication must
+depend on native/packed validation for the exact tagged commit, not merely main
+ancestry. Linux CI and local macOS validation are separate evidence.
 
-PR CI runs the native and packed integration gates. The release workflow runs
-only for pushed `v*` tags; it runs lint, types, unit tests and package dry run,
-not the native or packed gates. It rejects a tag that does
-not match `package.json` or is not on `main`, runs the validation gate, publishes
-with npm provenance, and creates a GitHub Release.
-
-### Trusted publishing
-
-The workflow uses GitHub Actions OIDC, not `NPM_TOKEN`. It needs:
-
-- a GitHub-hosted runner;
-- `id-token: write` in `.github/workflows/release.yml`;
-- an npm trusted publisher tied to `alexei-led/pi-plan-exec` and `release.yml`;
-- the `repository.url` in `package.json` to exactly match the GitHub repository.
-
-npm cannot configure a trusted publisher until the package already exists. The
-initial release therefore needs one authenticated local publish, then a one-time
-trust configuration. The exact bootstrap commands are supplied during release
-setup; do not add an npm token to GitHub secrets.
-
-After trusted publishing is configured, future releases must go through pushed
-version tags. Do not run local `npm publish` again.
-
+The trusted publisher must remain tied to alexei-led/pi-plan-exec and release.yml,
+with exact repository.url and id-token:write. Do not add NPM_TOKEN.
+See the committed changelog for required upgrade actions and limits.
 
 ## Rollback preflight
 
-Never point an older executor directly at a registry containing native data.
-The frozen 1.8.0 parser accepts the extra native service data; its reservation
-check can still block a competing owner, but that is not format rejection.
-Its explicit cleanup can delete native terminal artifacts or unreadable owner
-records. `test/rollback-preflight.test.ts` demonstrates those actual paths using
-unmodified source pinned to `bc5fb6ef800b6e88f3edeef542869bbd84a9ed3a` in a disposable fixture.
-
-Before any supported rollback, quiesce writers and use the new read-only check
-against an explicitly selected registry/consistent backup:
+Do not point an older executor at a registry containing native records/artifacts,
+including terminal/abandonment history. Older cleanup can erase incompatible
+evidence. The regression uses frozen unmodified 1.8.0 source at
+bc5fb6ef800b6e88f3edeef542869bbd84a9ed3a; CI needs full Git history.
 
 ```bash
-npm run check:rollback -- --registry /absolute/registry-directory
+npm run check:rollback -- --registry /absolute/registry-or-consistent-backup
 ```
 
-It refuses native records, retained native artifact directories, terminal and
-abandonment history, unreadable JSON, symlinks and incomplete inspection. It never
-opens a default live registry or deletes evidence to make rollback pass. Running
-old code directly bypasses this check and remains unsafe.
+The check is read-only and refuses native records/artifacts, unreadable data,
+symlinks and incomplete inspection. It never discovers a default live registry
+or deletes evidence to permit downgrade. Quiesce owners first; a passing build
+is not permission to discard reservations.

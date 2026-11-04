@@ -302,18 +302,17 @@ test('released public status correlation after a fresh OS host process', {
     );
     assert.equal(recovery.nativeStatusArtifact.runId, origin.nativeRunId);
     assert.equal(recovery.nativeStatusArtifact.sessionId, sessionId);
-    assert.equal(recovery.nativeStatusArtifact.toolCallId, null);
+    assert.equal(recovery.nativeStatusArtifact.toolCallId, recovery.aliasId);
     assert.equal(recovery.rawRequestId.success, false);
     assert.equal(recovery.rawRequestId.error?.code, 'execution_failed');
     assert.match(
       recovery.rawRequestId.error?.message ?? '',
       /Async run not found/i,
     );
-    assert.equal(recovery.rpcSpawnAlias.success, false);
-    assert.equal(recovery.rpcSpawnAlias.error?.code, 'execution_failed');
-    assert.match(
-      recovery.rpcSpawnAlias.error?.message ?? '',
-      /Async run not found/i,
+    assert.equal(recovery.rpcSpawnAlias.success, true);
+    assert.equal(
+      recovery.rpcSpawnAlias.processTerminal?.runId,
+      origin.nativeRunId,
     );
     assert.equal(
       recovery.nativeStatusArtifact.processTerminal?.state,
@@ -342,9 +341,9 @@ test('released public status correlation after a fresh OS host process', {
       structuredBindingFields(view, recovery.aliasId, origin.nativeRunId),
     );
     assert.equal(rawRecovered, false);
-    assert.equal(aliasRecovered, false);
+    assert.equal(aliasRecovered, true);
     assert.equal(rawStructuredBinding, false);
-    assert.equal(aliasStructuredBinding, false);
+    assert.equal(aliasStructuredBinding, true);
     t.diagnostic(
       JSON.stringify({
         rawRequestId: {
@@ -423,7 +422,7 @@ test('released public RPC launches direct worker/reviewer leaves and preserves e
   try {
     host = await createNativeRuntimeHost(sandbox);
     t.diagnostic(
-      `pi-subagents 0.76.1; fixture sandbox (removed on pass, retained on failure): ${sandbox}`,
+      `pi-subagents 0.84.0; fixture sandbox (removed on pass, retained on failure): ${sandbox}`,
     );
 
     const started = [];

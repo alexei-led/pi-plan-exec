@@ -238,6 +238,18 @@ async function advanceToCompletion(
   return current;
 }
 
+test('execution preview resolves real target and checks without allocating or dispatching', async (t) => {
+  const f = await fixture(t);
+  const before = await f.git('status', '--porcelain');
+  const preview = await f.controller.previewGoal(f.root, CHECK);
+  assert.equal(preview.cwd, f.root);
+  assert.equal(preview.branch, 'feature');
+  assert.deepEqual(preview.config.requiredChecks, CHECK);
+  assert.deepEqual(await f.registry.list(), []);
+  assert.equal(f.worker.launches.length, 0);
+  assert.equal(await f.git('status', '--porcelain'), before);
+});
+
 test('a goal continues after an intermediate answer and completes when checks pass', async (t) => {
   const f = await fixture(t);
   let run = await start(f);
@@ -823,6 +835,26 @@ test('a restart observes an active turn without relaunching it', async (t) => {
   );
   assert.equal(f.worker.launches.length, 1);
 });
+
+for (const [path, content] of [
+  ['repository.ts', 'const rows = query.skip(10);\n'],
+  ['README.md', 'Use test.skip() only while diagnosing failures.\n'],
+  [
+    'tests/sample.test.ts',
+    "const rows = query.only('name');\ntest('ok', () => {});\n",
+  ],
+] as const)
+  test(`goal completion accepts ordinary code and documentation: ${path}`, async (t) => {
+    const f = await fixture(t);
+    let run = await start(f);
+    await writeFile(join(f.root, path), content);
+    await writeFile(join(f.root, 'done.txt'), 'fixed\n');
+    await f.git('add', '--all');
+    await f.git('commit', '-m', 'complete goal without disabling tests');
+    run = await finishTurn(f, run, '<<<RALPHEX:GOAL_DONE>>>\nVerified.');
+    run = await advanceToCompletion(f, run);
+    assert.equal(run.status, 'completed', run.blocked?.reason ?? run.error);
+  });
 
 test('goal completion pauses when the diff deletes tests', async (t) => {
   const f = await fixture(t);

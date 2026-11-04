@@ -96,6 +96,22 @@ export function isInFlightStatus(status: RunStatus): boolean {
   return IN_FLIGHT_STATUSES.has(status);
 }
 
+export function pendingCleanup(run: PlanExecRun): boolean {
+  return Boolean(
+    run.localOperationActive ||
+      (run.activeOperation &&
+        !run.activeOperation.processTreeExited &&
+        !run.activeOperation.launchFenced),
+  );
+}
+
+export function hasManagedWork(run: PlanExecRun): boolean {
+  return (
+    isInFlightStatus(run.status) ||
+    (run.status === RUN_STATUS.PAUSED && pendingCleanup(run))
+  );
+}
+
 export function isReviewStage(stage: RunStage): boolean {
   return REVIEW_STAGES.has(stage);
 }

@@ -1,5 +1,9 @@
 import { basename } from 'node:path';
-import { isInFlightStatus, isTerminalStatus } from './lifecycle.js';
+import {
+  hasManagedWork,
+  isTerminalStatus,
+  pendingCleanup,
+} from './lifecycle.js';
 import { type PlanExecRun, RUN_STATUS } from './types.js';
 
 const EXTERNAL_SOURCE = 'pi-plan-exec';
@@ -157,7 +161,7 @@ export class PlanExecRuntimeIntegration {
       terminal: isTerminalStatus(run.status),
       updatedAt: run.updatedAt,
     });
-    if (isInFlightStatus(run.status))
+    if (hasManagedWork(run))
       this.activeWork.set(externalId, { id: externalId, sessionId });
     else this.activeWork.delete(externalId);
     const terminalRows = [...this.rows.entries()]
@@ -264,7 +268,10 @@ function externalRecord(
     source: EXTERNAL_SOURCE,
     label: `PlanExec ${run.planPath !== undefined ? basename(run.planPath) : `goal ${run.goal?.hash ?? run.id}`}`,
     state: externalState(run),
-    currentAction: run.stage,
+    currentAction:
+      run.status === RUN_STATUS.PAUSED && pendingCleanup(run)
+        ? 'stopping'
+        : run.stage,
     preview: `${run.status} · ${run.stage}`,
     startedAt: run.createdAt,
     updatedAt: run.updatedAt,
@@ -301,7 +308,7 @@ function externalState(run: PlanExecRun): ExternalRunState {
     case RUN_STATUS.CANCELLED:
       return 'stopped';
     case RUN_STATUS.PAUSED:
-      return 'stopped';
+      return pendingCleanup(run) ? 'running' : 'stopped';
     default:
       return 'running';
   }

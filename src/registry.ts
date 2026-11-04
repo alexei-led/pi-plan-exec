@@ -18,11 +18,13 @@ import { validLegacyImport } from './legacy-operation.js';
 import { isSkippableStage, isTerminalStatus } from './lifecycle.js';
 import { hasActiveLocalOperations } from './local-operation.js';
 import {
+  nativeDispatchAllowed,
   validNativeOperation,
   validProviderFailure,
 } from './operation-safety.js';
 import { parsePlan } from './plan.js';
 import { acquireLock, LockTimeoutError } from './registry-lock.js';
+import { required } from './required.js';
 import {
   type ActiveOperation,
   DEFAULT_FROZEN_RUN_CONFIG,
@@ -86,8 +88,8 @@ async function canonicalReservationPath(path: string): Promise<string> {
   }
 }
 
-async function reservedCheckouts(run: RunReservations): Promise<Set<string>> {
-  const paths = [
+function reservationPaths(run: RunReservations): Array<string | undefined> {
+  return [
     run.worktreeCwd,
     run.outputTarget?.cwd,
     run.lanePreparation?.cwd,
@@ -99,8 +101,11 @@ async function reservedCheckouts(run: RunReservations): Promise<Set<string>> {
       ...(task.recoveryHistory ?? []).map((source) => source.cwd),
     ]),
   ];
+}
+
+async function reservedCheckouts(run: RunReservations): Promise<Set<string>> {
   const unique = new Set(
-    paths.filter((path): path is string => path !== undefined),
+    reservationPaths(run).filter((path): path is string => path !== undefined),
   );
   return new Set(
     await Promise.all(
@@ -324,6 +329,42 @@ export class RunRegistry {
   }
 
   /** Short direct filesystem mutations share the stop record lock, never provider waits. */
+  /** The record lock covers durable intent and synchronous emit, never the RPC wait. */
+  async dispatchNative(
+    run: PlanExecRun,
+    operation: ActiveOperation,
+    sessionId: string,
+    emit: () => void,
+  ): Promise<{ run: PlanExecRun; applied: boolean }> {
+    const lock = await acquireLock(this.recordLockPath(run.id));
+    try {
+      const current = await this.get(run.id);
+      if (!current) throw new Error('Native owning run not found.');
+      if (
+        current.updatedAt !== run.updatedAt ||
+        current.worktreeCwd !== run.worktreeCwd ||
+        !nativeDispatchAllowed(current, operation, sessionId)
+      )
+        return { run: current, applied: false };
+      const updated: PlanExecRun = {
+        ...current,
+        revision: (current.revision ?? 1) + 1,
+        updatedAt: nextUpdatedAt(current.updatedAt),
+        activeOperation: {
+          ...operation,
+          launchStartedAt: Date.now(),
+          native: { ...required(operation.native), phase: 'dispatching' },
+        },
+      };
+      assertRun(updated);
+      await writeLocked(this.pathFor(run.id), updated, this.directory);
+      emit();
+      return { run: updated, applied: true };
+    } finally {
+      await lock.release();
+    }
+  }
+
   async withAuthorizedMutation(
     run: PlanExecRun,
     mutate: () => Promise<void>,
@@ -580,7 +621,11 @@ export class RunRegistry {
         updatedAt,
         ...(retiredAt !== undefined ? { retiredAt } : {}),
       };
-      await writeLocked(path, updated);
+      await writeLocked(
+        path,
+        updated,
+        requiresDurableWrite(current, updated) ? this.directory : undefined,
+      );
       return { run: updated, applied: true };
     } finally {
       await lock.release();
@@ -763,11 +808,52 @@ export class RunRegistry {
     const lockPath = this.recordLockPath(run.id);
     const lock = await acquireLock(lockPath);
     try {
-      await writeLocked(path, run);
+      await writeLocked(path, run, this.directory);
     } finally {
       await lock.release();
     }
   }
+}
+
+/** Heartbeats/diagnostics stay atomic; authority and external-effect intent reach disk. */
+export function requiresDurableWrite(
+  before: PlanExecRun,
+  after: PlanExecRun,
+): boolean {
+  const authority = (run: PlanExecRun) => ({
+    status: run.status,
+    stage: run.stage,
+    userStopped: run.userStopped,
+    stopGeneration: run.stopGeneration ?? 0,
+    executionGeneration: run.executionGeneration ?? 0,
+    branch: run.branch,
+    planPath: run.planPath,
+    planHash: run.planHash,
+    acceptedHead: run.acceptedHead,
+    reviewedCommit: run.reviewedCommit,
+    verifiedCommit: run.verifiedCommit,
+    owner: [run.lease?.sessionId, run.lease?.pid, run.lease?.hostname],
+    operations: [run.activeOperation, run.failedOperation].map((operation) =>
+      operation
+        ? [
+            operation.operationId,
+            operation.requestDigest,
+            operation.stopRequested,
+            operation.processTreeExited,
+            operation.launchFenced,
+            operation.native?.phase,
+            operation.native?.admittedAgent,
+          ]
+        : null,
+    ),
+    checkouts: reservationPaths(run),
+    archive: run.archiveOperation,
+    promotion: run.outputPromotion,
+    lane: run.lanePreparation,
+    isolation: run.isolationRecovery,
+    config: run.config,
+  });
+  return JSON.stringify(authority(before)) !== JSON.stringify(authority(after));
 }
 
 async function writeLocked(
@@ -786,10 +872,14 @@ async function writeLocked(
       await file.close();
     }
   } else
-    await writeFile(temporary, `${JSON.stringify(run, null, 2)}\n`, 'utf8');
+    await writeFile(temporary, `${JSON.stringify(run, null, 2)}\n`, {
+      encoding: 'utf8',
+      mode: 0o600,
+      flag: 'wx',
+    });
   await rename(temporary, path);
   if (syncRoot) {
-    // Persist both the rename and any newly created archive directories before deletion.
+    const root = syncRoot;
     for (
       let directory = resolve(dirname(path));
       ;
@@ -801,7 +891,7 @@ async function writeLocked(
       } finally {
         await handle.close();
       }
-      if (directory === resolve(syncRoot) || dirname(directory) === directory)
+      if (directory === resolve(root) || dirname(directory) === directory)
         break;
     }
   }

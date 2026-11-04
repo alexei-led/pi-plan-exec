@@ -1,5 +1,53 @@
 # Changelog
 
+## 2.3.0 - 2026-11-04
+
+### Changed
+
+- Launch new operations as direct async singles on unmodified pi-subagents
+  0.84.x and Pi/TUI 1.5.x. Singles avoid native workflow auto-resume without
+  editing global settings or installing Bridge.
+- Add `/exec inspect` and `/goal inspect`: native keyboard navigation, exact-run
+  actions and cancellation confirmation, with text output in RPC/print mode.
+  Start previews show worker/reviewer models, target, review and command argv.
+- Keep state, identity and inspect action visible in narrow progress strips.
+  Expired observations become Snapshot, including while a poll is pending.
+  Hide/unhide preserves selection and dismissed runs.
+- Keep paused cleanup active until retirement. Refresh from native jobs-changed
+  hints with periodic reconciliation; avoid duplicate probe-error notifications.
+- Preserve goal recovery errors and forward advanced recovery flags. Require
+  selection rather than silently choosing the newest ambiguous goal.
+- Limit the test-disable heuristic to test files/declarations, not ordinary
+  application `skip()` or `only()` APIs.
+- Synchronize critical authority/stop/dispatch writes. Final dispatch authorization,
+  durable intent and RPC emission share a record lock; replies wait outside it.
+  Omitted observation fields no longer restore stale metadata; invalid optional
+  timeout diagnostics no longer block valid retirement.
+- Repair installed documentation links and check them against the package.
+  Validate tagged releases, macOS/Linux hosts and the Node runtime floor.
+
+### Upgrade
+
+- **Before upgrading**, finish workflow-based runs with their original runtime
+  and quiesce every host sharing the registry. Preserve requests, journals and
+  checkout reservations. A retired failed/stopped workflow root alone does not
+  establish absence of a successor; unfinished v1 runs cannot continue in place
+  under the new adapter. Use explicitly approved isolated recovery instead.
+- Install Pi/TUI 1.5.0+ and pi-subagents 0.84.x, then restart Pi. Node >=22.19.0
+  and Darwin/Linux with a C compiler are required. Do not downgrade over retained
+  native evidence.
+
+### Limits
+
+- Native defaults still limit unbounded requests; requested maxTurns are not
+  native-enforced. Native completion notifications can start parent model turns.
+  Reported child usage does not include those parent turns or prove billing.
+- Retirement still requires exact identity, observed runner closure and bound
+  output. Unknown ownership never authorizes replay or another writer. Optional
+  Fusion/Revmux review remains unavailable without strict lifecycle evidence.
+
+[Full changes](https://github.com/alexei-led/pi-plan-exec/compare/v2.2.0...v2.3.0)
+
 ## 2.2.0 - 2026-11-03
 
 ### Changed
@@ -113,7 +161,7 @@
   Missing identity or retirement proof remains reserved.
 - Do not downgrade while any native record or artifact remains, including
   terminal history. Older cleanup can delete that evidence. Use the
-  [read-only rollback preflight](DEVELOPMENT.md#rollback-preflight); never erase
+  [read-only rollback preflight](https://github.com/alexei-led/pi-plan-exec/blob/v2.0.0/DEVELOPMENT.md#rollback-preflight); never erase
   records just to make it pass.
 
 ### Limits

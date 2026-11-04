@@ -91,22 +91,53 @@ for (const runtimeId of ['/tmp/pi-tests/sessions/session-1.jsonl', 'session-1'])
     try {
       integration.reconcile([run()], 'session-1', runtimeId);
       assert.equal(snapshotExternalRuns(runtimeId).length, 1);
-      assert.equal(snapshotBackgroundWork(runtimeId).items.length, 1);
+      assert.equal(snapshotBackgroundWork([runtimeId]).items.length, 1);
       if (runtimeId !== 'session-1') {
         assert.equal(snapshotExternalRuns('session-1').length, 0);
-        assert.equal(snapshotBackgroundWork('session-1').items.length, 0);
+        assert.equal(snapshotBackgroundWork(['session-1']).items.length, 0);
       }
       integration.reconcile(
         [run({ status: 'completed', updatedAt: 3 })],
         'session-1',
         runtimeId,
       );
-      assert.equal(snapshotBackgroundWork(runtimeId).items.length, 0);
+      assert.equal(snapshotBackgroundWork([runtimeId]).items.length, 0);
     } finally {
       integration.dispose();
     }
     assert.equal(snapshotExternalRuns(runtimeId).length, 0);
   });
+for (const patch of [
+  { localOperationActive: true },
+  {
+    activeOperation: {
+      operationId: 'pending-cleanup',
+      service: 'native' as const,
+      kind: 'implementation' as const,
+    },
+  },
+])
+  test(`paused pending cleanup remains active until retirement: ${JSON.stringify(patch)}`, () => {
+    const api = new FakeRuntimeApi();
+    const integration = new PlanExecRuntimeIntegration(api);
+    const paused = run({ status: 'paused', ...patch });
+    integration.sync(paused, 'session-1');
+    assert.equal([...api.providers.values()][0]?.listActiveWork().length, 1);
+    const row = [...api.rows.values()][0];
+    assert.equal(row?.state, 'running');
+    assert.equal(row?.currentAction, 'stopping');
+    const retired: PlanExecRun = {
+      ...paused,
+      localOperationActive: false,
+      updatedAt: 3,
+    };
+    delete retired.activeOperation;
+    integration.sync(retired, 'session-1');
+    assert.equal([...api.providers.values()][0]?.listActiveWork().length, 0);
+    assert.equal([...api.rows.values()][0]?.state, 'stopped');
+    integration.dispose();
+  });
+
 test('Fleet admission failure cannot hide active background work or leak completion', () => {
   const api = new FakeRuntimeApi();
   api.registerExternalRun = () => {

@@ -13,6 +13,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { ExtensionContext } from '@earendil-works/pi-coding-agent';
 import { beforeEach, expect, onTestFinished, test, vi } from 'vitest';
+import { workflowTerminalProof } from '../src/execution-contract.js';
 import { registerNativeReviewer } from '../src/native-reviewer.js';
 import { NativeRuntimeClient } from '../src/native-runtime.js';
 import { RunRegistry } from '../src/registry.js';
@@ -79,6 +80,7 @@ async function fixture(sessionFile?: string) {
   let session = 'session';
   const context = () =>
     ({
+      isProjectTrusted: () => true,
       modelRegistry: { getAvailable: () => [] },
       scopedModels: [],
       sessionManager: {
@@ -484,7 +486,11 @@ test('released public RPC publishes real proof/output with healthy and lost spaw
         observed = await client.operation(f.run.id, binding);
       }
       expect(observed.state, observed.reason).toBe('retired');
-      expect(observed.proof?.kind).toBe('workflow');
+      const workflowProof = workflowTerminalProof(
+        observed.proof,
+        required(observed.operation.externalRunId),
+      );
+      expect(workflowProof?.kind).toBe('workflow');
       expect(observed.operation.native?.observedLimits?.workflowTimeoutMs).toBe(
         60_000,
       );
@@ -503,11 +509,11 @@ test('released public RPC publishes real proof/output with healthy and lost spaw
       expect(actualStatus.steps).toHaveLength(1);
       expect(typeof actualStatus.steps[0].async).toBe('boolean');
       if (actualStatus.steps[0].async) {
-        expect(observed.proof?.children).toHaveLength(1);
-        expect(observed.proof?.children[0]?.runId).toBe(
+        expect(workflowProof?.children).toHaveLength(1);
+        expect(workflowProof?.children[0]?.runId).toBe(
           actualStatus.steps[0].runId,
         );
-      } else expect(observed.proof?.children).toHaveLength(0);
+      } else expect(workflowProof?.children).toHaveLength(0);
       // The exact S25 receipt can recover a successful child without replaying
       // the failed JavaScript wrapper or accepting arbitrary failure output.
       const receiptPath = join(
@@ -2039,11 +2045,34 @@ for (const reason of [
   });
 }
 
+test('project trust changed during admission refuses dispatch without rewriting prepared intent', async () => {
+  const f = await fixture();
+  let trusted = true;
+  const context = { ...f.context(), isProjectTrusted: () => trusted };
+  const client = new NativeRuntimeClient(f.bus, f.registry, () => context, {
+    rpcTimeoutMs: 30,
+  });
+  onTestFinished(() => client.dispose());
+  const before = await readFile(f.registry.authorizationPath(f.run.id));
+  admission.mockImplementation(async () => {
+    trusted = false;
+    return { ok: true, contract: {} } as Awaited<ReturnType<typeof admission>>;
+  });
+  await expect(client.spawn(f.run.id, f.binding)).rejects.toThrow(
+    'project_trust_changed',
+  );
+  expect(f.requests).toEqual([]);
+  expect(await readFile(f.registry.authorizationPath(f.run.id))).toEqual(
+    before,
+  );
+});
+
 test('public admission receives frozen fresh child and actual host model scope and MCP snapshot host', async () => {
   const f = await fixture('/native-session.jsonl');
   const { op, binding } = await admissionChild(f, 'configured-reviewer');
   const ctx = {
     ...f.context(),
+    isProjectTrusted: () => false,
     model: { provider: 'fixture', id: 'inherited' },
     scopedModels: [{ model: { provider: 'fixture', id: 'scoped' } }],
     modelRegistry: {
@@ -2073,11 +2102,14 @@ test('public admission receives frozen fresh child and actual host model scope a
       availableModels: [{ provider: 'fixture', id: 'requested' }],
       parentModel: { provider: 'fixture', id: 'inherited' },
       scopedModelIds: ['fixture/scoped'],
-      parentSessionId: '/native-session.jsonl',
+      parentSessionId: 'session',
+      projectTrusted: false,
       parentSessionFile: '/native-session.jsonl',
       runtimeSnapshotHost: host,
     }),
   );
+  expect(capabilityCeiling).toHaveBeenCalledWith('session');
+  expect(capabilityCeiling).not.toHaveBeenCalledWith('/native-session.jsonl');
   expect(f.requests[0]?.params).toEqual(op.native?.request.params);
 });
 
@@ -2125,6 +2157,8 @@ for (const race of [
 
 for (const state of [
   'live',
+  'suggestion',
+  'disabled',
   'absent',
   'disposed',
   'disposed-during-admission',
@@ -2140,6 +2174,20 @@ for (const state of [
     const role = state === 'absent' ? undefined : ownedReviewer(f);
     if (state === 'disposed') role?.dispose();
     admission.mockResolvedValue({ ...unknownReviewer, diagnostics: [] });
+    if (state === 'suggestion')
+      admission.mockResolvedValue({
+        ...unknownReviewer,
+        diagnostics: [],
+        message:
+          "Unknown agent: plan-exec-reviewer. Did you mean 'plan-exec-review'?\nAvailable agents: worker",
+      });
+    if (state === 'disabled')
+      admission.mockResolvedValue({
+        ...unknownReviewer,
+        diagnostics: [],
+        message:
+          'Unknown agent: plan-exec-reviewer is disabled by a settings override.\nAvailable agents: worker',
+      });
     if (state === 'collision')
       admission.mockResolvedValue({ ok: true, contract: {} } as Awaited<
         ReturnType<typeof admission>
@@ -2167,7 +2215,7 @@ for (const state of [
         role?.dispose();
         return { ...unknownReviewer, diagnostics: [] };
       });
-    if (state === 'live') {
+    if (state === 'live' || state === 'suggestion') {
       await f.client.spawn(f.run.id, binding);
       expect(f.requests.filter((r) => r.method === 'spawn')).toHaveLength(1);
     } else {
@@ -2262,17 +2310,13 @@ test('owned reviewer disposal after dispatch claim still prevents the synchronou
   const { binding } = await admissionChild(f, 'plan-exec-reviewer');
   const role = ownedReviewer(f);
   admission.mockResolvedValue({ ...unknownReviewer, diagnostics: [] });
-  const update = f.registry.updateIfCurrent.bind(f.registry);
-  vi.spyOn(f.registry, 'updateIfCurrent').mockImplementation(
-    async (...args) => {
-      const result = await update(...args);
-      if (
-        result.applied &&
-        args[0].activeOperation?.native?.phase === 'dispatching'
-      )
+  const dispatch = f.registry.dispatchNative.bind(f.registry);
+  vi.spyOn(f.registry, 'dispatchNative').mockImplementation(
+    async (run, operation, sessionId, emit) =>
+      dispatch(run, operation, sessionId, () => {
         role.dispose();
-      return result;
-    },
+        emit();
+      }),
   );
   const observed = await f.client.spawn(f.run.id, binding);
   expect(f.requests).toEqual([]);

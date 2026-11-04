@@ -43,6 +43,7 @@ approval, native failure and retirement guards still apply.
   its install command, and prints one next command per run. Pi also points at it
   at session start when its startup sweep finds an abandoned run.
 - Inspect one run: `/exec status <full-run-id>`.
+- Open native run details and exact-ID actions: `/exec inspect [full-run-id]` or `/goal inspect [full-run-id]`. Escape closes the picker; it does not stop work.
 - Toggle the strip and footer: `/exec hide` or `/goal hide`. Execution continues.
   Repeat to restore.
 - Compatibility display controls: `/exec ui off`, `/exec ui on`,
@@ -219,8 +220,7 @@ paused muted; cancelled runs are never displayed. Stop intent takes precedence o
 Native advisory observations are display-only, not verified progress or exit.
 An unpolled in-flight view keeps its execution label with an amber Snapshot
 qualifier and saved details, not current
-worker health. Live colors require this session's local controller and matching
-lease. Viewing or refreshing a snapshot never claims execution ownership. Optional projection repair is visibility only and cannot
+worker health. Live colors require this session's local controller, matching lease and a recent successful observation. A pending poll ages into Snapshot; it does not authorize replacement. Viewing or refreshing a snapshot never claims execution ownership. Optional projection repair is visibility only and cannot
 gate recovery.
 
 ## Observe before controlling
@@ -360,9 +360,9 @@ record, worktree, active-operation evidence, and approval or runtime fix needed.
 
 ## Prerequisites
 
-`pi-plan-exec` uses Pi 1.0.4 and unmodified pi-subagents 0.76.1. No Bridge,
+`pi-plan-exec` uses Pi 1.5.0 and unmodified pi-subagents 0.84.0. No Bridge,
 pi-tasks, cc-thingz or upstream-release prerequisite is needed. New work uses one
-keyed native workflow; request identity and unique output binding are persisted
+direct native single (adapter v2), excluded from workflow auto-resume; request identity and unique output binding are persisted
 before dispatch. Cwd must match the authorized execution target. Unknown launch
 or retirement stays fenced, never replayed.
 
@@ -370,12 +370,11 @@ The default required reviewer is the namespaced readonly `plan-exec-reviewer`,
 registered through public runtime-agent events. Configured frozen agents/models
 are honored. Typed review must bind the exact commit and contain schema-valid
 findings; missing, malformed or wrong-commit output cannot pass. Schema requests
-use supported inline settlement while retaining the caller-bound output file;
-marker requests keep file-only mode. Requested native maxTurns is unsupported,
+and marker requests both use file-only settlement at the caller-bound output path. Requested native maxTurns is unsupported,
 and unbounded workflow mode does not remove child defaults.
 
 Fusion and Revmux remain optional explicit backends with their own strict
-capability refusals and no automatic fallback. Read [runtime contracts](../../docs/runtime-contracts.md).
+capability refusals and no automatic fallback. Read [runtime contracts](references/runtime-contracts.md).
 Development uses npm 12.0.2 and released registry dependencies, not Git overrides.
 Restart after package upgrades; `/reload` is for local source/config changes.
 

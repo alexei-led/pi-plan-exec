@@ -1,839 +1,275 @@
-# pi-plan-exec Guide
+# Guide
 
-<!-- markdownlint-disable MD013 -->
+Use this reference to write plans, configure checks/review and control a run.
+The [installed runtime contracts](../skills/exec-plan/references/runtime-contracts.md)
+own safety guarantees and supported protocol limits; this guide owns commands
+and configuration.
 
-Use this guide to install `pi-plan-exec`, write an executable plan, run it, and
-recover a run safely. See [Architecture](architecture.md) for implementation
-contracts and component ownership.
+## Requirements and installation
 
-## Requirements
+Use Pi 1.5.0, pi-subagents 0.84.0 and this package as independent Pi packages.
+Runtime requires Node >=22.19.0, Git, Darwin/Linux and the platform C compiler
+for kernel registry locks. No Bridge, pi-tasks or cc-thingz installation is needed.
 
-- Pi in an **interactive** session for the plan/isolation pickers; an explicit
-  `--worktree` and plan path skip both pickers.
-- A Git repository with a non-detached `HEAD`.
-- A plan file inside that repository. When using an existing linked worktree,
-  the plan must be inside that selected worktree.
-- These independently installed Pi packages, with the runtime capabilities
-  described in [runtime contracts](runtime-contracts.md):
-  - `pi-subagents`;
-  - optional `@alexeiled/pi-fusion` when Fusion is selected as the review backend;
-  - optional Revmux executable when Revmux is selected as the review backend;
-  - `@alexeiled/pi-plan-exec`.
-
-The default backend targets unmodified pi-subagents 0.76.1 and Pi 1.0.4, with no
-upstream-release prerequisite. Development uses npm 12.0.2. Native's built-in
-`worker` and the extension's namespaced readonly `plan-exec-reviewer` work without
-cc-thingz. Explicit frozen agents/models are honored, never silently replaced.
-
-One public async workflow awaits one keyed `main` child. Cwd must match the
-current authorized execution target; immutable request identity is persisted
-before dispatch. Missing correlation or retirement remains fenced, never replayed.
-Local bootstrap/checks keep the owned POSIX runner. See
-[runtime contracts](runtime-contracts.md) for exact boundaries and limits.
-
-## Install
-
-Install pi-subagents 0.76.1 and this package as independent Pi packages. Bridge
-and pi-tasks are not dependencies. Restart after package upgrades; `/reload` is
-for local source/config changes, not mixed loaded package versions.
-
-The frozen run defaults are explicit: `{ "mode": "unbounded" }` execution
-lifetime, one required `subagent` reviewer, and an empty fallback list (`none`).
-Use a repository `.pi/plan-exec.json` to select a bounded compatibility lifetime
-or another review backend deliberately. A bounded lifetime must include a
-positive `timeoutMs`; `reviewFallback` must list each allowed backend explicitly.
-The selection is frozen into `run.json` when the run starts.
-
-```json
-{
-  "executionLifetime": { "mode": "bounded", "timeoutMs": 1800000 },
-  "reviewBackend": "fusion",
-  "reviewFallback": [],
-  "statsEnabled": false
-}
+```bash
+pi install -l npm:pi-subagents@0.84.0
+pi install -l npm:@alexeiled/pi-plan-exec@2.3.0
 ```
 
-Production dispatch requires the public native runtime to be available; see [runtime contracts](runtime-contracts.md).
+Before upgrading, quiesce old controllers/workers with their original runtime,
+back up evidence and restart all owning Pi sessions. Do not hot-reload a mixed
+dependency stack. Unresolved historical workflow operations retain their original
+identity and reservation; the new adapter does not silently continue them.
 
-Local bootstrap and required checks always use an unbounded, user-stoppable
-owned-process group. A run configured with bounded compatibility lifetime
-does not impose that bounded timer on local commands. Success or failure is
-accepted only after the process group retires for the matching durable
-binding; unknown or malformed ownership remains fenced.
+## Executable-plan format
 
-For a bounded worker or review operation, the controller adapts only after
-confirmed `execution_lifetime_expired`, full retirement proof, and recent
-verified model/tool progress: it doubles the next bounded timeout up to the
-native timer maximum and changes the continuation strategy. The frozen base
-remains unchanged. Heartbeats, silence, unknown results, wrapper exits,
-cancellation acknowledgements, and process-group snapshots do not count as
-progress or expiry.
-
-Native `workerMaxTurns`, `reviewerMaxTurns` and `statsMaxTurns` are requested
-settings only on 0.76.1 (`maxTurnsEnforced:false`). Unbounded workflow mode does
-not disable child defaults; bounded timeout is passed to root and child. Goal
-`maxTaskIterations` is a separate controller budget. Neither silence nor timeout
-text authorizes a duplicate writer.
-
-### Advanced legacy snapshot import
-
-Known recorded native IDs are observed without a journal. If a historical launch
-has no ID, supply a consistent offline schema-7 snapshot explicitly:
-
-```text
-/exec resume <full-run-id> --legacy-journal "/absolute/path/offline snapshot.sqlite"
-/goal resume <full-run-id> --legacy-journal /absolute/path/offline.sqlite
-```
-
-Use a closed/checkpointed database or a consistent SQLite snapshot with its WAL;
-never copy only the main file of a live WAL database. Nothing is auto-discovered,
-created, migrated or reset. The original run/operation/digest must match; imports
-preserve params, stop intent, leases and generations. Missing/mismatched/corrupt/
-busy snapshots stay fenced. A mapping/rejection/stop receipt is not retirement
-or replay permission, and abandoned runs cannot import or resume. Foreign native
-sessions do not gain control from a plan lease. Unresolved legacy isolation is
-refused because its old dispatcher cannot be fenced by a read-only import.
-
-Required native review is a typed commit-bound report from `plan-exec-reviewer`.
-Schema requests keep a unique owned output file but use default inline settlement
-(the released file-only guard can run before structured-output persistence).
-Missing, malformed and wrong-commit reports never pass review. Exact
-`settled-awaiting-resume` sole-child evidence can be recovered without relaunch;
-arbitrary failed-workflow output cannot. Early stops with unverified writer close
-retain reservations, including after force-stop/reload.
-
-## Pursue a goal
-
-`/goal <goal text>` pursues a goal autonomously in place; no plan file or
-checkbox list is required. For example:
-
-```text
-/goal Fix the failing tests
-/goal Add a greeting endpoint --check "npm test"
-```
-
-`/goal` refuses to start on a dirty worktree or without at least one required
-check. Checks are resolved the same way as for `/exec` (project test/build
-commands) or supplied with `--check "<command>"`; they are the completion
-evidence.
-
-The controller runs one worker turn per iteration through the same owned
-native runtime, registry, leases, stop fences, and recovery as `/exec`.
-Each turn receives the goal, the previous outcome, the current check failure,
-and the commits made so far; it inspects the state, chooses and executes the
-next useful action, verifies it, and commits. A turn that ends with an ordinary
-summary — no marker — is an intermediate answer: the controller schedules the
-next turn automatically.
-
-A worker claims completion with `<<<RALPHEX:GOAL_DONE>>>`. The claim only starts
-verification: the controller runs the required checks on the committed work,
-then the configured review and final-verification pipeline. A claim made while
-checks fail is recorded and the goal continues. Before completion, a diff guard
-pauses the goal if the work deleted test files or added `skip`/`only` markers,
-and completion requires a clean tree at the verified commit.
-
-For newly launched turns, stopping a duplicate or superseded assignment does
-not stop the goal. A
-`<<<RALPHEX:TASK_FAILED>>>` assignment result triggers another goal turn to
-reassess the owning work, without repeating the stopped assignment or bypassing
-an approval guard. The goal remains active within its authorized turn budget.
-
-A worker that cannot continue the entire goal ends with
-`<<<RALPHEX:GOAL_BLOCKED>>>`, `Blocker: <reason>`, and `Next step: <what is needed>`.
-An observed prerequisite reported with valid `Prerequisite:` and `Evidence:`
-fields also pauses the goal, even with an assignment-failure marker. The saved
-pause shows Why, Resolve and Resume separately. Resolve the reported condition,
-then use `/goal resume <run-id>`; resume does not grant missing approval.
-Unclassified native failures and unknown retirement keep their existing guards.
-Old in-flight turns retain their original blocker protocol across upgrades;
-a newly launched turn uses the new assignment-versus-goal distinction.
-After
-three unchanged tracked HEAD/check comparisons the next worker is asked to
-reassess its approach. This does not prove that investigation in another
-worktree made no progress. Automatic turns remain bounded by the turn budget
-(`maxTaskIterations`); when it is reached the goal pauses until resume authorizes
-another budget. Confirmed bounded lifetime expiry continues only after worker
-retirement is proven. An unclassified native failure still pauses for recovery;
-unknown retirement never permits a replacement.
-
-```text
-/goal status [run-id]   Progress, current turn, check result, blocker
-/goal resume [run-id]   Continue paused or stuck work
-/goal pause [run-id]    Stop scheduling turns; the current turn is preserved
-/goal cancel [run-id]   End and dismiss; saved work stays
-/goal hide             Toggle progress display; work continues
-/goal help              Command list
-```
-
-Goal runs live in the same registry and `/exec status` lists them.
-There is no external task projection for goals or plans; the working list is optional
-and an empty list is not an error.
-
-## Executable plan format
-
-An executable plan is a Markdown file with a sequence of numbered task or
-iteration sections. Each section contains one or more checkbox items.
+Keep the plan inside its Git repository. Every task section needs a title and
+a concrete verifiable checkbox:
 
 ```markdown
-# Add greeting
+# Deliver a small change
 
-Optional context is allowed before, between, and inside task sections.
-
-### Task 1: Add the greeting
-
-- [ ] Create `greeting.txt` containing exactly `hello`.
-- [ ] Verify it with `test "$(cat greeting.txt)" = "hello"`.
-
-### Task 2: Document the behavior
-
-- [ ] Add the user-facing documentation.
-- [ ] Run the relevant documentation checks.
-```
-
-To make Task 2 independent of Task 1, declare that choice explicitly:
-
-```markdown
-### Task 2: Document the behavior
+### Task 1: Implement it
 dependsOn: []
 
-- [ ] Add the user-facing documentation.
+- [ ] Add the behavior and its regression test.
+- [ ] Run the focused checks.
+
+### Task 2: Document it
+dependsOn: [1]
+
+- [ ] Update the guide and verify the example.
 ```
 
-The parser accepts a small set of heading-based formats. The original format
-remains supported:
+Canonical Task/Iteration numbering starts at 1 and is consecutive. Lightweight
+P0/Phase/Step/T001 headings are normalized to document order. Checkbox markers
+accept -, *, + or ordered-list prefixes and [ ], [x], [X]. Fenced examples are
+ignored. Dependencies are parsed from explicit JSON arrays of earlier task IDs;
+tables/prose do not declare dependencies.
+
+Omitted dependsOn retains legacy sequential order. dependsOn: [] is independent.
+Independent tasks can progress while another waits, but there is one authorized
+writer per target. Accepted tasks are not re-opened by an unchecked prerequisite.
+
+After a run starts, change checkbox markers only. Headings, labels, dependencies,
+item text/count and order are frozen. A structural change pauses for explicit
+review before resume.
+
+## Start and select a target
 
 ```text
-### Task 1: Short task title
-### Iteration 2: Another task
-```
-
-Lightweight variants are also accepted:
-
-```text
-### P0 — Prepare the change
-### P1: Implement the change
-## Phase 2: Verify it
-### Step 3: Document it
-### T004: Follow-up work
-```
-
-`Task` and `Iteration` headings keep their existing numbering rule. They must
-start at `1` and be consecutive. Other supported labels are normalized to
-execution order, so `P0` becomes the first runtime task and `P1` the second.
-Each task may declare dependencies immediately below its heading. Omit
-`dependsOn` to retain legacy sequential ordering; use `dependsOn: []` for an
-independent task, or list only earlier task IDs such as `dependsOn: [1, 2]`.
-Dependencies must be valid JSON and cannot contain duplicates. A task becomes
-ready only after all listed tasks are accepted. Each task needs one or more
-ordinary GFM-style checkbox items. These list
-markers are accepted:
-
-```text
-- [ ] Unchecked item
-* [x] Checked item
-+ [ ] Another item
-1. [ ] Ordered item
-```
-
-`[x]` and `[X]` mean checked. Nested checkbox items are treated as additional
-items in the same task. Checkboxes inside fenced code blocks are ignored.
-
-Text that is not a matching checkbox or dependency declaration is context only;
-it does not create work or complete a task. The parser does not infer task
-dependencies, approvals, parallelism, or special statuses from prose or tables.
-Keep the plan inside the Git repository. During an active run, change only
-checkbox markers; do not change headings, dependency metadata, checkbox text,
-or add/remove items. A structure change pauses the run for review.
-
-### Completion semantics
-
-A task is incomplete while it has any unchecked item. The controller schedules a
-ready task, then re-reads the plan after the worker finishes:
-
-- `[ ]` means pending work.
-- `[x]` or `[X]` means completed work.
-- A worker’s chat summary does **not** complete a task.
-- Checking every item in a task makes its committed candidate eligible for
-  acceptance; dependent tasks wait until that acceptance is recorded.
-- Independent ready tasks can use a clean lane based on the last accepted
-  commit. A failed task's partial work remains in its preserved lane.
-- Changing task structure during a run pauses the run for review. Restore the
-  original structure, or use interactive `/exec resume` to explicitly adopt the
-  current structure before continuing.
-
-Completion acceptance also requires the candidate commit to descend from the
-accepted baseline, pass the frozen required checks captured at run creation,
-leave a clean worktree with no uncommitted or untracked non-ignored files, and
-contain the completed plan checkboxes. The worker's response alone never
-accepts a task.
-
-Adopting a changed plan does not accept new completion claims. New or renamed
-items without matching accepted facts become pending, even when the edited
-plan marks them checked. New worktrees receive the authorized plan structure
-and accepted completion facts through a recoverable atomic publication. A
-failed attempt's checkbox changes never become another task's starting facts.
-
-Write concrete, verifiable items. Each item should name an outcome and, where
-possible, its verification. Avoid broad items such as “finish feature” that
-combine unrelated behavior and checks.
-
-### Invalid examples
-
-These plans are rejected before the controller starts work:
-
-```markdown
-## Design notes
-
-- [ ] This heading is not a supported task label.
-
-### Task 2: Wrong first task number
-
-- [ ] Canonical Task numbering must start at 1.
-
-### Task 1: Missing checkboxes
-
-Write the feature.
-```
-
-## Start a run
-
-From an interactive Pi session at the repository root:
-
-```text
-/exec docs/plans/20260713-add-greeting.md
-```
-
-To choose a Markdown plan beneath `docs/plans/`, excluding directories named
-`completed`:
-
-```text
+/exec docs/plans/change.md
 /exec
+/exec --worktree "/absolute/existing-worktree" docs/plans/change.md
 ```
 
-The extension asks whether to use the current checkout or an isolated Git
-worktree when no explicit target is supplied. Prefer the worktree for a new
-execution branch. On selection, Pi forks the current session into the worktree;
-its tools, footer, and task projection then use the execution branch. Worktrees
-created by plan-exec live outside the source repository:
+Bare /exec picks a Markdown plan under docs/plans, excluding completed.
+Prefer Worktree (isolated). In-place execution uses the current branch.
+An explicit --worktree uses that registered checkout and skips the isolation
+picker; its plan path is relative to that checkout.
+
+Interactive Pi previews the target, branch, models, review and command argv
+before allocation. Cancelling that preview starts nothing. The preview is a
+current configuration snapshot; start freezes its effective settings.
+
+Worktree sessions hand off to the execution checkout through Pi's replacement
+context. Recovery follow-ups dispatch as commands, not model input. Continue
+there; another source-checkout worker is not a substitute for resume.
+
+## Goals
 
 ```text
-~/.pi/plan-exec/worktrees/
+/goal Fix the parser failures --check "npm test"
+/goal status <full-run-id>
+/goal inspect <full-run-id>
 ```
 
-No stage pushes or merges a branch.
+Goals work in place with a clean tree and at least one required check. Each
+implementation turn inspects current state, makes useful progress, verifies and
+commits it. No plan file/DAG is required.
 
-To continue a plan that already lives in a linked worktree, run this from any
-checkout of the same repository:
+--check is repeatable and splits its value into argv on whitespace. It is not
+a shell parser. Put complex argument arrays in configuration rather than hiding
+pipes/expansions inside a check.
 
-```text
-/exec --worktree ../reflex.worktrees/feature docs/plans/20260713-add-greeting.md
-```
+The controller continues intermediate turns within the authorized budget.
+Unchanged HEAD/check fingerprints trigger reassessment, not invented proof of
+no useful investigation. TASK_FAILED means an assignment failed; GOAL_BLOCKED
+with an exact reason/next step means the goal needs external intervention.
+Observed prerequisite evidence and confirmed provider failures retain their
+specific recovery guard.
 
-The worktree path may be absolute or relative to the current Pi session. The
-plan path is resolved relative to the selected worktree; absolute plan paths
-must also remain inside it. The target must be a registered worktree of the
-same Git repository with a named branch. The main checkout is also accepted:
-`--worktree .` explicitly selects in-place execution from its root.
-Symlink aliases are resolved before validation. No worktrees are auto-detected.
+GOAL_DONE cannot pass a failed native child or failed checks. The completion
+guard catches deleted tests and supported JS disabled-test declarations; it is
+a heuristic, not universal anti-test-weakening verification. Application APIs
+such as query.skip()/query.only() and documentation mentions are not disabled tests.
+Required review/checks remain independent.
 
-Put `--worktree` first. Use single or double quotes around a worktree path with
-spaces; the remaining text is one plan path, optionally quoted. Quotes group
-paths only: there is no shell expansion or backslash escaping.
+## Configuration
 
-```text
-/exec --worktree "../feature tree" "docs/plans/my plan.md"
-```
-
-Plan-exec keeps the existing branch and does not create or copy a plan. It does
-not clean unrelated changes in the selected worktree; review them before
-starting and stop any other agent writing there. A non-terminal or failed run
-reserves its worktree and plan, even without a live lease. Use `/exec resume`
-for that run rather than starting another. Only settled completed or cancelled
-runs permit reuse. These checks cover plan-exec runs, not arbitrary editors or
-other agent processes.
-
-## Display controls
-
-The progress strip uses two lines, with one extra warning when needed.
-Healthy working/review/checking and complete states are green. Retry, external
-wait, unknown worker and stopping states are amber. Failed is red.
-User-paused runs are muted once cleanup finishes. Cancelled runs are never displayed.
-An observed operation pause is amber; it does not by itself prove a pending question. When another
-task is working, external waits appear alongside its activity rather than hiding it.
-State text and symbols do not depend on color.
-In-flight records not owned and polled by this session retain their execution
-label with an amber **Snapshot** qualifier, saved details and “No live updates here”. This includes foreign-owned runs
-and records viewed without a controller. A failed local polling request also
-returns the display to snapshot mode. `/exec show <id>` refreshes a snapshot
-without taking ownership; `/exec status <id>` reads current evidence. Settled
-terminal states keep their normal colors without requiring ongoing polling.
-
-```text
-/exec hide             Toggle the strip and footer; execution continues
-/exec show [run-id]     Restore the display; do not resume execution
-/exec clear [run-id]    Dismiss this run's display; do not delete its record
-```
-
-These controls are shared by `/exec` and `/goal`. Repeat `hide` to restore the display.
-`show`, `clear`, and `ui on|off` are compatibility controls.
-No `--apply` or confirmation is needed. Hide and clear without an ID act without
-waiting on the registry or worker. Show and clear with an ID re-read the registry
-to validate the selection, so a slow or unavailable registry can delay or refuse
-them. Neither writes execution state. Clear without an ID dismisses the displayed
-run; other runs can remain visible. Show without an ID restores all dismissed runs and
-selects a nonterminal run first. Use an ID to pin one run. Cancelled runs cannot
-be restored by any display command, including after reload or a new session.
-Cancellation retains worker ownership evidence and saved work, not a persistent UI.
-
-Preferences follow the active Pi session branch and survive reload. A fresh
-session starts with its own view preference. Timers and late projection replies
-cannot undo hide/clear. These controls also apply to goal displays.
-`/exec status` remains textual and read-only. See [native screenshots](ui-validation.md).
-
-## Commands
-
-Use `/exec help` for the short list inside Pi. The shared controls are
-`status`, `resume`, `pause`, `cancel`, `hide`, and `help`.
-Use `/exec help advanced` for recovery flags and compatibility commands.
-Run IDs are optional for normal use: when one run matches the current repository or worktree, `/exec resume` and
-`/exec cancel` select it automatically. Force-skip is intentionally different: it
-always requires a full run ID, reason, and interactive confirmation. If several
-runs match, Pi opens a picker; headless mode asks for the full ID. Bare
-`/exec status` never picks a run — it reports every run in the registry, so the
-full ID is always in front of you.
-Goal controls without an ID select the most recently updated eligible goal
-in this project, preferring the current worktree. Supply an ID to select another.
-
-```text
-/goal <goal> [--check "cmd"]  Pursue a goal autonomously in place; requires a clean worktree and at least one check
-/exec [plan]            Start a run; bare /exec opens the plan picker
-/exec --worktree <path> <plan>  Use an existing worktree and its current branch
-/exec status [run-id]   No run ID: every run grouped by what it needs, any missing package, and one next command per run. With a run ID: that run in detail
-/exec resume [run-id]  Continue paused or stuck work
-/exec pause [run-id]   Pause and keep for later
-/exec cancel [run-id]  End and dismiss immediately; saved work stays
-/exec hide            Toggle progress display; work continues
-/exec help            Show this list
-```
-
-Advanced controls remain available: `resume --model`, `recover-isolated`,
-`cancel --force` (also `stop --force`), `cleanup`, and `skip --reason`.
-Cancellation is final intent, not a successful result or proof of worker exit.
-No separate UI cleanup is needed.
-
-### Reading every run at once
-
-`/exec status` with no run ID is the whole read. It lists every run in the
-registry, groups the runs that claim work in flight by the evidence for that
-claim — `abandoned`, `ambiguous`, or `live` — lists the settled ones under
-`waiting for you` or `finished`, reports any missing prerequisite package with
-its install command, and ends every row in exactly one next command.
-
-Terminal runs drop out of that listing 24 hours after their last update. The
-footer names how many are hidden and both escapes: `/exec status --all` shows
-them, `/exec cleanup` removes them.
-
-### Permanent abandonment
-
-Use `/exec stop <full-run-id> --force` to end management even when worker
-retirement cannot be established. The run is hidden across restarts and cannot
-resume. A read-only display refresh also dismisses it in other open sessions.
-Cancellation is attempted only through its exact owned identity. Unknown
-operations retain their record and checkout reservation. The run stays reserved
-until controller quiescence and retirement permit cleanup. Pre-stop/final
-records are flushed to a private archive before eligible registry artifacts are
-removed. Worktrees, branches, progress and provider journals remain.
-See [force-stop recovery](../skills/exec-plan/references/recovery.md#pause-cancel-and-permanent-force-stop).
-
-### Retiring run records
-
-`/exec cleanup` previews and deletes nothing. `/exec cleanup --apply` deletes.
-A run is removable only when it is terminal, no live lease holds it, and it
-finished more than 7 days ago. Completion and cancellation persist a retirement
-timestamp; lease release and projection repair do not restart that clock.
-Older final records without a timestamp retain their previous cleanup age on
-their next write.
-`failed` runs are excluded by default,
-because their registry entry is what `/exec resume` needs; add
-`--include-failed` to consider them, or name one full run ID to act on exactly
-that run. Naming a run ID also bypasses the retention window — you named it —
-but still needs `--apply`, and a non-terminal or live-leased run is still
-refused.
-
-Removal deletes the registry entry only. The worktree, the branch, and the
-`.ralphex/progress/` log are all left in place.
-
-### Retired names and scripted flags
-
-`/exec pause` and `/exec stop` work without UI. Some `/exec resume` branches
-still ask for confirmation; use their supported flags for scripted callers.
-Former subcommand names still dispatch. They are absent from `/exec help` on
-purpose; `/skill:exec-plan` collects them for agents. `/exec runs` and
-`/exec doctor` both read exactly what `/exec status` reads, `/exec setup` still
-prints the install commands unconditionally where `/exec status` reports them
-only when a package is missing, `/exec adopt` means `/exec resume`, and
-`/exec stop` is the compatibility alias for final `/exec cancel`.
-`/goal stop` now also cancels finally, rather than pausing. `/exec pause`
-is a primary resumable command, not an alias for stop.
-`/exec start` was deleted outright: it was the same code path as bare `/exec`,
-and typing it now says so instead of reading the word as a plan path.
-
-One retired flag writes: `/exec doctor --reconcile` reconciles **every**
-provably abandoned run in the registry without launching a worker or creating a
-new operation. It preserves each existing operation, candidate, and saved
-result identity, records the evidence, and leaves the run ready for the normal
-recovery path. It is dispatched as a write command, so no read path can reach
-it. `/exec resume <full-run-id>` performs the same reconciliation for one run,
-which is the scoped answer to prefer.
-
-### Following a run in flight
-
-Pi shows the current task and accepted-task count in a compact progress strip.
-Paths, branch, owner IDs, usage and raw errors remain in `/exec status`. Stage transitions, observation degradation, and
-terminal states generate notifications. `/exec status <full-run-id>` shows the
-last successful observation and retry count, then names the run's situation in
-plain words and one safe next action.
-
-### Cancellation and missing worktrees
-
-“Cancelling” means stop intent is saved, not that the worker exited.
-Pending native stop delivery is retried against the same operation.
-A `delivered` stop receipt still needs separate retirement proof.
-The strip never lets a stale task's “running” state override cancellation.
-
-Native pi-subagents 0.76.1 RPC cannot stop some paused/queued workflows.
-The recorded refusal remains visible and pending. There is no alternate
-tool/CLI stop path. A missing child ID or manually deleted worktree does not
-prove worker exit, and cleanup cannot delete an unresolved record.
-Use hide/clear to remove the display independently.
-
-Recovery errors are retained in the run directory's `recovery.log`.
-Progress logging does not recreate a deleted execution checkout. It can recreate
-optional progress directories inside an existing checkout.
-
-### What status can prove about a worker
-
-A stored `running` status is a claim, not evidence, so status never renders the
-absence of a signal as health. Every in-flight situation reads differently:
-
-- `running, and the worker reported activity` — the provider reported per-turn
-  activity, and the observation that carried it is recent enough that something
-  is still polling this run. Wait for it.
-- `running, but nothing proves the worker is alive` — nothing reports what the
-  worker is doing, so it is neither confirmed alive nor confirmed dead. Re-check
-  later; a missing or stale signal is never permission to start a second run.
-  When the lease is dead too, nothing is polling, so use `/exec stop` if the
-  operator wants to end the run.
-- `running longer than its budget allows` — only an explicitly bounded
-  `executionLifetime` can produce this classification. It means the configured
-  `timeoutMs` has passed; there is no synthetic per-turn allowance. Unbounded
-  runs never receive this plan-exec classification, but the native child may
-  still reach its own default timeout. The bounded classification is diagnostic
-  only and does not authorize a replacement; use `/exec stop` when the user
-  wants to end the run.
-- `the worker is gone, so nothing is running` — checked at the moment status
-  ran: a matching owned-process-tree terminal proof covers the bound external
-  run, or an intact local prepared record proves no dispatch occurred. A missing/absent lookup never proves non-start. A missing directory or legacy journal row alone is inconclusive;
-  `/exec resume` clears the worker only after decisive evidence and continues
-  without starting a second one.
-- `the worker is gone, so the waived stage cannot finish` — the same evidence on
-  a run whose waiver is still pending. Nothing is left to stop, so the run
-  cannot move on by itself; `/exec resume` clears the dead worker and continues.
-- `the worker is gone, so the stop cannot land by itself` — the same evidence on
-  a run already told to stop. It will never reach `cancelled` on its own, and
-  the reset that recovers the others would erase the stop it carries, so
-  `/exec stop` finishes the cancellation instead.
-- `cannot check on the worker right now` — the provider could not be reached, or
-  the worker was launched and never named, while the run still claims work in
-  flight. Repair the provider and re-check. On a settled run the same unnamed
-  operation reads as the failure it is: resume looks the operation up by its ID
-  rather than launching a second worker.
-- `its lease names a machine that is not this one` — the host frozen on the
-  lease when the run was claimed is not the host this machine answers to now, so
-  every local check would measure the wrong machine. If that name was this
-  machine before it was renamed, say so with
-  `/exec resume <full-run-id> --same-machine`.
-- `between steps` — nothing is tracked because the controller is between two
-  stages. Its next tick opens the next one.
-
-Both reads gather that evidence the same way, so `/exec status` and
-`/exec status <full-run-id>` cannot disagree about one run. The resume gate
-reads the same evidence too, and none of the three asks who is calling: a lease
-is judged from the outside, so a Pi that restarted under the same session ID
-gets the same answer everyone else does. Nothing about liveness is taken from
-the record itself: a directory that was there at the last poll proves nothing
-about now, and neither does one that was missing. A classification that tells
-you to wait is only ever printed when nothing proved the worker gone — decisive
-evidence outranks a pending waiver, a pending stop, and an unreachable provider
-alike.
-
-The default unbounded lifetime has no controller wall-clock deadline. A bounded
-compatibility lifetime is only used when selected explicitly in the frozen run
-configuration. Neither silence nor an observation-failure counter authorizes a
-replacement while ownership is uncertain.
-
-A lease's liveness depends on its frozen hostname. A lease naming this host is
-live while its recorded pid is running, and a dead local pid is stale
-immediately. A lease naming another host is always live because local evidence
-cannot speak for that worker. Legacy leases without a hostname use their
-heartbeat freshness as the only available evidence. A matching session ID is
-not enough for takeover from another process: the reclaiming process must also
-match the recorded pid and local hostname. The explicit session observation used
-by status and resume does not change those ownership rules.
-
-The host on a lease is frozen when the run is claimed, and the whole name
-identifies the machine: a Mac that republishes itself as `foo.local`, `foo.lan`,
-or `foo.corp.example.com` names a different host each time. Matching on the
-first label alone would absorb those renames, but it would also read
-`build.a.example` as `build.b.example` — two real machines that share a registry
-on an NFS home — and then an absence measured here would start a second worker
-over a live remote one. `/exec resume <run-id> --same-machine` is the explicit
-operator assertion that the frozen host was this machine. It creates a temporary
-local view for the probe and abandonment decision without rewriting the lease;
-a worker still writing here keeps the run live, while decisive local evidence
-permits recovery and lets the subsequent claim stamp the current host.
-
-### Recovering a failure
-
-After repeated provider-observation failures, plan-exec records the failure
-without discarding the external operation ID and schedules another probe with
-backoff. A failed run preserves its worktree and remains visible in `/exec
-status` and the projected task description. Automatic recovery reconciles that
-known operation before retrying the stage. If the provider has no record of an
-operation whose launch outcome is unknown, automatic probes continue while
-replacement remains fenced.
-Legacy runs stopped by a plan structure mismatch can be resumed interactively
-after confirming the current structure. The first resume may only transition a
-legacy mismatch to `paused`; status explains that a second interactive resume
-is required after that explicit structural review. Ordinary no-progress
-implementation attempts retry automatically, preserving their partial work.
-
-When a worker returns `<<<RALPHEX:TASK_FAILED>>>` with incomplete checkboxes,
-the controller keeps the run in automatic recovery with the reported reason and
-schedules another evidence-gathering attempt. It does not globally pause or
-terminate the run at a retry cap. The same run, worktree, accepted baseline,
-preserved partial lane, completed tasks, and failed operation identity survive
-reload. A completed workflow receipt is not evidence that the task succeeded,
-and recovery does not waive required approvals or checks.
-
-If the accepted baseline advances while a task is retrying, the next attempt
-uses a fresh lane from that baseline and retains only the selective recovery
-checkpoint needed from the failed lane. It does not replay an old candidate
-against a newer accepted head.
-
-If the worker also reports an observed `Prerequisite:` value of `credentials`,
-`permission`, `missing_executable`, or `runtime` plus an `Evidence:` line, the
-task is recorded as `waiting_external` with that evidence and receives an
-automatic wake. Generic words such as “credentials” without observed evidence
-remain ordinary recovery and do not create an external-wait state.
-
-A run reading `stopped because the model or provider could not be used` is
-recorded separately from task progress. The controller keeps the failed child ID
-and terminal error, does not consume an implementation retry, and retries with
-the current authenticated Pi model. `--model current` or
-`--model provider/model` is an advanced override for that one replacement child;
-it never pins later workers in the run.
-
-For a confirmed tool failure, the controller queues at most one durable
-diagnostic follow-up for that failure identity. `queued` means the provider
-accepted guidance; it does not mean the tool was repaired. A pause or cancel
-fence wins over a late diagnostic reply, and the same diagnostic action is
-reconciled after restart.
-
-`/exec skip` is a last-resort waiver, not a pass. It is available only while an
-optional review or statistics stage is failed, paused, or already
-skip-pending. Required review and final verification cannot be skipped, including
-when the legacy `finalizeEnabled` option is false. If a
-native, Fusion, or Revmux operation is tracked, the controller requests
-stop and remains `skip_pending` until the provider proves that operation is
-terminal. The skipped stage remains visible in status and projected tasks, its
-known findings remain unresolved, and final completion is
-`completed_with_findings`. Implementation and archive stages cannot be skipped.
-
-If the execution directory was moved to another named branch outside plan-exec,
-the normal branch guard stops the run. An interactive `/exec resume <full-run-id>`
-asks before rebinding: it requires no active child, verifies that the worktree
-still belongs to the same Git repository, records the old and new branch in the
-durable run, and then resumes the same stage. Review that branch before
-answering. A caller with no human passes `--adopt-current-branch` to answer the
-same question in advance.
-
-## Watching and recovering a long run
-
-The controller polls an active worker or review operation every second. Under
-the default unbounded lifetime it does not impose a wall-clock limit of its own.
-Strict runtime preflight requires verified owned-tree containment. You
-do not need to keep reissuing `/exec` while a supported run works.
-Use this sequence instead:
-
-1. Run `/exec status` to see every run, what each one needs, and one next command
-   per run. Add a full run ID for the stage, active operation, worktree, branch,
-   progress path, and any error of that one run. It only observes.
-2. Run `/exec stop` for final cancellation, or `/exec pause` to preserve
-   resumability. Pause cancels the current attempt and preserves its checkpoint
-   and progress. Run `/exec resume` when you are
-   ready to continue a paused run. If an actual supervisor request is displayed,
-   answer it; a paused status alone does not prove there is a question.
-   A live controller keeps polling an attached paused operation and continues
-   automatically when it settles, unless you stopped the plan.
-   After a restart, resume consumes the finished child result or reattaches the
-   same workflow without launching a duplicate.
-3. Use the full run ID from `/exec status` with another command when more than
-   one run matches the repository and Pi cannot choose unambiguously.
-4. After a Pi restart or a session handoff, run `/exec status` first. A matching
-   run owned by the returning session reattaches automatically; `/exec resume`
-   takes over an unfinished run whose owning session is proven dead, and
-   reconciles the existing operation when its worker is provably gone before
-   continuing it.
-5. For a run reading `stopped because the model or provider could not be used`,
-   run `/exec resume`. It uses the current authenticated Pi model. Use
-   `--model current|provider/model` only to override that one replacement child.
-   Do not retry the reported failing model repeatedly.
-6. If repeated recovery cannot finish a skippable stage, inspect the known
-   findings and active operation, then use
-   `/exec skip <full-run-id> --reason <text>`. Do not use it to hide
-   unimplemented plan work.
-7. When a run is over, `/exec cleanup` previews the records that can be retired
-   and `/exec cleanup --apply` deletes them.
-
-Do not start the same plan again after an interruption. Inspect the existing run
-first. If the selected run uses a different worktree, `/exec resume` hands the Pi
-session into that worktree before it continues, so subsequent tools use the
-correct branch.
-
-## Run lifecycle
-
-A run:
-
-1. Validates the Git repository and executable-plan contract.
-2. Asks for in-place execution or worktree isolation.
-3. Creates the authoritative global run record and derives task summaries from it.
-4. Schedules dependency-ready implementation tasks with fresh `worker`
-   subagents. Omitted dependencies preserve sequential plans; explicit empty
-   dependencies allow independent work in a clean lane.
-5. Re-reads plan checkboxes after every worker; worker prose is not completion
-   evidence. It accepts only a committed candidate that descends from the
-   accepted baseline, passes the frozen checks, and leaves a clean worktree
-   with no uncommitted or untracked non-ignored files.
-   If work ran in an internal lane, the controller durably promotes the accepted
-   candidate back to the original output branch with a fast-forward after
-   checking known ancestry and preserving user changes. Review and final
-   verification run from that output target.
-6. Runs one required reviewer by default. Fusion or Revmux is used only when
-   selected explicitly in the frozen config; fallback defaults to `none`, and an
-   ambiguous provider start remains owned instead of being replaced.
-7. Runs mandatory final verification of the reviewed commit, records the
-   deterministic or optional statistics result, and archives the completed
-   plan. Verification and archival failures remain recoverable run failures;
-   they are not silently ignored.
-
-Statistics are bookkeeping by default: `statsEnabled` defaults to `false`, so
-the controller records a deterministic usage/task summary without launching an
-additional model. Set it explicitly to request the optional report child; a
-report failure is advisory bookkeeping, while an unknown child remains fenced
-and recoverable.
-
-Only one child is active at a time, and each execution lane has one writer.
-Every implementation, review, and fix operation has fresh subagent context.
-
-## Review results
-
-Native review calls `structured_output` with a schema-valid commit-bound report:
+Use repository .pi/plan-exec.json. Unknown keys and malformed values fail.
+Configuration is frozen into each run; editing the file does not redirect an
+existing operation. A model recovery override applies to one replacement only.
 
 ```json
 {
-  "schemaVersion": 1,
-  "reviewedCommit": "<exact full commit hash>",
-  "findings": [
-    {"severity":"MAJOR","summary":"Input validation is missing","evidence":"src/input.ts:17 accepts an empty value and throws.","suggestion":"Reject empty input at the boundary."}
-  ]
+  "requiredChecks": [["npm", "test"]],
+  "bootstrapCommands": [["npm", "ci"]],
+  "reviewEnabled": true,
+  "reviewRequired": true,
+  "reviewBackend": "subagent",
+  "reviewFallback": [],
+  "statsEnabled": false,
+  "workerAgent": "worker",
+  "reviewerAgent": "plan-exec-reviewer",
+  "executionLifetime": { "mode": "bounded", "timeoutMs": 1800000 },
+  "maxTaskIterations": 50
 }
 ```
 
-`findings: []` is clean only with exact successful-child/retirement and Git
-candidate evidence. There is no verdict field or prose fallback. Historical
-artifacts and explicitly selected Fusion/Revmux retain their separate legacy
-finding/report decoders; they do not change the new native contract.
+| Setting | Meaning |
+| --- | --- |
+| requiredChecks | Nonempty argv arrays. Empty/omitted permits repository detection. |
+| bootstrapCommands | Plan bootstrap argv; empty/omitted detects supported lockfiles. |
+| executionLifetime | unbounded requested by default, or bounded with positive timeoutMs. Native child defaults still apply. |
+| workerAgent / reviewerAgent / statsAgent | Frozen selectors; default worker and readonly plan-exec-reviewer. |
+| workerModel / reviewerModel / statsModel | Optional frozen native model selectors. No silent fallback. |
+| workerMaxTurns / reviewerMaxTurns / statsMaxTurns | Requested diagnostics; native RPC does not enforce them. |
+| maxTaskIterations | Goal implementation-turn budget; not an ordinary plan retry cap. |
+| retryDelayMs | Positive automatic recovery/backoff base. |
+| reviewEnabled / reviewRequired | Required review cannot be disabled. Default both true. |
+| reviewBackend / reviewFallback | Explicit provider policy; default subagent and no fallback. |
+| finalizeEnabled | Does not waive mandatory final verification. |
+| statsEnabled | Optional statistics stage, off by default. |
+| taskRetries / reviewIterations / fusionIterations | Deprecated diagnostic settings, not scheduling caps. |
 
-Supported severities are `CRITICAL`, `MAJOR`, and `MINOR`. Fusion review
-requests the `plan-review-v1` output contract and consumes only Fusion's
-validated top-level `callerOutput.output`; its production path uses a structured
-panel with one judge. Strict early-agreement profiles are rejected before
-dispatch. Revmux reports must prove complete source coverage and contain no unresolved questions;
-its explicit `--execution-lifetime` flag is wrapped by the outer owned process
-group. Missing, blank,
-malformed, or mismatched output fails closed; a partial `run.report` is never
-an approval fallback. The default fallback list is empty, so an unavailable or
-ambiguous provider operation stays recoverable under its original operation ID.
-CRITICAL and MAJOR findings keep review unmet and schedule recovery. MINOR-only
-advisory findings may be recorded as unresolved while the reviewed commit
-advances; the terminal result is then `completed_with_findings`. An explicit
-stage waiver also produces `completed_with_findings` and remains audited.
+Supported default bootstrap detection includes npm/pnpm/yarn/uv lockfiles.
+Default checks select supported Makefile targets or package scripts. Review
+the preview and configure explicit argv when repository defaults are unsuitable.
+These commands can execute repository code with your OS permissions.
 
-## Recovery and safety
+Local bootstrap/checks are unbounded but user-stoppable owned process groups.
+A bounded native lifetime does not bound local commands. Native timeout text,
+silence or a stop receipt is not retirement or permission to launch again.
 
-Authoritative records live at:
+## Status, inspector and display
 
 ```text
-~/.pi/plan-exec/runs/<run-id>/run.json
+/exec status
+/exec status <full-run-id>
+/exec inspect [full-run-id]
+/exec hide
+/exec ui off
+/exec ui on
+/exec show [full-run-id]
+/exec clear [full-run-id]
 ```
 
-Records store stage, attempts, active/failed native identity, immutable request,
-worktree, branch, findings, stop/skip audit and lease. The keyed workflow's RPC
-UUID and structured root/child inventory recover an ambiguous start without
-replaying it. Exact published proof is checked against actual async child mode;
-missing identity, directories or journal rows never prove absence. Registry CAS
-and controller locks prevent stale instances overwriting pause/cancel/generations.
+Status is observational: no dispatch, lease takeover or execution mutation.
+The inspector selects one exact run and offers overview, tasks, checks/review,
+ownership evidence and eligible actions. Native keybindings/selection apply.
+Escape closes it. Actions revalidate current state; an old menu is not authority.
 
-Fleet receives one owned external-run row and a background-work provider. Native
-children are not duplicated. Task summaries derive from the registry; no external
-task cache, task file repair or degraded task-store state exists.
+Both exec and goal controls use the selected eligible identity or require a
+choice when ambiguous. A destructive command does not pick a newer run silently.
+Use explicit full IDs across reloads or when several targets exist.
 
-Pause, cancellation, failure, and completion preserve the worktree for review.
-Cancellation retries transient provider failures without dropping the active
-operation record. Use `/exec status <run-id>` before manually changing it.
+Hide toggles visibility only and preserves pinning/dismissals. ui off is
+idempotent. Clear dismisses a view without cancelling work; show restores it.
+Cancelled/abandoned runs cannot be restored as active display.
 
-A record is retired, not accumulated: archiving stamps the run, terminal runs
-leave the default listing a day later, and `/exec cleanup --apply` deletes the
-record itself after 7 days. Nothing in that lifecycle touches the worktree, the
-branch, or the progress log — deleting a record only gives up the ability to
-`/exec resume` or inspect that run.
+The strip counts accepted tasks, not raw worker claims. Review/final checks
+remain gates after implementation progress. Narrow layouts drop decoration
+before state/source/action; long detail belongs in the inspector/status.
 
-After Pi starts or reloads, the native controller restores unfinished runs when
-their lease is claimable. It never steals a live foreign lease or an explicit
-user pause. Pending native or local cleanup is restored and reconciled without
-resuming plan work. A tracked operation is reattached by its durable operation
-ID; an uncertain launch remains fenced until exact retirement or local pre-dispatch non-start is proven. The strip projects state, accepted count and current action
-from `run.json`. `/exec status` retains dependency/retry waits, verified activity,
-usage, review backend and the active operation's persisted lifetime, including a
-grown budget. Missing lifetime evidence is reported as unknown. A broken
-advisory Fleet publication cannot block recovery. Projection writes coalesce one
-in-flight update and one latest snapshot; a cold technical prerequisite does not
-discard an authorized start.
+Green requires current local observation or completion. In-flight snapshots,
+uncertainty/stopping and prerequisites are amber; failed is red; user pause is
+muted. The 15-second local-observation freshness limit does not prove model
+progress. Native activity/actual-model telemetry is advisory.
 
-Safety limits:
+## Pause, resume, cancel
 
-- Git only; Mercurial and detached `HEAD` are rejected.
-- Dirty state is not silently copied into a worktree.
-- The execution directory and branch are checked before writer stages.
-- Controller Git writes use durable owned commands with workspace-safe
-  environment injection; Git observations disable fsmonitor and optional index
-  writes.
-- The controller launches one child at a time, while dependency-ready tasks may
-  use separate lanes; an unfinished task's partial lane is preserved.
-- Final verification is mandatory. Statistics are deterministic bookkeeping by
-  default, with an optional report child. Plan archival must succeed before the
-  run becomes terminal.
+```text
+/exec pause <full-run-id>
+/exec resume <full-run-id>
+/exec cancel <full-run-id>
+/goal pause <full-run-id>
+/goal resume <full-run-id> --model current
+/goal cancel <full-run-id>
+```
 
-Local commands keep the owned POSIX process-group contract. Native model work
-uses released workflow/child proofs, without fabricated host-process containment.
-Fusion/Revmux retain explicit capability refusals and no implicit fallback.
-See [runtime contracts](runtime-contracts.md) for supported guarantees and safe
-limitations, including native stop proofs that remain unknown.
+Pause is resumable and preserves work. Cleanup remains tracked until exit.
+Resume consumes/reconciles the same operation before authorizing another attempt.
+Ordinary no-progress plan retries retain their lane and use backoff; there is no
+global terminal retry cap. External prerequisites still need real resolution.
 
-For local setup, validation, and tag-driven releases, see
-[DEVELOPMENT.md](../DEVELOPMENT.md).
+Cancel is final, hides the run immediately and preserves work/evidence.
+Cancellation delivery is not retirement; wait for cancelled before claiming
+cleanup finished. stop is a compatibility alias for cancel in both commands.
 
-The declared host-boundary check is `npm run test:runtime-smoke`. It uses
-scripted model turns and does not prove a live-LLM run. It runs on any POSIX
-host and passed the full pipeline on the released pins.
+Requested and reported models differ. Status labels native-reported usage;
+billing basis can be unavailable. Missing telemetry is not zero usage.
+
+### Exceptional recovery
+
+Start with status, retain the full ID and follow its one safe next action.
+Do not manually resume a managed child through subagent.
+
+```text
+/exec resume <id> --model current
+/exec resume <id> --same-machine
+/exec resume <id> --retry-task
+/exec resume <id> --adopt-current-branch
+/exec recover-isolated <id> /absolute/new-checkout
+/exec recover-isolated <id> /absolute/new-checkout --apply
+/exec resume <id> --legacy-journal /absolute/offline.sqlite
+```
+
+Model override requires a current retired failed attempt and never changes later
+operations. --same-machine is a factual hostname assertion, not worker-exit
+evidence. Retry/branch adoption retain confirmation/ownership guards.
+
+Isolated recovery requires explicit local-files-only scope. It quarantines the
+old target/identity and leaves the new checkout paused; it does not prove the
+old worker exited or copy arbitrary partial/ignored user content.
+
+Legacy SQLite import is lazy, explicit, consistent/offline and read-only.
+Known native IDs need no journal. No live journal is discovered or mutated.
+Original identity, generations and abandonment remain authoritative.
+
+```text
+/exec cancel <id> --force
+/exec cleanup
+/exec cleanup --apply
+/exec skip <id> --reason "why this optional stage is waived"
+```
+
+Force-stop is irreversible abandonment of management, not proof of exit.
+Unknown ownership keeps its reservation; worktrees/branches/provider data stay.
+Cleanup previews first and removes only eligible registry entries after retention,
+never a live run or checkout. Failed records remain recoverable unless explicitly
+included. Skip requires a human and cannot waive implementation, required review,
+final verification or archive. A waiver ends as completed_with_findings.
+
+Read [recovery](../skills/exec-plan/references/recovery.md) before controlling an
+uncertain historical run. Never erase evidence to permit downgrade or restart.
+
+## Review and acceptance
+
+Default review is one readonly namespaced runtime role with commit-bound JSON.
+Missing reports, schema errors, wrong commits and contradictory output cannot
+pass. CRITICAL/MAJOR findings require fixes; MINOR-only advice may remain recorded.
+Review fixes use fresh managed leaves and must be reviewed at their new commit.
+
+New native requests are direct singles, excluded from workflow auto-resume.
+Their UUID/digest/cwd/output are persisted before dispatch. Lost replies use
+exact aliases; missing correlation never proves non-start. The final emission
+and stop intent share a record fence. Required native proof is separate from
+Git acceptance.
+
+Optional Fusion/Revmux remain explicit and capability-gated. A version upgrade
+or ordinary panel pass does not establish strict lifetime/ownership support.
+No fallback may start over uncertain prior ownership.
+
+For implementation boundaries see [architecture](architecture.md); for measured
+real-session evidence see [UI validation](ui-validation.md).

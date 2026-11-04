@@ -6,7 +6,8 @@ import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
 import { createJiti } from 'jiti';
 
-const [phase, sandbox, barrier] = process.argv.slice(2);
+const [phase, sandbox, barrier, adapter = 'workflow'] = process.argv.slice(2);
+assert.ok(['workflow', 'single'].includes(adapter));
 const rename = fs.rename;
 let successfulReply;
 // Interpose only the real atomic-publication filesystem boundary, never registry logic.
@@ -64,9 +65,11 @@ const jiti = createJiti(import.meta.url);
 const { createNativeRuntimeHost } = await jiti.import(
   './native-runtime-host.ts',
 );
-const { NativeRuntimeClient } = await jiti.import(
-  '../../src/native-runtime.ts',
-);
+const NativeRuntimeClient =
+  adapter === 'single'
+    ? (await jiti.import('../../src/native-single-runtime.ts'))
+        .NativeSingleRuntimeClient
+    : (await jiti.import('../../src/native-runtime.ts')).NativeRuntimeClient;
 const { RunRegistry } = await jiti.import('../../src/registry.ts');
 const { PlanExecController } = await jiti.import('../../src/controller.ts');
 const { DEFAULT_FROZEN_RUN_CONFIG } = await jiti.import('../../src/types.ts');
@@ -186,7 +189,10 @@ if (phase === 'origin') {
       runId: run.id,
       binding,
       rootId: observed.operation.externalRunId,
-      childRunId: observed.operation.native.childRunId,
+      childRunId:
+        observed.operation.native.childRunId ??
+        observed.operation.externalRunId,
+      adapterVersion: observed.operation.native.version,
       spawns,
     }),
   );
@@ -374,7 +380,10 @@ if (phase === 'origin') {
           spawns,
           sideEffects: calls.length,
           rootId: observed.operation.externalRunId,
-          childRunId: observed.operation.native.childRunId,
+          childRunId:
+            observed.operation.native.childRunId ??
+            observed.operation.externalRunId,
+          adapterVersion: observed.operation.native.version,
           childSessionFile: settled.steps[0].sessionFile,
           nativeProof: settled.processTerminal,
           state: observed.state,

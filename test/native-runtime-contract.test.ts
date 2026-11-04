@@ -146,15 +146,16 @@ test('released public RPC characterizes rejection, stop parity, ownership, and m
     state: 'queued',
   });
   const rpcQueuedStop = rpcReply(await host.rpc('stop', { id: queuedRunId }));
-  expect(rpcQueuedStop.success).toBe(false);
-  expect(record(rpcQueuedStop.error)?.code).toBe('invalid_state');
+  expect(rpcQueuedStop.success).toBe(true);
+  expect(record(rpcQueuedStop.data)?.state).toBe('stopping');
+  expect(record(rpcQueuedStop.data)?.previousState).toBe('queued');
 
   const toolQueuedStop = record(
     await host.executeTool({ action: 'stop', id: queuedRunId }),
   );
   expect(toolQueuedStop?.isError).not.toBe(true);
   await access(join(queuedDir, 'control', 'stop-requests'));
-  expect(await stopRequests(queuedDir)).toHaveLength(1);
+  expect(await stopRequests(queuedDir)).toHaveLength(2);
 
   const runningRunId = `fixture-running-${Date.now()}`;
   const runningDir = await host.seedStatus({
@@ -186,7 +187,10 @@ test('released public RPC characterizes rejection, stop parity, ownership, and m
   });
   const rpcPausedStop = rpcReply(await host.rpc('stop', { id: pausedRunId }));
   expect(rpcPausedStop.success).toBe(false);
-  expect(record(rpcPausedStop.error)?.code).toBe('invalid_state');
+  expect(record(rpcPausedStop.error)?.code).toBe('execution_failed');
+  expect(record(rpcPausedStop.error)?.message).toContain(
+    'process-terminal proof is missing',
+  );
 
   const toolPausedStop = record(
     await host.executeTool({ action: 'stop', id: pausedRunId }),
@@ -200,7 +204,7 @@ test('released public RPC characterizes rejection, stop parity, ownership, and m
     : '';
   expect(toolText).toContain('process-terminal proof is missing');
   await access(join(pausedDir, 'control', 'stop-requests'));
-  expect(await stopRequests(pausedDir)).toHaveLength(1);
+  expect(await stopRequests(pausedDir)).toHaveLength(2);
   await expect(
     access(join(pausedDir, 'process-terminal.json')),
   ).rejects.toMatchObject({ code: 'ENOENT' });

@@ -23,7 +23,7 @@ import {
   readSettledWorkflowCompletion,
   readSubagentArtifact,
 } from './artifact.js';
-import { resolveRunConfig } from './config.js';
+import { resolveExecutionConfig } from './config.js';
 import {
   diagnoseOperation,
   isModelProviderFailureText,
@@ -80,12 +80,7 @@ import {
   verifyIndependentCheckout,
   verifyResumableIsolation,
 } from './isolation.js';
-import {
-  bootstrapCommands,
-  gitValue,
-  requiredChecks,
-  runCommands,
-} from './lanes.js';
+import { bootstrapCommands, gitValue, runCommands } from './lanes.js';
 import {
   hasBoundNeverStarted,
   lookupLegacyOperation,
@@ -201,7 +196,7 @@ export type NativeRuntime = Pick<
   | 'observeLegacy'
   | 'resultLegacy'
   | 'stopLegacy'
->;
+> & { assertRunCompatible?: (run: PlanExecRun) => void };
 
 interface FusionLike {
   capabilities?(): Promise<FusionCapabilities>;
@@ -217,6 +212,13 @@ interface FusionLike {
   result(runId?: string, operationId?: string): Promise<ServiceReply>;
   adopt(runId: string): Promise<ServiceReply>;
   cancel(runId?: string, operationId?: string): Promise<ServiceReply>;
+}
+
+export interface ExecutionPreview {
+  kind: 'plan' | 'goal';
+  cwd: string;
+  branch: string;
+  config: FrozenRunConfig;
 }
 
 export interface StartRunOptions {
@@ -238,6 +240,58 @@ export class PlanExecController {
     private readonly runCommand: RunCommand,
     private readonly executeLocalCommands: typeof runCommands = runCommands,
   ) {}
+
+  async previewStart(
+    options: Omit<StartRunOptions, 'sessionId' | 'onRunAllocated'>,
+  ): Promise<ExecutionPreview> {
+    const repositoryRoot = await requireGitRepository(
+      this.runCommand,
+      options.cwd,
+    );
+    const target = options.existingWorktree
+      ? await verifyExistingWorktree(
+          this.runCommand,
+          repositoryRoot,
+          resolve(options.cwd, options.existingWorktree),
+        )
+      : options.cwd;
+    const path = resolve(target, options.planPath);
+    parsePlan(path, await readFile(path, 'utf8'));
+    const current = await currentBranch(this.runCommand, target);
+    const base = await defaultBranch(this.runCommand, repositoryRoot);
+    const planBranch = branchNameFromPlan(path);
+    const branch = options.useWorktree
+      ? current === base
+        ? planBranch
+        : `${current}-${planBranch}`
+      : current;
+    const cwd = options.useWorktree
+      ? executionWorktreePath(repositoryRoot, branch)
+      : resolve(target);
+    return {
+      kind: 'plan',
+      cwd,
+      branch,
+      config: await resolveExecutionConfig(
+        repositoryRoot,
+        options.useWorktree ? repositoryRoot : target,
+        { detectBootstrap: true },
+      ),
+    };
+  }
+
+  async previewGoal(
+    cwd: string,
+    checks?: string[][],
+  ): Promise<ExecutionPreview> {
+    const root = await requireGitRepository(this.runCommand, cwd);
+    return {
+      kind: 'goal',
+      cwd,
+      branch: await currentBranch(this.runCommand, cwd),
+      config: await resolveExecutionConfig(root, cwd, checks ? { checks } : {}),
+    };
+  }
 
   async previewIsolated(runId: string, target: string) {
     const run = await this.registry.get(runId);
@@ -515,21 +569,12 @@ export class PlanExecController {
       }
     }
 
-    const configured = await resolveRunConfig(repositoryRoot);
     const baselineCwd = options.useWorktree
       ? repositoryRoot
       : executionWorktreeCwd;
-    const config: FrozenRunConfig = {
-      ...configured,
-      requiredChecks: await requiredChecks(
-        baselineCwd,
-        configured.requiredChecks,
-      ),
-      bootstrapCommands: await bootstrapCommands(
-        baselineCwd,
-        configured.bootstrapCommands,
-      ),
-    };
+    const config = await resolveExecutionConfig(repositoryRoot, baselineCwd, {
+      detectBootstrap: true,
+    });
     const initialHead = await gitValue(this.runCommand, baselineCwd, [
       'rev-parse',
       'HEAD',
@@ -605,14 +650,11 @@ export class PlanExecController {
       throw new Error(
         'A goal run works in place and refuses a dirty worktree; commit or stash changes first.',
       );
-    const configured = await resolveRunConfig(repositoryRoot);
-    const config: FrozenRunConfig = {
-      ...configured,
-      requiredChecks: await requiredChecks(
-        options.cwd,
-        options.checks?.length ? options.checks : configured.requiredChecks,
-      ),
-    };
+    const config = await resolveExecutionConfig(
+      repositoryRoot,
+      options.cwd,
+      options.checks ? { checks: options.checks } : {},
+    );
     if (!config.requiredChecks.length)
       throw new Error(
         'A goal needs at least one required check to prove completion; add a test or build script, or pass --check <command>.',
@@ -1007,6 +1049,7 @@ export class PlanExecController {
         `Isolation preparation was stopped. Review /exec recover-isolated ${existing.id} "${existing.isolationRecovery.target}" --apply before continuing.`,
       );
     if (existing.status === RUN_STATUS.ABANDONED) return existing;
+    this.native.assertRunCompatible?.(existing);
     const providerFailure = modelRecoveryOperation(existing);
     if (
       recoveryModel &&
@@ -1406,6 +1449,7 @@ export class PlanExecController {
     if ((run.nextAttemptAt ?? 0) > Date.now()) return run;
     if (run.isolationRecovery && run.isolationRecovery.state !== 'active')
       return this.continueIsolation(run);
+    this.native.assertRunCompatible?.(run);
     if (
       !run.activeOperation &&
       run.failedOperation &&
@@ -2029,6 +2073,7 @@ export class PlanExecController {
       return 'Cannot verify the goal diff before completion.';
     const fields = diff.stdout.split('\0').filter(Boolean);
     const deletedTests: string[] = [];
+    const changedTests: string[] = [];
     for (let index = 0; index < fields.length; ) {
       const status = fields[index++] ?? '';
       const first = fields[index++] ?? '';
@@ -2037,13 +2082,24 @@ export class PlanExecController {
         const second = fields[index++] ?? '';
         if (kind === 'R' && isTestPath(first) && !isTestPath(second))
           deletedTests.push(first);
+        if (isTestPath(second)) changedTests.push(second);
       } else if (kind === 'D' && isTestPath(first)) deletedTests.push(first);
+      else if (isTestPath(first)) changedTests.push(first);
     }
     if (deletedTests.length)
       return `Goal completion deleted test files: ${deletedTests.join(', ')}. Restore or justify them, then resume.`;
+    if (!changedTests.length) return undefined;
     const added = await this.runCommand(
       'git',
-      ['diff', '-U0', '--no-relative', base, 'HEAD'],
+      [
+        'diff',
+        '-U0',
+        '--no-relative',
+        base,
+        'HEAD',
+        '--',
+        ...changedTests.map((path) => `:(literal)${path}`),
+      ],
       run.worktreeCwd,
     );
     if (added.code !== 0)
@@ -2052,7 +2108,9 @@ export class PlanExecController {
       .split('\n')
       .filter((line) => line.startsWith('+') && !line.startsWith('+++'))
       .filter((line) =>
-        /(?:\.(?:skip|only)\s*\(|\b(?:xit|fit)\s*\()/u.test(line),
+        /(?:\b(?:test|it|describe|suite|context)(?:\.(?:concurrent|serial))?\.(?:skip|only)\s*(?:\(|\.)|\b(?:xit|fit|xtest|xdescribe|fdescribe)\s*\()/u.test(
+          line,
+        ),
       );
     if (disabled.length)
       return `Goal completion disables tests: ${disabled
@@ -5809,7 +5867,11 @@ function nativeStatusReply(observed: NativeObservation): ServiceReply {
       runId: observed.operation.externalRunId,
       localNotStarted: observed.operation.launchFenced === true,
       stopPending: observed.stopPending === true,
-      ...(observed.proof ? { workflowTerminalProof: observed.proof } : {}),
+      ...(observed.proof
+        ? observed.operation.native?.version === 2
+          ? { processTerminalProof: observed.proof }
+          : { workflowTerminalProof: observed.proof }
+        : {}),
       ...(observed.reason ? { text: observed.reason } : {}),
     },
   };
