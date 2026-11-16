@@ -562,6 +562,8 @@ export interface PlanExecRun {
   userStopped?: boolean;
   /** Final cancellation dismisses presentation even if worker retirement fails. */
   displayDismissed?: boolean;
+  /** Cancel removes executor-owned state after verified retirement; survives restart. */
+  cleanupRequested?: boolean;
   lanePreparation?: {
     cwd: string;
     branch: string;

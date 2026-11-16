@@ -203,9 +203,17 @@ Resume consumes/reconciles the same operation before authorizing another attempt
 Ordinary no-progress plan retries retain their lane and use backoff; there is no
 global terminal retry cap. External prerequisites still need real resolution.
 
-Cancel is final, hides the run immediately and preserves work/evidence.
-Cancellation delivery is not retirement; wait for cancelled before claiming
-cleanup finished. stop is a compatibility alias for cancel in both commands.
+Cancel is final and hides the run immediately, including its Fleet row. It also
+accepts completed runs. After verified worker exit, it automatically removes the
+run registry directory (including private native outputs and local-command logs)
+and unshared untracked progress. No separate cleanup command or retention wait is
+required. Repository files, worktrees, branches, provider-owned history and shared
+kernel-lock files stay. Pause instead if you need to retain executor history.
+
+Cancellation delivery is not retirement. While exit is uncertain or deletion
+fails, the hidden record remains and cleanup retries across restarts; status names
+the pending reason. Successful cleanup removes the run from status. stop is a
+compatibility alias for cancel in both commands.
 
 Requested and reported models differ. Status labels native-reported usage;
 billing basis can be unavailable. Missing telemetry is not zero usage.

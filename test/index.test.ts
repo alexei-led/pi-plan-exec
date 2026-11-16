@@ -1298,7 +1298,7 @@ test('exec command completions explain the command family', () => {
   );
   assert.match(
     allItems.find((item) => item.value === 'cancel')?.description ?? '',
-    /End and dismiss/,
+    /Stop and clean executor state/,
   );
 });
 
@@ -1408,7 +1408,7 @@ test('setup installs native and optional fusion without removed packages', () =>
   assert.doesNotMatch(execSetup(), /Optional task visibility/);
 });
 
-test('cancel cannot bypass a pending force-skip', () => {
+test('cancel can supersede a pending force-skip without applying its waiver', async (t) => {
   const pending = run({
     status: 'skip_pending',
     stage: 'comprehensive_review',
@@ -1421,8 +1421,17 @@ test('cancel cannot bypass a pending force-skip', () => {
     },
   });
 
-  assert.equal(isActionAllowed('cancel', pending), false);
+  delete pending.activeOperation;
+  assert.equal(isActionAllowed('cancel', pending), true);
   assert.equal(isActionAllowed('skip', pending), true);
+  const { registry, directory } = await seedDirectory([pending]);
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const cancelled = await requestStatus(pending, EXEC_ACTION.CANCEL, registry);
+  assert.equal(cancelled.pendingStageSkip, undefined);
+  assert.equal(cancelled.status, 'cancel_pending');
+  assert.equal(cancelled.cleanupRequested, true);
+  assert.equal(cancelled.stage, pending.stage);
+  assert.deepEqual(cancelled.skippedStages, []);
   // Resume is what applies the waiver; nothing holds this run, so it is open.
   assert.equal(isActionAllowed('resume', pending), true);
 });
@@ -3771,7 +3780,7 @@ test('stop is final without a dialog; pause remains a primary resumable command'
   assert.equal(isActionAllowed('stop', run({ status: 'paused' })), true);
   assert.equal(
     isActionAllowed('stop', run({ status: 'completed', stage: 'complete' })),
-    false,
+    true,
   );
   assert.deepEqual(runActionFor('pause'), { action: 'pause' });
   assert.deepEqual(runActionFor('cancel'), {
@@ -6079,6 +6088,127 @@ for (const name of ['exec', 'goal'])
       assert.match(restored.notifications.at(-1) ?? '', /cannot be resumed/);
       await restored.emit('session_shutdown');
     });
+
+for (const name of ['exec', 'goal'])
+  for (const invocation of ['explicit', 'implicit', 'inspector'])
+    for (const status of [
+      'completed',
+      'completed_with_findings',
+      'cancelled',
+    ] as const)
+      test(`${name} cancel removes terminal run state and progress without deleting repository files: ${status} (${invocation})`, async (t) => {
+        const root = await mkdtemp(join(tmpdir(), 'exec-cancel-terminal-'));
+        t.after(() => rm(root, { recursive: true, force: true }));
+        assert.equal(
+          spawnSync('git', ['init', '-b', 'main'], { cwd: root }).status,
+          0,
+        );
+        const progressPath = join(
+          root,
+          '.ralphex',
+          'progress',
+          'progress-goal-aaaaaaaaaaaa.txt',
+        );
+        await mkdir(join(root, '.ralphex', 'progress'), { recursive: true });
+        await writeFile(progressPath, 'Saved progress');
+        const source = join(root, 'source.txt');
+        await writeFile(source, 'Keep repository work');
+        const held = retiredRun({
+          repositoryRoot: root,
+          worktreeCwd: root,
+          status,
+          updatedAt: Date.now(),
+          progressPath,
+          goal: {
+            text: 'fixture',
+            hash: 'aaaaaaaaaaaa',
+            iteration: 1,
+            maxTurns: 2,
+            noProgress: 0,
+          },
+        });
+        delete held.planPath;
+        delete held.planHash;
+        delete held.lease;
+        const { registry, directory } = await seedDirectory([held]);
+        t.after(() => rm(directory, { recursive: true, force: true }));
+        await mkdir(join(directory, held.id, 'native'), { recursive: true });
+        await writeFile(
+          join(directory, held.id, 'native', 'main.txt'),
+          'Run output',
+        );
+        for (const method of [
+          'get',
+          'listWithErrors',
+          'claim',
+          'updateIfCurrent',
+          'withControllerLock',
+          'remove',
+        ] as const)
+          t.mock.method(
+            RunRegistry.prototype,
+            method,
+            registry[method].bind(registry),
+          );
+        t.mock.method(
+          PlanExecRuntimeIntegration.prototype,
+          'sync',
+          async (current: PlanExecRun) => current,
+        );
+        const h = executionHarness(root, 'cancel-owner');
+        await h.command(`show ${held.id}`);
+        if (status !== 'cancelled') assert.ok(h.widget());
+        if (invocation === 'inspector') {
+          Object.assign(h.ctx, { mode: 'tui' });
+          h.ctx.ui.select = async (_title, options) => {
+            assert.ok(options.includes('Cancel this run'));
+            return 'Cancel this run';
+          };
+          await h.command(`inspect ${held.id}`, name);
+        } else
+          await h.command(
+            invocation === 'implicit' ? 'cancel' : `cancel ${held.id}`,
+            name,
+          );
+        assert.equal(
+          await registry.get(held.id),
+          undefined,
+          h.notifications.join('\n'),
+        );
+        await assert.rejects(access(join(directory, held.id)), {
+          code: 'ENOENT',
+        });
+        await assert.rejects(access(progressPath), { code: 'ENOENT' });
+        assert.equal(await readFile(source, 'utf8'), 'Keep repository work');
+        assert.equal(h.widget(), undefined);
+        assert.equal(h.footer(), undefined);
+        await h.emit('session_shutdown');
+        const restored = executionHarness(root, 'new-session');
+        await restored.emit('session_start');
+        assert.equal(restored.widget(), undefined);
+        await restored.emit('session_shutdown');
+      });
+
+test('terminal cancellation refuses a live foreign lease without changing the record', async (t) => {
+  const held = retiredRun({
+    status: 'completed_with_findings',
+    lease: {
+      sessionId: 'foreign-owner',
+      pid: process.pid,
+      heartbeatAt: Date.now(),
+      hostname: hostname(),
+    },
+  });
+  const { registry, directory } = await seedDirectory([held]);
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  t.mock.method(RunRegistry.prototype, 'get', registry.get.bind(registry));
+  const before = await snapshotRuns(directory);
+  const h = executionHarness(held.worktreeCwd, 'requesting-session');
+  await h.command(`cancel ${held.id}`);
+  assert.match(h.notifications.at(-1) ?? '', /another active Pi session/);
+  assert.deepEqual(await snapshotRuns(directory), before);
+  await h.emit('session_shutdown');
+});
 
 test('final cancellation cannot be resumed after failed retirement', () => {
   const cancelled = run({

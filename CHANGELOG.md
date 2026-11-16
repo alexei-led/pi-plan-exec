@@ -1,5 +1,29 @@
 # Changelog
 
+## 2.3.1 - 2026-11-16
+
+### Fixed
+
+- Make `/exec cancel`, `/goal cancel` and inspector cancellation accept completed
+  runs, including `completed_with_findings`. After verified worker exit, cancel
+  automatically deletes private run records, outputs/logs and unshared untracked
+  progress. No separate cleanup command or retention wait is required.
+- Remove cancelled runs from the progress strip and Fleet immediately while
+  retaining background shutdown tracking. Preserve pending cleanup across
+  restarts, retry deletion failures and report their cause.
+- Preserve repository files, worktrees, branches, shared/tracked progress,
+  provider-owned history and shared kernel locks. Unknown worker ownership
+  continues to block deletion; cancellation never fabricates retirement.
+
+### Upgrade
+
+- Restart Pi after installing this version.
+- Cancel now deletes executor history. Export any logs you need before
+  cancelling, or use pause to retain the run. Existing cancelled records remain
+  until explicitly cancelled again or cleaned up.
+
+[Full changes](https://github.com/alexei-led/pi-plan-exec/compare/v2.3.0...v2.3.1)
+
 ## 2.3.0 - 2026-11-04
 
 ### Changed

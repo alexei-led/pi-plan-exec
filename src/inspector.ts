@@ -121,7 +121,7 @@ export async function inspectRun(
     action === 'cancel' &&
     !(await ctx.ui.confirm(
       'Cancel this run finally?',
-      `Run ${run.id}\nSaved work stays. Worker retirement is tracked separately. Use pause to continue later.`,
+      `Run ${run.id}\nStop workers, then delete executor-owned records, artifacts and unshared untracked progress. Repository files, worktrees and branches stay. Cleanup waits for verified worker exit. Use pause to continue later.`,
     ))
   )
     return { kind: 'closed' };

@@ -91,15 +91,21 @@ function currentProgressView(run: PlanExecRun, now: number): ProgressView {
         : 'Preparing the next task',
   };
   if (run.status === 'cancel_pending') {
+    const cleanupError = run.wakeReason?.startsWith(
+      'Cancellation cleanup pending:',
+    )
+      ? run.wakeReason
+      : undefined;
     return {
       ...view,
       label: '◌ Cancelling',
       tone: 'warning',
       detail: clean(
-        run.activeOperation?.cancellationDeliveryError?.message ??
+        cleanupError ??
+          run.activeOperation?.cancellationDeliveryError?.message ??
           'Stop requested · worker exit not confirmed',
       ),
-      warning: `Waiting for confirmed exit · ${status}`,
+      warning: `${cleanupError ? 'Cleanup will retry' : 'Waiting for confirmed exit'} · ${status}`,
     };
   }
   if (run.status === 'paused') {

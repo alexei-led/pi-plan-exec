@@ -94,7 +94,7 @@ application APIs such as `query.skip()` are not test-disable declarations.
 | `/exec inspect [full-run-id]` | Native keyboard-driven overview, tasks, checks/review, evidence and exact-ID actions |
 | `/exec pause [full-run-id]` | Preserve work and pause resumably; track cleanup until exit |
 | `/exec resume [full-run-id]` | Recover the same run, consume saved output or authorize a safe new attempt |
-| `/exec cancel [full-run-id]` | Final cancellation and immediate display dismissal; saved work stays |
+| `/exec cancel [full-run-id]` | Stop workers, dismiss UI and automatically delete executor-owned state after verified exit; repository work stays |
 | `/exec hide` | Toggle display only; preserve pinning and dismissals |
 | `/exec help` | Basic controls; `help advanced` includes exceptional recovery |
 
@@ -103,6 +103,12 @@ flags. Prefer full IDs when several runs exist. A pinned eligible goal is not
 silently replaced by whichever run updated last; ambiguity requires selection.
 
 Escape closes an inspector/dialog. It does not cancel durable work.
+
+Cancel also accepts completed runs, including `completed_with_findings`. It removes
+the run record, private outputs/logs and unshared untracked progress; no separate
+cleanup command or retention wait is required. Worker-exit uncertainty or a deletion
+failure keeps cancellation pending and retryable across restarts. Repository files,
+worktrees, branches, provider-owned history and shared kernel-lock files stay.
 
 ### Display truth
 

@@ -1288,6 +1288,112 @@ test('metadata contention cannot log an unapplied stage transition', async () =>
     1,
   );
 });
+test('cancel cleanup failures retain a pending reason and retry after restart', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cancel-cleanup-retry-'));
+  onTestFinished(() => rm(root, { recursive: true, force: true }));
+  const source = join(root, 'source.txt');
+  await writeFile(source, 'keep');
+  const registry = new RunRegistry(join(root, 'runs'));
+  const run = await registry.create({
+    ...baseRun(root, join(root, 'plan.md')),
+    status: 'cancelled',
+    cleanupRequested: true,
+    displayDismissed: true,
+    userStopped: true,
+    progressPath: source,
+  });
+  const controller = new PlanExecController(
+    registry,
+    new FakeBridge(join(root, 'none')),
+    new FakeFusion(),
+    async () => {
+      throw new Error('Cleanup must not start execution');
+    },
+  );
+  const pending = await controller.tick(run.id, 'new-session');
+  assert.equal(pending.status, 'cancel_pending');
+  assert.match(
+    pending.wakeReason ?? '',
+    /Cancellation cleanup pending:.*executor-owned/,
+  );
+  assert.ok(await registry.get(run.id));
+  assert.equal(await readFile(source, 'utf8'), 'keep');
+  const corrected = { ...pending, nextAttemptAt: 0 };
+  delete corrected.progressPath;
+  await registry.update(corrected);
+  const restarted = new PlanExecController(
+    registry,
+    new FakeBridge(join(root, 'none')),
+    new FakeFusion(),
+    async () => {
+      throw new Error('Cleanup must not start execution');
+    },
+  );
+  assert.equal(
+    (await restarted.tick(run.id, 'new-session')).status,
+    'cancelled',
+  );
+  assert.equal(await registry.get(run.id), undefined);
+  assert.equal(await readFile(source, 'utf8'), 'keep');
+});
+
+test('cancel cleanup waits for exact worker retirement and then deletes all registry artifacts', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cancel-worker-cleanup-'));
+  onTestFinished(() => rm(root, { recursive: true, force: true }));
+  const registry = new RunRegistry(join(root, 'runs'));
+  class StopBridge extends FakeBridge {
+    retired = false;
+    override async status(runId = 'child') {
+      if (!this.retired) return success({ state: 'running' });
+      return super.status(runId);
+    }
+  }
+  const bridge = new StopBridge(join(root, 'result'));
+  bridge.bindOperation('child', 'op', 'digest');
+  const run = await registry.create({
+    ...baseRun(root, join(root, 'plan.md')),
+    status: 'cancel_pending',
+    stage: 'implementation',
+    cleanupRequested: true,
+    displayDismissed: true,
+    userStopped: true,
+    activeOperation: {
+      operationId: 'op',
+      requestDigest: 'digest',
+      service: 'bridge',
+      kind: 'implementation',
+      externalRunId: 'child',
+    },
+  });
+  await mkdir(join(root, 'runs', run.id, 'native'));
+  await writeFile(join(root, 'runs', run.id, 'native', 'main.txt'), 'output');
+  const controller = new PlanExecController(
+    registry,
+    bridge,
+    new FakeFusion(),
+    async () => {
+      throw new Error('Cancel must not execute Git or start replacement work');
+    },
+  );
+  const pending = await controller.tick(run.id, 'owner');
+  assert.equal(pending.status, 'cancel_pending');
+  assert.ok(await registry.get(run.id));
+  assert.equal(
+    await readFile(join(root, 'runs', run.id, 'native', 'main.txt'), 'utf8'),
+    'output',
+  );
+  bridge.retired = true;
+  await registry.update({ ...pending, nextAttemptAt: 0 });
+  const cancelled = await controller.tick(run.id, 'owner');
+  assert.equal(cancelled.status, 'cancelled');
+  assert.equal(await registry.get(run.id), undefined);
+  await assert.rejects(
+    readFile(join(root, 'runs', run.id, 'native', 'main.txt')),
+    { code: 'ENOENT' },
+  );
+  assert.equal(bridge.spawnCount, 0);
+});
+
 test('controller cancels a stopped review without advancing later stages', async () => {
   const root = await mkdtemp(join(tmpdir(), 'pi-plan-exec-controller-'));
   const planPath = join(root, 'plan.md');

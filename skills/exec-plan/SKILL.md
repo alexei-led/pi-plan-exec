@@ -81,8 +81,13 @@ external prerequisite.
 - Pause resumably: `/exec pause <full-run-id>`.
 - Cancel finally: `/exec cancel <full-run-id>` or `/goal cancel <full-run-id>`.
   Dismiss the UI immediately and across reloads. No separate display cleanup.
-  Saved work and ownership evidence stay. Wait for `cancelled` before claiming
-  worker retirement. Cancellation is not successful completion.
+  Works for completed runs too. After verified worker exit, automatically delete
+  the registry directory, private outputs/logs and unshared untracked progress.
+  No separate cleanup or retention wait. Repository files, worktrees, branches,
+  provider-owned history and shared kernel-lock files stay. Unknown exit or
+  deletion failure retains a hidden pending record and retries across restarts;
+  status reports the reason. Successful cleanup removes the run from status.
+  Cancellation is not successful completion.
 - End management permanently: `/exec stop <full-run-id> --force`. Requires
   explicit operator approval of abandonment. Stops automatic recovery and hides
   the run across restarts; attempts exact-operation cancellation but never
@@ -314,9 +319,10 @@ second writer.
 - Do not edit the worktree until status evidence rules out a live writer.
 - `/exec resume` on a run another session owns is an active takeover that may
   advance work. Inspect first.
-- Ordinary stop records `cancel_pending`; cancellation is complete only when
-  status says `cancelled`. Force-stop records `abandoned`, which ends management
-  but does not prove worker exit. Never resume an abandoned run.
+- Ordinary stop records `cancel_pending`; new cancellations delete their run
+  record after verified exit and cleanup. A missing record after observed cleanup
+  is not evidence that an arbitrary unknown worker exited. Force-stop records
+  `abandoned`, which ends management but does not prove worker exit. Never resume an abandoned run.
 - Preserve the worktree and run artifacts on every failed recovery attempt.
 - Changing globally installed Pi packages requires explicit user approval.
 

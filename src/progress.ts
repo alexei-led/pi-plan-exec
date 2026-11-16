@@ -249,7 +249,7 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function progressPath(run: PlanExecRun): string {
+export function progressPath(run: PlanExecRun): string {
   const stem =
     run.planPath !== undefined
       ? basename(run.planPath).replace(/\.md$/i, '')
