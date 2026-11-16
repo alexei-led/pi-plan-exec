@@ -16,7 +16,7 @@ import {
 import http from 'node:http';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, relative, resolve } from 'node:path';
 import test from 'node:test';
 import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
@@ -1559,6 +1559,51 @@ import{readFileSync}from'node:fs';assert.equal(readFileSync('result.txt','utf8')
             evidence.proof.instances.some(
               (instance) => instance.kind === 'runner',
             ),
+          );
+        }
+        if (mode === 'plan' || mode === 'goal') {
+          const headBefore = (await git(['rev-parse', 'HEAD'])).stdout;
+          const branchBefore = (await git(['branch', '--show-current'])).stdout;
+          const trackedProgress =
+            (
+              await git(['ls-files', '--', completed.progressPath])
+            ).stdout.trim().length > 0;
+          const statusArgs = [
+            'status',
+            '--porcelain',
+            '--untracked-files=all',
+            '--',
+            '.',
+          ];
+          if (!trackedProgress)
+            statusArgs.push(
+              `:(exclude,literal)${relative(cwd, completed.progressPath)}`,
+            );
+          const statusBefore = (await git(statusArgs)).stdout;
+          host.send({
+            id: 'cancel-completed',
+            type: 'prompt',
+            message: `/${mode === 'goal' ? 'goal' : 'exec'} cancel ${run.id}`,
+          });
+          await waitFor(
+            () => !existsSync(join(runs, run.id)),
+            `completed ${mode} cancellation removes executor artifacts`,
+          );
+          assert.equal(existsSync(completed.progressPath), trackedProgress);
+          assert.equal((await git(['rev-parse', 'HEAD'])).stdout, headBefore);
+          assert.equal(
+            (await git(['branch', '--show-current'])).stdout,
+            branchBefore,
+          );
+          assert.equal((await git(statusArgs)).stdout, statusBefore);
+          console.log(
+            JSON.stringify({
+              scenario: 'cancel completed ' + mode,
+              registryRemoved: true,
+              progressRemoved: !trackedProgress,
+              trackedProgressPreserved: trackedProgress,
+              repositoryPreserved: true,
+            }),
           );
         }
       } else {

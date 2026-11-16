@@ -285,6 +285,41 @@ test('late running snapshots cannot re-add terminal work to the provider', () =>
   integration.dispose();
 });
 
+test('cancel removes Fleet UI immediately but tracks pending shutdown until retirement', () => {
+  const api = new FakeRuntimeApi();
+  const integration = new PlanExecRuntimeIntegration(api);
+  integration.sync(run(), 'session-1');
+  integration.sync(
+    run({ status: 'cancel_pending', displayDismissed: true, updatedAt: 3 }),
+    'session-1',
+  );
+  assert.equal(api.rows.size, 0);
+  assert.equal([...api.providers.values()][0]?.listActiveWork().length, 1);
+  integration.sync(run({ status: 'running', updatedAt: 2 }), 'session-1');
+  assert.equal(api.rows.size, 0);
+  integration.sync(
+    run({ status: 'cancelled', displayDismissed: true, updatedAt: 4 }),
+    'session-1',
+  );
+  assert.equal(api.rows.size, 0);
+  assert.equal([...api.providers.values()][0]?.listActiveWork().length, 0);
+  integration.dispose();
+});
+
+test('reconciliation removes hidden cancellation tracking when its record is gone', () => {
+  const api = new FakeRuntimeApi();
+  const integration = new PlanExecRuntimeIntegration(api);
+  integration.sync(
+    run({ status: 'cancel_pending', displayDismissed: true }),
+    'session-1',
+  );
+  assert.equal([...api.providers.values()][0]?.listActiveWork().length, 1);
+  integration.reconcile([], 'session-1');
+  assert.equal(api.rows.size, 0);
+  assert.equal([...api.providers.values()][0]?.listActiveWork().length, 0);
+  integration.dispose();
+});
+
 test('terminal runs remain visible but leave background work', () => {
   const api = new FakeRuntimeApi();
   const integration = new PlanExecRuntimeIntegration(api);

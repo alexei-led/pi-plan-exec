@@ -122,6 +122,10 @@ export class PlanExecRuntimeIntegration {
         ownership.delete(rowKey);
       }
     }
+    for (const [id, work] of this.activeWork) {
+      if (work.sessionId === runtimeSessionId && !desiredExternal.has(id))
+        this.activeWork.delete(id);
+    }
     for (const runId of this.rows.keys()) {
       if (!desired.has(runId)) this.unregister(runId);
     }
@@ -145,9 +149,16 @@ export class PlanExecRuntimeIntegration {
     )
       this.unregister(run.id);
 
-    if (run.status === RUN_STATUS.ABANDONED) {
+    if (
+      run.status === RUN_STATUS.ABANDONED ||
+      run.status === RUN_STATUS.CANCELLED ||
+      run.displayDismissed
+    ) {
       this.observedAt.set(rowKey, run.updatedAt);
       this.unregister(run.id);
+      if (hasManagedWork(run) && run.status !== RUN_STATUS.ABANDONED)
+        this.activeWork.set(externalId, { id: externalId, sessionId });
+      else this.activeWork.delete(externalId);
       return;
     }
     const record = externalRecord(run, sessionId, externalId);

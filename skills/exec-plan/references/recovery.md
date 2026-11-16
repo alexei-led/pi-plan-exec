@@ -51,7 +51,13 @@ failed; arbitrary failed output is not success.
 Pause preserves the checkpoint and is resumable. Ordinary cancel is final
 cancellation without a dialog (`stop` is the compatibility alias for `cancel`).
 Both plans and goals dismiss the UI immediately on cancellation, across reloads
-and new sessions. Saved work stays. Ownership evidence remains until safe retirement.
+and new sessions. Completed runs can be cancelled too. After verified retirement,
+cancel removes the run registry directory, private outputs/logs and unshared
+untracked progress, without retention or a separate cleanup command. Repository
+files, worktrees, branches, provider-owned history and shared kernel-lock files
+stay. Unknown ownership or deletion failure keeps a hidden pending record;
+cleanup retries across restarts and status reports the reason. Successful cleanup
+removes the run from status. Pause instead to retain executor history.
 Both preserve newer stop generations over stale callbacks and refuse a live foreign controller.
 Do not use resume merely to erase an intentional pause.
 

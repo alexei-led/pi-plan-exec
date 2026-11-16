@@ -64,7 +64,11 @@ than manufacturing a no-successor guarantee. Explicit isolated recovery keeps
 the old identity/target quarantined and requires local-files-only approval.
 
 Pause/cancel intent is independent of stop delivery and exit. Cancel hides the
-view immediately; pending cleanup still counts as background work. Force-stop
+view and Fleet row immediately; pending cleanup still counts as background work.
+A durable cleanup request survives restart. After retirement, cancellation removes
+private registry artifacts and unshared untracked progress under controller,
+registry-allocation and record locks. Shared kernel-lock files remain to avoid
+splitting lock identity. Cleanup errors retain a pending record for retry. Force-stop
 backs up and abandons management before best-effort exact control, preserving
 unknown ownership. Cleanup does not remove worktrees/branches.
 

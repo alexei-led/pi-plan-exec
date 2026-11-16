@@ -882,6 +882,24 @@ export class PlanExecController {
     );
     const current = coordinated ?? (await this.registry.get(runId));
     if (!current) throw new Error(`Plan execution run not found: ${runId}`);
+    if (current.status === RUN_STATUS.CANCELLED && current.cleanupRequested) {
+      try {
+        await this.registry.remove(runId, { cancelled: true });
+        return current;
+      } catch (error) {
+        return (
+          await this.registry.updateIfCurrent(
+            {
+              ...current,
+              status: RUN_STATUS.CANCEL_PENDING,
+              wakeReason: `Cancellation cleanup pending: ${error instanceof Error ? error.message : String(error)}`,
+              nextAttemptAt: Date.now() + CONTROLLER_POLL_INTERVAL_MS,
+            },
+            current.updatedAt,
+          )
+        ).run;
+      }
+    }
     return current;
   }
 
@@ -5653,7 +5671,7 @@ export class PlanExecController {
           status: RUN_STATUS.CANCELLED,
         }),
       );
-    if (operation.launchFenced)
+    if (operation.launchFenced || operation.processTreeExited)
       return this.registry.release(
         await this.registry.update(
           withoutOperation({ ...run, status: RUN_STATUS.CANCELLED }),

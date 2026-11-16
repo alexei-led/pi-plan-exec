@@ -5,6 +5,22 @@ agterm on macOS. The local provider was scripted, with isolated HOME, Git
 repositories, native registry and session files. This checks integration and UI
 behavior, not model quality or live-provider reliability.
 
+## 2.3.1 cancellation validation
+
+An isolated Pi 1.5.0 / pi-subagents 0.84.0 session in agterm completed a plan and
+a goal through the scripted local provider. The completed-plan inspector exposed
+**Cancel this run** and its cleanup confirmation. Confirming removed the run
+directory and strip/footer. Implicit `/goal cancel` removed the completed goal
+record, progress and strip/footer. Reload did not restore the cancelled goal.
+Both Git checkouts remained clean on their original branches.
+
+The packed normal-loader suite also checks completed-plan and completed-goal
+cancellation: registry artifacts disappear, tracked progress remains, untracked
+progress disappears, and source status, branch and HEAD stay unchanged. All 24
+scenarios passed through the existing scenario selector in two groups, preserving
+the per-scenario assertions and deadlines. The initial combined local run reached
+its cumulative ten-minute budget and is not counted as a pass.
+
 ## Process-recovery gate
 
 The v2 direct-single fixture kills the actual host with SIGKILL, confirms the

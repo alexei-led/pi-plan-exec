@@ -212,7 +212,7 @@ const EXEC_COMMANDS: AutocompleteItem[] = [
   {
     value: 'cancel',
     label: 'cancel',
-    description: 'End and dismiss; preserve saved work',
+    description: 'Stop and clean executor state; preserve repository work',
   },
   {
     value: 'hide',
@@ -570,7 +570,11 @@ export default function planExecExtension(pi: ExtensionAPI): void {
     const runId = initialRun.id;
     if (
       sessionClosed ||
-      isTerminal(initialRun.status) ||
+      (isTerminal(initialRun.status) &&
+        !(
+          initialRun.status === RUN_STATUS.CANCELLED &&
+          initialRun.cleanupRequested
+        )) ||
       abandonedRuns.has(runId) ||
       retiringSession(initialRun) ||
       activeControllers.has(runId)
@@ -798,6 +802,7 @@ export default function planExecExtension(pi: ExtensionAPI): void {
       });
       if (
         viewAction === EXEC_ACTION.CLEANUP ||
+        viewAction === INSPECT_ACTION ||
         viewAction === EXEC_ACTION.STOP ||
         viewAction === EXEC_ACTION.CANCEL
       ) {
@@ -2952,12 +2957,16 @@ export function shouldAutoRestoreRun(
 ): boolean {
   const pausedCleanup = run.status === RUN_STATUS.PAUSED && pendingCleanup(run);
   if (
-    (!isInFlightStatus(run.status) && !pausedCleanup) ||
-    isTerminal(run.status)
+    (!isInFlightStatus(run.status) &&
+      !pausedCleanup &&
+      !(run.status === RUN_STATUS.CANCELLED && run.cleanupRequested)) ||
+    (isTerminal(run.status) &&
+      !(run.status === RUN_STATUS.CANCELLED && run.cleanupRequested))
   )
     return false;
   if (
     run.status !== RUN_STATUS.CANCEL_PENDING &&
+    !(run.status === RUN_STATUS.CANCELLED && run.cleanupRequested) &&
     !pausedCleanup &&
     run.userStopped === true
   )
@@ -3387,7 +3396,9 @@ async function runAction(
     startCleanup(paused);
     return `Run ${shortRunId(paused.id)} paused; its current attempt is stopping and its checkpoint is preserved. Use /exec resume ${paused.id} to continue after confirmed exit.`;
   }
-  const cancelled = await syncRuntime(
+  const refusal = retiring ? undefined : takeoverRefusal(resolved, sessionId);
+  if (refusal) throw new Error(refusal);
+  let cancelled = await syncRuntime(
     await mutateCommand(dependencies, async () =>
       requestStatus(
         retiring ? resolved : await defaultRegistry.claim(resolved, sessionId),
@@ -3398,8 +3409,15 @@ async function runAction(
   );
   const superseded = supersededCommandMessage(cancelled, dependencies);
   if (superseded) return superseded;
+  if (isTerminal(resolved.status) && !retiring) {
+    cancelled = await dependencies.controller.tick(cancelled.id, sessionId);
+    if (cancelled.status === RUN_STATUS.CANCELLED) {
+      await syncRuntime(cancelled, runtimeContext(ctx));
+      return `Run ${shortRunId(cancelled.id)} cancelled and cleaned up. Executor-owned records, artifacts and unshared untracked progress removed; repository files, worktrees and branches preserved.`;
+    }
+  }
   startCleanup(cancelled);
-  return `Run ${shortRunId(cancelled.id)} marked cancel-pending. Its worktree is preserved.`;
+  return `Run ${shortRunId(cancelled.id)} marked cancel-pending. Worker retirement and automatic cleanup are tracked; repository files, worktrees and branches are preserved.${cancelled.wakeReason?.startsWith('Cancellation cleanup pending:') ? ` ${cancelled.wakeReason}` : ''}`;
 }
 
 async function resumeRun(
@@ -3596,11 +3614,20 @@ async function resolveRunForAction(
     return run;
   }
 
-  const candidates = (await defaultRegistry.list()).filter(
+  let candidates = (await defaultRegistry.list()).filter(
     (run) =>
       matchesContext(run, ctx.cwd) &&
       isActionAllowed(action, run, adoptCurrentBranch),
   );
+  if (
+    (action === EXEC_ACTION.CANCEL || action === EXEC_ACTION.STOP) &&
+    !preferredRunId
+  ) {
+    const unfinished = candidates.filter(
+      (run) => !isTerminal(run.status) || run.status === RUN_STATUS.FAILED,
+    );
+    if (unfinished.length) candidates = unfinished;
+  }
   if (candidates.length === 0) {
     const verb =
       action === EXEC_ACTION.STATUS
@@ -3888,11 +3915,7 @@ export function isActionAllowed(
           isRecoverableFailure(run) ||
           isClaimableRun(run);
   if (action === EXEC_ACTION.SKIP) return isStageWaiverAvailable(run);
-  if (action === EXEC_ACTION.CANCEL)
-    return (
-      run.pendingStageSkip === undefined &&
-      (!isTerminal(run.status) || run.status === RUN_STATUS.FAILED)
-    );
+  if (action === EXEC_ACTION.CANCEL) return run.status !== RUN_STATUS.ABANDONED;
   // A verb added to `RunAction` fails to compile here until it is decided.
   // Only a caller outside the type system reaches the refusal below.
   const unhandled: never = action;
@@ -4137,20 +4160,29 @@ export async function requestStatus(
   let current = run;
   for (let attempt = 0; attempt < COMMAND_CAS_RETRIES; attempt += 1) {
     assertActionAllowed(action, current);
-    const requested = await registry.updateIfCurrent(
-      {
-        ...current,
-        userStopped: true,
-        ...(action === EXEC_ACTION.CANCEL ? { displayDismissed: true } : {}),
-        nextAttemptAt: 0,
-        stopGeneration: (current.stopGeneration ?? 0) + 1,
-        status:
-          action === EXEC_ACTION.PAUSE
-            ? RUN_STATUS.PAUSED
-            : RUN_STATUS.CANCEL_PENDING,
-      },
-      current.updatedAt,
-    );
+    const next: PlanExecRun = {
+      ...current,
+      userStopped: true,
+      nextAttemptAt: 0,
+      stopGeneration: (current.stopGeneration ?? 0) + 1,
+      status:
+        action === EXEC_ACTION.PAUSE
+          ? RUN_STATUS.PAUSED
+          : RUN_STATUS.CANCEL_PENDING,
+    };
+    if (action === EXEC_ACTION.CANCEL) {
+      next.displayDismissed = true;
+      next.cleanupRequested = true;
+      delete next.pendingStageSkip;
+      if (
+        !next.activeOperation &&
+        next.failedOperation &&
+        !next.failedOperation.launchFenced &&
+        !next.failedOperation.processTreeExited
+      )
+        next.activeOperation = next.failedOperation;
+    }
+    const requested = await registry.updateIfCurrent(next, current.updatedAt);
     if (requested.applied) return requested.run;
     current = requested.run;
   }
@@ -4428,15 +4460,22 @@ async function resolveGoalRun(
     return run && isGoalRun(run) ? run : undefined;
   }
   const { runs } = await defaultRegistry.listWithErrors();
-  const candidates = runs.filter(
+  let candidates = runs.filter(
     (run) =>
       isGoalRun(run) &&
       isActionAllowed(action, run) &&
       matchesContext(run, ctx.cwd) &&
-      !run.displayDismissed &&
-      run.status !== RUN_STATUS.CANCELLED &&
-      run.status !== RUN_STATUS.CANCEL_PENDING,
+      (action === EXEC_ACTION.CANCEL ||
+        (!run.displayDismissed &&
+          run.status !== RUN_STATUS.CANCELLED &&
+          run.status !== RUN_STATUS.CANCEL_PENDING)),
   );
+  if (action === EXEC_ACTION.CANCEL && !preferredId) {
+    const unfinished = candidates.filter(
+      (run) => !isTerminal(run.status) || run.status === RUN_STATUS.FAILED,
+    );
+    if (unfinished.length) candidates = unfinished;
+  }
   if (!candidates.length) return undefined;
   return selectContextualRun(candidates, action, ctx, preferredId);
 }
@@ -4457,7 +4496,7 @@ export function goalHelp(): string {
     '/goal inspect [run-id] Open run details and exact-ID actions.',
     '/goal resume [run-id]  Continue paused or stuck work.',
     '/goal pause [run-id]   Stop scheduling turns; the current turn is stopped and preserved.',
-    '/goal cancel [run-id]  End and dismiss the goal; saved work stays.',
+    '/goal cancel [run-id]  Stop and delete executor state after verified exit; repository work stays.',
     '/goal hide            Toggle progress display; work continues.',
     '/goal help              Show this list.',
     '',
@@ -4485,12 +4524,12 @@ export function execHelp(advanced = false): string {
       '/exec inspect [run-id] Open run details and exact-ID actions.',
       '/exec resume [run-id] Continue paused or stuck work.',
       '/exec pause [run-id]  Pause; keep for later.',
-      '/exec cancel [run-id] End and dismiss; saved work stays.',
+      '/exec cancel [run-id] Stop and delete executor state after verified exit; repository work stays.',
       '/exec hide           Toggle progress display; work continues.',
       '/exec help           Show this list.',
       '',
       '/goal <text> starts a goal. Both commands use the same controls.',
-      'Cancellation is final, not successful completion. Worker shutdown continues safely in the background.',
+      'Cancellation is final, including completed runs. Worker shutdown and automatic cleanup continue safely in the background; failures stay pending.',
       'Advanced recovery and compatibility commands: /exec help advanced.',
     ].join('\n');
   return [
@@ -4503,7 +4542,7 @@ export function execHelp(advanced = false): string {
     "                        Continue a stuck run: take over a dead session's lease while retaining the existing operation and saved result. Explicit pauses require resume; automatic task retries preserve their checkpoints.",
     '/exec ui on|off         Toggle the display without changing execution.',
     '/exec pause [run-id]    Pause current work; resume continues after confirmed exit.',
-    '/exec cancel [run-id]   Final cancellation and permanent UI dismissal; preserve saved work.',
+    '/exec cancel [run-id]   Stop and dismiss, then delete private run artifacts and unshared untracked progress after verified exit; preserve repository work.',
     '/exec stop [run-id]     Compatibility alias for cancel.',
     '/exec cancel <run-id> --force (also stop <run-id> --force)  End management permanently and clean eligible registry artifacts. Unknown workers keep a hidden ownership record; no worker-exit claim or worktree deletion.',
     `/exec cleanup [full-run-id] [${CLEANUP_APPLY_OPTION}]`,

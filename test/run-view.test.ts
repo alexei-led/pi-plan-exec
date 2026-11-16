@@ -37,6 +37,21 @@ function run(patch: Partial<PlanExecRun> = {}): PlanExecRun {
     ...patch,
   };
 }
+test('cancellation cleanup failure reports deletion retry rather than unverified worker exit', () => {
+  const view = progressView(
+    run({
+      status: 'cancel_pending',
+      cleanupRequested: true,
+      wakeReason: 'Cancellation cleanup pending: permission denied',
+    }),
+    Date.now(),
+    true,
+  );
+  assert.match(view.detail, /permission denied/);
+  assert.match(view.warning ?? '', /Cleanup will retry/);
+  assert.doesNotMatch(view.warning ?? '', /Waiting for confirmed exit/);
+});
+
 for (const [status, tone, label] of [
   ['running', 'success', 'Working'],
   ['completed', 'success', 'Complete'],

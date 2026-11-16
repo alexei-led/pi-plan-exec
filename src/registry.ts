@@ -11,6 +11,7 @@ import {
 } from 'node:fs/promises';
 import { homedir, hostname } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
+import { removeRunProgress } from './cancel-cleanup.js';
 import { parseOperationActivity } from './diagnostics.js';
 import { worktreeIdentity } from './git.js';
 import { GOAL_OUTCOME_VERSION } from './goal-loop.js';
@@ -713,7 +714,10 @@ export class RunRegistry {
    * resume holds it across the whole recovery, and the record it is about to
    * write must not be deleted underneath it.
    */
-  async remove(runId: string): Promise<boolean> {
+  async remove(
+    runId: string,
+    options: { cancelled?: boolean } = {},
+  ): Promise<boolean> {
     assertRunId(runId);
     const controllerPath = this.controllerLockPath(runId);
     let controllerLock: Awaited<ReturnType<typeof acquireLock>>;
@@ -731,13 +735,25 @@ export class RunRegistry {
       throw error;
     }
     try {
-      return await this.removeLocked(runId);
+      if (!options.cancelled) return await this.removeLocked(runId);
+      // Serialize progress ownership checks with new run allocation.
+      const registryLock = await acquireLock(
+        join(this.directory, 'registry.lock'),
+      );
+      try {
+        return await this.removeLocked(runId, true);
+      } finally {
+        await registryLock.release();
+      }
     } finally {
       await controllerLock.release();
     }
   }
 
-  private async removeLocked(runId: string): Promise<boolean> {
+  private async removeLocked(
+    runId: string,
+    cancelled = false,
+  ): Promise<boolean> {
     const path = this.pathFor(runId);
     const lockPath = this.recordLockPath(runId);
     const lock = await acquireLock(lockPath);
@@ -748,8 +764,23 @@ export class RunRegistry {
         );
       const run = await this.readForRemoval(runId);
       if (run === undefined) return false;
+      if (
+        cancelled &&
+        (!run || run.status !== RUN_STATUS.CANCELLED || !run.cleanupRequested)
+      )
+        throw new Error(
+          `Run ${runId} has not completed cancellation; nothing was deleted.`,
+        );
       const refusal = run === null ? undefined : removalRefusal(run);
       if (refusal) throw new Error(refusal);
+      if (cancelled && run) {
+        const { runs, errors } = await this.listWithErrors();
+        if (errors.length)
+          throw new Error(
+            'Cannot verify progress ownership while run records are unreadable.',
+          );
+        await removeRunProgress(run, runs);
+      }
       if (run?.status === RUN_STATUS.ABANDONED)
         await writeLocked(
           join(dirname(this.abandonmentBackupPath(runId)), 'run.json'),
@@ -757,6 +788,12 @@ export class RunRegistry {
           this.directory,
         );
       await rm(dirname(path), { recursive: true, force: true });
+      const directory = await open(this.directory, 'r');
+      try {
+        await directory.sync();
+      } finally {
+        await directory.close();
+      }
       return true;
     } finally {
       await lock.release();
@@ -824,6 +861,7 @@ export function requiresDurableWrite(
     status: run.status,
     stage: run.stage,
     userStopped: run.userStopped,
+    cleanupRequested: run.cleanupRequested,
     stopGeneration: run.stopGeneration ?? 0,
     executionGeneration: run.executionGeneration ?? 0,
     branch: run.branch,
@@ -1558,6 +1596,11 @@ function isAutonomousState(run: PlanExecRun): boolean {
   if (
     run.displayDismissed !== undefined &&
     typeof run.displayDismissed !== 'boolean'
+  )
+    return false;
+  if (
+    run.cleanupRequested !== undefined &&
+    typeof run.cleanupRequested !== 'boolean'
   )
     return false;
   if (run.userStopped !== undefined && typeof run.userStopped !== 'boolean')
